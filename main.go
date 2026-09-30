@@ -29,6 +29,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -68,7 +69,8 @@ type config struct {
 	SafePhrases    []string        // lowercase phrases stripped before marker matching ("no red flags")
 	Chains         map[string]bool
 
-	ScanGap time.Duration // pause between consecutive CAs
+	ScanGap      time.Duration // pause between consecutive CAs
+	PollInterval time.Duration // re-check the channel for missed posts (0 = off)
 
 	StateDir string
 	DryRun   bool
@@ -133,6 +135,7 @@ func loadConfig(envFile string) (*config, error) {
 		Chains:         map[string]bool{},
 		ScanGap:        envDur("SCOUT_SCAN_GAP", 3*time.Second),
 		StateDir:       env("SCOUT_STATE_DIR", "scoutanalytics_data"),
+		PollInterval:   envDur("SCOUT_POLL_INTERVAL", 20*time.Second),
 		DBMode:         strings.ToLower(env("SCOUT_DB", "repo")),
 		DatabaseURL:    os.Getenv("SCOUT_DATABASE_URL"),
 		DBAutoMigrate:  !strings.EqualFold(env("SCOUT_DB_AUTO_MIGRATE", "true"), "false"),
@@ -191,7 +194,14 @@ func extractCAs(text string, urls []string, chains map[string]bool) []string {
 			out = append(out, ca)
 		}
 	}
-	sources := append([]string{text}, urls...)
+	sources := []string{text}
+	for _, u := range urls {
+		// Links to wallet / transaction pages (e.g. the "Live buys" wallets) carry
+		// addresses that are not the token's CA.
+		if !walletURLRe.MatchString(u) {
+			sources = append(sources, u)
+		}
+	}
 	for _, s := range sources {
 		if chains["evm"] {
 			for _, m := range evmRe.FindAllString(s, -1) {
@@ -208,6 +218,9 @@ func extractCAs(text string, urls []string, chains map[string]bool) []string {
 	}
 	return out
 }
+
+// walletURLRe matches explorer/profile links for wallets and transactions.
+var walletURLRe = regexp.MustCompile(`(?i)/(address|addr|account|accounts|wallet|wallets|tx|txs|transaction|transactions|profile|portfolio|user|holder|holders)/`)
 
 func caKey(ca string) string {
 	if strings.HasPrefix(ca, "0x") {
@@ -323,15 +336,20 @@ type scanner struct {
 	queue chan job
 
 	listOnly bool // -list-chats: don't resolve the delivery target
+
+	postMu      sync.Mutex
+	handled     map[string]bool // "msgID|ca" (and "msgID" for CA-less posts) already processed
+	sourceInput tg.InputChannelClass
 }
 
 func newScanner(cfg *config) *scanner {
 	s := &scanner{
-		cfg:   cfg,
-		seen:  loadSeen(filepath.Join(cfg.StateDir, "seen_cas.json")),
-		logf:  filepath.Join(cfg.StateDir, "scans.jsonl"),
-		queue: make(chan job, 500),
-		byBot: map[int64]*toolRunner{},
+		cfg:     cfg,
+		seen:    loadSeen(filepath.Join(cfg.StateDir, "seen_cas.json")),
+		logf:    filepath.Join(cfg.StateDir, "scans.jsonl"),
+		queue:   make(chan job, 500),
+		byBot:   map[int64]*toolRunner{},
+		handled: map[string]bool{},
 	}
 	for _, t := range cfg.Tools {
 		s.runners = append(s.runners, newToolRunner(t))
@@ -358,7 +376,8 @@ func (s *scanner) onBotMessage(msg *tg.Message) {
 }
 
 // onChannelPost is called for each new message in the source channel.
-// postURLs returns the links in a channel post (text links and link preview).
+// postURLs returns the links in a channel post: text links, link preview and
+// inline buttons (calls often put the CA only behind a "Buy"/"Chart" button).
 func postURLs(msg *tg.Message) []string {
 	var urls []string
 	for _, e := range msg.Entities {
@@ -371,16 +390,34 @@ func postURLs(msg *tg.Message) []string {
 			urls = append(urls, page.URL)
 		}
 	}
-	return urls
+	return append(urls, buttonURLs(msg)...)
 }
 
+// onChannelPost handles a new or edited post in the source channel. It can be
+// called for the same post several times (live update, edit, polling); each
+// (post, CA) pair is handled once.
 func (s *scanner) onChannelPost(msg *tg.Message) {
+	s.postMu.Lock()
+	defer s.postMu.Unlock()
 	urls := postURLs(msg)
 	cas := extractCAs(msg.Message, urls, s.cfg.Chains)
+	var fresh []string
+	for _, ca := range cas {
+		k := strconv.Itoa(msg.ID) + "|" + caKey(ca)
+		if !s.handled[k] {
+			s.handled[k] = true
+			fresh = append(fresh, ca)
+		}
+	}
 	if len(cas) == 0 {
+		if !s.handled[strconv.Itoa(msg.ID)] {
+			s.handled[strconv.Itoa(msg.ID)] = true
+			log.Printf("post %d: no CA found (%d chars, %d links/buttons) — %s",
+				msg.ID, len([]rune(msg.Message)), len(urls), s.sourceLink(msg.ID))
+		}
 		return
 	}
-	for _, ca := range cas {
+	for _, ca := range fresh {
 		if !s.seen.markNew(ca) {
 			log.Printf("post %d: %s already scanned, skipping", msg.ID, ca)
 			s.recordCall(msg, ca, urls, CallStatusDuplicate)
@@ -393,6 +430,91 @@ func (s *scanner) onChannelPost(msg *tg.Message) {
 		default:
 			log.Printf("queue full, dropping %s", ca)
 			s.setCallStatus(callID, CallStatusDropped)
+		}
+	}
+}
+
+// messagesOf returns the plain messages in a history/search result.
+func messagesOf(res tg.MessagesMessagesClass) []*tg.Message {
+	var raw []tg.MessageClass
+	switch m := res.(type) {
+	case *tg.MessagesChannelMessages:
+		raw = m.Messages
+	case *tg.MessagesMessagesSlice:
+		raw = m.Messages
+	case *tg.MessagesMessages:
+		raw = m.Messages
+	}
+	var out []*tg.Message
+	for _, mc := range raw {
+		if m, ok := mc.(*tg.Message); ok {
+			out = append(out, m)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out
+}
+
+// fetchNewPosts returns source-channel posts with id > minID, oldest first.
+func (s *scanner) fetchNewPosts(ctx context.Context, minID, limit int) ([]*tg.Message, error) {
+	res, err := s.api.MessagesGetHistory(ctx, &tg.MessagesGetHistoryRequest{Peer: s.sourcePeer, MinID: minID, Limit: limit})
+	if err != nil {
+		return nil, err
+	}
+	return messagesOf(res), nil
+}
+
+// fetchPosts returns specific source-channel posts by id.
+func (s *scanner) fetchPosts(ctx context.Context, ids []int) ([]*tg.Message, error) {
+	var in []tg.InputMessageClass
+	for _, id := range ids {
+		in = append(in, &tg.InputMessageID{ID: id})
+	}
+	res, err := s.api.ChannelsGetMessages(ctx, &tg.ChannelsGetMessagesRequest{Channel: s.sourceInput, ID: in})
+	if err != nil {
+		return nil, err
+	}
+	return messagesOf(res), nil
+}
+
+// poll is a safety net next to live updates: Telegram does not always push
+// every post of a large channel to user accounts, so every PollInterval we ask
+// for posts newer than the last one polled. Already-handled posts are skipped.
+func (s *scanner) poll(ctx context.Context) {
+	if s.cfg.PollInterval <= 0 {
+		return
+	}
+	cursor := 0
+	if top, err := s.fetchNewPosts(ctx, 0, 1); err != nil {
+		log.Printf("poll: initial read of @%s failed: %v", s.cfg.SourceChannel, err)
+	} else if len(top) > 0 {
+		cursor = top[len(top)-1].ID // start from now; no backfill of old posts
+	}
+	log.Printf("polling @%s every %s as a backup (starting after post %d)", s.cfg.SourceChannel, s.cfg.PollInterval, cursor)
+	t := time.NewTicker(s.cfg.PollInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+		if cursor == 0 {
+			if top, err := s.fetchNewPosts(ctx, 0, 1); err == nil && len(top) > 0 {
+				cursor = top[len(top)-1].ID
+			}
+			continue
+		}
+		msgs, err := s.fetchNewPosts(ctx, cursor, 50)
+		if err != nil {
+			log.Printf("poll: %v", err)
+			continue
+		}
+		for _, m := range msgs {
+			s.onChannelPost(m) // no-op if the live update already handled it
+			if m.ID > cursor {
+				cursor = m.ID
+			}
 		}
 	}
 }
@@ -1106,8 +1228,9 @@ func main() {
 	envFile := flag.String("env", ".env", "path to .env file")
 	oneShot := flag.String("scan", "", "investigate a single CA with every tool, print the reports and deliver them (if allowed), then exit")
 	_ = flag.Bool("deliver", true, "deprecated: -scan now delivers by default (use -no-deliver to only print)")
-	noDeliver := flag.Bool("no-deliver", false, "with -scan: print the reports only, don't send them")
+	noDeliver := flag.Bool("no-deliver", false, "with -scan / -post: print the reports only, don't send them")
 	dryRun := flag.Bool("dry-run", false, "listen and scan, but never deliver (verdicts are logged)")
+	postFlag := flag.String("post", "", "process specific @scoutrobinhood post id(s), e.g. 10002 or 10002,10005: show what was found, investigate and deliver, then exit")
 	listChats := flag.Bool("list-chats", false, "print your groups/channels with their ids (for SCOUT_NOTIFY_PEER), then exit")
 	flag.Parse()
 
@@ -1163,6 +1286,49 @@ func main() {
 		return
 	}
 
+	if *postFlag != "" {
+		var ids []int
+		for _, p := range strings.Split(*postFlag, ",") {
+			p = strings.TrimSpace(p)
+			if i := strings.LastIndex(p, "/"); i >= 0 { // accept https://t.me/scoutrobinhood/10002
+				p = p[i+1:]
+			}
+			id, err := strconv.Atoi(p)
+			if err != nil {
+				log.Fatalf("-post: %q is not a post id", p)
+			}
+			ids = append(ids, id)
+		}
+		if err := run(ctx, s, func(ctx context.Context) error {
+			posts, err := s.fetchPosts(ctx, ids)
+			if err != nil {
+				return err
+			}
+			if len(posts) == 0 {
+				return fmt.Errorf("post(s) %v not found in @%s", ids, cfg.SourceChannel)
+			}
+			for _, m := range posts {
+				urls := postURLs(m)
+				cas := extractCAs(m.Message, urls, cfg.Chains)
+				fmt.Printf("===== post %d %s =====\n%s\n", m.ID, s.sourceLink(m.ID), m.Message)
+				fmt.Printf("links/buttons (%d):\n", len(urls))
+				for _, u := range urls {
+					fmt.Println("  ", u)
+				}
+				fmt.Printf("CAs found: %v\n\n", cas)
+				for _, ca := range cas {
+					s.seen.markNew(ca)
+					j := job{CA: ca, SourceMsg: m.ID, SourceText: m.Message, CallID: s.recordCall(m, ca, urls, CallStatusQueued)}
+					printResults(s, s.process(ctx, j, !*noDeliver), *noDeliver)
+				}
+			}
+			return nil
+		}); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
+
 	if *oneShot != "" {
 		if err := run(ctx, s, func(ctx context.Context) error {
 			j := job{CA: strings.TrimSpace(*oneShot)}
@@ -1175,22 +1341,7 @@ func main() {
 			} else {
 				log.Printf("no post mentioning %s found in @%s; delivering without the original call", j.CA, cfg.SourceChannel)
 			}
-			results := s.process(ctx, j, !*noDeliver)
-			for _, r := range results {
-				v := r.Verdict
-				fmt.Printf("===== %s (@%s) — %s =====\n", r.Spec.Name, r.Spec.Bot, r.Status)
-				if r.Err != nil {
-					fmt.Println("error:", r.Err)
-				}
-				fmt.Println(r.ReportText())
-				fmt.Printf("verdict: %s  label=%q  ticker=%s  summary=%q  via=%s %s  gate=%v\n\n",
-					v.Level, v.Label, v.Ticker, v.Summary, v.Source, v.URL, r.Spec.Gate)
-			}
-			would := s.shouldDeliver(results)
-			fmt.Printf("would deliver: %v\n", would)
-			if would && *noDeliver {
-				fmt.Println("(not sent: -no-deliver)")
-			}
+			printResults(s, s.process(ctx, j, !*noDeliver), *noDeliver)
 			return nil
 		}); err != nil {
 			log.Fatal(err)
@@ -1204,6 +1355,7 @@ func main() {
 		start := time.Now()
 		err := run(ctx, s, func(ctx context.Context) error {
 			go s.worker(ctx)
+			go s.poll(ctx)
 			var names []string
 			for _, t := range cfg.Tools {
 				g := ""
@@ -1300,6 +1452,24 @@ func (s *scanner) registerTools(ctx context.Context) error {
 	return s.db.SetActiveInvestigationTools(ctx, codes)
 }
 
+func printResults(s *scanner, results []*toolResult, noDeliver bool) {
+	for _, r := range results {
+		v := r.Verdict
+		fmt.Printf("===== %s (@%s) — %s =====\n", r.Spec.Name, r.Spec.Bot, r.Status)
+		if r.Err != nil {
+			fmt.Println("error:", r.Err)
+		}
+		fmt.Println(r.ReportText())
+		fmt.Printf("verdict: %s  label=%q  ticker=%s  summary=%q  via=%s %s  gate=%v\n\n",
+			v.Level, v.Label, v.Ticker, v.Summary, v.Source, v.URL, r.Spec.Gate)
+	}
+	would := s.shouldDeliver(results)
+	fmt.Printf("deliver: %v\n", would)
+	if would && noDeliver {
+		fmt.Println("(not sent: -no-deliver)")
+	}
+}
+
 func deliveryLabel(c *config) string {
 	if c.NotifyBotToken != "" {
 		return "bot API chat " + c.NotifyChatID
@@ -1318,14 +1488,22 @@ func run(ctx context.Context, s *scanner, body func(ctx context.Context) error) 
 		UpdateHandler:  gaps,
 	})
 
-	dispatcher.OnNewChannelMessage(func(ctx context.Context, e tg.Entities, u *tg.UpdateNewChannelMessage) error {
-		msg, ok := u.Message.(*tg.Message)
+	onSource := func(m tg.MessageClass) {
+		msg, ok := m.(*tg.Message)
 		if !ok {
-			return nil
+			return
 		}
 		if p, ok := msg.PeerID.(*tg.PeerChannel); ok && p.ChannelID == s.sourceChannelID {
 			s.onChannelPost(msg)
 		}
+	}
+	dispatcher.OnNewChannelMessage(func(ctx context.Context, e tg.Entities, u *tg.UpdateNewChannelMessage) error {
+		onSource(u.Message)
+		return nil
+	})
+	// A call is sometimes posted first and the CA added by an edit.
+	dispatcher.OnEditChannelMessage(func(ctx context.Context, e tg.Entities, u *tg.UpdateEditChannelMessage) error {
+		onSource(u.Message)
 		return nil
 	})
 	dispatcher.OnNewMessage(func(ctx context.Context, e tg.Entities, u *tg.UpdateNewMessage) error {
@@ -1370,6 +1548,7 @@ func run(ctx context.Context, s *scanner, body func(ctx context.Context) error) 
 		}
 		s.sourceChannelID = src.ID
 		s.sourcePeer = src.AsInputPeer()
+		s.sourceInput = src.AsInput()
 		if src.Left {
 			log.Printf("joining @%s so we receive its posts", cfg.SourceChannel)
 			if _, err := s.api.ChannelsJoinChannel(ctx, src.AsInput()); err != nil {

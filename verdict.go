@@ -72,12 +72,32 @@ func messageURLs(msg *tg.Message) []string {
 			urls = append(urls, page.URL)
 		}
 	}
-	if kb, ok := msg.ReplyMarkup.(*tg.ReplyInlineMarkup); ok {
-		for _, row := range kb.Rows {
-			for _, b := range row.Buttons {
-				if u, ok := b.(*tg.KeyboardButtonURL); ok {
-					urls = append(urls, u.URL)
-				}
+	return append(urls, buttonURLs(msg)...)
+}
+
+// buttonURLs returns the links behind a message's inline buttons
+// ("Buy", "Chart", "DexScreener", mini-app buttons, …).
+func buttonURLs(msg *tg.Message) []string {
+	var urls []string
+	kb, ok := msg.ReplyMarkup.(*tg.ReplyInlineMarkup)
+	if !ok {
+		return nil
+	}
+	for _, row := range kb.Rows {
+		for _, b := range row.Buttons {
+			switch x := b.(type) {
+			case *tg.KeyboardButtonURL:
+				urls = append(urls, x.URL)
+			case *tg.KeyboardButtonURLAuth:
+				urls = append(urls, x.URL)
+			case *tg.KeyboardButtonWebView:
+				urls = append(urls, x.URL)
+			case *tg.KeyboardButtonSimpleWebView:
+				urls = append(urls, x.URL)
+			case *tg.KeyboardButtonSwitchInline:
+				urls = append(urls, x.Query) // e.g. "0x… " share buttons
+			case *tg.KeyboardButtonCopy:
+				urls = append(urls, x.CopyText) // "copy CA" buttons
 			}
 		}
 	}

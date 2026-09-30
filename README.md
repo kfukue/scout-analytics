@@ -27,6 +27,9 @@ go run ./telegrambot/scoutanalytics -scan 0xYourTestCA
 #    print only, don't send:
 go run ./telegrambot/scoutanalytics -scan 0xYourTestCA -no-deliver
 
+# 1b. process a specific call post (prints what it found in the post, then investigates + delivers)
+go run ./telegrambot/scoutanalytics -post 10002          # or -post https://t.me/scoutrobinhood/10002
+
 # 2. watch the channel but deliver nothing (verdicts go to the log)
 go run ./telegrambot/scoutanalytics -dry-run
 
@@ -36,6 +39,19 @@ go run ./telegrambot/scoutanalytics
 
 First run asks for the Telegram login code (and uses `TG_PASSWORD` if you have 2FA).
 Make sure you've pressed **Start** on **@perceptor0xBot and @salpha_research_bot** once from this account.
+
+## How calls are picked up
+
+- **Live updates** for new posts, plus **edited posts** (a call posted first and the CA added later).
+- **Polling backup** every `SCOUT_POLL_INTERVAL` (default `20s`, `0` = off): Telegram doesn't
+  always push every post of a big channel to user accounts, so the scanner also asks for
+  posts newer than the last one it polled. Each (post, CA) is handled once.
+- The CA is read from the post text, text links, link previews **and inline buttons**
+  (Chart/Buy/"Copy CA"). Links to **wallet or transaction pages** (`/address/`, `/tx/`,
+  `/profile/`, …, e.g. the "Live buys" wallets) are ignored, so wallets aren't scanned.
+- Every post is logged: `post 10002: queued 0x…` or `post 10002: no CA found (… links/buttons)`.
+  If a post you expected isn't in the log at all, it wasn't received; if it says "no CA found",
+  run `-post <id>` to see exactly what the scanner saw.
 
 ## Where clean reports go
 
