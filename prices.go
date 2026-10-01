@@ -30,6 +30,8 @@ import (
 // ---------------------------------------------------------------------------
 
 type priceConfig struct {
+	Source    string // "onchain" (Uniswap pools + Chainlink, default) | "gecko" (GeckoTerminal API)
+	Onchain   onchainConfig
 	BaseURL   string
 	Network   string
 	APIKey    string
@@ -63,6 +65,7 @@ func parseHorizon(s string) (time.Duration, error) {
 
 func loadPriceConfig() (priceConfig, error) {
 	pc := priceConfig{
+		Source:    strings.ToLower(env("SCOUT_PRICE_SOURCE", "onchain")),
 		BaseURL:   strings.TrimRight(env("SCOUT_PRICE_API_BASE", "https://api.geckoterminal.com/api/v2"), "/"),
 		Network:   env("SCOUT_PRICE_NETWORK", "robinhood"),
 		APIKey:    env("SCOUT_PRICE_API_KEY", ""),
@@ -101,6 +104,13 @@ func loadPriceConfig() (priceConfig, error) {
 		pc.Horizons = append(pc.Horizons, horizon{Name: h, Dur: d})
 	}
 	sort.Slice(pc.Horizons, func(i, j int) bool { return pc.Horizons[i].Dur < pc.Horizons[j].Dur })
+	if pc.Source != "onchain" && pc.Source != "gecko" {
+		return pc, fmt.Errorf("SCOUT_PRICE_SOURCE=%q: use onchain or gecko", pc.Source)
+	}
+	var err error
+	if pc.Onchain, err = loadOnchainConfig(); err != nil {
+		return pc, err
+	}
 	if len(pc.Horizons) == 0 {
 		return pc, errors.New("SCOUT_PERF_HORIZONS is empty")
 	}

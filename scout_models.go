@@ -173,24 +173,26 @@ func (LiveBuy) TableName() string { return "scout_call_live_buys" }
 
 // ScoutCallTracking is one row of scout_call_tracking.
 type ScoutCallTracking struct {
-	CallID              int        `json:"call_id"`
-	ContractAddress     string     `json:"contract_address"`
-	EntryAt             time.Time  `json:"entry_at"`
-	Priority            int        `json:"priority"`
-	Status              string     `json:"status"`
-	PoolAddress         *string    `json:"pool_address"`
-	PoolName            *string    `json:"pool_name"`
-	PoolDex             *string    `json:"pool_dex"`
-	PoolCreatedAt       *time.Time `json:"pool_created_at"`
-	EntryPriceUSD       *float64   `json:"entry_price_usd"`
-	EntryPriceSource    *string    `json:"entry_price_source"`
-	CurrentPriceUSD     *float64   `json:"current_price_usd"`
-	CurrentLiquidityUSD *float64   `json:"current_liquidity_usd"`
-	Rugged              *bool      `json:"rugged"`
-	NextCheckAt         time.Time  `json:"next_check_at"`
-	LastCheckedAt       *time.Time `json:"last_checked_at"`
-	Attempts            int        `json:"attempts"`
-	Error               *string    `json:"error"`
+	CallID              int             `json:"call_id"`
+	ContractAddress     string          `json:"contract_address"`
+	EntryAt             time.Time       `json:"entry_at"`
+	Priority            int             `json:"priority"`
+	Status              string          `json:"status"`
+	PoolAddress         *string         `json:"pool_address"`
+	PoolName            *string         `json:"pool_name"`
+	PoolDex             *string         `json:"pool_dex"`
+	PoolCreatedAt       *time.Time      `json:"pool_created_at"`
+	EntryPriceUSD       *float64        `json:"entry_price_usd"`
+	EntryPriceSource    *string         `json:"entry_price_source"`
+	CurrentPriceUSD     *float64        `json:"current_price_usd"`
+	CurrentLiquidityUSD *float64        `json:"current_liquidity_usd"`
+	Rugged              *bool           `json:"rugged"`
+	NextCheckAt         time.Time       `json:"next_check_at"`
+	LastCheckedAt       *time.Time      `json:"last_checked_at"`
+	Attempts            int             `json:"attempts"`
+	Error               *string         `json:"error"`
+	PriceUnit           *string         `json:"price_unit"` // "usd", or the quote asset's symbol when no USD source exists
+	Onchain             json.RawMessage `json:"onchain"`    // on-chain tracker state (pool, scan progress)
 }
 
 // TableName returns the table name for this model.

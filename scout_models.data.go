@@ -671,16 +671,19 @@ func (st *ScoutStore) EnsureTracking(ctx context.Context, callID int, ca string,
 
 const trackingColumns = `call_id, contract_address, entry_at, priority, status, pool_address, pool_name, pool_dex,
 	pool_created_at, entry_price_usd::float8, entry_price_source, current_price_usd::float8,
-	current_liquidity_usd::float8, rugged, next_check_at, last_checked_at, attempts, error`
+	current_liquidity_usd::float8, rugged, next_check_at, last_checked_at, attempts, error, price_unit, onchain`
 
 func scanTracking(row pgx.Row) (*ScoutCallTracking, error) {
 	var t ScoutCallTracking
+	var onchain []byte
 	err := row.Scan(&t.CallID, &t.ContractAddress, &t.EntryAt, &t.Priority, &t.Status, &t.PoolAddress, &t.PoolName,
 		&t.PoolDex, &t.PoolCreatedAt, &t.EntryPriceUSD, &t.EntryPriceSource, &t.CurrentPriceUSD,
-		&t.CurrentLiquidityUSD, &t.Rugged, &t.NextCheckAt, &t.LastCheckedAt, &t.Attempts, &t.Error)
+		&t.CurrentLiquidityUSD, &t.Rugged, &t.NextCheckAt, &t.LastCheckedAt, &t.Attempts, &t.Error,
+		&t.PriceUnit, &onchain)
 	if err != nil {
 		return nil, err
 	}
+	t.Onchain = onchain
 	return &t, nil
 }
 
@@ -726,14 +729,20 @@ func (st *ScoutStore) KnownPool(ctx context.Context, ca string) (*ScoutCallTrack
 
 // SaveTracking writes the mutable fields of a tracking row.
 func (st *ScoutStore) SaveTracking(ctx context.Context, t *ScoutCallTracking) error {
+	var onchainJSON *string
+	if len(t.Onchain) > 0 {
+		s := string(t.Onchain)
+		onchainJSON = &s
+	}
 	_, err := st.Pool.Exec(ctx, `UPDATE scout_call_tracking SET
 		status = $2, pool_address = $3, pool_name = $4, pool_dex = $5, pool_created_at = $6,
 		entry_price_usd = $7, entry_price_source = $8, current_price_usd = $9, current_liquidity_usd = $10,
-		rugged = $11, next_check_at = $12, last_checked_at = $13, attempts = $14, error = $15, updated_at = now()
+		rugged = $11, next_check_at = $12, last_checked_at = $13, attempts = $14, error = $15,
+		price_unit = $16, onchain = $17::jsonb, updated_at = now()
 		WHERE call_id = $1`,
 		t.CallID, t.Status, t.PoolAddress, t.PoolName, t.PoolDex, t.PoolCreatedAt,
 		t.EntryPriceUSD, t.EntryPriceSource, t.CurrentPriceUSD, t.CurrentLiquidityUSD,
-		t.Rugged, t.NextCheckAt.UTC(), t.LastCheckedAt, t.Attempts, t.Error)
+		t.Rugged, t.NextCheckAt.UTC(), t.LastCheckedAt, t.Attempts, t.Error, t.PriceUnit, onchainJSON)
 	return err
 }
 

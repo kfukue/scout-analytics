@@ -189,8 +189,8 @@ CREATE TABLE IF NOT EXISTS scout_call_tracking (
     pool_name             TEXT,
     pool_dex              TEXT,
     pool_created_at       TIMESTAMPTZ,
-    entry_price_usd       NUMERIC,
-    entry_price_source    TEXT,                           -- minute | hour (candle resolution used)
+    entry_price_usd       NUMERIC,                        -- in price_unit (usd unless noted)
+    entry_price_source    TEXT,                           -- onchain-v2/v3/v4, or minute | hour (GeckoTerminal candles)
     current_price_usd     NUMERIC,
     current_liquidity_usd NUMERIC,
     rugged                BOOLEAN,
@@ -201,6 +201,9 @@ CREATE TABLE IF NOT EXISTS scout_call_tracking (
     created_at            TIMESTAMPTZ  NOT NULL DEFAULT now(),
     updated_at            TIMESTAMPTZ  NOT NULL DEFAULT now()
 );
+-- added with the on-chain price source
+ALTER TABLE scout_call_tracking ADD COLUMN IF NOT EXISTS price_unit TEXT;   -- usd, or the quote asset's symbol (no USD source)
+ALTER TABLE scout_call_tracking ADD COLUMN IF NOT EXISTS onchain    JSONB;  -- pool kind/id, quote asset, scan progress
 CREATE INDEX IF NOT EXISTS scout_call_tracking_due_idx ON scout_call_tracking (status, priority, next_check_at);
 CREATE INDEX IF NOT EXISTS scout_call_tracking_ca_idx  ON scout_call_tracking (contract_address);
 
@@ -235,7 +238,8 @@ SELECT cv.call_id, cv.message_id, cv.message_date, cv.contract_address, cv.statu
        cv.live_buys_elite_usd::float8 AS live_buys_elite_usd, cv.live_buys_good_usd::float8 AS live_buys_good_usd,
        p.verdict_level AS perceptor_verdict,
        t.status AS tracking_status, t.pool_address, t.pool_dex,
-       t.entry_price_usd::float8 AS entry_price_usd, t.entry_price_source,
+       t.entry_price_usd::float8 AS entry_price_usd, t.entry_price_source, t.price_unit,
+       t.onchain->>'quote_sym' AS quote_asset,
        t.current_liquidity_usd::float8 AS current_liquidity_usd, t.rugged,
        r.ret_1h, r.max_gain_1h, r.max_dd_1h,
        r.ret_1d, r.max_gain_1d, r.max_dd_1d,

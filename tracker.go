@@ -22,8 +22,12 @@ func (s *scanner) trackLoop(ctx context.Context) {
 	if s.db == nil || !s.pc.Enabled {
 		return
 	}
-	log.Printf("performance tracking on: %s via %s (network %q, %d req/min)",
-		horizonNames(s.pc.Horizons), s.pc.BaseURL, s.pc.Network, s.pc.RPM)
+	if s.pc.Source == "onchain" {
+		log.Printf("performance tracking on: %s via %s", horizonNames(s.pc.Horizons), s.onchain.describe())
+	} else {
+		log.Printf("performance tracking on: %s via %s (network %q, %d req/min)",
+			horizonNames(s.pc.Horizons), s.pc.BaseURL, s.pc.Network, s.pc.RPM)
+	}
 	t := time.NewTicker(s.pc.Interval)
 	defer t.Stop()
 	for {
@@ -61,7 +65,11 @@ func (s *scanner) trackDue(ctx context.Context, limit int) int {
 		if ctx.Err() != nil {
 			break
 		}
-		s.trackOne(ctx, &rows[i])
+		if s.pc.Source == "onchain" {
+			s.trackOneOnchain(ctx, &rows[i])
+		} else {
+			s.trackOne(ctx, &rows[i])
+		}
 		n++
 	}
 	return n

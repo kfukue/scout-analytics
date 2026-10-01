@@ -81,20 +81,58 @@ you can check a post's parse before relying on it.
 
 ## Performance tracking (for building a prediction model)
 
-For every call the scanner records how the token did afterwards, using
-[GeckoTerminal](https://www.geckoterminal.com/robinhood/pools) price candles (it indexes
-Robinhood Chain; DexScreener mostly doesn't):
+For every call the scanner records how the token did afterwards, **straight from the chain**
+(Robinhood Chain, your node at `SCOUT_RPC_URL`, default `http://localhost:8540`). A **full node
+is enough**, as long as it serves old event logs (`eth_getLogs`); an archive node also works:
 
-1. **Pool:** the most liquid pool that existed at the call (looked up once per CA).
-2. **Entry price:** the price when the call was posted, from 1-minute candles (hourly if
-   minute history isn't available; `entry_price_source` says which).
-3. **Each horizon** (`1h, 1d, 3d, 7d, 30d`): price at entry + horizon, **return %**, **max gain %**
-   (best high in the window) and **max drawdown %** (worst low) → `scout_call_returns`.
-4. When the last horizon is done, liquidity is re-checked: **rugged** = liquidity < $500 or
-   price < 5% of entry.
+1. **Pool:** found from the token's own transfers around the call: the address it moved
+   to/from most is checked on-chain and identified as a Uniswap **v2** pair, **v3** pool or a
+   **v4** pool on the PoolManager (matched through the swaps in the same transactions).
+   No indexer or factory address needed.
+2. **Prices:** every trade, from the pool's events: v2 `Sync` (reserves), v3/v4 `Swap`
+   (`sqrtPriceX96`). So peak and drawdown are exact, not candle approximations.
+3. **USD:** the pool price is in the pool's other asset. It's converted with a **Chainlink
+   feed** as of that block, `$1` for stablecoins (USDG), and for ETH the WETH/USDG v3 pool if
+   no ETH feed is configured. On an archive node the value is read from contract state
+   (`latestRoundData()` / `slot0()` at the block); on a **full node** (no historical state) it
+   comes from event logs instead: the feed aggregator's last `AnswerUpdated` and the pool's
+   last `Swap` at or before the block. This is detected automatically.
+4. **Each horizon** (`1h, 1d, 3d, 7d, 30d`): price, **return %**, **max gain %**, **max drawdown %**
+   → `scout_call_returns`. Swaps are scanned once: progress is kept per call, each check
+   only reads the new block range.
+5. After the last horizon: **rugged** = price < 5% of entry, or pool liquidity < $500 (v2/v3).
 
-Checks are scheduled for when each horizon comes due (`scout_call_tracking.next_check_at`), so a
-call costs ~3 API requests per check. It runs inside the listener automatically.
+**ETH price from your Ethereum archive node (recommended):** ETH/USD is the same on every
+chain, so it can be read from Chainlink's ETH/USD feed on Ethereum mainnet. Point the scanner
+at an Ethereum **archive** node (e.g. Erigon):
+
+```
+SCOUT_MAINNET_RPC_URL=http://localhost:8545
+```
+For each Robinhood Chain block it takes the block's timestamp, finds the Ethereum block at
+that time, and reads `latestRoundData()` of the feed there (`0x5f4eC3Df…5b8419`, built in).
+The Robinhood node then only has to serve logs (a full node is enough). Other mainnet feeds
+can be mapped to a paired asset with `SCOUT_MAINNET_CHAINLINK_FEEDS=0xQuoteTokenOnRobinhood=0xFeedOnEthereum`.
+
+Order of sources for a paired asset's USD price: stablecoin ($1) → mainnet Chainlink feed
+(if `SCOUT_MAINNET_RPC_URL` is set) → Chainlink feed on Robinhood Chain → WETH/USDG pool (ETH only).
+
+**Long.xyz tokens trade against Stock Tokens** (NVDA, TSLA, …), so add their Chainlink feeds:
+
+```
+SCOUT_CHAINLINK_FEEDS=eth=0xEthUsdFeed,0xNvdaToken=0xNvdaFeed,0xTslaToken=0xTslaFeed
+```
+A pair whose quote asset has no feed is still tracked, **in that asset's units**
+(`price_unit` = e.g. `TSLA` instead of `usd`); the returns are then relative to the stock token.
+Chainlink stock feeds run 24/5, so weekend conversions use Friday's price. Max gain/drawdown
+are converted with the quote asset's USD price at the horizon (not at each trade).
+
+**Check it against your node first:**
+```bash
+./scoutanalytics -price-check 0xTokenCA -price-at 6h     # or -price-at 2026-10-01T14:30:00Z
+```
+prints the latest block, the block at the call time, the pool it found (v2/v3/v4, paired
+asset), the entry price, the USD conversion (or which feed to add) and the move since.
 
 ### Backfill past calls (dataset without waiting 30 days)
 
@@ -117,9 +155,7 @@ instead of duplicating:
 | `scout_call_tracking` | untouched: entry price, schedule and progress are kept |
 | `scout_call_returns` | untouched by backfill; one row per call + horizon |
 
-The summary shows it: `backfill: 500 posts read, 180 calls, 182 CAs (0 new, 182 already recorded)`. The free API allows
-~10 requests/min, so thousands of calls take hours; the running listener works through
-them, or run `./scoutanalytics -track` as a separate process.
+The summary shows it: `backfill: 500 posts read, 180 calls, 182 CAs (0 new, 182 already recorded)`. The running listener works through them, or run `./scoutanalytics -track` as a separate process.
 
 ### Export the training dataset
 
@@ -135,9 +171,18 @@ Only use the feature columns as model inputs; everything about the future is an 
 |---|---|---|
 | `SCOUT_TRACK_PERFORMANCE` | `true` | turn tracking off |
 | `SCOUT_PERF_HORIZONS` | `1h,1d,3d,7d,30d` | up to 40d |
-| `SCOUT_PRICE_RPM` | `10` | GeckoTerminal keyless limit; raise with a plan |
-| `SCOUT_PRICE_API_BASE` / `SCOUT_PRICE_API_KEY` | public API | e.g. CoinGecko on-chain API + `x-cg-pro-api-key` |
-| `SCOUT_PRICE_NETWORK` | `robinhood` | GeckoTerminal network id |
+| `SCOUT_PRICE_SOURCE` | `onchain` | `gecko` = GeckoTerminal API instead (candles, ~10 req/min, no node needed) |
+| `SCOUT_RPC_URL` | `http://localhost:8540` | Robinhood Chain node (full or archive; must serve historical logs) |
+| `SCOUT_PRICE_LOOKBACK_BLOCKS` | `8640000` | full node: how far back (~10 days) to look for the last feed update / ETH swap |
+| `SCOUT_RPC_RPS` | `50` | max RPC requests per second |
+| `SCOUT_RPC_LOG_CHUNK` | `200000` | blocks per `eth_getLogs`; halved automatically if the node refuses a range |
+| `SCOUT_MAINNET_RPC_URL` | none | Ethereum mainnet **archive** node; enables ETH/USD from mainnet Chainlink |
+| `SCOUT_MAINNET_CHAINLINK_FEEDS` | `eth=` ETH/USD feed | extra `token=feedOnEthereum` mappings |
+| `SCOUT_MAINNET_RPC_RPS` | `50` | max requests per second to the Ethereum node |
+| `SCOUT_CHAINLINK_FEEDS` | none | feeds **on Robinhood Chain**: `token=feed,…`; use `eth` for WETH/native ETH |
+| `SCOUT_STABLES` | USDG | tokens worth $1 |
+| `SCOUT_WETH`, `SCOUT_V4_POOL_MANAGER`, `SCOUT_ETH_USD_POOL` | Robinhood Chain addresses | override if needed |
+| `SCOUT_DISCOVERY_BLOCKS` | `18000` | ± blocks around the call searched for the token's transfers (widened automatically) |
 | `SCOUT_RUG_LIQ_USD` | `500` | liquidity below this = rugged |
 | `SCOUT_TRACK_INTERVAL` | `1m` | how often due checks are processed |
 

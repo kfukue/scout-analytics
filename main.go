@@ -345,8 +345,9 @@ type scanner struct {
 
 	listOnly bool // -list-chats: don't resolve the delivery target
 
-	pc    priceConfig
-	gecko *geckoClient
+	pc      priceConfig
+	gecko   *geckoClient
+	onchain *onchainSource
 
 	postMu      sync.Mutex
 	handled     map[string]bool // "msgID|ca" (and "msgID" for CA-less posts) already processed
@@ -367,6 +368,7 @@ func newScanner(cfg *config) *scanner {
 	}
 	s.pc = cfg.Price
 	s.gecko = newGeckoClient(cfg.Price)
+	s.onchain = newOnchainSource(cfg.Price.Onchain)
 	return s
 }
 
@@ -1376,6 +1378,8 @@ func main() {
 	backfillMax := flag.Int("backfill-max", 0, "with -backfill: stop after this many posts (0 = no limit)")
 	trackOnly := flag.Bool("track", false, "run only the performance tracker (no Telegram), forever")
 	trackOnce := flag.Bool("track-once", false, "process the price checks that are due now, then exit (no Telegram)")
+	priceCheck := flag.String("price-check", "", "on-chain diagnostic for a CA: find its pool and print entry/current price (no DB, no Telegram), then exit")
+	priceAt := flag.String("price-at", "", "with -price-check: the call time, RFC3339 (e.g. 2026-10-01T14:30:00Z) or a duration ago (e.g. 6h); default 1h ago")
 	exportPath := flag.String("export-dataset", "", "write the training dataset (one row per call: features + 1h/1d/3d/7d/30d outcomes) to this CSV file, then exit")
 	testNotify := flag.Bool("test-notify", false, "send one test message to SCOUT_NOTIFY_PEER and exit")
 	postFlag := flag.String("post", "", "process specific @scoutrobinhood post id(s), e.g. 10002 or 10002,10005: show what was found, investigate and deliver, then exit")
@@ -1390,6 +1394,13 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	if *priceCheck != "" {
+		if err := runPriceCheck(ctx, cfg, strings.TrimSpace(*priceCheck), *priceAt); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
 
 	s := newScanner(cfg)
 	db, dbSource, err := openScoutStore(ctx, cfg)
@@ -1682,6 +1693,79 @@ func (s *scanner) registerTools(ctx context.Context) error {
 		codes = append(codes, t.Code)
 	}
 	return s.db.SetActiveInvestigationTools(ctx, codes)
+}
+
+// runPriceCheck exercises the on-chain price source for one token and prints
+// every step, to verify the RPC node, pool discovery and USD conversion.
+func runPriceCheck(ctx context.Context, cfg *config, token, at string) error {
+	o := newOnchainSource(cfg.Price.Onchain)
+	when := time.Now().Add(-time.Hour)
+	if at != "" {
+		if d, err := parseHorizon(at); err == nil {
+			when = time.Now().Add(-d)
+		} else if t, err := time.Parse(time.RFC3339, at); err == nil {
+			when = t
+		} else {
+			return fmt.Errorf("-price-at %q: use RFC3339 or a duration like 6h / 3d", at)
+		}
+	}
+	fmt.Println("source:", o.describe())
+	latest, err := o.rpc.blockNumber(ctx)
+	if err != nil {
+		return fmt.Errorf("RPC %s: %w", cfg.Price.Onchain.RPCURL, err)
+	}
+	lt, _ := o.rpc.blockTime(ctx, latest)
+	fmt.Printf("latest block: %d (%s)\n", latest, time.Unix(lt, 0).UTC().Format(time.RFC3339))
+	eb, err := o.rpc.blockAt(ctx, when.Unix())
+	if err != nil {
+		return err
+	}
+	et, _ := o.rpc.blockTime(ctx, eb)
+	fmt.Printf("call time:    %s → block %d (%s)\n", when.UTC().Format(time.RFC3339), eb, time.Unix(et, 0).UTC().Format(time.RFC3339))
+	st, err := o.discover(ctx, token, eb)
+	if err != nil {
+		return fmt.Errorf("pool discovery: %w", err)
+	}
+	pool := st.Pool
+	if st.Kind == "v4" {
+		pool = "PoolManager " + st.Pool + " id " + st.PoolID
+	}
+	fmt.Printf("pool:         uniswap-%s %s\n", st.Kind, pool)
+	fmt.Printf("pair:         token (%d dec) / %s %s (%d dec), token is token%d\n", st.TokenDec, st.QuoteSym, st.Quote, st.QuoteDec, map[bool]int{true: 0, false: 1}[st.TokenIs0])
+	if err := o.entryPrice(ctx, st, latest); err != nil {
+		return fmt.Errorf("entry price: %w", err)
+	}
+	fmt.Printf("entry price:  %.12g %s (trade at block %d)\n", st.EntryPriceQ, st.QuoteSym, st.LastPriceBlock)
+	if o.mainnet != nil {
+		if mb, rt, mt, err := o.mainnetBlockFor(ctx, st.EntryBlock); err != nil {
+			fmt.Printf("block conversion: ERROR %v\n", err)
+		} else {
+			fmt.Printf("block conversion: Robinhood block %d (%s) → Ethereum block %d (%s)\n", st.EntryBlock,
+				time.Unix(rt, 0).UTC().Format(time.RFC3339), mb, time.Unix(mt, 0).UTC().Format(time.RFC3339))
+		}
+	}
+	q, ok, err := o.quoteUSD(ctx, st.Quote, st.EntryBlock)
+	switch {
+	case err != nil:
+		fmt.Printf("USD of %s at the call: ERROR %v\n", st.QuoteSym, err)
+	case !ok:
+		fmt.Printf("USD of %s: no source. Add its Chainlink feed: SCOUT_CHAINLINK_FEEDS=%s=0xFeedAddress (prices stay in %s until then)\n", st.QuoteSym, st.Quote, st.QuoteSym)
+	default:
+		fmt.Printf("USD of %s at the call: $%.6g (%s) → entry $%.12g\n", st.QuoteSym, q, o.quoteSource(st.Quote), st.EntryPriceQ*q)
+	}
+	if err := o.scan(ctx, st, latest); err != nil {
+		return fmt.Errorf("scan swaps to now: %w", err)
+	}
+	fmt.Printf("now:          %.12g %s (%+.1f%%), peak %+.1f%%, low %+.1f%% since the call; last trade block %d\n",
+		st.LastPriceQ, st.QuoteSym, (st.LastPriceQ/st.EntryPriceQ-1)*100, (st.RunMaxQ/st.EntryPriceQ-1)*100,
+		(st.RunMinQ/st.EntryPriceQ-1)*100, st.LastPriceBlock)
+	fmt.Printf("log chunk in use: %d blocks\n", o.rpc.chunk.Load())
+	if o.noState.Load() {
+		fmt.Println("node type:    full node (no historical state) — USD prices of the paired asset come from event logs")
+	} else {
+		fmt.Println("node type:    historical state available (archive) or not needed for this pair")
+	}
+	return nil
 }
 
 func printResults(s *scanner, results []*toolResult, noDeliver bool) {

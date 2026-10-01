@@ -22,6 +22,7 @@ func trackerFixture(t *testing.T) (*scanner, *ScoutStore, *fakeGecko) {
 	f := &fakeGecko{pools: map[string][]map[string]any{}, candles: map[string][]candle{}}
 	srv := httptest.NewServer(f.handler(t))
 	t.Cleanup(srv.Close)
+	t.Setenv("SCOUT_PRICE_SOURCE", "gecko")
 	t.Setenv("SCOUT_PRICE_API_BASE", srv.URL)
 	t.Setenv("SCOUT_PRICE_RPM", "6000")
 	pc, err := loadPriceConfig()
