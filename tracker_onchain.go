@@ -14,11 +14,18 @@ import (
 // the running last/max/min price is kept in scout_call_tracking.onchain.
 func (s *scanner) trackOneOnchain(ctx context.Context, t *ScoutCallTracking) {
 	now := time.Now().UTC()
+	prev := *t // restored if the run is interrupted
 	t.Attempts++
 	t.LastCheckedAt = &now
 	t.Error = nil
 	deadline := t.EntryAt.Add(s.pc.maxHorizon() + 48*time.Hour)
 	o := s.onchain
+	tag := fmt.Sprintf("call %d%s", t.CallID, s.trackPos)
+	reqStart := o.rpc.requests.Load()
+	ctx = withScanProgress(ctx, tag, 5*time.Second)
+	log.Printf("%s: %s, posted %s (%s ago), status %s",
+		tag, t.ContractAddress, t.EntryAt.UTC().Format("2006-01-02 15:04"), time.Since(t.EntryAt).Round(time.Minute), t.Status)
+	interrupted := false
 
 	var st *onchainState
 	if len(t.Onchain) > 0 && string(t.Onchain) != "null" {
@@ -28,16 +35,34 @@ func (s *scanner) trackOneOnchain(ctx context.Context, t *ScoutCallTracking) {
 		}
 	}
 	fail := func(status string, err error, retryIn time.Duration) {
+		if ctx.Err() != nil { // Ctrl+C / shutdown: not a failure of this call
+			interrupted = true
+			log.Printf("%s: interrupted — progress kept, it resumes on the next run", tag)
+			return
+		}
 		msg := err.Error()
 		t.Error = &msg
 		t.Status = status
-		if now.After(deadline) {
+		// Give up only when waiting can't help: no pool / no trades, well after the last horizon.
+		// RPC or database errors are always retried.
+		if now.After(deadline) && (status == TrackNoPool || errors.Is(err, errNoTrades)) {
 			t.Status = TrackGaveUp
 		}
 		t.NextCheckAt = now.Add(retryIn)
-		log.Printf("tracking call %d (%s): %s: %v", t.CallID, t.ContractAddress, t.Status, err)
+		log.Printf("%s: %s: %v (retry in %s)", tag, t.Status, err, retryIn.Round(time.Minute))
 	}
 	defer func() {
+		if interrupted {
+			// keep what was already scanned, but leave status / attempts / schedule as they were
+			t.Status, t.Attempts, t.NextCheckAt, t.LastCheckedAt, t.Error = prev.Status, prev.Attempts, prev.NextCheckAt, prev.LastCheckedAt, prev.Error
+		} else if t.Error == nil {
+			next := "all horizons done"
+			if t.Status == TrackTracking {
+				next = "next check " + t.NextCheckAt.Local().Format("2006-01-02 15:04")
+			}
+			log.Printf("%s: %s in %s, %d RPC requests — %s", tag, t.Status, time.Since(now).Round(100*time.Millisecond),
+				o.rpc.requests.Load()-reqStart, next)
+		}
 		if st != nil {
 			t.Onchain, _ = json.Marshal(st)
 		}
@@ -81,6 +106,7 @@ func (s *scanner) trackOneOnchain(ctx context.Context, t *ScoutCallTracking) {
 			pool = st.PoolID
 		}
 		t.PoolAddress, t.PoolName, t.PoolDex = &pool, &name, &dex
+		log.Printf("%s: pool found: %s %s, paired with %s (entry block %d)", tag, dex, pool, st.QuoteSym, st.EntryBlock)
 	}
 	if st.Done == nil {
 		st.Done = map[string]bool{}
@@ -105,6 +131,11 @@ func (s *scanner) trackOneOnchain(ctx context.Context, t *ScoutCallTracking) {
 		}
 		src := "onchain-" + st.Kind
 		t.EntryPriceUSD, t.EntryPriceSource, t.PriceUnit = &p, &src, &unit
+		if ok {
+			log.Printf("%s: entry price $%.6g (%.6g %s × $%.6g, %s)", tag, p, st.EntryPriceQ, st.QuoteSym, q, o.quoteSource(st.Quote))
+		} else {
+			log.Printf("%s: entry price %.6g %s (no USD source for %s — tracked in %s)", tag, p, st.QuoteSym, st.QuoteSym, st.QuoteSym)
+		}
 	}
 	inUSD := t.PriceUnit != nil && *t.PriceUnit == "usd"
 
@@ -162,6 +193,7 @@ func (s *scanner) trackOneOnchain(ctx context.Context, t *ScoutCallTracking) {
 		st.Done[h.Name] = true
 		cur := r.PriceUSD
 		t.CurrentPriceUSD = &cur
+		log.Printf("%s: +%s → %.6g (%+.1f%%), peak %+.1f%%, low %+.1f%%", tag, h.Name, r.PriceUSD, r.ReturnPct, r.MaxGainPct, r.MaxDDPct)
 	}
 
 	// 4. Schedule the next horizon, or finish.

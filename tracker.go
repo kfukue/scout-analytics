@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"strings"
 	"time"
 
 	"github.com/gotd/td/tg"
@@ -31,8 +32,13 @@ func (s *scanner) trackLoop(ctx context.Context) {
 	t := time.NewTicker(s.pc.Interval)
 	defer t.Stop()
 	for {
-		if n := s.trackDue(ctx, 50); n > 0 {
-			log.Printf("tracking: processed %d call(s)", n)
+		n := s.trackDue(ctx, 50)
+		if ctx.Err() != nil {
+			return
+		}
+		s.logTrackingStatus(ctx, n)
+		if n == 50 {
+			continue // more are waiting: keep going without the pause
 		}
 		select {
 		case <-ctx.Done():
@@ -60,11 +66,15 @@ func (s *scanner) trackDue(ctx context.Context, limit int) int {
 		log.Printf("tracking: %v", err)
 		return 0
 	}
+	if len(rows) > 0 {
+		log.Printf("tracking: %d call(s) due now", len(rows))
+	}
 	n := 0
 	for i := range rows {
 		if ctx.Err() != nil {
 			break
 		}
+		s.trackPos = fmt.Sprintf(" [%d/%d]", i+1, len(rows))
 		if s.pc.Source == "onchain" {
 			s.trackOneOnchain(ctx, &rows[i])
 		} else {
@@ -73,6 +83,39 @@ func (s *scanner) trackDue(ctx context.Context, limit int) int {
 		n++
 	}
 	return n
+}
+
+// logTrackingStatus prints a one-line summary so it's clear the tracker is alive
+// and how much is left.
+func (s *scanner) logTrackingStatus(ctx context.Context, processed int) {
+	counts, nextDue, err := s.db.TrackingStats(ctx)
+	if err != nil {
+		log.Printf("tracking: status: %v", err)
+		return
+	}
+	var parts []string
+	for _, st := range []string{TrackPending, TrackTracking, TrackDone, TrackNoPool, TrackError, TrackGaveUp} {
+		if counts[st] > 0 {
+			parts = append(parts, fmt.Sprintf("%s %d", st, counts[st]))
+		}
+	}
+	summary := "no calls yet"
+	if len(parts) > 0 {
+		summary = strings.Join(parts, ", ")
+	}
+	next := "nothing scheduled"
+	if nextDue != nil {
+		if d := time.Until(*nextDue); d > 0 {
+			next = fmt.Sprintf("next check in %s", d.Round(time.Second))
+		} else {
+			next = "more due now"
+		}
+	}
+	if processed > 0 {
+		log.Printf("tracking: processed %d call(s) — %s; %s", processed, summary, next)
+	} else {
+		log.Printf("tracking: idle — %s; %s", summary, next)
+	}
 }
 
 func backoff(attempts int) time.Duration {
@@ -93,17 +136,28 @@ func (s *scanner) trackOne(ctx context.Context, t *ScoutCallTracking) {
 	t.LastCheckedAt = &now
 	t.Error = nil
 	deadline := t.EntryAt.Add(s.pc.maxHorizon() + 48*time.Hour)
+	prev := *t
+	interrupted := false
 	fail := func(status string, err error, retryIn time.Duration) {
+		if ctx.Err() != nil { // Ctrl+C / shutdown: not a failure of this call
+			interrupted = true
+			return
+		}
 		msg := err.Error()
 		t.Error = &msg
 		t.Status = status
-		if now.After(deadline) {
+		// Give up only when waiting can't help (no pool / no trades), never on transient errors.
+		if now.After(deadline) && (status == TrackNoPool || strings.Contains(msg, "no trades")) {
 			t.Status = TrackGaveUp
 		}
 		t.NextCheckAt = now.Add(retryIn)
 		log.Printf("tracking call %d (%s): %s: %v", t.CallID, t.ContractAddress, t.Status, err)
 	}
 	defer func() {
+		if interrupted {
+			*t = prev
+			return
+		}
 		sctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		if err := s.db.SaveTracking(sctx, t); err != nil {

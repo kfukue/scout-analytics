@@ -269,9 +269,10 @@ type rpcError struct {
 func (e *rpcError) Error() string { return fmt.Sprintf("rpc error %d: %s", e.Code, e.Message) }
 
 type rpcClient struct {
-	url  string
-	http *http.Client
-	id   atomic.Int64
+	url      string
+	http     *http.Client
+	id       atomic.Int64
+	requests atomic.Int64 // total JSON-RPC requests sent (for progress logs)
 
 	mu   sync.Mutex
 	next time.Time
@@ -330,6 +331,7 @@ func (c *rpcClient) call(ctx context.Context, out any, method string, params ...
 		if err := c.wait(ctx); err != nil {
 			return err
 		}
+		c.requests.Add(1)
 		req, _ := http.NewRequestWithContext(ctx, http.MethodPost, c.url, bytes.NewReader(body))
 		req.Header.Set("Content-Type", "application/json")
 		resp, err := c.http.Do(req)
@@ -408,6 +410,8 @@ func (c *rpcClient) getLogs(ctx context.Context, address string, topics []any, f
 // node refuses a range (too many blocks / results), and calls fn for each log
 // in order.
 func (c *rpcClient) getLogsChunked(ctx context.Context, address string, topics []any, from, to uint64, fn func(rpcLog)) error {
+	progress := progressFrom(ctx)
+	events := 0
 	for cur := from; cur <= to; {
 		size := c.chunk.Load()
 		end := cur + size - 1
@@ -436,12 +440,43 @@ func (c *rpcClient) getLogsChunked(ctx context.Context, address string, topics [
 		for _, l := range logs {
 			fn(l)
 		}
+		events += len(logs)
+		if progress != nil {
+			progress(from, end, to, events)
+		}
 		if end == to {
 			break
 		}
 		cur = end + 1
 	}
 	return nil
+}
+
+// Progress reporting for long log scans (a 30-day window is ~26M blocks).
+type progressKey struct{}
+
+type progressFunc func(from, done, to uint64, events int)
+
+func progressFrom(ctx context.Context) progressFunc {
+	p, _ := ctx.Value(progressKey{}).(progressFunc)
+	return p
+}
+
+// withScanProgress returns a context under which log scans print a progress
+// line at most every `every` (and never for scans that finish sooner).
+func withScanProgress(ctx context.Context, label string, every time.Duration) context.Context {
+	last := time.Now()
+	return context.WithValue(ctx, progressKey{}, progressFunc(func(from, done, to uint64, events int) {
+		if time.Since(last) < every || done >= to {
+			return
+		}
+		last = time.Now()
+		pct := 100.0
+		if to > from {
+			pct = float64(done-from) / float64(to-from) * 100
+		}
+		log.Printf("%s: scanning blocks %d → %d: %.0f%% (at %d, %d events so far)", label, from, to, pct, done, events)
+	}))
 }
 
 // blockTime returns a block's timestamp (cached).
@@ -630,7 +665,10 @@ func newOnchainSource(oc onchainConfig) *onchainSource {
 	return o
 }
 
-var errNoPool = errors.New("no pool found")
+var (
+	errNoPool   = errors.New("no pool found")
+	errNoTrades = errors.New("no trades around the call time")
+)
 
 // discover finds the pool the token traded in around entryBlock.
 func (o *onchainSource) discover(ctx context.Context, token string, entryBlock uint64) (*onchainState, error) {
@@ -931,7 +969,7 @@ func (o *onchainSource) entryPrice(ctx context.Context, st *onchainState, latest
 		return err
 	}
 	if first == 0 {
-		return errors.New("no trades around the call time")
+		return errNoTrades
 	}
 	st.EntryPriceQ, st.LastPriceQ, st.LastPriceBlock = first, first, firstBlock
 	st.RunMaxQ, st.RunMinQ, st.ScanBlock = first, first, firstBlock

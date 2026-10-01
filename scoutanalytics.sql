@@ -205,6 +205,9 @@ CREATE TABLE IF NOT EXISTS scout_call_tracking (
 ALTER TABLE scout_call_tracking ADD COLUMN IF NOT EXISTS price_unit TEXT;   -- usd, or the quote asset's symbol (no USD source)
 ALTER TABLE scout_call_tracking ADD COLUMN IF NOT EXISTS onchain    JSONB;  -- pool kind/id, quote asset, scan progress
 CREATE INDEX IF NOT EXISTS scout_call_tracking_due_idx ON scout_call_tracking (status, priority, next_check_at);
+-- Repair: an interrupted run (Ctrl+C) used to mark the call it was working on as given up.
+UPDATE scout_call_tracking SET status = 'pending', next_check_at = now(), attempts = 0, error = NULL
+WHERE status IN ('gave_up', 'error') AND error LIKE '%context canceled%';
 CREATE INDEX IF NOT EXISTS scout_call_tracking_ca_idx  ON scout_call_tracking (contract_address);
 
 -- Performance of a call after each horizon (1h, 1d, 3d, 7d, 30d by default).

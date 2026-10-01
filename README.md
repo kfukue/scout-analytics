@@ -188,6 +188,29 @@ Only use the feature columns as model inputs; everything about the future is an 
 
 Other commands: `-track` (tracker only, forever, no Telegram), `-track-once` (process what's due and exit).
 
+### What the tracker logs
+
+```
+tracking: 37 call(s) due now
+call 10126 [1/37]: 0x129b…, posted 2026-09-28 14:02 (70h ago), status pending
+call 10126 [1/37]: pool found: uniswap-v3 0x…, paired with WETH (entry block 21300412)
+call 10126 [1/37]: entry price $0.0031 (1.03e-06 WETH × $3010, Chainlink on Ethereum mainnet)
+call 10126 [1/37]: +1h → 0.0052 (+67.7%), peak +120.4%, low -8.1%
+call 10126 [1/37]: scanning blocks 21726610 → 22164412: 46% (at 21926609, 12 events so far)
+call 10126 [1/37]: tracking in 14s, 212 RPC requests — next check 2026-10-01 14:12
+tracking: processed 37 call(s) — pending 112, tracking 37, done 4; more due now
+tracking: idle — tracking 149, done 4; next check in 42m10s
+```
+
+Long block scans print a progress line every few seconds, and a status line is
+printed after every cycle (every `SCOUT_TRACK_INTERVAL`, even when idle), so a
+quiet terminal for more than a minute means something is stuck.
+
+**Ctrl+C is safe.** A call that is interrupted mid-scan is left exactly as it was
+and picked up again on the next start. `gave_up` is only used when a call is past
+its last horizon and still has no pool or no trades. Calls an older version
+marked `gave_up`/`error` with `context canceled` are reset automatically at startup.
+
 ## Where clean reports go
 
 | Setting | Result |

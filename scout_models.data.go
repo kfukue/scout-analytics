@@ -707,6 +707,32 @@ func (st *ScoutStore) DueTracking(ctx context.Context, now time.Time, limit int)
 	return out, rows.Err()
 }
 
+// TrackingStats returns how many calls are in each tracking status and when the
+// next check is due (nil if nothing is scheduled).
+func (st *ScoutStore) TrackingStats(ctx context.Context) (map[string]int, *time.Time, error) {
+	rows, err := st.Pool.Query(ctx, `SELECT status, count(*) FROM scout_call_tracking GROUP BY status`)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer rows.Close()
+	counts := map[string]int{}
+	for rows.Next() {
+		var s string
+		var n int
+		if err := rows.Scan(&s, &n); err != nil {
+			return nil, nil, err
+		}
+		counts[s] = n
+	}
+	if err := rows.Err(); err != nil {
+		return nil, nil, err
+	}
+	var next *time.Time
+	err = st.Pool.QueryRow(ctx, `SELECT min(next_check_at) FROM scout_call_tracking
+		WHERE status IN ('pending','tracking','no_pool','error')`).Scan(&next)
+	return counts, next, err
+}
+
 // GetTracking returns the tracking row of a call (nil if none).
 func (st *ScoutStore) GetTracking(ctx context.Context, callID int) (*ScoutCallTracking, error) {
 	t, err := scanTracking(st.Pool.QueryRow(ctx, `SELECT `+trackingColumns+` FROM scout_call_tracking WHERE call_id = $1`, callID))

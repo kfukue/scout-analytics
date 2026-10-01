@@ -345,9 +345,10 @@ type scanner struct {
 
 	listOnly bool // -list-chats: don't resolve the delivery target
 
-	pc      priceConfig
-	gecko   *geckoClient
-	onchain *onchainSource
+	pc       priceConfig
+	gecko    *geckoClient
+	onchain  *onchainSource
+	trackPos string // " [3/50]" position of the call being tracked (for logs)
 
 	postMu      sync.Mutex
 	handled     map[string]bool // "msgID|ca" (and "msgID" for CA-less posts) already processed
@@ -1455,6 +1456,7 @@ func main() {
 					break
 				}
 			}
+			s.logTrackingStatus(context.Background(), total)
 			fmt.Printf("processed %d call(s)\n", total)
 		case *trackOnly:
 			if !s.pc.Enabled {
