@@ -12,6 +12,17 @@ const (
 	CallStatusDropped   = "dropped"   // queue was full
 	CallStatusScanned   = "scanned"   // at least one tool returned a report
 	CallStatusFailed    = "failed"    // every tool failed / timed out
+	CallStatusBackfill  = "backfill"  // imported from channel history (not investigated)
+)
+
+// Tracking statuses (scout_call_tracking.status).
+const (
+	TrackPending  = "pending"  // nothing fetched yet
+	TrackTracking = "tracking" // some horizons done, more due later
+	TrackDone     = "done"     // all horizons computed
+	TrackNoPool   = "no_pool"  // price source doesn't know the token yet; retried
+	TrackError    = "error"    // last attempt failed; retried with back-off
+	TrackGaveUp   = "gave_up"  // no pool / no price data well after the last horizon
 )
 
 // Investigation statuses.
@@ -140,3 +151,47 @@ func chainOf(ca string) string {
 	}
 	return "solana"
 }
+
+// ScoutCallMetrics is the parsed post data for one call (scout_call_metrics).
+type ScoutCallMetrics struct {
+	CallID             int             `json:"call_id"`
+	Meta               CallMeta        `json:"meta"`
+	LiveBuysEliteCount int             `json:"live_buys_elite_count"`
+	LiveBuysGoodCount  int             `json:"live_buys_good_count"`
+	LiveBuysEliteUSD   float64         `json:"live_buys_elite_usd"`
+	LiveBuysGoodUSD    float64         `json:"live_buys_good_usd"`
+	Parsed             json.RawMessage `json:"parsed"`
+	CreatedAt          time.Time       `json:"created_at"`
+	UpdatedAt          time.Time       `json:"updated_at"`
+}
+
+// TableName returns the table name for this model.
+func (ScoutCallMetrics) TableName() string { return "scout_call_metrics" }
+
+// TableName for the live-buy rows (model: LiveBuy in callmeta.go).
+func (LiveBuy) TableName() string { return "scout_call_live_buys" }
+
+// ScoutCallTracking is one row of scout_call_tracking.
+type ScoutCallTracking struct {
+	CallID              int        `json:"call_id"`
+	ContractAddress     string     `json:"contract_address"`
+	EntryAt             time.Time  `json:"entry_at"`
+	Priority            int        `json:"priority"`
+	Status              string     `json:"status"`
+	PoolAddress         *string    `json:"pool_address"`
+	PoolName            *string    `json:"pool_name"`
+	PoolDex             *string    `json:"pool_dex"`
+	PoolCreatedAt       *time.Time `json:"pool_created_at"`
+	EntryPriceUSD       *float64   `json:"entry_price_usd"`
+	EntryPriceSource    *string    `json:"entry_price_source"`
+	CurrentPriceUSD     *float64   `json:"current_price_usd"`
+	CurrentLiquidityUSD *float64   `json:"current_liquidity_usd"`
+	Rugged              *bool      `json:"rugged"`
+	NextCheckAt         time.Time  `json:"next_check_at"`
+	LastCheckedAt       *time.Time `json:"last_checked_at"`
+	Attempts            int        `json:"attempts"`
+	Error               *string    `json:"error"`
+}
+
+// TableName returns the table name for this model.
+func (ScoutCallTracking) TableName() string { return "scout_call_tracking" }

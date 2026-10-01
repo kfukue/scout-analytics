@@ -3,8 +3,12 @@ package main
 import (
 	"context"
 	_ "embed"
+	"encoding/csv"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"strconv"
 	"strings"
 	"time"
 
@@ -108,9 +112,18 @@ func scanScoutCall(row pgx.Row) (*ScoutCall, error) {
 }
 
 // InsertScoutCall inserts a call and returns its id. If the same
-// (channel, message, CA) already exists (e.g. after a restart), the existing id
-// is returned instead.
+// (channel, message, CA) already exists (e.g. after a restart or a re-run of
+// -backfill), the existing id is returned instead.
 func (st *ScoutStore) InsertScoutCall(ctx context.Context, c *ScoutCall) (*int, error) {
+	id, _, err := st.UpsertScoutCall(ctx, c)
+	return id, err
+}
+
+// UpsertScoutCall is InsertScoutCall that also reports whether a new row was
+// created. A call is the same call when channel + post + CA match, with the CA
+// compared case-insensitively (0xAbC… == 0xabc…). On a match, only the post
+// text/links and updated_at are refreshed; status and everything else is kept.
+func (st *ScoutStore) UpsertScoutCall(ctx context.Context, c *ScoutCall) (*int, bool, error) {
 	now := time.Now().UTC()
 	if c.UUID == "" {
 		c.UUID = uuid.NewString()
@@ -124,23 +137,36 @@ func (st *ScoutStore) InsertScoutCall(ctx context.Context, c *ScoutCall) (*int, 
 	if c.URLs == nil {
 		c.URLs = []string{}
 	}
-	query := `INSERT INTO scout_calls (
+	var id int
+	err := st.Pool.QueryRow(ctx, `UPDATE scout_calls SET message_text = $4, urls = $5, updated_at = $6
+		WHERE id = (SELECT id FROM scout_calls
+		            WHERE channel_id = $1 AND message_id = $2 AND lower(contract_address) = lower($3)
+		            ORDER BY id LIMIT 1)
+		RETURNING id`,
+		c.ChannelID, c.MessageID, c.ContractAddress, c.MessageText, c.URLs, now).Scan(&id)
+	if err == nil {
+		c.ID = &id
+		return &id, false, nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return nil, false, err
+	}
+	var created bool
+	err = st.Pool.QueryRow(ctx, `INSERT INTO scout_calls (
 		uuid, channel_id, channel_username, message_id, message_date, message_text,
 		urls, contract_address, chain, status, created_by, created_at, updated_by, updated_at
 	) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
 	ON CONFLICT (channel_id, message_id, contract_address) DO UPDATE
-		SET updated_at = EXCLUDED.updated_at
-	RETURNING id`
-	var id int
-	err := st.Pool.QueryRow(ctx, query,
+		SET message_text = EXCLUDED.message_text, urls = EXCLUDED.urls, updated_at = EXCLUDED.updated_at
+	RETURNING id, (xmax = 0)`,
 		c.UUID, c.ChannelID, c.ChannelUsername, c.MessageID, c.MessageDate, c.MessageText,
 		c.URLs, c.ContractAddress, c.Chain, c.Status, c.CreatedBy, now, c.UpdatedBy, now,
-	).Scan(&id)
+	).Scan(&id, &created)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	c.ID = &id
-	return &id, nil
+	return &id, created, nil
 }
 
 // UpdateScoutCallStatus sets the status of a call.
@@ -530,4 +556,273 @@ func (st *ScoutStore) SelectScoutDeliveries(ctx context.Context, callID *int, li
 		out = append(out, d)
 	}
 	return out, rows.Err()
+}
+
+// ---------------------------------------------------------------------------
+// scout_call_metrics + scout_call_live_buys
+// ---------------------------------------------------------------------------
+
+// UpsertCallMetrics stores the parsed post data for a call and replaces its
+// live-buy rows, in one transaction.
+func (st *ScoutStore) UpsertCallMetrics(ctx context.Context, callID int, m *CallMeta) error {
+	if m == nil {
+		return nil
+	}
+	parsed, err := json.Marshal(m)
+	if err != nil {
+		return err
+	}
+	en, gn, eu, gu := m.LiveBuyTotals()
+	now := time.Now().UTC()
+	tx, err := st.Pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+	if _, err := tx.Exec(ctx, `INSERT INTO scout_call_metrics (
+		call_id, token_symbol, chain_name, called_at_mcap_usd, dex, mcap_usd, liq_usd, liq_pct,
+		tax_buy_pct, tax_sell_pct, age_text, age_seconds, launchpad, holders, proof_elite, proof_good,
+		live_buys_elite_count, live_buys_good_count, live_buys_elite_usd, live_buys_good_usd, parsed,
+		created_by, created_at, updated_by, updated_at
+	) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21::jsonb,$22,$23,$22,$23)
+	ON CONFLICT (call_id) DO UPDATE SET
+		token_symbol = EXCLUDED.token_symbol, chain_name = EXCLUDED.chain_name,
+		called_at_mcap_usd = EXCLUDED.called_at_mcap_usd, dex = EXCLUDED.dex, mcap_usd = EXCLUDED.mcap_usd,
+		liq_usd = EXCLUDED.liq_usd, liq_pct = EXCLUDED.liq_pct, tax_buy_pct = EXCLUDED.tax_buy_pct,
+		tax_sell_pct = EXCLUDED.tax_sell_pct, age_text = EXCLUDED.age_text, age_seconds = EXCLUDED.age_seconds,
+		launchpad = EXCLUDED.launchpad, holders = EXCLUDED.holders, proof_elite = EXCLUDED.proof_elite,
+		proof_good = EXCLUDED.proof_good, live_buys_elite_count = EXCLUDED.live_buys_elite_count,
+		live_buys_good_count = EXCLUDED.live_buys_good_count, live_buys_elite_usd = EXCLUDED.live_buys_elite_usd,
+		live_buys_good_usd = EXCLUDED.live_buys_good_usd, parsed = EXCLUDED.parsed,
+		updated_by = EXCLUDED.updated_by, updated_at = EXCLUDED.updated_at`,
+		callID, m.TokenSymbol, m.ChainName, m.CalledAtMcapUSD, m.Dex, m.McapUSD, m.LiqUSD, m.LiqPct,
+		m.TaxBuyPct, m.TaxSellPct, m.AgeText, m.AgeSeconds, m.Launchpad, m.Holders, m.ProofElite, m.ProofGood,
+		en, gn, eu, gu, string(parsed), scoutDBUser, now,
+	); err != nil {
+		return fmt.Errorf("scout_call_metrics: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM scout_call_live_buys WHERE call_id = $1`, callID); err != nil {
+		return err
+	}
+	for _, b := range m.LiveBuys {
+		if _, err := tx.Exec(ctx, `INSERT INTO scout_call_live_buys
+			(call_id, position, tier, tier_emoji, amount_usd, wallet_display, wallet_prefix, wallet_suffix)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+			callID, b.Position, b.Tier, b.TierEmoji, b.AmountUSD, b.WalletDisplay, b.WalletPrefix, b.WalletSuffix); err != nil {
+			return fmt.Errorf("scout_call_live_buys: %w", err)
+		}
+	}
+	return tx.Commit(ctx)
+}
+
+// GetCallMetrics returns the parsed post data for a call, with its live buys
+// (nil if the call has none).
+func (st *ScoutStore) GetCallMetrics(ctx context.Context, callID int) (*ScoutCallMetrics, error) {
+	var r ScoutCallMetrics
+	m := &r.Meta
+	var parsed []byte
+	err := st.Pool.QueryRow(ctx, `SELECT call_id, token_symbol, chain_name, called_at_mcap_usd::float8, dex,
+		mcap_usd::float8, liq_usd::float8, liq_pct::float8, tax_buy_pct::float8, tax_sell_pct::float8,
+		age_text, age_seconds, launchpad, holders, proof_elite, proof_good,
+		live_buys_elite_count, live_buys_good_count, live_buys_elite_usd::float8, live_buys_good_usd::float8,
+		parsed, created_at, updated_at
+		FROM scout_call_metrics WHERE call_id = $1`, callID).Scan(
+		&r.CallID, &m.TokenSymbol, &m.ChainName, &m.CalledAtMcapUSD, &m.Dex,
+		&m.McapUSD, &m.LiqUSD, &m.LiqPct, &m.TaxBuyPct, &m.TaxSellPct,
+		&m.AgeText, &m.AgeSeconds, &m.Launchpad, &m.Holders, &m.ProofElite, &m.ProofGood,
+		&r.LiveBuysEliteCount, &r.LiveBuysGoodCount, &r.LiveBuysEliteUSD, &r.LiveBuysGoodUSD,
+		&parsed, &r.CreatedAt, &r.UpdatedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	r.Parsed = parsed
+	rows, err := st.Pool.Query(ctx, `SELECT position, tier, tier_emoji, amount_usd::float8, wallet_display,
+		wallet_prefix, wallet_suffix FROM scout_call_live_buys WHERE call_id = $1 ORDER BY position`, callID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var b LiveBuy
+		if err := rows.Scan(&b.Position, &b.Tier, &b.TierEmoji, &b.AmountUSD, &b.WalletDisplay,
+			&b.WalletPrefix, &b.WalletSuffix); err != nil {
+			return nil, err
+		}
+		m.LiveBuys = append(m.LiveBuys, b)
+	}
+	return &r, rows.Err()
+}
+
+// ---------------------------------------------------------------------------
+// scout_call_tracking + scout_call_returns
+// ---------------------------------------------------------------------------
+
+// EnsureTracking creates the tracking row for a call (no-op if it exists).
+func (st *ScoutStore) EnsureTracking(ctx context.Context, callID int, ca string, entryAt time.Time, priority int, firstCheck time.Time) error {
+	_, err := st.Pool.Exec(ctx, `INSERT INTO scout_call_tracking
+		(call_id, contract_address, entry_at, priority, status, next_check_at)
+		VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT (call_id) DO NOTHING`,
+		callID, ca, entryAt.UTC(), priority, TrackPending, firstCheck.UTC())
+	return err
+}
+
+const trackingColumns = `call_id, contract_address, entry_at, priority, status, pool_address, pool_name, pool_dex,
+	pool_created_at, entry_price_usd::float8, entry_price_source, current_price_usd::float8,
+	current_liquidity_usd::float8, rugged, next_check_at, last_checked_at, attempts, error`
+
+func scanTracking(row pgx.Row) (*ScoutCallTracking, error) {
+	var t ScoutCallTracking
+	err := row.Scan(&t.CallID, &t.ContractAddress, &t.EntryAt, &t.Priority, &t.Status, &t.PoolAddress, &t.PoolName,
+		&t.PoolDex, &t.PoolCreatedAt, &t.EntryPriceUSD, &t.EntryPriceSource, &t.CurrentPriceUSD,
+		&t.CurrentLiquidityUSD, &t.Rugged, &t.NextCheckAt, &t.LastCheckedAt, &t.Attempts, &t.Error)
+	if err != nil {
+		return nil, err
+	}
+	return &t, nil
+}
+
+// DueTracking returns calls whose next price check is due: live calls first.
+func (st *ScoutStore) DueTracking(ctx context.Context, now time.Time, limit int) ([]ScoutCallTracking, error) {
+	rows, err := st.Pool.Query(ctx, `SELECT `+trackingColumns+` FROM scout_call_tracking
+		WHERE status IN ('pending','tracking','no_pool','error') AND next_check_at <= $1
+		ORDER BY priority, next_check_at LIMIT $2`, now.UTC(), limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []ScoutCallTracking
+	for rows.Next() {
+		t, err := scanTracking(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, *t)
+	}
+	return out, rows.Err()
+}
+
+// GetTracking returns the tracking row of a call (nil if none).
+func (st *ScoutStore) GetTracking(ctx context.Context, callID int) (*ScoutCallTracking, error) {
+	t, err := scanTracking(st.Pool.QueryRow(ctx, `SELECT `+trackingColumns+` FROM scout_call_tracking WHERE call_id = $1`, callID))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
+	return t, err
+}
+
+// KnownPool returns a pool already chosen for this CA by another call (saves an API call).
+func (st *ScoutStore) KnownPool(ctx context.Context, ca string) (*ScoutCallTracking, error) {
+	t, err := scanTracking(st.Pool.QueryRow(ctx, `SELECT `+trackingColumns+` FROM scout_call_tracking
+		WHERE lower(contract_address) = lower($1) AND pool_address IS NOT NULL
+		ORDER BY updated_at DESC LIMIT 1`, ca))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
+	return t, err
+}
+
+// SaveTracking writes the mutable fields of a tracking row.
+func (st *ScoutStore) SaveTracking(ctx context.Context, t *ScoutCallTracking) error {
+	_, err := st.Pool.Exec(ctx, `UPDATE scout_call_tracking SET
+		status = $2, pool_address = $3, pool_name = $4, pool_dex = $5, pool_created_at = $6,
+		entry_price_usd = $7, entry_price_source = $8, current_price_usd = $9, current_liquidity_usd = $10,
+		rugged = $11, next_check_at = $12, last_checked_at = $13, attempts = $14, error = $15, updated_at = now()
+		WHERE call_id = $1`,
+		t.CallID, t.Status, t.PoolAddress, t.PoolName, t.PoolDex, t.PoolCreatedAt,
+		t.EntryPriceUSD, t.EntryPriceSource, t.CurrentPriceUSD, t.CurrentLiquidityUSD,
+		t.Rugged, t.NextCheckAt.UTC(), t.LastCheckedAt, t.Attempts, t.Error)
+	return err
+}
+
+// UpsertReturn stores the result for one horizon.
+func (st *ScoutStore) UpsertReturn(ctx context.Context, callID int, h horizon, r horizonResult) error {
+	nz := func(v float64) *float64 {
+		if r.Status != "done" {
+			return nil
+		}
+		return &v
+	}
+	_, err := st.Pool.Exec(ctx, `INSERT INTO scout_call_returns
+		(call_id, horizon, horizon_seconds, due_at, status, price_usd, return_pct, max_gain_pct, max_drawdown_pct,
+		 max_price_usd, min_price_usd, last_trade_at, computed_at)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,now())
+		ON CONFLICT (call_id, horizon) DO UPDATE SET
+		 horizon_seconds = EXCLUDED.horizon_seconds, due_at = EXCLUDED.due_at, status = EXCLUDED.status,
+		 price_usd = EXCLUDED.price_usd, return_pct = EXCLUDED.return_pct, max_gain_pct = EXCLUDED.max_gain_pct,
+		 max_drawdown_pct = EXCLUDED.max_drawdown_pct, max_price_usd = EXCLUDED.max_price_usd,
+		 min_price_usd = EXCLUDED.min_price_usd, last_trade_at = EXCLUDED.last_trade_at, computed_at = now()`,
+		callID, h.Name, int(h.Dur/time.Second), r.DueAt.UTC(), r.Status, nz(r.PriceUSD), nz(r.ReturnPct),
+		nz(r.MaxGainPct), nz(r.MaxDDPct), nz(r.MaxPriceUSD), nz(r.MinPriceUSD), r.LastTradeAt)
+	return err
+}
+
+// ReturnsForCall returns the stored horizon results of a call, by horizon name.
+func (st *ScoutStore) ReturnsForCall(ctx context.Context, callID int) (map[string]horizonResult, error) {
+	rows, err := st.Pool.Query(ctx, `SELECT horizon, due_at, status, COALESCE(price_usd,0)::float8,
+		COALESCE(return_pct,0)::float8, COALESCE(max_gain_pct,0)::float8, COALESCE(max_drawdown_pct,0)::float8,
+		COALESCE(max_price_usd,0)::float8, COALESCE(min_price_usd,0)::float8, last_trade_at
+		FROM scout_call_returns WHERE call_id = $1`, callID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]horizonResult{}
+	for rows.Next() {
+		var r horizonResult
+		if err := rows.Scan(&r.Horizon, &r.DueAt, &r.Status, &r.PriceUSD, &r.ReturnPct, &r.MaxGainPct,
+			&r.MaxDDPct, &r.MaxPriceUSD, &r.MinPriceUSD, &r.LastTradeAt); err != nil {
+			return nil, err
+		}
+		out[r.Horizon] = r
+	}
+	return out, rows.Err()
+}
+
+// ExportDatasetCSV writes scout_call_dataset_v (one row per call) as CSV.
+func (st *ScoutStore) ExportDatasetCSV(ctx context.Context, w io.Writer) (int, error) {
+	rows, err := st.Pool.Query(ctx, `SELECT * FROM scout_call_dataset_v ORDER BY message_date, call_id`)
+	if err != nil {
+		return 0, err
+	}
+	defer rows.Close()
+	cw := csv.NewWriter(w)
+	var header []string
+	for _, f := range rows.FieldDescriptions() {
+		header = append(header, f.Name)
+	}
+	if err := cw.Write(header); err != nil {
+		return 0, err
+	}
+	n := 0
+	for rows.Next() {
+		vals, err := rows.Values()
+		if err != nil {
+			return n, err
+		}
+		rec := make([]string, len(vals))
+		for i, v := range vals {
+			switch x := v.(type) {
+			case nil:
+				rec[i] = ""
+			case time.Time:
+				rec[i] = x.UTC().Format(time.RFC3339)
+			case float64:
+				rec[i] = strconv.FormatFloat(x, 'f', -1, 64)
+			default:
+				rec[i] = fmt.Sprint(x)
+			}
+		}
+		if err := cw.Write(rec); err != nil {
+			return n, err
+		}
+		n++
+	}
+	cw.Flush()
+	if err := cw.Error(); err != nil {
+		return n, err
+	}
+	return n, rows.Err()
 }

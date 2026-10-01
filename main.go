@@ -79,6 +79,8 @@ type config struct {
 	DBMode        string // SCOUT_DB: "repo" (default: the repo's database package, DB_USER/DB_PASS/DB_NAME_DEV) | "off"
 	DatabaseURL   string // SCOUT_DATABASE_URL: optional override with an explicit DSN
 	DBAutoMigrate bool
+
+	Price priceConfig // performance tracking (GeckoTerminal), see prices.go
 }
 
 func env(key, def string) string {
@@ -152,6 +154,9 @@ func loadConfig(envFile string) (*config, error) {
 		return nil, errors.New("API_HASH is required")
 	}
 	if c.Tools, err = loadTools(); err != nil {
+		return nil, err
+	}
+	if c.Price, err = loadPriceConfig(); err != nil {
 		return nil, err
 	}
 	if c.NotifyBotToken != "" && c.NotifyChatID == "" {
@@ -282,6 +287,7 @@ type scanRecord struct {
 	Time      time.Time    `json:"time"`
 	CA        string       `json:"ca"`
 	SourceMsg int          `json:"source_msg_id,omitempty"`
+	CallMeta  *CallMeta    `json:"call_meta,omitempty"`
 	Tools     []toolRecord `json:"tools"`
 	Deliver   bool         `json:"should_deliver"`
 	Delivered bool         `json:"delivered"`
@@ -313,9 +319,10 @@ func appendLog(path string, r scanRecord) {
 
 type job struct {
 	CA         string
-	SourceMsg  int    // id of the original call post in the source channel (0 = unknown)
-	SourceText string // its text (used for Bot-API delivery / forward fallback)
-	CallID     *int   // scout_calls.id (nil when DB is off or no source post)
+	SourceMsg  int       // id of the original call post in the source channel (0 = unknown)
+	SourceText string    // its text (used for Bot-API delivery / forward fallback)
+	Meta       *CallMeta // parsed post data (MCap, Liq, Tax, Age, Holders, Proof, live buys)
+	CallID     *int      // scout_calls.id (nil when DB is off or no source post)
 }
 
 type scanner struct {
@@ -338,6 +345,9 @@ type scanner struct {
 
 	listOnly bool // -list-chats: don't resolve the delivery target
 
+	pc    priceConfig
+	gecko *geckoClient
+
 	postMu      sync.Mutex
 	handled     map[string]bool // "msgID|ca" (and "msgID" for CA-less posts) already processed
 	sourceInput tg.InputChannelClass
@@ -355,6 +365,8 @@ func newScanner(cfg *config) *scanner {
 	for _, t := range cfg.Tools {
 		s.runners = append(s.runners, newToolRunner(t))
 	}
+	s.pc = cfg.Price
+	s.gecko = newGeckoClient(cfg.Price)
 	return s
 }
 
@@ -427,7 +439,7 @@ func (s *scanner) onChannelPost(msg *tg.Message) {
 		callID := s.recordCall(msg, ca, urls, CallStatusQueued)
 		log.Printf("post %d: queued %s", msg.ID, ca)
 		select {
-		case s.queue <- job{CA: ca, SourceMsg: msg.ID, SourceText: msg.Message, CallID: callID}:
+		case s.queue <- job{CA: ca, SourceMsg: msg.ID, SourceText: msg.Message, CallID: callID, Meta: metaOf(msg.Message)}:
 		default:
 			log.Printf("queue full, dropping %s", ca)
 			s.setCallStatus(callID, CallStatusDropped)
@@ -550,6 +562,11 @@ func (s *scanner) deliveryHeader(j job, results []*toolResult) string {
 		b.WriteString("🔎 New call")
 	}
 	fmt.Fprintf(&b, "\nCA: %s", j.CA)
+	if j.Meta != nil {
+		if line := j.Meta.SummaryLine(); line != "" {
+			b.WriteString("\n" + line)
+		}
+	}
 	for _, r := range results {
 		v := r.Verdict
 		line := fmt.Sprintf("\n• %s: ", r.Spec.Name)
@@ -794,7 +811,7 @@ func (s *scanner) shouldDeliver(results []*toolResult) bool {
 }
 
 func (s *scanner) process(ctx context.Context, j job, deliver bool) []*toolResult {
-	rec := scanRecord{Time: time.Now(), CA: j.CA, SourceMsg: j.SourceMsg}
+	rec := scanRecord{Time: time.Now(), CA: j.CA, SourceMsg: j.SourceMsg, CallMeta: j.Meta}
 	defer func() { appendLog(s.logf, rec) }()
 
 	results := s.investigateAll(ctx, j.CA)
@@ -852,12 +869,19 @@ func (s *scanner) process(ctx context.Context, j job, deliver bool) []*toolResul
 // ---------------------------------------------------------------------------
 
 func (s *scanner) recordCall(msg *tg.Message, ca string, urls []string, status string) *int {
+	id, _ := s.recordCallInfo(msg, ca, urls, status)
+	return id
+}
+
+// recordCallInfo records a call (idempotent) plus its parsed data and price
+// tracking row; created reports whether the call was new.
+func (s *scanner) recordCallInfo(msg *tg.Message, ca string, urls []string, status string) (*int, bool) {
 	if s.db == nil {
-		return nil
+		return nil, false
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	id, err := s.db.InsertScoutCall(ctx, &ScoutCall{
+	id, created, err := s.db.UpsertScoutCall(ctx, &ScoutCall{
 		ChannelID:       s.sourceChannelID,
 		ChannelUsername: s.cfg.SourceChannel,
 		MessageID:       msg.ID,
@@ -870,9 +894,32 @@ func (s *scanner) recordCall(msg *tg.Message, ca string, urls []string, status s
 	})
 	if err != nil {
 		log.Printf("db: insert scout_calls %s: %v", ca, err)
-		return nil
+		return nil, false
 	}
-	return id
+	if meta := metaOf(msg.Message); meta != nil {
+		if err := s.db.UpsertCallMetrics(ctx, *id, meta); err != nil {
+			log.Printf("db: call metrics for post %d: %v", msg.ID, err)
+		}
+	}
+	if s.pc.Enabled && len(s.pc.Horizons) > 0 {
+		entry := time.Unix(int64(msg.Date), 0).UTC()
+		priority := 0
+		if status == CallStatusBackfill {
+			priority = 1
+		}
+		if err := s.db.EnsureTracking(ctx, *id, ca, entry, priority, s.firstCheckAt(entry)); err != nil {
+			log.Printf("db: tracking for post %d: %v", msg.ID, err)
+		}
+	}
+	return id, created
+}
+
+// metaOf parses the call post; nil when it isn't in the call format.
+func metaOf(text string) *CallMeta {
+	if m, ok := parseCallMeta(text); ok {
+		return m
+	}
+	return nil
 }
 
 func (s *scanner) setCallStatus(id *int, status string) {
@@ -1323,6 +1370,13 @@ func main() {
 	_ = flag.Bool("deliver", true, "deprecated: -scan now delivers by default (use -no-deliver to only print)")
 	noDeliver := flag.Bool("no-deliver", false, "with -scan / -post: print the reports only, don't send them")
 	dryRun := flag.Bool("dry-run", false, "listen and scan, but never deliver (verdicts are logged)")
+	backfillFlag := flag.Bool("backfill", false, "import past calls from the channel history into the DB (no bot scans) so their performance can be tracked, then exit")
+	backfillFrom := flag.Int("backfill-from", 1, "with -backfill: oldest post id to import")
+	backfillTo := flag.Int("backfill-to", 0, "with -backfill: newest post id to import (0 = latest)")
+	backfillMax := flag.Int("backfill-max", 0, "with -backfill: stop after this many posts (0 = no limit)")
+	trackOnly := flag.Bool("track", false, "run only the performance tracker (no Telegram), forever")
+	trackOnce := flag.Bool("track-once", false, "process the price checks that are due now, then exit (no Telegram)")
+	exportPath := flag.String("export-dataset", "", "write the training dataset (one row per call: features + 1h/1d/3d/7d/30d outcomes) to this CSV file, then exit")
 	testNotify := flag.Bool("test-notify", false, "send one test message to SCOUT_NOTIFY_PEER and exit")
 	postFlag := flag.String("post", "", "process specific @scoutrobinhood post id(s), e.g. 10002 or 10002,10005: show what was found, investigate and deliver, then exit")
 	listChats := flag.Bool("list-chats", false, "print your groups/channels with their ids (for SCOUT_NOTIFY_PEER), then exit")
@@ -1357,6 +1411,66 @@ func main() {
 			dbSource, db.Describe(ctx))
 	} else {
 		log.Println("SCOUT_DB=off — not recording to SQL")
+	}
+
+	// Modes that need only the database (no Telegram login).
+	if *exportPath != "" || *trackOnly || *trackOnce {
+		if s.db == nil {
+			log.Fatal("these modes need the database (SCOUT_DB=off is set)")
+		}
+		switch {
+		case *exportPath != "":
+			f, err := os.Create(*exportPath)
+			if err != nil {
+				log.Fatal(err)
+			}
+			n, err := s.db.ExportDatasetCSV(ctx, f)
+			if cerr := f.Close(); err == nil {
+				err = cerr
+			}
+			if err != nil {
+				log.Fatal(err)
+			}
+			fmt.Printf("wrote %d calls to %s\n", n, *exportPath)
+		case *trackOnce:
+			if !s.pc.Enabled {
+				log.Fatal("SCOUT_TRACK_PERFORMANCE=false")
+			}
+			total := 0
+			for {
+				n := s.trackDue(ctx, 50)
+				total += n
+				if n < 50 || ctx.Err() != nil {
+					break
+				}
+			}
+			fmt.Printf("processed %d call(s)\n", total)
+		case *trackOnly:
+			if !s.pc.Enabled {
+				log.Fatal("SCOUT_TRACK_PERFORMANCE=false")
+			}
+			s.trackLoop(ctx)
+		}
+		return
+	}
+
+	if *backfillFlag {
+		if s.db == nil {
+			log.Fatal("-backfill needs the database (SCOUT_DB=off is set)")
+		}
+		s.listOnly = true // no delivery target needed
+		if err := run(ctx, s, func(ctx context.Context) error {
+			st, err := s.backfill(ctx, *backfillFrom, *backfillTo, *backfillMax)
+			fmt.Printf("backfill: %d posts read, %d calls, %d CAs (%d new, %d already recorded)\n",
+				st.Posts, st.Calls, st.CAs, st.New, st.Existing)
+			if err == nil && s.pc.Enabled {
+				fmt.Println("their performance is filled in by the tracker (running listener, or -track / -track-once)")
+			}
+			return err
+		}); err != nil {
+			log.Fatal(err)
+		}
+		return
 	}
 
 	if *listChats {
@@ -1425,10 +1539,17 @@ func main() {
 				for _, u := range urls {
 					fmt.Println("  ", u)
 				}
-				fmt.Printf("CAs found: %v\n\n", cas)
+				fmt.Printf("CAs found: %v\n", cas)
+				meta := metaOf(m.Message)
+				if meta != nil {
+					pretty, _ := json.MarshalIndent(meta, "", "  ")
+					fmt.Printf("parsed call data:\n%s\n%s\n\n", pretty, meta.SummaryLine())
+				} else {
+					fmt.Print("parsed call data: none (post isn't in the call format)\n\n")
+				}
 				for _, ca := range cas {
 					s.seen.markNew(ca)
-					j := job{CA: ca, SourceMsg: m.ID, SourceText: m.Message, CallID: s.recordCall(m, ca, urls, CallStatusQueued)}
+					j := job{CA: ca, SourceMsg: m.ID, SourceText: m.Message, Meta: meta, CallID: s.recordCall(m, ca, urls, CallStatusQueued)}
 					printResults(s, s.process(ctx, j, !*noDeliver), *noDeliver)
 				}
 			}
@@ -1445,7 +1566,7 @@ func main() {
 			if msg, err := s.findCallMessage(ctx, j.CA); err != nil {
 				log.Printf("looking up the original call in @%s: %v", cfg.SourceChannel, err)
 			} else if msg != nil {
-				j.SourceMsg, j.SourceText = msg.ID, msg.Message
+				j.SourceMsg, j.SourceText, j.Meta = msg.ID, msg.Message, metaOf(msg.Message)
 				j.CallID = s.recordCall(msg, j.CA, postURLs(msg), CallStatusQueued)
 				log.Printf("original call: %s", s.sourceLink(msg.ID))
 			} else {
@@ -1466,6 +1587,7 @@ func main() {
 		err := run(ctx, s, func(ctx context.Context) error {
 			go s.worker(ctx)
 			go s.poll(ctx)
+			go s.trackLoop(ctx)
 			var names []string
 			for _, t := range cfg.Tools {
 				g := ""

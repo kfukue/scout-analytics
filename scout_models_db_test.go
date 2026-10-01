@@ -29,9 +29,10 @@ func testStore(t *testing.T) *ScoutStore {
 		t.Fatal(err)
 	}
 	t.Cleanup(st.Close)
-	if _, err := st.Pool.Exec(ctx, `DROP VIEW IF EXISTS scout_investigations_v;
+	if _, err := st.Pool.Exec(ctx, `DROP VIEW IF EXISTS scout_investigations_v, scout_call_dataset_v, scout_calls_v;
 		DROP TABLE IF EXISTS scout_delivery_investigations, scout_deliveries, scout_investigations,
-			scout_investigation_tools, scout_scan_reports, scout_calls CASCADE`); err != nil {
+			scout_investigation_tools, scout_scan_reports, scout_call_live_buys, scout_call_metrics,
+			scout_call_returns, scout_call_tracking, scout_calls CASCADE`); err != nil {
 		t.Fatal(err)
 	}
 	return st
@@ -348,4 +349,70 @@ func TestOpenScoutStoreSelection(t *testing.T) {
 		t.Fatalf("shared pool was closed: %v", err)
 	}
 	st.Close()
+}
+
+func TestCallMetricsStore(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+	if err := st.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config{SourceChannel: "scoutrobinhood", Chains: map[string]bool{"evm": true}, StateDir: t.TempDir()}
+	s := newScanner(cfg)
+	s.db = st
+	s.sourceChannelID = 777
+
+	ca := "0x3333333333333333333333333333333333333333"
+	msg := &tg.Message{ID: 10120, Date: int(time.Now().Unix()), Message: samplePost,
+		ReplyMarkup: &tg.ReplyInlineMarkup{Rows: []tg.KeyboardButtonRow{{Buttons: []tg.KeyboardButtonClass{
+			&tg.KeyboardButtonURL{Text: "Chart", URL: "https://dexscreener.com/robinhood/" + ca}}}}}}
+	s.onChannelPost(msg)
+	j := <-s.queue
+	if j.CallID == nil || j.Meta == nil || str(j.Meta.TokenSymbol) != "MALFOID" {
+		t.Fatalf("job = %+v", j)
+	}
+	got, err := st.GetCallMetrics(ctx, *j.CallID)
+	if err != nil || got == nil {
+		t.Fatalf("GetCallMetrics: %v %v", got, err)
+	}
+	m := got.Meta
+	if f(m.McapUSD) != 52000 || f(m.LiqUSD) != 20000 || f(m.LiqPct) != 38 || f(m.TaxSellPct) != 2.5 ||
+		i(m.AgeSeconds) != 720 || i(m.Holders) != 1150 || i(m.ProofElite) != 3 || i(m.ProofGood) != 5 ||
+		str(m.Dex) != "Longxyz" || f(m.CalledAtMcapUSD) != 45200 {
+		t.Fatalf("metrics = %+v", m)
+	}
+	if got.LiveBuysEliteCount != 2 || got.LiveBuysGoodCount != 2 || got.LiveBuysEliteUSD != 2000 || got.LiveBuysGoodUSD != 445.5 {
+		t.Fatalf("totals = %+v", got)
+	}
+	if len(m.LiveBuys) != 4 || m.LiveBuys[0].Tier != "elite" || m.LiveBuys[0].WalletDisplay != "0x79f6…5c5d" || f(m.LiveBuys[3].AmountUSD) != 95.5 {
+		t.Fatalf("buys = %+v", m.LiveBuys)
+	}
+
+	// re-parse (e.g. edited post) replaces the buys instead of appending
+	edited := strings.Replace(samplePost, "✅ $95.5 · 0x9999…aaaa\n", "", 1)
+	mm, _ := parseCallMeta(edited)
+	if err := st.UpsertCallMetrics(ctx, *j.CallID, mm); err != nil {
+		t.Fatal(err)
+	}
+	got, _ = st.GetCallMetrics(ctx, *j.CallID)
+	if len(got.Meta.LiveBuys) != 3 || got.LiveBuysGoodCount != 1 {
+		t.Fatalf("after re-upsert: %d buys, good=%d", len(got.Meta.LiveBuys), got.LiveBuysGoodCount)
+	}
+
+	// convenience view
+	var sym string
+	var holders, elite int
+	if err := st.Pool.QueryRow(ctx, `SELECT token_symbol, holders, proof_elite FROM scout_calls_v WHERE call_id = $1`, *j.CallID).
+		Scan(&sym, &holders, &elite); err != nil || sym != "MALFOID" || holders != 1150 || elite != 3 {
+		t.Fatalf("view: %s %d %d %v", sym, holders, elite, err)
+	}
+	// a post that isn't a call has no metrics row
+	if none, err := st.GetCallMetrics(ctx, 999999); none != nil || err != nil {
+		t.Fatalf("missing metrics: %v %v", none, err)
+	}
+	// header shows the summary
+	h := s.deliveryHeader(j, nil)
+	if !strings.Contains(h, "MCap $52k") || !strings.Contains(h, "Proof 💎3 ✅5") {
+		t.Fatalf("header:\n%s", h)
+	}
 }

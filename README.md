@@ -53,6 +53,96 @@ Make sure you've pressed **Start** on **@perceptor0xBot and @salpha_research_bot
   If a post you expected isn't in the log at all, it wasn't received; if it says "no CA found",
   run `-post <id>` to see exactly what the scanner saw.
 
+## Call data parsed from the post
+
+Each @scoutrobinhood call is parsed into fields (stored in `scout_call_metrics` /
+`scout_call_live_buys`, shown in the delivery header):
+
+| Post line | Fields |
+|---|---|
+| `🚨 EARLY CALL — $TOKEN · robinhood` | `token_symbol`, `chain_name` |
+| `💰 called at $45k` | `called_at_mcap_usd` |
+| `🏛 DEX: Longxyz` | `dex` |
+| `📈 Mcap: $52k` | `mcap_usd` |
+| `💧 Liq: $20k \| 38%` | `liq_usd`, `liq_pct` |
+| `🧾 Tax: B 0% \| S 0%` | `tax_buy_pct`, `tax_sell_pct` |
+| `⏱ Age: 12m · 🚀 Longxyz` | `age_text`, `age_seconds`, `launchpad` |
+| `👥 Holders: 150` | `holders` |
+| `🔎 Proof: 3 elite + 5 good holding` | `proof_elite`, `proof_good` |
+| `💎 $1.2k · 0x79f6…5c5d` / `✅ $350 · 0x12ab…9f00` (under "Live buys") | one `scout_call_live_buys` row each: `tier` elite/good, `amount_usd`, wallet; plus counts/totals per tier in `scout_call_metrics` |
+
+Header line in the delivery:
+```
+📊 MCap $52k · Liq $20k (38%) · Tax 0/0% · Age 12m · Holders 150 · Proof 💎3 ✅5
+Live buys: 💎 2 ($2k) · ✅ 2 ($446)
+```
+Fields missing from a post are stored as NULL. `-post <id>` prints the parsed data, so
+you can check a post's parse before relying on it.
+
+## Performance tracking (for building a prediction model)
+
+For every call the scanner records how the token did afterwards, using
+[GeckoTerminal](https://www.geckoterminal.com/robinhood/pools) price candles (it indexes
+Robinhood Chain; DexScreener mostly doesn't):
+
+1. **Pool:** the most liquid pool that existed at the call (looked up once per CA).
+2. **Entry price:** the price when the call was posted, from 1-minute candles (hourly if
+   minute history isn't available; `entry_price_source` says which).
+3. **Each horizon** (`1h, 1d, 3d, 7d, 30d`): price at entry + horizon, **return %**, **max gain %**
+   (best high in the window) and **max drawdown %** (worst low) → `scout_call_returns`.
+4. When the last horizon is done, liquidity is re-checked: **rugged** = liquidity < $500 or
+   price < 5% of entry.
+
+Checks are scheduled for when each horizon comes due (`scout_call_tracking.next_check_at`), so a
+call costs ~3 API requests per check. It runs inside the listener automatically.
+
+### Backfill past calls (dataset without waiting 30 days)
+
+```bash
+./scoutanalytics -backfill                       # import every past call in @scoutrobinhood
+./scoutanalytics -backfill -backfill-from 9000   # or only posts 9000…latest
+```
+Backfilled calls are parsed and stored (status `backfill`, no bot scans, Perceptor verdict
+empty) and queued for price tracking at lower priority than live calls.
+
+**Safe to re-run** (e.g. after an interruption, or with overlapping ranges). A call is
+identified by channel + post + CA (CA compared case-insensitively), so a re-run updates
+instead of duplicating:
+
+| Table | On re-run |
+|---|---|
+| `scout_calls` | same row; only the post text/links are refreshed, status kept (a live call stays `scanned`) |
+| `scout_call_metrics` | same row, re-parsed |
+| `scout_call_live_buys` | replaced for that call (never appended) |
+| `scout_call_tracking` | untouched: entry price, schedule and progress are kept |
+| `scout_call_returns` | untouched by backfill; one row per call + horizon |
+
+The summary shows it: `backfill: 500 posts read, 180 calls, 182 CAs (0 new, 182 already recorded)`. The free API allows
+~10 requests/min, so thousands of calls take hours; the running listener works through
+them, or run `./scoutanalytics -track` as a separate process.
+
+### Export the training dataset
+
+```bash
+./scoutanalytics -export-dataset calls.csv
+```
+One row per call (`scout_call_dataset_v`): **features known at call time** (MCap, Liq, Liq %,
+Tax, Age, Holders, Proof elite/good, live-buy counts/$ per tier, Perceptor verdict, DEX,
+launchpad) + **outcomes** (`ret_*`, `max_gain_*`, `max_dd_*` for 1h/1d/3d/7d/30d, `rugged`).
+Only use the feature columns as model inputs; everything about the future is an outcome.
+
+| Setting | Default | |
+|---|---|---|
+| `SCOUT_TRACK_PERFORMANCE` | `true` | turn tracking off |
+| `SCOUT_PERF_HORIZONS` | `1h,1d,3d,7d,30d` | up to 40d |
+| `SCOUT_PRICE_RPM` | `10` | GeckoTerminal keyless limit; raise with a plan |
+| `SCOUT_PRICE_API_BASE` / `SCOUT_PRICE_API_KEY` | public API | e.g. CoinGecko on-chain API + `x-cg-pro-api-key` |
+| `SCOUT_PRICE_NETWORK` | `robinhood` | GeckoTerminal network id |
+| `SCOUT_RUG_LIQ_USD` | `500` | liquidity below this = rugged |
+| `SCOUT_TRACK_INTERVAL` | `1m` | how often due checks are processed |
+
+Other commands: `-track` (tracker only, forever, no Telegram), `-track-once` (process what's due and exit).
+
 ## Where clean reports go
 
 | Setting | Result |
@@ -218,6 +308,12 @@ scout_calls ──< scout_investigations >── scout_investigation_tools
 | Table | One row per | Key columns |
 |---|---|---|
 | `scout_investigation_tools` | tool (bot) | `code`, `bot_username`, `command_template`, `parser`, `is_gate`, `is_active` |
+| `scout_call_metrics` | call (1:1) | MCap, Liq, Liq %, Tax buy/sell, Age, launchpad, Holders, Proof elite/good, live-buy counts and $ per tier, `parsed` (JSONB) |
+| `scout_call_live_buys` | live-buy line of a call | `call_id`, `position`, `tier` (elite/good), `amount_usd`, `wallet_display` |
+| `scout_calls_v` (view) | call + its parsed data | for ad-hoc queries |
+| `scout_call_tracking` | call (1:1) | pool, entry price (+ source), status, next check, current liquidity, `rugged` |
+| `scout_call_returns` | call × horizon | `horizon`, `price_usd`, `return_pct`, `max_gain_pct`, `max_drawdown_pct`, `last_trade_at` |
+| `scout_call_dataset_v` (view) | call | features + pivoted outcomes; what `-export-dataset` writes |
 | `scout_calls` | CA found in a @scoutrobinhood post | `message_id`, `message_date`, `message_text`, `urls`, `contract_address`, `chain`, `status` (`queued` → `scanned`/`failed`, or `duplicate`/`dropped`) |
 | `scout_investigations` | (CA, tool) request | `call_id`, `tool_id`, `request_text`, `requested_at`, `completed_at`, `status` (`completed`/`failed`/`timeout`/`rate_limited`), `bot_message_ids`, `report_text`, `report_urls`, `report_url`, `external_id`, `verdict_level`, `verdict_label`, `ticker`, `verdict_summary`, `details` (JSONB: attempts, rate-limit waits, files, photos, buttons), `error` |
 | `scout_deliveries` | bundle sent to you (or failed attempt) | `call_id`, `target`, `status` (`sent`/`failed`), `header_text`, `delivered_at`, `error` |
@@ -255,6 +351,15 @@ GROUP BY c.id ORDER BY c.message_date DESC LIMIT 50;
 SELECT s.contract_address, s.report_text
 FROM scout_investigations_v s JOIN scout_investigations_v p ON p.call_id = s.call_id
 WHERE s.tool = 'salpha' AND p.tool = 'perceptor' AND p.verdict_level IN ('clean','caution');
+
+-- calls with their post data and Perceptor verdict
+SELECT c.message_date, c.token_symbol, c.mcap_usd, c.liq_usd, c.holders, c.proof_elite, c.proof_good,
+       v.verdict_level AS perceptor
+FROM scout_calls_v c LEFT JOIN scout_investigations_v v ON v.call_id = c.call_id AND v.tool = 'perceptor'
+ORDER BY c.message_date DESC LIMIT 50;
+
+-- elite vs good live-buy volume per call
+SELECT call_id, tier, count(*) buys, sum(amount_usd) usd FROM scout_call_live_buys GROUP BY 1,2 ORDER BY 1 DESC;
 
 -- tool reliability (timeouts / failures) per day
 SELECT date_trunc('day', requested_at) d, tool, status, count(*)
