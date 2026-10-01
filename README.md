@@ -58,7 +58,8 @@ Make sure you've pressed **Start** on **@perceptor0xBot and @salpha_research_bot
 | Setting | Result |
 |---|---|
 | default (`SCOUT_NOTIFY_PEER=me`) | Your **Saved Messages** (no push notification) |
-| `SCOUT_NOTIFY_PEER="scout analytics"` | A private group/channel **by its title** (case-insensitive). **Recommended.** |
+| `SCOUT_NOTIFY_PEER=https://t.me/+AbCdEf…` | A private group/channel **by its invite link**: exact, joins it if needed. **Recommended.** |
+| `SCOUT_NOTIFY_PEER="scout analytics"` | A private group/channel by its title (case-insensitive; groups you've left are ignored) |
 | `SCOUT_NOTIFY_PEER=-1001234567890` or `@username` | A group/channel by id or public username |
 | `SCOUT_NOTIFY_BOT_TOKEN` + `SCOUT_NOTIFY_CHAT_ID` | Sent by your own bot via Bot API (text copy, push notifications) |
 
@@ -76,6 +77,10 @@ CA: 0x…
 • sAlpha: report attached
 Source: https://t.me/scoutrobinhood/1234
 ```
+
+Check it with `./scoutanalytics -test-notify` (sends one test message and exits).
+If Telegram later rejects the chat (`PEER_ID_INVALID`, e.g. the group was upgraded to a
+supergroup), the scanner looks `SCOUT_NOTIFY_PEER` up again and retries once.
 
 Not sure of the name or id? `go run ./telegrambot/scoutanalytics -list-chats` prints
 all your groups and channels with their ids. On startup the log shows where reports

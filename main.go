@@ -41,6 +41,7 @@ import (
 	"github.com/gotd/td/telegram/message"
 	"github.com/gotd/td/telegram/updates"
 	"github.com/gotd/td/tg"
+	"github.com/gotd/td/tgerr"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/joho/godotenv"
 	"github.com/kfukue/geth-analytics-api/database"
@@ -604,7 +605,7 @@ func (s *scanner) deliver(ctx context.Context, j job, header string, results []*
 		return botAPISend(ctx, s.cfg.NotifyBotToken, s.cfg.NotifyChatID, s.botAPIText(header, j, results))
 	}
 
-	if _, err := s.sender.To(s.notifyPeer).Text(ctx, header); err != nil {
+	if err := s.sendNotifyText(ctx, header); err != nil {
 		return fmt.Errorf("send header: %w", err)
 	}
 	if j.SourceMsg != 0 && s.sourcePeer != nil {
@@ -1091,6 +1092,9 @@ func (s *scanner) resolveNotify(ctx context.Context) (tg.InputPeerClass, string,
 	if p == "" || strings.EqualFold(p, "me") || strings.EqualFold(p, "self") {
 		return &tg.InputPeerSelf{}, "Saved Messages", nil
 	}
+	if m := inviteLinkRe.FindStringSubmatch(p); m != nil {
+		return s.resolveInvite(ctx, m[1])
+	}
 	if id, err := strconv.ParseInt(p, 10, 64); err == nil {
 		return s.findDialog(ctx, func(d dialogInfo) bool { return d.ID == normalizeChatID(id) }, p)
 	}
@@ -1106,6 +1110,92 @@ func (s *scanner) resolveNotify(ctx context.Context) (tg.InputPeerClass, string,
 }
 
 var usernameRe = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9_]{3,31}$`)
+
+// inviteLinkRe matches private invite links: https://t.me/+HASH, t.me/joinchat/HASH, tg://join?invite=HASH, +HASH.
+var inviteLinkRe = regexp.MustCompile(`(?:t\.me/\+|t\.me/joinchat/|join\?invite=|^\+)([A-Za-z0-9_-]{8,})`)
+
+// chatPeer converts a chat from an API result into an input peer + description.
+func chatPeer(c tg.ChatClass) (tg.InputPeerClass, string, bool) {
+	switch ch := c.(type) {
+	case *tg.Channel:
+		kind := "channel"
+		if ch.Megagroup {
+			kind = "supergroup"
+		}
+		return ch.AsInputPeer(), fmt.Sprintf("%s %q (id %d)", kind, ch.Title, ch.ID), true
+	case *tg.Chat:
+		if ch.MigratedTo != nil {
+			return nil, "", false
+		}
+		return &tg.InputPeerChat{ChatID: ch.ID}, fmt.Sprintf("group %q (id %d)", ch.Title, ch.ID), true
+	}
+	return nil, "", false
+}
+
+// resolveInvite finds the chat behind a private invite link, joining it if
+// this account isn't a member yet.
+func (s *scanner) resolveInvite(ctx context.Context, hash string) (tg.InputPeerClass, string, error) {
+	inv, err := s.api.MessagesCheckChatInvite(ctx, hash)
+	if err != nil {
+		return nil, "", fmt.Errorf("invite link: %w", err)
+	}
+	var chat tg.ChatClass
+	switch x := inv.(type) {
+	case *tg.ChatInviteAlready:
+		chat = x.Chat
+	case *tg.ChatInvitePeek:
+		chat = x.Chat
+	case *tg.ChatInvite:
+		log.Printf("not a member of %q yet — joining via the invite link", x.Title)
+		upd, err := s.api.MessagesImportChatInvite(ctx, hash)
+		if err != nil && !tgerr.Is(err, "USER_ALREADY_PARTICIPANT") {
+			return nil, "", fmt.Errorf("join via invite link: %w", err)
+		}
+		var chats []tg.ChatClass
+		switch u := upd.(type) {
+		case *tg.Updates:
+			chats = u.Chats
+		case *tg.UpdatesCombined:
+			chats = u.Chats
+		}
+		for _, c := range chats {
+			if p, label, ok := chatPeer(c); ok {
+				return p, label, nil
+			}
+		}
+		// Joined but the response had no chat: look it up by title.
+		want := strings.ToLower(strings.TrimSpace(x.Title))
+		return s.findDialog(ctx, func(d dialogInfo) bool { return strings.ToLower(strings.TrimSpace(d.Title)) == want }, x.Title)
+	}
+	if p, label, ok := chatPeer(chat); ok {
+		return p, label, nil
+	}
+	return nil, "", fmt.Errorf("invite link points to an unusable chat (%T)", chat)
+}
+
+// isPeerError: the chat id we hold is no longer valid (group upgraded to a
+// supergroup, left, re-created, …) and should be looked up again.
+func isPeerError(err error) bool {
+	return tgerr.Is(err, "PEER_ID_INVALID", "CHAT_ID_INVALID", "CHANNEL_INVALID", "CHANNEL_PRIVATE", "CHAT_FORBIDDEN")
+}
+
+// sendNotifyText sends text to the delivery chat; if Telegram says the chat id
+// is invalid, it looks the chat up again once and retries.
+func (s *scanner) sendNotifyText(ctx context.Context, text string) error {
+	_, err := s.sender.To(s.notifyPeer).Text(ctx, text)
+	if err == nil || !isPeerError(err) {
+		return err
+	}
+	log.Printf("delivery chat rejected (%v) — looking up SCOUT_NOTIFY_PEER=%q again", err, s.cfg.NotifyPeer)
+	peer, label, rerr := s.resolveNotify(ctx)
+	if rerr != nil {
+		return fmt.Errorf("%w (re-resolve failed: %v)", err, rerr)
+	}
+	s.notifyPeer = peer
+	log.Printf("reports will be delivered to %s", label)
+	_, err = s.sender.To(s.notifyPeer).Text(ctx, text)
+	return err
+}
 
 // normalizeChatID converts Bot-API style ids (-100<channel>, -<chat>) to raw MTProto ids.
 func normalizeChatID(id int64) int64 {
@@ -1155,14 +1245,17 @@ func (s *scanner) listDialogs(ctx context.Context) ([]dialogInfo, error) {
 		for _, c := range md.GetChats() {
 			switch ch := c.(type) {
 			case *tg.Channel:
+				if ch.Left {
+					continue // you're not in it any more
+				}
 				kind := "channel"
 				if ch.Megagroup {
 					kind = "supergroup"
 				}
 				add(dialogInfo{ID: ch.ID, Title: ch.Title, Kind: kind, Peer: ch.AsInputPeer()})
 			case *tg.Chat:
-				if ch.Deactivated || ch.MigratedTo != nil {
-					continue // upgraded to a supergroup; the Channel entry is the live one
+				if ch.Left || ch.Deactivated || ch.MigratedTo != nil {
+					continue // left, or upgraded to a supergroup (the Channel entry is the live one)
 				}
 				add(dialogInfo{ID: ch.ID, Title: ch.Title, Kind: "group", Peer: &tg.InputPeerChat{ChatID: ch.ID}})
 			}
@@ -1230,6 +1323,7 @@ func main() {
 	_ = flag.Bool("deliver", true, "deprecated: -scan now delivers by default (use -no-deliver to only print)")
 	noDeliver := flag.Bool("no-deliver", false, "with -scan / -post: print the reports only, don't send them")
 	dryRun := flag.Bool("dry-run", false, "listen and scan, but never deliver (verdicts are logged)")
+	testNotify := flag.Bool("test-notify", false, "send one test message to SCOUT_NOTIFY_PEER and exit")
 	postFlag := flag.String("post", "", "process specific @scoutrobinhood post id(s), e.g. 10002 or 10002,10005: show what was found, investigate and deliver, then exit")
 	listChats := flag.Bool("list-chats", false, "print your groups/channels with their ids (for SCOUT_NOTIFY_PEER), then exit")
 	flag.Parse()
@@ -1279,6 +1373,22 @@ func main() {
 				}
 			}
 			fmt.Println("\nSet SCOUT_NOTIFY_PEER in .env to a title (e.g. \"scout analytics\") or an id from this list.")
+			return nil
+		}); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
+
+	if *testNotify {
+		if err := run(ctx, s, func(ctx context.Context) error {
+			if cfg.NotifyBotToken != "" {
+				return botAPISend(ctx, cfg.NotifyBotToken, cfg.NotifyChatID, "✅ scoutanalytics test message")
+			}
+			if err := s.sendNotifyText(ctx, "✅ scoutanalytics test message — reports will arrive here"); err != nil {
+				return fmt.Errorf("test message to %q failed: %w", cfg.NotifyPeer, err)
+			}
+			fmt.Println("test message sent — check the chat")
 			return nil
 		}); err != nil {
 			log.Fatal(err)
