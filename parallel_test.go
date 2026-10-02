@@ -90,6 +90,34 @@ func TestGetLogsChunkedFetchesInParallel(t *testing.T) {
 	if m := maxInFlight.Load(); m != 2 {
 		t.Fatalf("capped client had %d requests in flight, want 2", m)
 	}
+	// Identical ranges wanted by several scans at once are asked for once.
+	mu.Lock()
+	ranges = nil
+	mu.Unlock()
+	c3 := newRPCClient(onchainConfig{RPCURL: srv.URL, LogChunk: 100, Parallel: 2, MaxInflight: 16})
+	var wg sync.WaitGroup
+	counts := make([]int, 5)
+	for w := 0; w < 5; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			if err := c3.getLogsChunked(context.Background(), "0xaa", []any{"0x01"}, 1000, 1199, func(rpcLog) { counts[w]++ }); err != nil {
+				t.Error(err)
+			}
+		}(w)
+	}
+	wg.Wait()
+	mu.Lock()
+	asked := len(ranges)
+	mu.Unlock()
+	for w, n := range counts {
+		if n != 4 {
+			t.Fatalf("scan %d got %d logs", w, n)
+		}
+	}
+	if asked > 4 { // 2 ranges; a late scan may ask again after the first answer left
+		t.Fatalf("5 identical scans made %d requests", asked)
+	}
 	if !isTimeout(context.DeadlineExceeded) || isTimeout(context.Canceled) {
 		t.Fatal("isTimeout")
 	}

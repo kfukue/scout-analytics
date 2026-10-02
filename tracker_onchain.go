@@ -24,6 +24,7 @@ func (s *scanner) trackOneOnchain(ctx context.Context, t *ScoutCallTracking, pos
 	o := s.onchain
 	tag := fmt.Sprintf("call %d%s", t.CallID, pos)
 	ctx, reqs := withReqCounter(ctx) // this call's own requests (other workers share the client)
+	ctx, _ = withInflightSlot(ctx)
 	ctx = withScanProgress(ctx, tag, 5*time.Second)
 	log.Printf("%s: %s, posted %s (%s ago), status %s",
 		tag, t.ContractAddress, t.EntryAt.UTC().Format("2006-01-02 15:04"), time.Since(t.EntryAt).Round(time.Minute), t.Status)
@@ -339,10 +340,16 @@ func (s *scanner) heartbeat(ctx context.Context, tag string, start time.Time, re
 				return
 			case <-t.C:
 				waiting := "between requests"
-				if w := o.rpc.waitingOn(); w != "" {
-					waiting = "Robinhood node busy with: " + w
-				} else if w := o.mainnet.waitingOn(); w != "" {
-					waiting = "Ethereum node busy with: " + w
+				if slot := inflightSlotFrom(ctx); slot != nil { // this call's own request
+					if f := slot.Load(); f != nil {
+						node := "Robinhood node"
+						if o.mainnet != nil && f.url == o.mainnet.url {
+							node = "Ethereum node"
+						}
+						waiting = "waiting on " + node + ": " + f.String()
+					}
+				} else if w := o.rpc.waitingOn(); w != "" {
+					waiting = "waiting on Robinhood node: " + w
 				}
 				log.Printf("%s: still working — %s elapsed, %d RPC requests so far; %s",
 					tag, time.Since(start).Round(time.Second), reqs.Load(), waiting)
