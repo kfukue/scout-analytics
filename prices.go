@@ -75,7 +75,7 @@ func loadPriceConfig() (priceConfig, error) {
 		RugLiqUSD: 500,
 		Enabled:   envBool("SCOUT_TRACK_PERFORMANCE", true),
 		Interval:  envDur("SCOUT_TRACK_INTERVAL", time.Minute),
-		Workers:   4,
+		Workers:   8,
 	}
 	if v := env("SCOUT_PRICE_RPM", ""); v != "" {
 		n, err := strconv.Atoi(v)

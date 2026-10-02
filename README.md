@@ -174,19 +174,20 @@ Only use the feature columns as model inputs; everything about the future is an 
 | `SCOUT_PRICE_SOURCE` | `onchain` | `gecko` = GeckoTerminal API instead (candles, ~10 req/min, no node needed) |
 | `SCOUT_RPC_URL` | `http://localhost:8540` | Robinhood Chain node (full or archive; must serve historical logs) |
 | `SCOUT_PRICE_LOOKBACK_BLOCKS` | `8640000` | full node: how far back (~10 days) to look for the last feed update / ETH swap |
-| `SCOUT_RPC_RPS` | `50` | max RPC requests per second |
+| `SCOUT_RPC_RPS` | `0` | max RPC requests per second (`0` = no limit, for your own node; set a number for a shared or public endpoint) |
 | `SCOUT_RPC_LOG_CHUNK` | `200000` | blocks per `eth_getLogs`; halved automatically if the node refuses a range |
 | `SCOUT_MAINNET_RPC_URL` | none | Ethereum mainnet **archive** node; enables ETH/USD from mainnet Chainlink |
 | `SCOUT_MAINNET_CHAINLINK_FEEDS` | `eth=` ETH/USD feed | extra `token=feedOnEthereum` mappings |
-| `SCOUT_MAINNET_RPC_RPS` | `50` | max requests per second to the Ethereum node |
+| `SCOUT_MAINNET_RPC_RPS` | `0` | max requests per second to the Ethereum node (`0` = no limit) |
 | `SCOUT_CHAINLINK_FEEDS` | none | feeds **on Robinhood Chain**: `token=feed,…`; use `eth` for WETH/native ETH |
 | `SCOUT_STABLES` | USDG | tokens worth $1 |
 | `SCOUT_WETH`, `SCOUT_V4_POOL_MANAGER`, `SCOUT_ETH_USD_POOL` | Robinhood Chain addresses | override if needed |
 | `SCOUT_DISCOVERY_BLOCKS` | `18000` | ± blocks around the call searched for the token's transfers (widened automatically) |
 | `SCOUT_RUG_LIQ_USD` | `500` | liquidity below this = rugged |
 | `SCOUT_TRACK_INTERVAL` | `1m` | how often due checks are processed |
-| `SCOUT_TRACK_WORKERS` | `4` | calls tracked at the same time (on-chain source). Raise it while the node keeps up; all workers share `SCOUT_RPC_RPS` |
-| `SCOUT_RPC_PARALLEL` | `4` | block ranges of one scan fetched from the node at the same time. Requests in flight ≈ workers × this, capped by `SCOUT_RPC_RPS` |
+| `SCOUT_TRACK_WORKERS` | `8` | calls tracked at the same time (on-chain source) |
+| `SCOUT_RPC_PARALLEL` | `8` | block ranges of one scan fetched from the node at the same time |
+| `SCOUT_RPC_MAX_INFLIGHT` | `64` | most requests in flight to the node at once (workers × ranges, capped here) |
 | `SCOUT_RPC_LOG_CACHE` | `300000` | swap logs kept in memory so repeat calls of a token are not scanned twice (`0` = off) |
 
 Other commands: `-track` (tracker only, forever, no Telegram), `-track-once` (process what's due and exit).

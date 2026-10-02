@@ -11,6 +11,7 @@ import (
 	"log"
 	"math"
 	"math/big"
+	"net"
 	"net/http"
 	"sort"
 	"strconv"
@@ -40,7 +41,8 @@ import (
 
 type onchainConfig struct {
 	RPCURL          string
-	RPS             int
+	RPS             int    // requests per second (0 = no limit)
+	MaxInflight     int    // requests in flight at the same time
 	Parallel        int    // eth_getLogs chunks fetched at the same time within one scan
 	LogCache        int    // eth_getLogs results kept in memory, in logs (0 = off); repeat calls of a token reuse them
 	LogChunk        uint64 // max blocks per eth_getLogs (halved automatically when the node refuses)
@@ -70,11 +72,12 @@ const zeroAddr = "0x0000000000000000000000000000000000000000"
 func loadOnchainConfig() (onchainConfig, error) {
 	oc := onchainConfig{
 		RPCURL:          env("SCOUT_RPC_URL", "http://localhost:8540"),
-		RPS:             50,
+		RPS:             0, // no limit: the node is our own; MaxInflight bounds the load
+		MaxInflight:     64,
 		LogChunk:        200_000,
 		MinLogChunk:     200,
 		LogCache:        300_000,
-		Parallel:        4,
+		Parallel:        8,
 		DiscoveryBlocks: 18_000,    // ≈ 30 min at ~10 blocks/s
 		PriceLookback:   8_640_000, // ≈ 10 days
 		PoolManagerV4:   strings.ToLower(env("SCOUT_V4_POOL_MANAGER", "0x8366a39cc670b4001a1121b8f6a443a643e40951")),
@@ -83,7 +86,7 @@ func loadOnchainConfig() (onchainConfig, error) {
 		Stables:         map[string]bool{},
 		Feeds:           map[string]string{},
 		MainnetRPCURL:   env("SCOUT_MAINNET_RPC_URL", ""),
-		MainnetRPS:      50,
+		MainnetRPS:      0,
 		MainnetFeeds:    map[string]string{"eth": mainnetEthUsdFeed},
 		EntryDelay:      envDur("SCOUT_ENTRY_DELAY", 60*time.Second),
 	}
@@ -92,8 +95,8 @@ func loadOnchainConfig() (onchainConfig, error) {
 	}
 	if v := env("SCOUT_MAINNET_RPC_RPS", ""); v != "" {
 		n, err := strconv.Atoi(v)
-		if err != nil || n < 1 {
-			return oc, fmt.Errorf("SCOUT_MAINNET_RPC_RPS=%q: want a number >= 1", v)
+		if err != nil || n < 0 {
+			return oc, fmt.Errorf("SCOUT_MAINNET_RPC_RPS=%q: want a number >= 0 (0 = no limit)", v)
 		}
 		oc.MainnetRPS = n
 	}
@@ -136,10 +139,17 @@ func loadOnchainConfig() (onchainConfig, error) {
 	}
 	if v := env("SCOUT_RPC_RPS", ""); v != "" {
 		n, err := strconv.Atoi(v)
-		if err != nil || n < 1 {
-			return oc, fmt.Errorf("SCOUT_RPC_RPS=%q: want a number >= 1", v)
+		if err != nil || n < 0 {
+			return oc, fmt.Errorf("SCOUT_RPC_RPS=%q: want a number >= 0 (0 = no limit)", v)
 		}
 		oc.RPS = n
+	}
+	if v := env("SCOUT_RPC_MAX_INFLIGHT", ""); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 || n > 1024 {
+			return oc, fmt.Errorf("SCOUT_RPC_MAX_INFLIGHT=%q: want a number from 1 to 1024", v)
+		}
+		oc.MaxInflight = n
 	}
 	for _, a := range splitList(env("SCOUT_STABLES", "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168")) { // USDG
 		oc.Stables[a] = true
@@ -300,6 +310,7 @@ type rpcClient struct {
 	inflight atomic.Pointer[rpcInflight] // the request being waited on right now (for heartbeat logs)
 	head     atomic.Uint64               // newest block number seen (results near it are not cached)
 	parallel int                         // log chunks fetched at once per scan
+	slots    chan struct{}               // bounds the requests in flight
 	logs     *logCache                   // finished eth_getLogs chunks (nil = off)
 
 	mu   sync.Mutex
@@ -361,17 +372,24 @@ func describeRPC(method string, params []any) string {
 }
 
 func newRPCClient(oc onchainConfig) *rpcClient {
-	if oc.RPS < 1 {
-		oc.RPS = 50
+	if oc.MaxInflight < 1 {
+		oc.MaxInflight = 64
 	}
+	var gap time.Duration // 0 = no rate limit
+	if oc.RPS > 0 {
+		gap = time.Second / time.Duration(oc.RPS)
+	}
+	// Many requests run at once: keep enough connections open to the node
+	// (Go's default keeps 2 per host and reopens the rest every time).
+	tr := &http.Transport{MaxIdleConns: 2 * oc.MaxInflight, MaxIdleConnsPerHost: 2 * oc.MaxInflight, IdleConnTimeout: 90 * time.Second}
 	if oc.LogChunk == 0 {
 		oc.LogChunk = 200_000
 	}
 	if oc.MinLogChunk == 0 {
 		oc.MinLogChunk = 200
 	}
-	c := &rpcClient{url: oc.RPCURL, http: &http.Client{Timeout: 60 * time.Second},
-		gap: time.Second / time.Duration(oc.RPS), minChunk: oc.MinLogChunk,
+	c := &rpcClient{url: oc.RPCURL, http: &http.Client{Timeout: 60 * time.Second, Transport: tr},
+		gap: gap, minChunk: oc.MinLogChunk, slots: make(chan struct{}, oc.MaxInflight),
 		times: map[uint64]int64{}, meta: map[string]tokenMeta{}}
 	c.chunk.Store(oc.LogChunk)
 	c.parallel = oc.Parallel
@@ -382,6 +400,9 @@ func newRPCClient(oc onchainConfig) *rpcClient {
 }
 
 func (c *rpcClient) wait(ctx context.Context) error {
+	if c.gap <= 0 {
+		return ctx.Err()
+	}
 	c.mu.Lock()
 	now := time.Now()
 	start := c.next
@@ -416,12 +437,19 @@ func (c *rpcClient) call(ctx context.Context, out any, method string, params ...
 		c.inflight.Store(f)
 		req, _ := http.NewRequestWithContext(ctx, http.MethodPost, c.url, bytes.NewReader(body))
 		req.Header.Set("Content-Type", "application/json")
+		select {
+		case c.slots <- struct{}{}:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 		resp, err := c.http.Do(req)
 		if err != nil {
+			<-c.slots
 			lastErr = err
 		} else {
 			raw, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<20))
 			resp.Body.Close()
+			<-c.slots
 			if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500 {
 				lastErr = fmt.Errorf("%s: HTTP %s", method, resp.Status)
 			} else {
@@ -540,7 +568,8 @@ func (c *rpcClient) getLogsChunked(ctx context.Context, address string, topics [
 			if r.err != nil {
 				cancel()
 				var re *rpcError
-				if errors.As(r.err, &re) && size > c.minChunk {
+				// The node refused the range, or took too long over it: smaller chunks.
+				if (errors.As(r.err, &re) || (isTimeout(r.err) && ctx.Err() == nil)) && size > c.minChunk {
 					half := size / 2
 					if half < c.minChunk {
 						half = c.minChunk
@@ -570,6 +599,12 @@ func (c *rpcClient) getLogsChunked(ctx context.Context, address string, topics [
 		}
 	}
 	return nil
+}
+
+// isTimeout: the request ran into the client's time limit (not a cancelled run).
+func isTimeout(err error) bool {
+	var ne net.Error
+	return errors.Is(err, context.DeadlineExceeded) || (errors.As(err, &ne) && ne.Timeout())
 }
 
 // fetchLogs returns one chunk's logs in block order, from memory when this
@@ -1510,7 +1545,11 @@ func (o *onchainSource) quoteSource(quote string) string {
 }
 
 func (o *onchainSource) describe() string {
-	s := fmt.Sprintf("on-chain pools via %s (v4 PoolManager %s, %d Chainlink feed(s) on Robinhood Chain)", o.cfg.RPCURL, o.cfg.PoolManagerV4, len(o.cfg.Feeds))
+	limit := "no rate limit"
+	if o.cfg.RPS > 0 {
+		limit = fmt.Sprintf("%d req/s", o.cfg.RPS)
+	}
+	s := fmt.Sprintf("%d ranges per scan, up to %d requests in flight, %s; ", o.cfg.Parallel, cap(o.rpc.slots), limit) + fmt.Sprintf("on-chain pools via %s (v4 PoolManager %s, %d Chainlink feed(s) on Robinhood Chain)", o.cfg.RPCURL, o.cfg.PoolManagerV4, len(o.cfg.Feeds))
 	if o.mainnet != nil {
 		s += fmt.Sprintf("; ETH/USD + %d other feed(s) from Ethereum mainnet via %s", len(o.cfg.MainnetFeeds)-1, o.cfg.MainnetRPCURL)
 	}

@@ -272,19 +272,30 @@ CREATE TABLE IF NOT EXISTS scout_call_precall (
     computed_at        TIMESTAMPTZ  NOT NULL DEFAULT now()
 );
 
--- Model scores: one row per call, model version and holding-period bucket.
+-- Model scores. The table is shared with the first model experiment (rug_prob,
+-- ret_1d_pred, pos_7d_prob: one row per scoring). The bucket model adds one row
+-- per call, model version and holding-period bucket, in the columns added below.
 CREATE TABLE IF NOT EXISTS scout_call_predictions (
-    id               SERIAL PRIMARY KEY,
-    call_id          INTEGER      NOT NULL REFERENCES scout_calls (id) ON DELETE CASCADE,
-    model_version    TEXT         NOT NULL,
-    bucket           TEXT         NOT NULL,          -- short | 3day | medium | long
-    runner_prob      NUMERIC,                        -- 0..1
-    collapse_prob    NUMERIC,                        -- 0..1
-    runner_rank_pct  NUMERIC,                        -- % of recent calls with a lower runner score
-    features         JSONB,                          -- the feature row that was scored
-    created_at       TIMESTAMPTZ  NOT NULL DEFAULT now(),
-    CONSTRAINT scout_call_predictions_uq UNIQUE (call_id, model_version, bucket)
+    id                SERIAL PRIMARY KEY,
+    uuid              UUID         NOT NULL UNIQUE,
+    call_id           INTEGER      REFERENCES scout_calls (id) ON DELETE CASCADE,
+    contract_address  TEXT         NOT NULL,
+    model_version     TEXT         NOT NULL,
+    rug_prob          DOUBLE PRECISION,
+    ret_1d_pred       DOUBLE PRECISION,
+    pos_7d_prob       DOUBLE PRECISION,
+    created_by        TEXT         NOT NULL,
+    created_at        TIMESTAMPTZ  NOT NULL DEFAULT now()
 );
+ALTER TABLE scout_call_predictions ADD COLUMN IF NOT EXISTS bucket          TEXT;     -- short | 3day | medium | long (NULL = first experiment's rows)
+ALTER TABLE scout_call_predictions ADD COLUMN IF NOT EXISTS runner_prob     NUMERIC;  -- 0..1
+ALTER TABLE scout_call_predictions ADD COLUMN IF NOT EXISTS collapse_prob   NUMERIC;  -- 0..1
+ALTER TABLE scout_call_predictions ADD COLUMN IF NOT EXISTS runner_rank_pct NUMERIC;  -- % of recent calls with a lower runner score
+ALTER TABLE scout_call_predictions ADD COLUMN IF NOT EXISTS features        JSONB;    -- the feature row that was scored
+CREATE INDEX IF NOT EXISTS scout_call_predictions_call_idx ON scout_call_predictions (call_id);
+CREATE INDEX IF NOT EXISTS scout_call_predictions_ca_idx   ON scout_call_predictions (contract_address);
+-- one bucket row per call and model version (rows without a bucket are not limited)
+CREATE UNIQUE INDEX IF NOT EXISTS scout_call_predictions_bucket_uq ON scout_call_predictions (call_id, model_version, bucket);
 CREATE INDEX IF NOT EXISTS scout_calls_ca_date_idx ON scout_calls (contract_address, message_date);
 
 -- Training dataset: one row per call = features known at call time + outcomes.
@@ -390,7 +401,8 @@ SELECT pr.call_id, pr.model_version, pr.bucket, pr.runner_prob::float8 AS runner
        d.message_id, d.message_date, d.contract_address, d.token_symbol, d.price_unit, d.rugged,
        d.ret_late_1d, d.max_gain_late_1d, d.ret_late_3d, d.ret_late_7d, d.ret_late_30d
 FROM scout_call_predictions pr
-JOIN scout_call_dataset_v d ON d.call_id = pr.call_id;
+JOIN scout_call_dataset_v d ON d.call_id = pr.call_id
+WHERE pr.bucket IS NOT NULL;
 
 -- One-time upgrade from the earlier single-tool table (scout_scan_reports), if present.
 -- The old table is left in place; drop it yourself once you're happy.
