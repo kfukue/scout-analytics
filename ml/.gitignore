@@ -1,0 +1,4 @@
+models/
+*.csv
+__pycache__/
+.pytest_cache/

@@ -185,6 +185,9 @@ Only use the feature columns as model inputs; everything about the future is an 
 | `SCOUT_DISCOVERY_BLOCKS` | `18000` | ± blocks around the call searched for the token's transfers (widened automatically) |
 | `SCOUT_RUG_LIQ_USD` | `500` | liquidity below this = rugged |
 | `SCOUT_TRACK_INTERVAL` | `1m` | how often due checks are processed |
+| `SCOUT_TRACK_WORKERS` | `4` | calls tracked at the same time (on-chain source). Raise it while the node keeps up; all workers share `SCOUT_RPC_RPS` |
+| `SCOUT_RPC_PARALLEL` | `4` | block ranges of one scan fetched from the node at the same time. Requests in flight ≈ workers × this, capped by `SCOUT_RPC_RPS` |
+| `SCOUT_RPC_LOG_CACHE` | `300000` | swap logs kept in memory so repeat calls of a token are not scanned twice (`0` = off) |
 
 Other commands: `-track` (tracker only, forever, no Telegram), `-track-once` (process what's due and exit).
 
@@ -196,6 +199,41 @@ with `-track`. New calls are still queued for tracking by the listener.
 ./scoutanalytics -listen-only   # terminal 1: scan + deliver new calls
 ./scoutanalytics -track         # terminal 2: compute performance
 ```
+
+### Data for the prediction model
+
+The on-chain tracker also stores what a model needs (state version 2):
+
+| What | Where | Notes |
+|---|---|---|
+| Dollar prices for every pair | `scout_call_tracking.price_unit` | A quote asset without a Chainlink feed (VIRTUAL, a stock token) is priced from its own WETH or stablecoin pool. It stays in quote units only if no such pool exists. |
+| Realistic entry | `scout_call_tracking.entry_late_price_usd`, `scout_call_returns.*_late_pct` | The pool price `SCOUT_ENTRY_DELAY` (default `60s`) after the post, and return / peak / drawdown measured from it. |
+| Price path | `scout_call_candles` | 5-minute candles for the first 24 hours, hourly candles for the whole window. Only buckets with trades. |
+| Trading before the call | `scout_call_precall` | Swaps, buys, sells, volume and price change in the 5, 15 and 60 minutes before the post. |
+| Peaks and lows | `scout_call_returns.max_gain_pct`, `max_drawdown_pct` | Each trade is valued at its own hour's ETH (or quote asset) price, not the price at the horizon. |
+
+Calls tracked by an earlier version are queued again automatically at startup and
+tracked from scratch (their old results stay until replaced). Expect the tracker
+to work through the whole history once more after upgrading.
+
+`scout_call_dataset_v` now has one row per call with all of the above plus
+repeat-call and channel-activity columns (`prior_calls`, `calls_prev_1h`, …).
+Training, the report and the scoring service live in [`ml/`](ml/README.md).
+
+### Scoring new calls
+
+Off by default. With `SCOUT_MODEL_URL` set (for example `http://127.0.0.1:8601`,
+the service in `ml/serve.py`), the listener sends each new call's dataset row to
+the service, stores the scores in `scout_call_predictions` and adds one line to
+the delivered message:
+
+```
+Model 20261002-1530 · short: runner 31%, collapse 44% · 3-day: runner 22% · medium: runner 18% · long: up at 30d 6%
+```
+
+Scores never filter deliveries. If the service is down or slower than
+`SCOUT_MODEL_TIMEOUT` (default `5s`), the call is delivered without the line.
+`scout_call_predictions_v` shows each score next to the real outcome.
 
 ### What the tracker logs
 

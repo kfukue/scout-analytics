@@ -671,7 +671,8 @@ func (st *ScoutStore) EnsureTracking(ctx context.Context, callID int, ca string,
 
 const trackingColumns = `call_id, contract_address, entry_at, priority, status, pool_address, pool_name, pool_dex,
 	pool_created_at, entry_price_usd::float8, entry_price_source, current_price_usd::float8,
-	current_liquidity_usd::float8, rugged, next_check_at, last_checked_at, attempts, error, price_unit, onchain`
+	current_liquidity_usd::float8, rugged, next_check_at, last_checked_at, attempts, error, price_unit, onchain,
+	entry_late_price_usd::float8`
 
 func scanTracking(row pgx.Row) (*ScoutCallTracking, error) {
 	var t ScoutCallTracking
@@ -679,7 +680,7 @@ func scanTracking(row pgx.Row) (*ScoutCallTracking, error) {
 	err := row.Scan(&t.CallID, &t.ContractAddress, &t.EntryAt, &t.Priority, &t.Status, &t.PoolAddress, &t.PoolName,
 		&t.PoolDex, &t.PoolCreatedAt, &t.EntryPriceUSD, &t.EntryPriceSource, &t.CurrentPriceUSD,
 		&t.CurrentLiquidityUSD, &t.Rugged, &t.NextCheckAt, &t.LastCheckedAt, &t.Attempts, &t.Error,
-		&t.PriceUnit, &onchain)
+		&t.PriceUnit, &onchain, &t.EntryLatePriceUSD)
 	if err != nil {
 		return nil, err
 	}
@@ -764,11 +765,11 @@ func (st *ScoutStore) SaveTracking(ctx context.Context, t *ScoutCallTracking) er
 		status = $2, pool_address = $3, pool_name = $4, pool_dex = $5, pool_created_at = $6,
 		entry_price_usd = $7, entry_price_source = $8, current_price_usd = $9, current_liquidity_usd = $10,
 		rugged = $11, next_check_at = $12, last_checked_at = $13, attempts = $14, error = $15,
-		price_unit = $16, onchain = $17::jsonb, updated_at = now()
+		price_unit = $16, onchain = $17::jsonb, entry_late_price_usd = $18, updated_at = now()
 		WHERE call_id = $1`,
 		t.CallID, t.Status, t.PoolAddress, t.PoolName, t.PoolDex, t.PoolCreatedAt,
 		t.EntryPriceUSD, t.EntryPriceSource, t.CurrentPriceUSD, t.CurrentLiquidityUSD,
-		t.Rugged, t.NextCheckAt.UTC(), t.LastCheckedAt, t.Attempts, t.Error, t.PriceUnit, onchainJSON)
+		t.Rugged, t.NextCheckAt.UTC(), t.LastCheckedAt, t.Attempts, t.Error, t.PriceUnit, onchainJSON, t.EntryLatePriceUSD)
 	return err
 }
 
@@ -782,15 +783,18 @@ func (st *ScoutStore) UpsertReturn(ctx context.Context, callID int, h horizon, r
 	}
 	_, err := st.Pool.Exec(ctx, `INSERT INTO scout_call_returns
 		(call_id, horizon, horizon_seconds, due_at, status, price_usd, return_pct, max_gain_pct, max_drawdown_pct,
-		 max_price_usd, min_price_usd, last_trade_at, computed_at)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,now())
+		 max_price_usd, min_price_usd, last_trade_at, return_late_pct, max_gain_late_pct, max_drawdown_late_pct, computed_at)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,now())
 		ON CONFLICT (call_id, horizon) DO UPDATE SET
 		 horizon_seconds = EXCLUDED.horizon_seconds, due_at = EXCLUDED.due_at, status = EXCLUDED.status,
 		 price_usd = EXCLUDED.price_usd, return_pct = EXCLUDED.return_pct, max_gain_pct = EXCLUDED.max_gain_pct,
 		 max_drawdown_pct = EXCLUDED.max_drawdown_pct, max_price_usd = EXCLUDED.max_price_usd,
-		 min_price_usd = EXCLUDED.min_price_usd, last_trade_at = EXCLUDED.last_trade_at, computed_at = now()`,
+		 min_price_usd = EXCLUDED.min_price_usd, last_trade_at = EXCLUDED.last_trade_at,
+		 return_late_pct = EXCLUDED.return_late_pct, max_gain_late_pct = EXCLUDED.max_gain_late_pct,
+		 max_drawdown_late_pct = EXCLUDED.max_drawdown_late_pct, computed_at = now()`,
 		callID, h.Name, int(h.Dur/time.Second), r.DueAt.UTC(), r.Status, nz(r.PriceUSD), nz(r.ReturnPct),
-		nz(r.MaxGainPct), nz(r.MaxDDPct), nz(r.MaxPriceUSD), nz(r.MinPriceUSD), r.LastTradeAt)
+		nz(r.MaxGainPct), nz(r.MaxDDPct), nz(r.MaxPriceUSD), nz(r.MinPriceUSD), r.LastTradeAt,
+		r.ReturnLatePct, r.MaxGainLatePct, r.MaxDDLatePct)
 	return err
 }
 
@@ -798,7 +802,8 @@ func (st *ScoutStore) UpsertReturn(ctx context.Context, callID int, h horizon, r
 func (st *ScoutStore) ReturnsForCall(ctx context.Context, callID int) (map[string]horizonResult, error) {
 	rows, err := st.Pool.Query(ctx, `SELECT horizon, due_at, status, COALESCE(price_usd,0)::float8,
 		COALESCE(return_pct,0)::float8, COALESCE(max_gain_pct,0)::float8, COALESCE(max_drawdown_pct,0)::float8,
-		COALESCE(max_price_usd,0)::float8, COALESCE(min_price_usd,0)::float8, last_trade_at
+		COALESCE(max_price_usd,0)::float8, COALESCE(min_price_usd,0)::float8, last_trade_at,
+		return_late_pct::float8, max_gain_late_pct::float8, max_drawdown_late_pct::float8
 		FROM scout_call_returns WHERE call_id = $1`, callID)
 	if err != nil {
 		return nil, err
@@ -808,7 +813,8 @@ func (st *ScoutStore) ReturnsForCall(ctx context.Context, callID int) (map[strin
 	for rows.Next() {
 		var r horizonResult
 		if err := rows.Scan(&r.Horizon, &r.DueAt, &r.Status, &r.PriceUSD, &r.ReturnPct, &r.MaxGainPct,
-			&r.MaxDDPct, &r.MaxPriceUSD, &r.MinPriceUSD, &r.LastTradeAt); err != nil {
+			&r.MaxDDPct, &r.MaxPriceUSD, &r.MinPriceUSD, &r.LastTradeAt,
+			&r.ReturnLatePct, &r.MaxGainLatePct, &r.MaxDDLatePct); err != nil {
 			return nil, err
 		}
 		out[r.Horizon] = r
@@ -860,4 +866,147 @@ func (st *ScoutStore) ExportDatasetCSV(ctx context.Context, w io.Writer) (int, e
 		return n, err
 	}
 	return n, rows.Err()
+}
+
+// ---------------------------------------------------------------------------
+// Candles, pre-call trading, predictions
+// ---------------------------------------------------------------------------
+
+// DeleteCandles removes a call's candles (before it is tracked again from scratch).
+func (st *ScoutStore) DeleteCandles(ctx context.Context, callID int) error {
+	_, err := st.Pool.Exec(ctx, `DELETE FROM scout_call_candles WHERE call_id = $1`, callID)
+	return err
+}
+
+// UpsertCandles stores candles. A bucket seen again (it straddled two scans) is
+// merged: open is kept, high/low widen, close is replaced.
+func (st *ScoutStore) UpsertCandles(ctx context.Context, callID int, cs []candleRow) error {
+	if len(cs) == 0 {
+		return nil
+	}
+	iv := make([]int32, len(cs))
+	ts := make([]time.Time, len(cs))
+	o, h, l, c := make([]float64, len(cs)), make([]float64, len(cs)), make([]float64, len(cs)), make([]float64, len(cs))
+	n := make([]int32, len(cs))
+	for i, r := range cs {
+		iv[i], ts[i], o[i], h[i], l[i], c[i], n[i] = int32(r.IntervalS), r.Start.UTC(), r.O, r.H, r.L, r.C, int32(r.Events)
+	}
+	_, err := st.Pool.Exec(ctx, `INSERT INTO scout_call_candles AS k
+		(call_id, interval_seconds, bucket_start, open, high, low, close, events)
+		SELECT $1, * FROM unnest($2::int[], $3::timestamptz[], $4::float8[], $5::float8[], $6::float8[], $7::float8[], $8::int[])
+		ON CONFLICT (call_id, interval_seconds, bucket_start) DO UPDATE SET
+		 high = GREATEST(k.high, EXCLUDED.high), low = LEAST(k.low, EXCLUDED.low),
+		 close = EXCLUDED.close, events = k.events + EXCLUDED.events`,
+		callID, iv, ts, o, h, l, c, n)
+	return err
+}
+
+// CandlesForCall returns a call's candles of one interval, oldest first.
+func (st *ScoutStore) CandlesForCall(ctx context.Context, callID, intervalS int) ([]candleRow, error) {
+	rows, err := st.Pool.Query(ctx, `SELECT interval_seconds, bucket_start, open::float8, high::float8, low::float8,
+		close::float8, events FROM scout_call_candles WHERE call_id = $1 AND interval_seconds = $2 ORDER BY bucket_start`, callID, intervalS)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []candleRow
+	for rows.Next() {
+		var r candleRow
+		if err := rows.Scan(&r.IntervalS, &r.Start, &r.O, &r.H, &r.L, &r.C, &r.Events); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// UpsertPrecall stores the trading stats of the hour before a call.
+func (st *ScoutStore) UpsertPrecall(ctx context.Context, callID int, p *precallStats) error {
+	_, err := st.Pool.Exec(ctx, `INSERT INTO scout_call_precall
+		(call_id, window_seconds, vol_unit, first_trade_age_s,
+		 swaps_5m, swaps_15m, swaps_60m, buys_5m, buys_15m, buys_60m, sells_5m, sells_15m, sells_60m,
+		 buy_vol_5m, buy_vol_15m, buy_vol_60m, sell_vol_5m, sell_vol_15m, sell_vol_60m,
+		 price_chg_5m_pct, price_chg_15m_pct, price_chg_60m_pct, computed_at)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,now())
+		ON CONFLICT (call_id) DO UPDATE SET
+		 window_seconds = EXCLUDED.window_seconds, vol_unit = EXCLUDED.vol_unit, first_trade_age_s = EXCLUDED.first_trade_age_s,
+		 swaps_5m = EXCLUDED.swaps_5m, swaps_15m = EXCLUDED.swaps_15m, swaps_60m = EXCLUDED.swaps_60m,
+		 buys_5m = EXCLUDED.buys_5m, buys_15m = EXCLUDED.buys_15m, buys_60m = EXCLUDED.buys_60m,
+		 sells_5m = EXCLUDED.sells_5m, sells_15m = EXCLUDED.sells_15m, sells_60m = EXCLUDED.sells_60m,
+		 buy_vol_5m = EXCLUDED.buy_vol_5m, buy_vol_15m = EXCLUDED.buy_vol_15m, buy_vol_60m = EXCLUDED.buy_vol_60m,
+		 sell_vol_5m = EXCLUDED.sell_vol_5m, sell_vol_15m = EXCLUDED.sell_vol_15m, sell_vol_60m = EXCLUDED.sell_vol_60m,
+		 price_chg_5m_pct = EXCLUDED.price_chg_5m_pct, price_chg_15m_pct = EXCLUDED.price_chg_15m_pct,
+		 price_chg_60m_pct = EXCLUDED.price_chg_60m_pct, computed_at = now()`,
+		callID, p.WindowS, p.VolUnit, p.FirstTradeAgeS,
+		p.Swaps[0], p.Swaps[1], p.Swaps[2], p.Buys[0], p.Buys[1], p.Buys[2], p.Sells[0], p.Sells[1], p.Sells[2],
+		p.BuyVol[0], p.BuyVol[1], p.BuyVol[2], p.SellVol[0], p.SellVol[1], p.SellVol[2],
+		p.PriceChgPct[0], p.PriceChgPct[1], p.PriceChgPct[2])
+	return err
+}
+
+// HasPrecall reports whether pre-call stats are stored for a call.
+func (st *ScoutStore) HasPrecall(ctx context.Context, callID int) (bool, error) {
+	var ok bool
+	err := st.Pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM scout_call_precall WHERE call_id = $1)`, callID).Scan(&ok)
+	return ok, err
+}
+
+// DatasetRowJSON returns the call's row of scout_call_dataset_v as JSON: the
+// exact features the model was trained on (nil if the call is unknown).
+func (st *ScoutStore) DatasetRowJSON(ctx context.Context, callID int) ([]byte, error) {
+	var b []byte
+	err := st.Pool.QueryRow(ctx, `SELECT row_to_json(v) FROM scout_call_dataset_v v WHERE call_id = $1`, callID).Scan(&b)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
+	return b, err
+}
+
+// ScoutCallPrediction is one model score for one call and holding-period bucket.
+type ScoutCallPrediction struct {
+	CallID        int      `json:"call_id"`
+	ModelVersion  string   `json:"model_version"`
+	Bucket        string   `json:"bucket"` // short | 3day | medium | long
+	RunnerProb    *float64 `json:"runner_prob"`
+	CollapseProb  *float64 `json:"collapse_prob"`
+	RunnerRankPct *float64 `json:"runner_rank_pct"` // share of recent calls with a lower runner score
+}
+
+// TableName returns the table name for this model.
+func (ScoutCallPrediction) TableName() string { return "scout_call_predictions" }
+
+// UpsertPrediction stores a score (one row per call, model version and bucket).
+func (st *ScoutStore) UpsertPrediction(ctx context.Context, p ScoutCallPrediction, features []byte) error {
+	var f *string
+	if len(features) > 0 {
+		s := string(features)
+		f = &s
+	}
+	_, err := st.Pool.Exec(ctx, `INSERT INTO scout_call_predictions
+		(call_id, model_version, bucket, runner_prob, collapse_prob, runner_rank_pct, features)
+		VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb)
+		ON CONFLICT (call_id, model_version, bucket) DO UPDATE SET
+		 runner_prob = EXCLUDED.runner_prob, collapse_prob = EXCLUDED.collapse_prob,
+		 runner_rank_pct = EXCLUDED.runner_rank_pct, features = EXCLUDED.features, created_at = now()`,
+		p.CallID, p.ModelVersion, p.Bucket, p.RunnerProb, p.CollapseProb, p.RunnerRankPct, f)
+	return err
+}
+
+// PredictionsForCall returns the stored scores of a call.
+func (st *ScoutStore) PredictionsForCall(ctx context.Context, callID int) ([]ScoutCallPrediction, error) {
+	rows, err := st.Pool.Query(ctx, `SELECT call_id, model_version, bucket, runner_prob::float8, collapse_prob::float8,
+		runner_rank_pct::float8 FROM scout_call_predictions WHERE call_id = $1 ORDER BY model_version, id`, callID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []ScoutCallPrediction
+	for rows.Next() {
+		var p ScoutCallPrediction
+		if err := rows.Scan(&p.CallID, &p.ModelVersion, &p.Bucket, &p.RunnerProb, &p.CollapseProb, &p.RunnerRankPct); err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
 }

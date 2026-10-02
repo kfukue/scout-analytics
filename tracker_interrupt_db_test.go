@@ -37,7 +37,7 @@ func TestTrackerInterruptedLeavesCallUntouched(t *testing.T) {
 	}
 	cctx, cancel := context.WithCancel(ctx)
 	cancel()
-	s.trackOneOnchain(cctx, &rows[0])
+	s.trackOneOnchain(cctx, &rows[0], "")
 
 	got, _ := st.GetTracking(ctx, id)
 	if got.Status != TrackPending || got.Attempts != 0 || got.Error != nil {
