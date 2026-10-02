@@ -80,4 +80,17 @@ func TestGetLogsChunkedFetchesInParallel(t *testing.T) {
 	if m := maxInFlight.Load(); m != 1 {
 		t.Fatalf("sequential client had %d requests in flight", m)
 	}
+
+	// SCOUT_RPC_MAX_INFLIGHT caps the load on the node whatever the other settings are.
+	maxInFlight.Store(0)
+	c2 := newRPCClient(onchainConfig{RPCURL: srv.URL, LogChunk: 100, Parallel: 8, MaxInflight: 2})
+	if err := c2.getLogsChunked(context.Background(), "0xaa", []any{"0x01"}, 1000, 1799, func(rpcLog) {}); err != nil {
+		t.Fatal(err)
+	}
+	if m := maxInFlight.Load(); m != 2 {
+		t.Fatalf("capped client had %d requests in flight, want 2", m)
+	}
+	if !isTimeout(context.DeadlineExceeded) || isTimeout(context.Canceled) {
+		t.Fatal("isTimeout")
+	}
 }

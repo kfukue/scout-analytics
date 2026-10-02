@@ -982,20 +982,21 @@ func (st *ScoutStore) UpsertPrediction(ctx context.Context, p ScoutCallPredictio
 		s := string(features)
 		f = &s
 	}
+	// uuid, contract_address and created_by are the shared table's required columns.
 	_, err := st.Pool.Exec(ctx, `INSERT INTO scout_call_predictions
-		(call_id, model_version, bucket, runner_prob, collapse_prob, runner_rank_pct, features)
-		VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb)
+		(uuid, call_id, contract_address, model_version, bucket, runner_prob, collapse_prob, runner_rank_pct, features, created_by)
+		SELECT $8::uuid, c.id, c.contract_address, $2, $3, $4, $5, $6, $7::jsonb, $9 FROM scout_calls c WHERE c.id = $1
 		ON CONFLICT (call_id, model_version, bucket) DO UPDATE SET
 		 runner_prob = EXCLUDED.runner_prob, collapse_prob = EXCLUDED.collapse_prob,
 		 runner_rank_pct = EXCLUDED.runner_rank_pct, features = EXCLUDED.features, created_at = now()`,
-		p.CallID, p.ModelVersion, p.Bucket, p.RunnerProb, p.CollapseProb, p.RunnerRankPct, f)
+		p.CallID, p.ModelVersion, p.Bucket, p.RunnerProb, p.CollapseProb, p.RunnerRankPct, f, uuid.NewString(), "scoutanalytics")
 	return err
 }
 
 // PredictionsForCall returns the stored scores of a call.
 func (st *ScoutStore) PredictionsForCall(ctx context.Context, callID int) ([]ScoutCallPrediction, error) {
 	rows, err := st.Pool.Query(ctx, `SELECT call_id, model_version, bucket, runner_prob::float8, collapse_prob::float8,
-		runner_rank_pct::float8 FROM scout_call_predictions WHERE call_id = $1 ORDER BY model_version, id`, callID)
+		runner_rank_pct::float8 FROM scout_call_predictions WHERE call_id = $1 AND bucket IS NOT NULL ORDER BY model_version, id`, callID)
 	if err != nil {
 		return nil, err
 	}
