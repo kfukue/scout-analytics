@@ -191,8 +191,9 @@ type ScoutCallTracking struct {
 	LastCheckedAt       *time.Time      `json:"last_checked_at"`
 	Attempts            int             `json:"attempts"`
 	Error               *string         `json:"error"`
-	PriceUnit           *string         `json:"price_unit"` // "usd", or the quote asset's symbol when no USD source exists
-	Onchain             json.RawMessage `json:"onchain"`    // on-chain tracker state (pool, scan progress)
+	PriceUnit           *string         `json:"price_unit"`           // "usd", or the quote asset's symbol when no USD source exists
+	Onchain             json.RawMessage `json:"onchain"`              // on-chain tracker state (pool, scan progress)
+	EntryLatePriceUSD   *float64        `json:"entry_late_price_usd"` // pool price SCOUT_ENTRY_DELAY after the post (same unit)
 }
 
 // TableName returns the table name for this model.

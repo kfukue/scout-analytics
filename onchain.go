@@ -56,6 +56,8 @@ type onchainConfig struct {
 	MainnetRPCURL string
 	MainnetRPS    int
 	MainnetFeeds  map[string]string // quote token (lower) or "eth" → Chainlink feed on Ethereum mainnet
+
+	EntryDelay time.Duration // realistic entry: the pool price this long after the post (default 60s)
 }
 
 // Chainlink ETH/USD on Ethereum mainnet (8 decimals).
@@ -79,6 +81,10 @@ func loadOnchainConfig() (onchainConfig, error) {
 		MainnetRPCURL:   env("SCOUT_MAINNET_RPC_URL", ""),
 		MainnetRPS:      50,
 		MainnetFeeds:    map[string]string{"eth": mainnetEthUsdFeed},
+		EntryDelay:      envDur("SCOUT_ENTRY_DELAY", 60*time.Second),
+	}
+	if oc.EntryDelay < 0 {
+		return oc, fmt.Errorf("SCOUT_ENTRY_DELAY: want a duration >= 0")
 	}
 	if v := env("SCOUT_MAINNET_RPC_RPS", ""); v != "" {
 		n, err := strconv.Atoi(v)
@@ -272,7 +278,8 @@ type rpcClient struct {
 	url      string
 	http     *http.Client
 	id       atomic.Int64
-	requests atomic.Int64 // total JSON-RPC requests sent (for progress logs)
+	requests atomic.Int64                // total JSON-RPC requests sent (for progress logs)
+	inflight atomic.Pointer[rpcInflight] // the request being waited on right now (for heartbeat logs)
 
 	mu   sync.Mutex
 	next time.Time
@@ -290,6 +297,46 @@ type rpcClient struct {
 type tokenMeta struct {
 	Decimals int
 	Symbol   string
+}
+
+// rpcInflight describes the request currently being waited on.
+type rpcInflight struct {
+	what    string
+	since   time.Time
+	attempt int
+	lastErr string
+}
+
+// waitingOn says what the client is waiting for right now ("" when idle).
+func (c *rpcClient) waitingOn() string {
+	if c == nil {
+		return ""
+	}
+	f := c.inflight.Load()
+	if f == nil {
+		return ""
+	}
+	s := fmt.Sprintf("%s for %s", f.what, time.Since(f.since).Round(time.Second))
+	if f.attempt > 1 {
+		s += fmt.Sprintf(" (attempt %d, last error: %s)", f.attempt, f.lastErr)
+	}
+	return s
+}
+
+// describeRPC is a short human description of a request, e.g. "eth_getLogs blocks 100-200".
+func describeRPC(method string, params []any) string {
+	if method == "eth_getLogs" && len(params) == 1 {
+		if m, ok := params[0].(map[string]any); ok {
+			from, _ := m["fromBlock"].(string)
+			to, _ := m["toBlock"].(string)
+			if f, err1 := strconv.ParseUint(strings.TrimPrefix(from, "0x"), 16, 64); err1 == nil {
+				if t, err2 := strconv.ParseUint(strings.TrimPrefix(to, "0x"), 16, 64); err2 == nil {
+					return fmt.Sprintf("eth_getLogs blocks %d-%d (%d blocks)", f, t, t-f+1)
+				}
+			}
+		}
+	}
+	return method
 }
 
 func newRPCClient(oc onchainConfig) *rpcClient {
@@ -327,11 +374,18 @@ func (c *rpcClient) call(ctx context.Context, out any, method string, params ...
 	}
 	body, _ := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": c.id.Add(1), "method": method, "params": params})
 	var lastErr error
+	what, since := describeRPC(method, params), time.Now()
+	defer c.inflight.Store(nil)
 	for attempt := 0; attempt < 4; attempt++ {
 		if err := c.wait(ctx); err != nil {
 			return err
 		}
 		c.requests.Add(1)
+		f := &rpcInflight{what: what, since: since, attempt: attempt + 1}
+		if lastErr != nil {
+			f.lastErr = lastErr.Error()
+		}
+		c.inflight.Store(f)
 		req, _ := http.NewRequestWithContext(ctx, http.MethodPost, c.url, bytes.NewReader(body))
 		req.Header.Set("Content-Type", "application/json")
 		resp, err := c.http.Do(req)
@@ -638,7 +692,28 @@ type onchainState struct {
 	RunMaxQ        float64         `json:"run_max_q"` // extremes since entry, in quote units
 	RunMinQ        float64         `json:"run_min_q"`
 	Done           map[string]bool `json:"done,omitempty"` // horizons already computed
+
+	// v2: realistic entry (pool price EntryDelay after the post), extremes after
+	// it, the quote asset's USD price at entry, and whether the pre-call stats
+	// were stored.
+	V             int     `json:"v"`
+	LateBlock     uint64  `json:"late_block,omitempty"`
+	LatePriceQ    float64 `json:"late_price_q,omitempty"`
+	RunMaxLateQ   float64 `json:"run_max_late_q,omitempty"`
+	RunMinLateQ   float64 `json:"run_min_late_q,omitempty"`
+	EntryQuoteUSD float64 `json:"entry_quote_usd,omitempty"` // 0 = prices are in quote units
+	// Extremes since the call / since the late entry in the price unit (USD when
+	// available), each event converted at its own hour's rate. 0 = no trades yet.
+	RunMaxU     float64 `json:"run_max_u,omitempty"`
+	RunMinU     float64 `json:"run_min_u,omitempty"`
+	RunMaxLateU float64 `json:"run_max_late_u,omitempty"`
+	RunMinLateU float64 `json:"run_min_late_u,omitempty"`
+	PreDone     bool    `json:"pre_done,omitempty"`
 }
+
+// onchainStateVersion: calls tracked with an older state are tracked again from
+// scratch, so every call has the late entry, candles and pre-call stats.
+const onchainStateVersion = 2
 
 type onchainSource struct {
 	cfg onchainConfig
@@ -652,13 +727,18 @@ type onchainSource struct {
 	aggregators map[string][]string // feed proxy → aggregator contracts that emit AnswerUpdated
 
 	mainnet *rpcClient // Ethereum archive node (nil unless SCOUT_MAINNET_RPC_URL is set)
+
+	hourBlocks map[int64]uint64         // UTC hour → block at that time
+	hourQuotes map[string]float64       // "quote|hour" → USD price of the quote asset
+	quotePools map[string]*onchainState // quote asset → its own WETH/stable pool (nil = none)
 }
 
 func newOnchainSource(oc onchainConfig) *onchainSource {
 	if oc.PriceLookback == 0 {
 		oc.PriceLookback = 8_640_000
 	}
-	o := &onchainSource{cfg: oc, rpc: newRPCClient(oc)}
+	o := &onchainSource{cfg: oc, rpc: newRPCClient(oc), hourBlocks: map[int64]uint64{},
+		hourQuotes: map[string]float64{}, quotePools: map[string]*onchainState{}}
 	if oc.MainnetRPCURL != "" {
 		o.mainnet = newRPCClient(onchainConfig{RPCURL: oc.MainnetRPCURL, RPS: oc.MainnetRPS})
 	}
@@ -672,6 +752,12 @@ var (
 
 // discover finds the pool the token traded in around entryBlock.
 func (o *onchainSource) discover(ctx context.Context, token string, entryBlock uint64) (*onchainState, error) {
+	return o.discoverWith(ctx, token, entryBlock, nil)
+}
+
+// discoverWith is discover restricted to pools whose other asset passes accept
+// (nil = any). Used to find a quote asset's own WETH / stablecoin pool.
+func (o *onchainSource) discoverWith(ctx context.Context, token string, entryBlock uint64, accept func(quote string) bool) (*onchainState, error) {
 	token = strings.ToLower(token)
 	tm, err := o.rpc.tokenInfo(ctx, token)
 	if err != nil {
@@ -735,16 +821,23 @@ func (o *onchainSource) discover(ctx context.Context, token string, entryBlock u
 		}
 		return cands[i].addr < cands[j].addr
 	})
-	if len(cands) > 8 {
-		cands = cands[:8]
+	limit := 8
+	if accept != nil {
+		limit = 32 // the wanted pool is rarely the busiest counterparty
+	}
+	if len(cands) > limit {
+		cands = cands[:limit]
 	}
 	for _, c := range cands {
 		st := &onchainState{TokenDec: tm.Decimals, EntryBlock: entryBlock}
 		var ok bool
 		if c.addr == o.cfg.PoolManagerV4 {
-			ok, err = o.resolveV4(ctx, st, token, c.txs, from, to)
+			ok, err = o.resolveV4(ctx, st, token, c.txs, from, to, accept)
 		} else {
 			ok, err = o.resolveV2V3(ctx, st, token, c.addr)
+			if ok && accept != nil && !accept(st.Quote) {
+				ok = false
+			}
 		}
 		if err != nil {
 			return nil, err
@@ -804,7 +897,7 @@ func nonRPC(err error) error {
 
 // resolveV4 finds the v4 pool id the token traded in (the pool whose Swap
 // events share transactions with the token's transfers) and its currencies.
-func (o *onchainSource) resolveV4(ctx context.Context, st *onchainState, token string, txs map[string]bool, from, to uint64) (bool, error) {
+func (o *onchainSource) resolveV4(ctx context.Context, st *onchainState, token string, txs map[string]bool, from, to uint64, accept func(string) bool) (bool, error) {
 	counts := map[string]int{}
 	err := o.rpc.getLogsChunked(ctx, o.cfg.PoolManagerV4, []any{topicSwapV4}, from, to, func(l rpcLog) {
 		if len(l.Topics) >= 2 && txs[l.TxHash] {
@@ -859,6 +952,9 @@ func (o *onchainSource) resolveV4(ctx context.Context, st *onchainState, token s
 		default:
 			continue // a multi-hop leg through another pool
 		}
+		if accept != nil && !accept(st.Quote) {
+			continue
+		}
 		st.Kind, st.Pool, st.PoolID = "v4", o.cfg.PoolManagerV4, id
 		return true, nil
 	}
@@ -899,7 +995,8 @@ func (st *onchainState) logFilter() (string, []any) {
 }
 
 // scan folds price events in (from, to] into the running state.
-func (o *onchainSource) scan(ctx context.Context, st *onchainState, to uint64) error {
+// obs (optional) sees every price event, in order.
+func (o *onchainSource) scan(ctx context.Context, st *onchainState, to uint64, obs func(block uint64, p float64)) error {
 	if to <= st.ScanBlock {
 		return nil
 	}
@@ -910,6 +1007,19 @@ func (o *onchainSource) scan(ctx context.Context, st *onchainState, to uint64) e
 			return
 		}
 		st.LastPriceQ, st.LastPriceBlock = p, l.block()
+		if l.block() <= st.LateBlock {
+			st.LatePriceQ = p // the pool price EntryDelay after the post
+		} else {
+			if p > st.RunMaxLateQ {
+				st.RunMaxLateQ = p
+			}
+			if st.RunMinLateQ == 0 || p < st.RunMinLateQ {
+				st.RunMinLateQ = p
+			}
+		}
+		if obs != nil {
+			obs(l.block(), p)
+		}
 		if p > st.RunMaxQ {
 			st.RunMaxQ = p
 		}
@@ -946,6 +1056,7 @@ func (o *onchainSource) entryPrice(ctx context.Context, st *onchainState, latest
 		if last > 0 {
 			st.EntryPriceQ, st.LastPriceQ, st.LastPriceBlock = last, last, lastBlock
 			st.RunMaxQ, st.RunMinQ, st.ScanBlock = last, last, st.EntryBlock
+			st.LatePriceQ, st.RunMaxLateQ, st.RunMinLateQ = last, 0, 0
 			return nil
 		}
 		if from == 1 {
@@ -973,12 +1084,24 @@ func (o *onchainSource) entryPrice(ctx context.Context, st *onchainState, latest
 	}
 	st.EntryPriceQ, st.LastPriceQ, st.LastPriceBlock = first, first, firstBlock
 	st.RunMaxQ, st.RunMinQ, st.ScanBlock = first, first, firstBlock
+	st.LatePriceQ, st.RunMaxLateQ, st.RunMinLateQ = first, 0, 0
 	return nil
 }
 
 // quoteUSD: USD value of one unit of the pool's quote asset at a block.
 // ok=false when no source is configured (prices then stay in quote units).
 func (o *onchainSource) quoteUSD(ctx context.Context, quote string, block uint64) (float64, bool, error) {
+	p, ok, err := o.quoteUSDDirect(ctx, quote, block)
+	if ok || err != nil {
+		return p, ok, err
+	}
+	// No feed for this asset (e.g. VIRTUAL, a stock token): price it from its own
+	// pool against WETH or a stablecoin.
+	return o.quoteViaPool(ctx, quote, block)
+}
+
+// quoteUSDDirect: stablecoins, Chainlink feeds and the WETH/USDG pool.
+func (o *onchainSource) quoteUSDDirect(ctx context.Context, quote string, block uint64) (float64, bool, error) {
 	quote = strings.ToLower(quote)
 	if o.cfg.Stables[quote] {
 		return 1, true, nil
@@ -1281,16 +1404,14 @@ func (o *onchainSource) liquidityUSD(ctx context.Context, st *onchainState, qUSD
 // quoteSource names where a quote asset's USD price comes from (for diagnostics).
 func (o *onchainSource) quoteSource(quote string) string {
 	quote = strings.ToLower(quote)
-	isETH := quote == zeroAddr || quote == o.cfg.WETH
-	switch {
-	case o.cfg.Stables[quote]:
-		return "stablecoin = $1"
-	case o.mainnet != nil && (o.cfg.MainnetFeeds[quote] != "" || (isETH && o.cfg.MainnetFeeds["eth"] != "")):
-		return "Chainlink on Ethereum mainnet"
-	case o.cfg.Feeds[quote] != "" || (isETH && o.cfg.Feeds["eth"] != ""):
-		return "Chainlink on Robinhood Chain"
-	case isETH && o.cfg.EthUSDPool != "":
-		return "WETH/USDG pool"
+	if d := o.quoteSourceDirect(quote); d != "none" {
+		return d
+	}
+	o.mu.Lock()
+	qp := o.quotePools[quote]
+	o.mu.Unlock()
+	if qp != nil {
+		return "its " + qp.QuoteSym + " pool (uniswap-" + qp.Kind + ")"
 	}
 	return "none"
 }

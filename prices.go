@@ -384,6 +384,11 @@ type horizonResult struct {
 	MaxPriceUSD float64
 	MinPriceUSD float64
 	LastTradeAt *time.Time
+
+	// Measured from the realistic entry (on-chain source only).
+	ReturnLatePct  *float64
+	MaxGainLatePct *float64
+	MaxDDLatePct   *float64
 }
 
 // horizonStats computes return / peak gain / drawdown at entry+h from hourly

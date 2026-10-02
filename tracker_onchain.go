@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math"
 	"time"
 )
 
@@ -26,12 +27,14 @@ func (s *scanner) trackOneOnchain(ctx context.Context, t *ScoutCallTracking) {
 	log.Printf("%s: %s, posted %s (%s ago), status %s",
 		tag, t.ContractAddress, t.EntryAt.UTC().Format("2006-01-02 15:04"), time.Since(t.EntryAt).Round(time.Minute), t.Status)
 	interrupted := false
+	stopBeat := s.heartbeat(ctx, tag, now, reqStart)
+	defer stopBeat()
 
 	var st *onchainState
 	if len(t.Onchain) > 0 && string(t.Onchain) != "null" {
 		st = &onchainState{}
-		if err := json.Unmarshal(t.Onchain, st); err != nil {
-			st = nil
+		if err := json.Unmarshal(t.Onchain, st); err != nil || st.V < onchainStateVersion {
+			st = nil // unreadable, or tracked by an older version: start this call again
 		}
 	}
 	fail := func(status string, err error, retryIn time.Duration) {
@@ -96,7 +99,19 @@ func (s *scanner) trackOneOnchain(ctx context.Context, t *ScoutCallTracking) {
 			return
 		}
 		st = found
+		st.V = onchainStateVersion
 		st.Done = map[string]bool{}
+		if st.LateBlock, err = o.rpc.blockAt(ctx, t.EntryAt.Add(o.cfg.EntryDelay).Unix()); err != nil {
+			st = nil
+			fail(TrackError, fmt.Errorf("block at call time + %s: %w", o.cfg.EntryDelay, err), backoff(t.Attempts))
+			return
+		}
+		if err := s.db.DeleteCandles(ctx, t.CallID); err != nil {
+			st = nil
+			fail(TrackError, fmt.Errorf("clear candles: %w", err), backoff(t.Attempts))
+			return
+		}
+		t.EntryLatePriceUSD = nil
 		// Fresh on-chain state: drop any entry price left by another source
 		// (e.g. GeckoTerminal) so every number for this call comes from one source.
 		t.EntryPriceUSD, t.EntryPriceSource, t.PriceUnit = nil, nil, nil
@@ -126,8 +141,10 @@ func (s *scanner) trackOneOnchain(ctx context.Context, t *ScoutCallTracking) {
 			return
 		}
 		unit, p := "usd", st.EntryPriceQ*q
+		st.EntryQuoteUSD = q
 		if !ok { // no USD source for this quote asset: keep everything in quote units
 			unit, p = st.QuoteSym, st.EntryPriceQ
+			st.EntryQuoteUSD = 0
 		}
 		src := "onchain-" + st.Kind
 		t.EntryPriceUSD, t.EntryPriceSource, t.PriceUnit = &p, &src, &unit
@@ -138,6 +155,29 @@ func (s *scanner) trackOneOnchain(ctx context.Context, t *ScoutCallTracking) {
 		}
 	}
 	inUSD := t.PriceUnit != nil && *t.PriceUnit == "usd"
+	entryQ := 1.0 // quote → price unit at the call
+	if inUSD && st.EntryQuoteUSD > 0 {
+		entryQ = st.EntryQuoteUSD
+	}
+
+	// 2b. Trading in the hour before the call (features known at call time).
+	if !st.PreDone {
+		ps, err := o.precall(ctx, st, t.EntryAt.Unix())
+		if err != nil {
+			fail(TrackError, fmt.Errorf("pre-call trades: %w", err), backoff(t.Attempts))
+			return
+		}
+		if inUSD {
+			ps.scale(entryQ)
+		}
+		if err := s.db.UpsertPrecall(ctx, t.CallID, ps); err != nil {
+			fail(TrackError, fmt.Errorf("save pre-call trades: %w", err), backoff(t.Attempts))
+			return
+		}
+		st.PreDone = true
+		log.Printf("%s: before the call: %d swaps in 5m, %d in 15m, %d in 60m (%d buys / %d sells in 60m)",
+			tag, ps.Swaps[0], ps.Swaps[1], ps.Swaps[2], ps.Buys[2], ps.Sells[2])
+	}
 
 	// 3. Horizons, in order, each scanned once.
 	var next time.Time
@@ -158,8 +198,53 @@ func (s *scanner) trackOneOnchain(ctx context.Context, t *ScoutCallTracking) {
 			fail(TrackError, fmt.Errorf("block at +%s: %w", h.Name, err), backoff(t.Attempts))
 			return
 		}
-		if err := o.scan(ctx, st, hBlock); err != nil {
+		// Scan the swaps up to this horizon, building candles on the way. Event
+		// times come from the block number (see timeOfBlock).
+		segFrom, segTo := st.ScanBlock, hBlock
+		tFrom, err := o.rpc.blockTime(ctx, segFrom)
+		if err != nil {
+			fail(TrackError, fmt.Errorf("time of block %d: %w", segFrom, err), backoff(t.Attempts))
+			return
+		}
+		buf := newCandleBuf(t.EntryAt.Unix())
+		var obsErr error
+		obs := func(block uint64, p float64) {
+			est := tFrom
+			if segTo > segFrom {
+				est = tFrom + int64(float64(block-segFrom)/float64(segTo-segFrom)*float64(due.Unix()-tFrom))
+			}
+			ts, err := o.timeOfBlock(ctx, block, est)
+			if err != nil {
+				if obsErr == nil {
+					obsErr = err
+				}
+				return
+			}
+			buf.add(ts, p, block > st.LateBlock)
+		}
+		if err := o.scan(ctx, st, hBlock, obs); err != nil {
 			fail(TrackError, fmt.Errorf("swaps to +%s: %w", h.Name, err), backoff(t.Attempts))
+			return
+		}
+		if obsErr != nil {
+			fail(TrackError, fmt.Errorf("candle times to +%s: %w", h.Name, obsErr), backoff(t.Attempts))
+			return
+		}
+		scale := func(hour int64) (float64, error) {
+			if !inUSD {
+				return 1, nil
+			}
+			return o.quoteUSDHour(ctx, st.Quote, hour)
+		}
+		candles, err := buf.list(scale)
+		if err == nil {
+			err = buf.foldExtremes(st, scale)
+		}
+		if err == nil {
+			err = s.db.UpsertCandles(ctx, t.CallID, candles)
+		}
+		if err != nil {
+			fail(TrackError, fmt.Errorf("candles to +%s: %w", h.Name, err), backoff(t.Attempts))
 			return
 		}
 		q := 1.0
@@ -175,11 +260,28 @@ func (s *scanner) trackOneOnchain(ctx context.Context, t *ScoutCallTracking) {
 		}
 		lastQ = q
 		entry := *t.EntryPriceUSD
+		// Peak and low since the call, each trade valued at its own hour's rate.
+		hiU, loU := math.Max(st.RunMaxU, entry), entry
+		if st.RunMinU > 0 && st.RunMinU < loU {
+			loU = st.RunMinU
+		}
 		r := horizonResult{Horizon: h.Name, DueAt: due, Status: "done",
-			PriceUSD: st.LastPriceQ * q, MaxPriceUSD: st.RunMaxQ * q, MinPriceUSD: st.RunMinQ * q}
+			PriceUSD: st.LastPriceQ * q, MaxPriceUSD: hiU, MinPriceUSD: loU}
 		r.ReturnPct = (r.PriceUSD/entry - 1) * 100
 		r.MaxGainPct = (r.MaxPriceUSD/entry - 1) * 100
 		r.MaxDDPct = (r.MinPriceUSD/entry - 1) * 100
+		// The same, measured from the realistic entry: the pool price EntryDelay
+		// after the post, and only what happened after it.
+		if st.LatePriceQ > 0 {
+			late := st.LatePriceQ * entryQ
+			t.EntryLatePriceUSD = &late
+			hi, lo := math.Max(st.RunMaxLateU, late), late
+			if st.RunMinLateU > 0 && st.RunMinLateU < lo {
+				lo = st.RunMinLateU
+			}
+			rl, gl, dl := (r.PriceUSD/late-1)*100, (hi/late-1)*100, (lo/late-1)*100
+			r.ReturnLatePct, r.MaxGainLatePct, r.MaxDDLatePct = &rl, &gl, &dl
+		}
 		if st.LastPriceBlock > st.EntryBlock {
 			if ts, err := o.rpc.blockTime(ctx, st.LastPriceBlock); err == nil {
 				lt := time.Unix(ts, 0).UTC()
@@ -214,4 +316,37 @@ func (s *scanner) trackOneOnchain(ctx context.Context, t *ScoutCallTracking) {
 	t.Rugged = &rug
 	t.Status = TrackDone
 	t.NextCheckAt = now
+}
+
+// heartbeatEvery is how often a call that is still being worked on says so.
+var heartbeatEvery = 10 * time.Second
+
+// heartbeat logs, every heartbeatEvery, that the call is still being worked on
+// and which node request it is waiting for — so a slow node is visible instead
+// of looking like a hang. The returned func stops it.
+func (s *scanner) heartbeat(ctx context.Context, tag string, start time.Time, reqStart int64) func() {
+	o := s.onchain
+	done := make(chan struct{})
+	go func() {
+		t := time.NewTicker(heartbeatEvery)
+		defer t.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				waiting := "between requests"
+				if w := o.rpc.waitingOn(); w != "" {
+					waiting = "waiting on Robinhood node: " + w
+				} else if w := o.mainnet.waitingOn(); w != "" {
+					waiting = "waiting on Ethereum node: " + w
+				}
+				log.Printf("%s: still working — %s elapsed, %d RPC requests so far; %s",
+					tag, time.Since(start).Round(time.Second), o.rpc.requests.Load()-reqStart, waiting)
+			}
+		}
+	}()
+	return func() { close(done) }
 }

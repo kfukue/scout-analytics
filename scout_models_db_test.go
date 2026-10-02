@@ -29,8 +29,8 @@ func testStore(t *testing.T) *ScoutStore {
 		t.Fatal(err)
 	}
 	t.Cleanup(st.Close)
-	if _, err := st.Pool.Exec(ctx, `DROP VIEW IF EXISTS scout_investigations_v, scout_call_dataset_v, scout_calls_v;
-		DROP TABLE IF EXISTS scout_delivery_investigations, scout_deliveries, scout_investigations,
+	if _, err := st.Pool.Exec(ctx, `DROP VIEW IF EXISTS scout_call_predictions_v, scout_investigations_v, scout_call_dataset_v, scout_calls_v;
+		DROP TABLE IF EXISTS scout_call_predictions, scout_call_precall, scout_call_candles, scout_delivery_investigations, scout_deliveries, scout_investigations,
 			scout_investigation_tools, scout_scan_reports, scout_call_live_buys, scout_call_metrics,
 			scout_call_returns, scout_call_tracking, scout_calls CASCADE`); err != nil {
 		t.Fatal(err)

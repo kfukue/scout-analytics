@@ -228,7 +228,67 @@ CREATE TABLE IF NOT EXISTS scout_call_returns (
     PRIMARY KEY (call_id, horizon)
 );
 
+-- Realistic entry: the pool price SCOUT_ENTRY_DELAY (60s) after the post, and returns measured from it.
+ALTER TABLE scout_call_tracking ADD COLUMN IF NOT EXISTS entry_late_price_usd  NUMERIC;
+ALTER TABLE scout_call_returns  ADD COLUMN IF NOT EXISTS return_late_pct       NUMERIC;
+ALTER TABLE scout_call_returns  ADD COLUMN IF NOT EXISTS max_gain_late_pct     NUMERIC;  -- peak after the late entry
+ALTER TABLE scout_call_returns  ADD COLUMN IF NOT EXISTS max_drawdown_late_pct NUMERIC;
+
+-- Calls tracked before state version 2 lack the late entry, candles and pre-call
+-- stats: queue them to be tracked again (their old results stay until replaced).
+UPDATE scout_call_tracking SET status = 'pending', next_check_at = now(), attempts = 0, error = NULL
+WHERE onchain IS NOT NULL AND COALESCE((onchain->>'v')::int, 0) < 2
+  AND status IN ('done', 'tracking', 'error', 'gave_up');
+
+-- Price path of a call: 5-minute candles for the first 24 hours (interval_seconds = 300)
+-- and hourly candles for the whole tracked window (3600). Prices are in the call's
+-- price_unit (scout_call_tracking.price_unit). Only buckets with trades are stored.
+CREATE TABLE IF NOT EXISTS scout_call_candles (
+    call_id           INTEGER      NOT NULL REFERENCES scout_calls (id) ON DELETE CASCADE,
+    interval_seconds  INTEGER      NOT NULL,
+    bucket_start      TIMESTAMPTZ  NOT NULL,
+    open              NUMERIC      NOT NULL,
+    high              NUMERIC      NOT NULL,
+    low               NUMERIC      NOT NULL,
+    close             NUMERIC      NOT NULL,
+    events            INTEGER      NOT NULL DEFAULT 0,
+    PRIMARY KEY (call_id, interval_seconds, bucket_start)
+);
+
+-- Trading in the pool during the hour before the call (features known at call time).
+CREATE TABLE IF NOT EXISTS scout_call_precall (
+    call_id            INTEGER      PRIMARY KEY REFERENCES scout_calls (id) ON DELETE CASCADE,
+    window_seconds     INTEGER      NOT NULL,
+    vol_unit           TEXT         NOT NULL,       -- usd, or the quote asset's symbol
+    first_trade_age_s  INTEGER,                     -- first trade in the window → call (NULL = no trades)
+    swaps_5m   INTEGER NOT NULL DEFAULT 0, swaps_15m  INTEGER NOT NULL DEFAULT 0, swaps_60m  INTEGER NOT NULL DEFAULT 0,
+    buys_5m    INTEGER NOT NULL DEFAULT 0, buys_15m   INTEGER NOT NULL DEFAULT 0, buys_60m   INTEGER NOT NULL DEFAULT 0,
+    sells_5m   INTEGER NOT NULL DEFAULT 0, sells_15m  INTEGER NOT NULL DEFAULT 0, sells_60m  INTEGER NOT NULL DEFAULT 0,
+    buy_vol_5m  NUMERIC NOT NULL DEFAULT 0, buy_vol_15m  NUMERIC NOT NULL DEFAULT 0, buy_vol_60m  NUMERIC NOT NULL DEFAULT 0,
+    sell_vol_5m NUMERIC NOT NULL DEFAULT 0, sell_vol_15m NUMERIC NOT NULL DEFAULT 0, sell_vol_60m NUMERIC NOT NULL DEFAULT 0,
+    price_chg_5m_pct   NUMERIC,                     -- price at the call vs 5 minutes earlier
+    price_chg_15m_pct  NUMERIC,
+    price_chg_60m_pct  NUMERIC,
+    computed_at        TIMESTAMPTZ  NOT NULL DEFAULT now()
+);
+
+-- Model scores: one row per call, model version and holding-period bucket.
+CREATE TABLE IF NOT EXISTS scout_call_predictions (
+    id               SERIAL PRIMARY KEY,
+    call_id          INTEGER      NOT NULL REFERENCES scout_calls (id) ON DELETE CASCADE,
+    model_version    TEXT         NOT NULL,
+    bucket           TEXT         NOT NULL,          -- short | 3day | medium | long
+    runner_prob      NUMERIC,                        -- 0..1
+    collapse_prob    NUMERIC,                        -- 0..1
+    runner_rank_pct  NUMERIC,                        -- % of recent calls with a lower runner score
+    features         JSONB,                          -- the feature row that was scored
+    created_at       TIMESTAMPTZ  NOT NULL DEFAULT now(),
+    CONSTRAINT scout_call_predictions_uq UNIQUE (call_id, model_version, bucket)
+);
+CREATE INDEX IF NOT EXISTS scout_calls_ca_date_idx ON scout_calls (contract_address, message_date);
+
 -- Training dataset: one row per call = features known at call time + outcomes.
+DROP VIEW IF EXISTS scout_call_predictions_v;
 DROP VIEW IF EXISTS scout_call_dataset_v;
 CREATE VIEW scout_call_dataset_v AS
 SELECT cv.call_id, cv.message_id, cv.message_date, cv.contract_address, cv.status AS call_status,
@@ -239,43 +299,98 @@ SELECT cv.call_id, cv.message_id, cv.message_date, cv.contract_address, cv.statu
        cv.age_seconds, cv.holders, cv.proof_elite, cv.proof_good,
        cv.live_buys_elite_count, cv.live_buys_good_count,
        cv.live_buys_elite_usd::float8 AS live_buys_elite_usd, cv.live_buys_good_usd::float8 AS live_buys_good_usd,
+       lb.live_buy_max_usd,
+       -- repeat calls and how busy the channel was (all known at call time)
+       pc.prior_calls, pc.secs_since_prev_call, bz.calls_prev_1h, bz.calls_prev_24h,
+       -- trading in the hour before the call
+       x.swaps_5m AS pre_swaps_5m, x.swaps_15m AS pre_swaps_15m, x.swaps_60m AS pre_swaps_60m,
+       x.buys_5m AS pre_buys_5m, x.buys_15m AS pre_buys_15m, x.buys_60m AS pre_buys_60m,
+       x.sells_5m AS pre_sells_5m, x.sells_15m AS pre_sells_15m, x.sells_60m AS pre_sells_60m,
+       x.buy_vol_5m::float8 AS pre_buy_vol_5m, x.buy_vol_15m::float8 AS pre_buy_vol_15m, x.buy_vol_60m::float8 AS pre_buy_vol_60m,
+       x.sell_vol_5m::float8 AS pre_sell_vol_5m, x.sell_vol_15m::float8 AS pre_sell_vol_15m, x.sell_vol_60m::float8 AS pre_sell_vol_60m,
+       x.price_chg_5m_pct::float8 AS pre_price_chg_5m_pct, x.price_chg_15m_pct::float8 AS pre_price_chg_15m_pct,
+       x.price_chg_60m_pct::float8 AS pre_price_chg_60m_pct,
+       x.first_trade_age_s AS pre_first_trade_age_s, x.vol_unit AS pre_vol_unit,
        p.verdict_level AS perceptor_verdict,
        t.status AS tracking_status, t.pool_address, t.pool_dex,
        t.entry_price_usd::float8 AS entry_price_usd, t.entry_price_source, t.price_unit,
        t.onchain->>'quote_sym' AS quote_asset,
+       t.entry_late_price_usd::float8 AS entry_late_price_usd,
        t.current_liquidity_usd::float8 AS current_liquidity_usd, t.rugged,
-       r.ret_1h, r.max_gain_1h, r.max_dd_1h,
-       r.ret_1d, r.max_gain_1d, r.max_dd_1d,
-       r.ret_3d, r.max_gain_3d, r.max_dd_3d,
-       r.ret_7d, r.max_gain_7d, r.max_dd_7d,
-       r.ret_30d, r.max_gain_30d, r.max_dd_30d
+       r.ret_1h, r.max_gain_1h, r.max_dd_1h, r.ret_late_1h, r.max_gain_late_1h, r.max_dd_late_1h,
+       r.ret_1d, r.max_gain_1d, r.max_dd_1d, r.ret_late_1d, r.max_gain_late_1d, r.max_dd_late_1d,
+       r.ret_3d, r.max_gain_3d, r.max_dd_3d, r.ret_late_3d, r.max_gain_late_3d, r.max_dd_late_3d,
+       r.ret_7d, r.max_gain_7d, r.max_dd_7d, r.ret_late_7d, r.max_gain_late_7d, r.max_dd_late_7d,
+       r.ret_30d, r.max_gain_30d, r.max_dd_30d, r.ret_late_30d, r.max_gain_late_30d, r.max_dd_late_30d
 FROM scout_calls_v cv
 LEFT JOIN scout_call_tracking t ON t.call_id = cv.call_id
+LEFT JOIN scout_call_precall x ON x.call_id = cv.call_id
+LEFT JOIN LATERAL (
+    SELECT max(amount_usd)::float8 AS live_buy_max_usd FROM scout_call_live_buys WHERE call_id = cv.call_id
+) lb ON true
+LEFT JOIN LATERAL (
+    SELECT count(*)::int AS prior_calls,
+           extract(epoch FROM cv.message_date - max(c2.message_date))::int AS secs_since_prev_call
+    FROM scout_calls c2
+    WHERE c2.contract_address = cv.contract_address AND c2.message_date < cv.message_date
+) pc ON true
+LEFT JOIN LATERAL (
+    SELECT count(*) FILTER (WHERE c3.message_date >= cv.message_date - interval '1 hour')::int AS calls_prev_1h,
+           count(*)::int AS calls_prev_24h
+    FROM scout_calls c3
+    WHERE c3.message_date < cv.message_date AND c3.message_date >= cv.message_date - interval '24 hours'
+) bz ON true
+-- Perceptor verdict: this call's own scan, else the latest earlier scan of the same token.
 LEFT JOIN LATERAL (
     SELECT i.verdict_level FROM scout_investigations i
     JOIN scout_investigation_tools tt ON tt.id = i.tool_id
-    WHERE i.call_id = cv.call_id AND tt.code = 'perceptor' AND i.status = 'completed'
-    ORDER BY i.requested_at DESC LIMIT 1
+    WHERE tt.code = 'perceptor' AND i.status = 'completed'
+      AND (i.call_id = cv.call_id OR (i.contract_address = cv.contract_address AND i.requested_at <= cv.message_date))
+    ORDER BY (i.call_id = cv.call_id) DESC, i.requested_at DESC LIMIT 1
 ) p ON true
 LEFT JOIN LATERAL (
     SELECT
-      max(return_pct)       FILTER (WHERE horizon = '1h')::float8  AS ret_1h,
-      max(max_gain_pct)     FILTER (WHERE horizon = '1h')::float8  AS max_gain_1h,
-      max(max_drawdown_pct) FILTER (WHERE horizon = '1h')::float8  AS max_dd_1h,
-      max(return_pct)       FILTER (WHERE horizon = '1d')::float8  AS ret_1d,
-      max(max_gain_pct)     FILTER (WHERE horizon = '1d')::float8  AS max_gain_1d,
-      max(max_drawdown_pct) FILTER (WHERE horizon = '1d')::float8  AS max_dd_1d,
-      max(return_pct)       FILTER (WHERE horizon = '3d')::float8  AS ret_3d,
-      max(max_gain_pct)     FILTER (WHERE horizon = '3d')::float8  AS max_gain_3d,
-      max(max_drawdown_pct) FILTER (WHERE horizon = '3d')::float8  AS max_dd_3d,
-      max(return_pct)       FILTER (WHERE horizon = '7d')::float8  AS ret_7d,
-      max(max_gain_pct)     FILTER (WHERE horizon = '7d')::float8  AS max_gain_7d,
-      max(max_drawdown_pct) FILTER (WHERE horizon = '7d')::float8  AS max_dd_7d,
-      max(return_pct)       FILTER (WHERE horizon = '30d')::float8 AS ret_30d,
-      max(max_gain_pct)     FILTER (WHERE horizon = '30d')::float8 AS max_gain_30d,
-      max(max_drawdown_pct) FILTER (WHERE horizon = '30d')::float8 AS max_dd_30d
+      max(return_pct)            FILTER (WHERE horizon = '1h')::float8 AS ret_1h,
+      max(max_gain_pct)          FILTER (WHERE horizon = '1h')::float8 AS max_gain_1h,
+      max(max_drawdown_pct)      FILTER (WHERE horizon = '1h')::float8 AS max_dd_1h,
+      max(return_late_pct)       FILTER (WHERE horizon = '1h')::float8 AS ret_late_1h,
+      max(max_gain_late_pct)     FILTER (WHERE horizon = '1h')::float8 AS max_gain_late_1h,
+      max(max_drawdown_late_pct) FILTER (WHERE horizon = '1h')::float8 AS max_dd_late_1h,
+      max(return_pct)            FILTER (WHERE horizon = '1d')::float8 AS ret_1d,
+      max(max_gain_pct)          FILTER (WHERE horizon = '1d')::float8 AS max_gain_1d,
+      max(max_drawdown_pct)      FILTER (WHERE horizon = '1d')::float8 AS max_dd_1d,
+      max(return_late_pct)       FILTER (WHERE horizon = '1d')::float8 AS ret_late_1d,
+      max(max_gain_late_pct)     FILTER (WHERE horizon = '1d')::float8 AS max_gain_late_1d,
+      max(max_drawdown_late_pct) FILTER (WHERE horizon = '1d')::float8 AS max_dd_late_1d,
+      max(return_pct)            FILTER (WHERE horizon = '3d')::float8 AS ret_3d,
+      max(max_gain_pct)          FILTER (WHERE horizon = '3d')::float8 AS max_gain_3d,
+      max(max_drawdown_pct)      FILTER (WHERE horizon = '3d')::float8 AS max_dd_3d,
+      max(return_late_pct)       FILTER (WHERE horizon = '3d')::float8 AS ret_late_3d,
+      max(max_gain_late_pct)     FILTER (WHERE horizon = '3d')::float8 AS max_gain_late_3d,
+      max(max_drawdown_late_pct) FILTER (WHERE horizon = '3d')::float8 AS max_dd_late_3d,
+      max(return_pct)            FILTER (WHERE horizon = '7d')::float8 AS ret_7d,
+      max(max_gain_pct)          FILTER (WHERE horizon = '7d')::float8 AS max_gain_7d,
+      max(max_drawdown_pct)      FILTER (WHERE horizon = '7d')::float8 AS max_dd_7d,
+      max(return_late_pct)       FILTER (WHERE horizon = '7d')::float8 AS ret_late_7d,
+      max(max_gain_late_pct)     FILTER (WHERE horizon = '7d')::float8 AS max_gain_late_7d,
+      max(max_drawdown_late_pct) FILTER (WHERE horizon = '7d')::float8 AS max_dd_late_7d,
+      max(return_pct)            FILTER (WHERE horizon = '30d')::float8 AS ret_30d,
+      max(max_gain_pct)          FILTER (WHERE horizon = '30d')::float8 AS max_gain_30d,
+      max(max_drawdown_pct)      FILTER (WHERE horizon = '30d')::float8 AS max_dd_30d,
+      max(return_late_pct)       FILTER (WHERE horizon = '30d')::float8 AS ret_late_30d,
+      max(max_gain_late_pct)     FILTER (WHERE horizon = '30d')::float8 AS max_gain_late_30d,
+      max(max_drawdown_late_pct) FILTER (WHERE horizon = '30d')::float8 AS max_dd_late_30d
     FROM scout_call_returns WHERE call_id = cv.call_id AND status = 'done'
 ) r ON true;
+
+-- Scores next to what really happened (for a website or a live-accuracy check).
+CREATE VIEW scout_call_predictions_v AS
+SELECT pr.call_id, pr.model_version, pr.bucket, pr.runner_prob::float8 AS runner_prob,
+       pr.collapse_prob::float8 AS collapse_prob, pr.runner_rank_pct::float8 AS runner_rank_pct, pr.created_at AS scored_at,
+       d.message_id, d.message_date, d.contract_address, d.token_symbol, d.price_unit, d.rugged,
+       d.ret_late_1d, d.max_gain_late_1d, d.ret_late_3d, d.ret_late_7d, d.ret_late_30d
+FROM scout_call_predictions pr
+JOIN scout_call_dataset_v d ON d.call_id = pr.call_id;
 
 -- One-time upgrade from the earlier single-tool table (scout_scan_reports), if present.
 -- The old table is left in place; drop it yourself once you're happy.

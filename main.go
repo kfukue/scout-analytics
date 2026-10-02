@@ -81,6 +81,10 @@ type config struct {
 	DBAutoMigrate bool
 
 	Price priceConfig // performance tracking (GeckoTerminal), see prices.go
+
+	// Model scoring (see score.go). Off unless SCOUT_MODEL_URL is set.
+	ModelURL     string        // base URL of the scoring service, e.g. http://127.0.0.1:8601
+	ModelTimeout time.Duration // per request; delivery never waits longer than this
 }
 
 func env(key, def string) string {
@@ -142,6 +146,8 @@ func loadConfig(envFile string) (*config, error) {
 		DBMode:         strings.ToLower(env("SCOUT_DB", "repo")),
 		DatabaseURL:    os.Getenv("SCOUT_DATABASE_URL"),
 		DBAutoMigrate:  !strings.EqualFold(env("SCOUT_DB_AUTO_MIGRATE", "true"), "false"),
+		ModelURL:       strings.TrimRight(env("SCOUT_MODEL_URL", ""), "/"),
+		ModelTimeout:   envDur("SCOUT_MODEL_TIMEOUT", 5*time.Second),
 	}
 	c.DeliverLevels = map[string]bool{}
 	for _, l := range splitList(env("SCOUT_DELIVER_LEVELS", levelClean+","+levelCaution)) {
@@ -839,6 +845,10 @@ func (s *scanner) process(ctx context.Context, j job, deliver bool) []*toolResul
 		s.setCallStatus(j.CallID, CallStatusFailed)
 	}
 
+	// Model score: stored for every call, shown in the delivery header. Never
+	// filters and never blocks: no line when the service is off or down.
+	scoreLine := s.scoreCall(ctx, j)
+
 	rec.Deliver = s.shouldDeliver(results)
 	if !rec.Deliver {
 		log.Printf("%s: gate verdict not in SCOUT_DELIVER_LEVELS — not delivering", j.CA)
@@ -848,6 +858,9 @@ func (s *scanner) process(ctx context.Context, j job, deliver bool) []*toolResul
 		return results
 	}
 	header := s.deliveryHeader(j, results)
+	if scoreLine != "" {
+		header += "\n" + scoreLine
+	}
 	err := s.deliver(ctx, j, header, results)
 	var attached []int
 	for _, r := range results {
@@ -1756,11 +1769,11 @@ func runPriceCheck(ctx context.Context, cfg *config, token, at string) error {
 	case err != nil:
 		fmt.Printf("USD of %s at the call: ERROR %v\n", st.QuoteSym, err)
 	case !ok:
-		fmt.Printf("USD of %s: no source. Add its Chainlink feed: SCOUT_CHAINLINK_FEEDS=%s=0xFeedAddress (prices stay in %s until then)\n", st.QuoteSym, st.Quote, st.QuoteSym)
+		fmt.Printf("USD of %s: no source (no feed, and no WETH or stablecoin pool found for it). Add its Chainlink feed: SCOUT_CHAINLINK_FEEDS=%s=0xFeedAddress (prices stay in %s until then)\n", st.QuoteSym, st.Quote, st.QuoteSym)
 	default:
 		fmt.Printf("USD of %s at the call: $%.6g (%s) → entry $%.12g\n", st.QuoteSym, q, o.quoteSource(st.Quote), st.EntryPriceQ*q)
 	}
-	if err := o.scan(ctx, st, latest); err != nil {
+	if err := o.scan(ctx, st, latest, nil); err != nil {
 		return fmt.Errorf("scan swaps to now: %w", err)
 	}
 	fmt.Printf("now:          %.12g %s (%+.1f%%), peak %+.1f%%, low %+.1f%% since the call; last trade block %d\n",

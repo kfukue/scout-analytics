@@ -370,14 +370,14 @@ func TestDiscoverAndPriceV3WithChainlink(t *testing.T) {
 		t.Fatalf("quoteUSD %v %v %v", q, ok, err)
 	}
 	// scan to +1h: last 0.000002, max 0.000005, min 0.000001
-	if err := o.scan(ctx, st, eb+36000); err != nil {
+	if err := o.scan(ctx, st, eb+36000, nil); err != nil {
 		t.Fatal(err)
 	}
 	if math.Abs(st.LastPriceQ-0.000002) > 1e-12 || math.Abs(st.RunMaxQ-0.000005) > 1e-12 || math.Abs(st.RunMinQ-0.000001) > 1e-12 {
 		t.Fatalf("after 1h: %+v", st)
 	}
 	// incremental: scanning to day 7 only reads the new range and picks up the dump
-	if err := o.scan(ctx, st, eb+7*864000); err != nil || math.Abs(st.LastPriceQ-0.0000005) > 1e-13 || math.Abs(st.RunMinQ-0.0000005) > 1e-13 {
+	if err := o.scan(ctx, st, eb+7*864000, nil); err != nil || math.Abs(st.LastPriceQ-0.0000005) > 1e-13 || math.Abs(st.RunMinQ-0.0000005) > 1e-13 {
 		t.Fatalf("after 7d: %+v %v", st, err)
 	}
 	if q, _, _ := o.quoteUSD(ctx, st.Quote, eb+7*864000); q != 3300 {
@@ -413,7 +413,7 @@ func TestDiscoverAndPriceV2Stable(t *testing.T) {
 	if err := o.entryPrice(ctx, st, f.latest); err != nil || math.Abs(st.EntryPriceQ-0.005) > 1e-12 {
 		t.Fatalf("entry %v %v", st.EntryPriceQ, err)
 	}
-	o.scan(ctx, st, eb+10000)
+	o.scan(ctx, st, eb+10000, nil)
 	if math.Abs(st.LastPriceQ-0.0078125) > 1e-12 {
 		t.Fatalf("last %v", st.LastPriceQ)
 	}
@@ -456,7 +456,7 @@ func TestDiscoverV4StockTokenPair(t *testing.T) {
 	if err := o.entryPrice(ctx, st, f.latest); err != nil || math.Abs(st.EntryPriceQ-0.00002) > 1e-12 {
 		t.Fatalf("entry %v %v", st.EntryPriceQ, err)
 	}
-	o.scan(ctx, st, eb+2000)
+	o.scan(ctx, st, eb+2000, nil)
 	if math.Abs(st.LastPriceQ-0.00006) > 1e-12 {
 		t.Fatalf("last %v (other pool's swap must be ignored)", st.LastPriceQ)
 	}
