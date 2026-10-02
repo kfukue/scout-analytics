@@ -188,6 +188,15 @@ Only use the feature columns as model inputs; everything about the future is an 
 
 Other commands: `-track` (tracker only, forever, no Telegram), `-track-once` (process what's due and exit).
 
+To split the work over two processes (so the tracker can be restarted without
+interrupting the listener), run the listener with `-listen-only` and the tracker
+with `-track`. New calls are still queued for tracking by the listener.
+
+```
+./scoutanalytics -listen-only   # terminal 1: scan + deliver new calls
+./scoutanalytics -track         # terminal 2: compute performance
+```
+
 ### What the tracker logs
 
 ```

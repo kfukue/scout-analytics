@@ -1384,6 +1384,7 @@ func main() {
 	exportPath := flag.String("export-dataset", "", "write the training dataset (one row per call: features + 1h/1d/3d/7d/30d outcomes) to this CSV file, then exit")
 	testNotify := flag.Bool("test-notify", false, "send one test message to SCOUT_NOTIFY_PEER and exit")
 	postFlag := flag.String("post", "", "process specific @scoutrobinhood post id(s), e.g. 10002 or 10002,10005: show what was found, investigate and deliver, then exit")
+	listenOnly := flag.Bool("listen-only", false, "listener without the performance tracker: new calls are still scanned, delivered and queued for tracking; run -track in another terminal to compute performance")
 	listChats := flag.Bool("list-chats", false, "print your groups/channels with their ids (for SCOUT_NOTIFY_PEER), then exit")
 	flag.Parse()
 
@@ -1600,7 +1601,11 @@ func main() {
 		err := run(ctx, s, func(ctx context.Context) error {
 			go s.worker(ctx)
 			go s.poll(ctx)
-			go s.trackLoop(ctx)
+			if *listenOnly {
+				log.Printf("listen-only: the performance tracker is not running in this process (new calls are still queued; run -track separately)")
+			} else {
+				go s.trackLoop(ctx)
+			}
 			var names []string
 			for _, t := range cfg.Tools {
 				g := ""
