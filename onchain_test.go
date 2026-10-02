@@ -314,6 +314,31 @@ func TestGetLogsChunkedAdapts(t *testing.T) {
 	if c := o.rpc.chunk.Load(); c > 5000 {
 		t.Fatalf("chunk not reduced: %d", c)
 	}
+	small := o.rpc.chunk.Load()
+	scan := func(n int) {
+		for i := 0; i < n; i++ {
+			if err := o.rpc.getLogsChunked(context.Background(), pool, []any{topicSwapV3}, 1, 60000, func(rpcLog) {}); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	// The size that just failed is not retried right away, however many quick answers follow …
+	scan(3)
+	if c := o.rpc.chunk.Load(); c != small {
+		t.Fatalf("chunk moved to %d while the failed size is still fresh", c)
+	}
+	// … but once that wait is over (and the node copes), the range grows back to the configured size.
+	old := chunkRetryAfter
+	chunkRetryAfter = 0
+	defer func() { chunkRetryAfter = old }()
+	o.rpc.ceilingEnd.Store(0)
+	f.mu.Lock()
+	f.maxRange = 0
+	f.mu.Unlock()
+	scan(40)
+	if c := o.rpc.chunk.Load(); c != 200000 {
+		t.Fatalf("chunk did not grow back: %d", c)
+	}
 }
 
 // v3 pool TOKEN/WETH where the token is token1, priced in USD via a Chainlink ETH feed.
