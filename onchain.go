@@ -41,6 +41,7 @@ import (
 type onchainConfig struct {
 	RPCURL          string
 	RPS             int
+	Parallel        int    // eth_getLogs chunks fetched at the same time within one scan
 	LogCache        int    // eth_getLogs results kept in memory, in logs (0 = off); repeat calls of a token reuse them
 	LogChunk        uint64 // max blocks per eth_getLogs (halved automatically when the node refuses)
 	MinLogChunk     uint64
@@ -73,6 +74,7 @@ func loadOnchainConfig() (onchainConfig, error) {
 		LogChunk:        200_000,
 		MinLogChunk:     200,
 		LogCache:        300_000,
+		Parallel:        4,
 		DiscoveryBlocks: 18_000,    // ≈ 30 min at ~10 blocks/s
 		PriceLookback:   8_640_000, // ≈ 10 days
 		PoolManagerV4:   strings.ToLower(env("SCOUT_V4_POOL_MANAGER", "0x8366a39cc670b4001a1121b8f6a443a643e40951")),
@@ -111,6 +113,13 @@ func loadOnchainConfig() (onchainConfig, error) {
 	}
 	if err := num("SCOUT_RPC_LOG_CHUNK", &oc.LogChunk); err != nil {
 		return oc, err
+	}
+	if v := env("SCOUT_RPC_PARALLEL", ""); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 || n > 64 {
+			return oc, fmt.Errorf("SCOUT_RPC_PARALLEL=%q: want a number from 1 to 64", v)
+		}
+		oc.Parallel = n
 	}
 	if v := env("SCOUT_RPC_LOG_CACHE", ""); v != "" {
 		n, err := strconv.Atoi(v)
@@ -290,6 +299,7 @@ type rpcClient struct {
 	requests atomic.Int64                // total JSON-RPC requests sent (for progress logs)
 	inflight atomic.Pointer[rpcInflight] // the request being waited on right now (for heartbeat logs)
 	head     atomic.Uint64               // newest block number seen (results near it are not cached)
+	parallel int                         // log chunks fetched at once per scan
 	logs     *logCache                   // finished eth_getLogs chunks (nil = off)
 
 	mu   sync.Mutex
@@ -364,6 +374,7 @@ func newRPCClient(oc onchainConfig) *rpcClient {
 		gap: time.Second / time.Duration(oc.RPS), minChunk: oc.MinLogChunk,
 		times: map[uint64]int64{}, meta: map[string]tokenMeta{}}
 	c.chunk.Store(oc.LogChunk)
+	c.parallel = oc.Parallel
 	if oc.LogCache > 0 {
 		c.logs = newLogCache(oc.LogCache)
 	}
@@ -487,64 +498,105 @@ func (c *rpcClient) getLogs(ctx context.Context, address string, topics []any, f
 func (c *rpcClient) getLogsChunked(ctx context.Context, address string, topics []any, from, to uint64, fn func(rpcLog)) error {
 	progress := progressFrom(ctx)
 	events := 0
+	type span struct{ from, to uint64 }
+	type result struct {
+		logs []rpcLog
+		err  error
+	}
+	par := c.parallel
+	if par < 1 {
+		par = 1
+	}
 	for cur := from; cur <= to; {
 		size := c.chunk.Load()
-		// Chunks end on multiples of the chunk size, so two scans of the same
-		// pool (repeat calls of a token) ask for identical ranges and the second
-		// one is answered from memory.
-		end := cur - cur%size + size - 1
-		if end > to || end < cur {
-			end = to
-		}
-		full := cur%size == 0 && end-cur+1 == size
-		key := ""
-		var logs []rpcLog
-		var err error
-		cached := false
-		if full && c.logs != nil {
-			key = logCacheKey(address, topics, cur, end)
-			logs, cached = c.logs.get(key)
-		}
-		if !cached {
-			logs, err = c.getLogs(ctx, address, topics, cur, end)
-		}
-		if err != nil {
-			var re *rpcError
-			if errors.As(err, &re) && size > c.minChunk {
-				half := size / 2
-				if half < c.minChunk {
-					half = c.minChunk
-				}
-				c.chunk.Store(half)
-				continue
+		// Plan the next few chunks. They end on multiples of the chunk size, so
+		// two scans of the same pool (repeat calls of a token) ask for identical
+		// ranges and the second one is answered from memory.
+		var spans []span
+		for b := cur; b <= to && len(spans) < par; {
+			end := b - b%size + size - 1
+			if end > to || end < b {
+				end = to
 			}
-			return fmt.Errorf("eth_getLogs %d-%d: %w", cur, end, err)
-		}
-		if !cached {
-			sort.SliceStable(logs, func(i, j int) bool {
-				if logs[i].block() != logs[j].block() {
-					return logs[i].block() < logs[j].block()
-				}
-				return logs[i].index() < logs[j].index()
-			})
-			// Only settled history is kept: a chunk that reaches the chain's tip may still grow.
-			if key != "" && end+1000 < c.head.Load() {
-				c.logs.put(key, logs)
+			spans = append(spans, span{b, end})
+			if end == to {
+				break
 			}
+			b = end + 1
 		}
-		for _, l := range logs {
-			fn(l)
+		// Fetch them at the same time; hand the logs to fn in block order.
+		bctx, cancel := context.WithCancel(ctx)
+		out := make([]chan result, len(spans))
+		for i, sp := range spans {
+			out[i] = make(chan result, 1)
+			go func(ch chan result, sp span) {
+				logs, err := c.fetchLogs(bctx, address, topics, sp.from, sp.to, size)
+				ch <- result{logs, err}
+			}(out[i], sp)
 		}
-		events += len(logs)
-		if progress != nil {
-			progress(from, end, to, events)
+		done := false
+		for i, sp := range spans {
+			r := <-out[i]
+			if r.err != nil {
+				cancel()
+				var re *rpcError
+				if errors.As(r.err, &re) && size > c.minChunk {
+					half := size / 2
+					if half < c.minChunk {
+						half = c.minChunk
+					}
+					c.chunk.CompareAndSwap(size, half) // another scan may have shrunk it already
+					cur = sp.from                      // again from here, with smaller chunks
+					break
+				}
+				return fmt.Errorf("eth_getLogs %d-%d: %w", sp.from, sp.to, r.err)
+			}
+			for _, l := range r.logs {
+				fn(l)
+			}
+			events += len(r.logs)
+			if progress != nil {
+				progress(from, sp.to, to, events)
+			}
+			if sp.to == to {
+				done = true
+				break
+			}
+			cur = sp.to + 1
 		}
-		if end == to {
+		cancel()
+		if done {
 			break
 		}
-		cur = end + 1
 	}
 	return nil
+}
+
+// fetchLogs returns one chunk's logs in block order, from memory when this
+// exact full chunk was fetched before.
+func (c *rpcClient) fetchLogs(ctx context.Context, address string, topics []any, from, to, size uint64) ([]rpcLog, error) {
+	key := ""
+	if c.logs != nil && from%size == 0 && to-from+1 == size {
+		key = logCacheKey(address, topics, from, to)
+		if logs, ok := c.logs.get(key); ok {
+			return logs, nil
+		}
+	}
+	logs, err := c.getLogs(ctx, address, topics, from, to)
+	if err != nil {
+		return nil, err
+	}
+	sort.SliceStable(logs, func(i, j int) bool {
+		if logs[i].block() != logs[j].block() {
+			return logs[i].block() < logs[j].block()
+		}
+		return logs[i].index() < logs[j].index()
+	})
+	// Only settled history is kept: a chunk that reaches the chain's tip may still grow.
+	if key != "" && to+1000 < c.head.Load() {
+		c.logs.put(key, logs)
+	}
+	return logs, nil
 }
 
 // Progress reporting for long log scans (a 30-day window is ~26M blocks).
