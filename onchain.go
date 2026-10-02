@@ -311,7 +311,14 @@ type rpcClient struct {
 	head     atomic.Uint64               // newest block number seen (results near it are not cached)
 	parallel int                         // log chunks fetched at once per scan
 	slots    chan struct{}               // bounds the requests in flight
-	logs     *logCache                   // finished eth_getLogs chunks (nil = off)
+
+	// The log range adapts both ways: it halves when the node refuses or times
+	// out, and grows back towards maxChunk after a run of quick answers.
+	maxChunk   uint64
+	okStreak   atomic.Int64
+	ceiling    atomic.Uint64 // a size that failed recently …
+	ceilingEnd atomic.Int64  // … and until when (unix seconds) not to try it again
+	logs       *logCache     // finished eth_getLogs chunks (nil = off)
 
 	mu   sync.Mutex
 	next time.Time
@@ -392,6 +399,7 @@ func newRPCClient(oc onchainConfig) *rpcClient {
 		gap: gap, minChunk: oc.MinLogChunk, slots: make(chan struct{}, oc.MaxInflight),
 		times: map[uint64]int64{}, meta: map[string]tokenMeta{}}
 	c.chunk.Store(oc.LogChunk)
+	c.maxChunk = oc.LogChunk
 	c.parallel = oc.Parallel
 	if oc.LogCache > 0 {
 		c.logs = newLogCache(oc.LogCache)
@@ -562,7 +570,8 @@ func (c *rpcClient) getLogsChunked(ctx context.Context, address string, topics [
 				ch <- result{logs, err}
 			}(out[i], sp)
 		}
-		done := false
+		batchStart := time.Now()
+		done, failed := false, false
 		for i, sp := range spans {
 			r := <-out[i]
 			if r.err != nil {
@@ -574,8 +583,14 @@ func (c *rpcClient) getLogsChunked(ctx context.Context, address string, topics [
 					if half < c.minChunk {
 						half = c.minChunk
 					}
-					c.chunk.CompareAndSwap(size, half) // another scan may have shrunk it already
-					cur = sp.from                      // again from here, with smaller chunks
+					if c.chunk.CompareAndSwap(size, half) { // false: another scan shrank it already
+						c.ceiling.Store(size)
+						c.ceilingEnd.Store(time.Now().Add(chunkRetryAfter).Unix())
+						c.okStreak.Store(0)
+						log.Printf("node could not answer eth_getLogs %d-%d (%d blocks): %v — using %d-block ranges for now",
+							sp.from, sp.to, sp.to-sp.from+1, r.err, half)
+					}
+					cur, failed = sp.from, true // again from here, with smaller chunks
 					break
 				}
 				return fmt.Errorf("eth_getLogs %d-%d: %w", sp.from, sp.to, r.err)
@@ -594,11 +609,44 @@ func (c *rpcClient) getLogsChunked(ctx context.Context, address string, topics [
 			cur = sp.to + 1
 		}
 		cancel()
+		if !failed {
+			c.maybeGrow(size, time.Since(batchStart))
+		}
 		if done {
 			break
 		}
 	}
 	return nil
+}
+
+// chunkRetryAfter: how long a range size that failed is left alone before it is tried again.
+var chunkRetryAfter = 10 * time.Minute
+
+// maybeGrow doubles the log range after a run of batches the node answered
+// quickly, so one refused or slow request does not leave every later scan
+// crawling in tiny steps.
+func (c *rpcClient) maybeGrow(size uint64, took time.Duration) {
+	if size >= c.maxChunk || c.chunk.Load() != size {
+		return
+	}
+	if took > 3*time.Second {
+		c.okStreak.Store(0)
+		return
+	}
+	if c.okStreak.Add(1) < 6 {
+		return
+	}
+	next := size * 2
+	if next > c.maxChunk {
+		next = c.maxChunk
+	}
+	if next >= c.ceiling.Load() && c.ceiling.Load() != 0 && time.Now().Unix() < c.ceilingEnd.Load() {
+		return // that size failed a moment ago
+	}
+	if c.chunk.CompareAndSwap(size, next) {
+		c.okStreak.Store(0)
+		log.Printf("node is answering quickly: eth_getLogs ranges back up to %d blocks", next)
+	}
 }
 
 // isTimeout: the request ran into the client's time limit (not a cancelled run).
