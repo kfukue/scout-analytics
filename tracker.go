@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"log"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gotd/td/tg"
@@ -24,7 +26,7 @@ func (s *scanner) trackLoop(ctx context.Context) {
 		return
 	}
 	if s.pc.Source == "onchain" {
-		log.Printf("performance tracking on: %s via %s", horizonNames(s.pc.Horizons), s.onchain.describe())
+		log.Printf("performance tracking on: %s via %s; %d call(s) at a time", horizonNames(s.pc.Horizons), s.onchain.describe(), max(s.pc.Workers, 1))
 	} else {
 		log.Printf("performance tracking on: %s via %s (network %q, %d req/min)",
 			horizonNames(s.pc.Horizons), s.pc.BaseURL, s.pc.Network, s.pc.RPM)
@@ -69,20 +71,43 @@ func (s *scanner) trackDue(ctx context.Context, limit int) int {
 	if len(rows) > 0 {
 		log.Printf("tracking: %d call(s) due now", len(rows))
 	}
-	n := 0
+	// On-chain tracking runs several calls at once (SCOUT_TRACK_WORKERS): the
+	// time goes into waiting for the node, and they share one rate limit. The
+	// GeckoTerminal source stays one at a time (its API allowance is small).
+	workers := 1
+	if s.pc.Source == "onchain" {
+		workers = s.pc.Workers
+	}
+	if workers < 1 {
+		workers = 1
+	}
+	var n atomic.Int64
+	var wg sync.WaitGroup
+	next := make(chan int)
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := range next {
+				pos := fmt.Sprintf(" [%d/%d]", i+1, len(rows))
+				if s.pc.Source == "onchain" {
+					s.trackOneOnchain(ctx, &rows[i], pos)
+				} else {
+					s.trackOne(ctx, &rows[i])
+				}
+				n.Add(1)
+			}
+		}()
+	}
 	for i := range rows {
 		if ctx.Err() != nil {
 			break
 		}
-		s.trackPos = fmt.Sprintf(" [%d/%d]", i+1, len(rows))
-		if s.pc.Source == "onchain" {
-			s.trackOneOnchain(ctx, &rows[i])
-		} else {
-			s.trackOne(ctx, &rows[i])
-		}
-		n++
+		next <- i
 	}
-	return n
+	close(next)
+	wg.Wait()
+	return int(n.Load())
 }
 
 // logTrackingStatus prints a one-line summary so it's clear the tracker is alive

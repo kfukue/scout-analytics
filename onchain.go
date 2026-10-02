@@ -41,6 +41,7 @@ import (
 type onchainConfig struct {
 	RPCURL          string
 	RPS             int
+	LogCache        int    // eth_getLogs results kept in memory, in logs (0 = off); repeat calls of a token reuse them
 	LogChunk        uint64 // max blocks per eth_getLogs (halved automatically when the node refuses)
 	MinLogChunk     uint64
 	DiscoveryBlocks uint64 // look this many blocks either side of the call for the token's transfers
@@ -71,6 +72,7 @@ func loadOnchainConfig() (onchainConfig, error) {
 		RPS:             50,
 		LogChunk:        200_000,
 		MinLogChunk:     200,
+		LogCache:        300_000,
 		DiscoveryBlocks: 18_000,    // ≈ 30 min at ~10 blocks/s
 		PriceLookback:   8_640_000, // ≈ 10 days
 		PoolManagerV4:   strings.ToLower(env("SCOUT_V4_POOL_MANAGER", "0x8366a39cc670b4001a1121b8f6a443a643e40951")),
@@ -109,6 +111,13 @@ func loadOnchainConfig() (onchainConfig, error) {
 	}
 	if err := num("SCOUT_RPC_LOG_CHUNK", &oc.LogChunk); err != nil {
 		return oc, err
+	}
+	if v := env("SCOUT_RPC_LOG_CACHE", ""); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 0 {
+			return oc, fmt.Errorf("SCOUT_RPC_LOG_CACHE=%q: want a number >= 0 (0 = off)", v)
+		}
+		oc.LogCache = n
 	}
 	if err := num("SCOUT_DISCOVERY_BLOCKS", &oc.DiscoveryBlocks); err != nil {
 		return oc, err
@@ -280,6 +289,8 @@ type rpcClient struct {
 	id       atomic.Int64
 	requests atomic.Int64                // total JSON-RPC requests sent (for progress logs)
 	inflight atomic.Pointer[rpcInflight] // the request being waited on right now (for heartbeat logs)
+	head     atomic.Uint64               // newest block number seen (results near it are not cached)
+	logs     *logCache                   // finished eth_getLogs chunks (nil = off)
 
 	mu   sync.Mutex
 	next time.Time
@@ -353,6 +364,9 @@ func newRPCClient(oc onchainConfig) *rpcClient {
 		gap: time.Second / time.Duration(oc.RPS), minChunk: oc.MinLogChunk,
 		times: map[uint64]int64{}, meta: map[string]tokenMeta{}}
 	c.chunk.Store(oc.LogChunk)
+	if oc.LogCache > 0 {
+		c.logs = newLogCache(oc.LogCache)
+	}
 	return c
 }
 
@@ -381,6 +395,9 @@ func (c *rpcClient) call(ctx context.Context, out any, method string, params ...
 			return err
 		}
 		c.requests.Add(1)
+		if n := reqCounterFrom(ctx); n != nil {
+			n.Add(1)
+		}
 		f := &rpcInflight{what: what, since: since, attempt: attempt + 1}
 		if lastErr != nil {
 			f.lastErr = lastErr.Error()
@@ -436,7 +453,11 @@ func (c *rpcClient) blockNumber(ctx context.Context) (uint64, error) {
 	if err := c.call(ctx, &s, "eth_blockNumber"); err != nil {
 		return 0, err
 	}
-	return strconv.ParseUint(strings.TrimPrefix(s, "0x"), 16, 64)
+	n, err := strconv.ParseUint(strings.TrimPrefix(s, "0x"), 16, 64)
+	if err == nil && n > c.head.Load() {
+		c.head.Store(n)
+	}
+	return n, err
 }
 
 // ethCall runs a read-only call at a block (0 = latest). An empty result or a
@@ -468,11 +489,25 @@ func (c *rpcClient) getLogsChunked(ctx context.Context, address string, topics [
 	events := 0
 	for cur := from; cur <= to; {
 		size := c.chunk.Load()
-		end := cur + size - 1
+		// Chunks end on multiples of the chunk size, so two scans of the same
+		// pool (repeat calls of a token) ask for identical ranges and the second
+		// one is answered from memory.
+		end := cur - cur%size + size - 1
 		if end > to || end < cur {
 			end = to
 		}
-		logs, err := c.getLogs(ctx, address, topics, cur, end)
+		full := cur%size == 0 && end-cur+1 == size
+		key := ""
+		var logs []rpcLog
+		var err error
+		cached := false
+		if full && c.logs != nil {
+			key = logCacheKey(address, topics, cur, end)
+			logs, cached = c.logs.get(key)
+		}
+		if !cached {
+			logs, err = c.getLogs(ctx, address, topics, cur, end)
+		}
 		if err != nil {
 			var re *rpcError
 			if errors.As(err, &re) && size > c.minChunk {
@@ -485,12 +520,18 @@ func (c *rpcClient) getLogsChunked(ctx context.Context, address string, topics [
 			}
 			return fmt.Errorf("eth_getLogs %d-%d: %w", cur, end, err)
 		}
-		sort.SliceStable(logs, func(i, j int) bool {
-			if logs[i].block() != logs[j].block() {
-				return logs[i].block() < logs[j].block()
+		if !cached {
+			sort.SliceStable(logs, func(i, j int) bool {
+				if logs[i].block() != logs[j].block() {
+					return logs[i].block() < logs[j].block()
+				}
+				return logs[i].index() < logs[j].index()
+			})
+			// Only settled history is kept: a chunk that reaches the chain's tip may still grow.
+			if key != "" && end+1000 < c.head.Load() {
+				c.logs.put(key, logs)
 			}
-			return logs[i].index() < logs[j].index()
-		})
+		}
 		for _, l := range logs {
 			fn(l)
 		}

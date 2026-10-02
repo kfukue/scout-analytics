@@ -351,10 +351,9 @@ type scanner struct {
 
 	listOnly bool // -list-chats: don't resolve the delivery target
 
-	pc       priceConfig
-	gecko    *geckoClient
-	onchain  *onchainSource
-	trackPos string // " [3/50]" position of the call being tracked (for logs)
+	pc      priceConfig
+	gecko   *geckoClient
+	onchain *onchainSource
 
 	postMu      sync.Mutex
 	handled     map[string]bool // "msgID|ca" (and "msgID" for CA-less posts) already processed

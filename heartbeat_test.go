@@ -37,13 +37,14 @@ func TestHeartbeatNamesTheSlowRequest(t *testing.T) {
 
 	rpc := newRPCClient(onchainConfig{RPCURL: srv.URL, RPS: 100000})
 	s := &scanner{onchain: &onchainSource{rpc: rpc}}
-	stop := s.heartbeat(context.Background(), "call 7 [1/1]", time.Now(), 0)
-	if _, err := rpc.getLogs(context.Background(), "0x00000000000000000000000000000000000000aa", nil, 100, 299); err != nil {
+	hctx, reqs := withReqCounter(context.Background())
+	stop := s.heartbeat(hctx, "call 7 [1/1]", time.Now(), reqs)
+	if _, err := rpc.getLogs(hctx, "0x00000000000000000000000000000000000000aa", nil, 100, 299); err != nil {
 		t.Fatal(err)
 	}
 	stop()
 	out := buf.String()
-	for _, want := range []string{"call 7 [1/1]: still working", "1 RPC requests so far", "waiting on Robinhood node: eth_getLogs blocks 100-299 (200 blocks)"} {
+	for _, want := range []string{"call 7 [1/1]: still working", "1 RPC requests so far", "Robinhood node busy with: eth_getLogs blocks 100-299 (200 blocks)"} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("missing %q in:\n%s", want, out)
 		}

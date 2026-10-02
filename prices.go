@@ -41,6 +41,7 @@ type priceConfig struct {
 	RugLiqUSD float64 // pool liquidity below this (now) → rugged
 	Enabled   bool
 	Interval  time.Duration // tracker loop interval
+	Workers   int           // calls tracked at the same time (on-chain source)
 }
 
 type horizon struct {
@@ -74,6 +75,7 @@ func loadPriceConfig() (priceConfig, error) {
 		RugLiqUSD: 500,
 		Enabled:   envBool("SCOUT_TRACK_PERFORMANCE", true),
 		Interval:  envDur("SCOUT_TRACK_INTERVAL", time.Minute),
+		Workers:   4,
 	}
 	if v := env("SCOUT_PRICE_RPM", ""); v != "" {
 		n, err := strconv.Atoi(v)
@@ -81,6 +83,13 @@ func loadPriceConfig() (priceConfig, error) {
 			return pc, fmt.Errorf("SCOUT_PRICE_RPM=%q: want a number >= 1", v)
 		}
 		pc.RPM = n
+	}
+	if v := env("SCOUT_TRACK_WORKERS", ""); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 || n > 64 {
+			return pc, fmt.Errorf("SCOUT_TRACK_WORKERS=%q: want a number from 1 to 64", v)
+		}
+		pc.Workers = n
 	}
 	if v := env("SCOUT_RUG_LIQ_USD", ""); v != "" {
 		f, err := strconv.ParseFloat(v, 64)

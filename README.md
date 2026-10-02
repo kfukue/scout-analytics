@@ -185,6 +185,8 @@ Only use the feature columns as model inputs; everything about the future is an 
 | `SCOUT_DISCOVERY_BLOCKS` | `18000` | ± blocks around the call searched for the token's transfers (widened automatically) |
 | `SCOUT_RUG_LIQ_USD` | `500` | liquidity below this = rugged |
 | `SCOUT_TRACK_INTERVAL` | `1m` | how often due checks are processed |
+| `SCOUT_TRACK_WORKERS` | `4` | calls tracked at the same time (on-chain source). Raise it while the node keeps up; all workers share `SCOUT_RPC_RPS` |
+| `SCOUT_RPC_LOG_CACHE` | `300000` | swap logs kept in memory so repeat calls of a token are not scanned twice (`0` = off) |
 
 Other commands: `-track` (tracker only, forever, no Telegram), `-track-once` (process what's due and exit).
 

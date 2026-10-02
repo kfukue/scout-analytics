@@ -7,13 +7,14 @@ import (
 	"fmt"
 	"log"
 	"math"
+	"sync/atomic"
 	"time"
 )
 
 // trackOneOnchain updates one call from on-chain data. Work is incremental:
 // swaps are scanned once, from the entry block up to each horizon's block, and
 // the running last/max/min price is kept in scout_call_tracking.onchain.
-func (s *scanner) trackOneOnchain(ctx context.Context, t *ScoutCallTracking) {
+func (s *scanner) trackOneOnchain(ctx context.Context, t *ScoutCallTracking, pos string) {
 	now := time.Now().UTC()
 	prev := *t // restored if the run is interrupted
 	t.Attempts++
@@ -21,13 +22,13 @@ func (s *scanner) trackOneOnchain(ctx context.Context, t *ScoutCallTracking) {
 	t.Error = nil
 	deadline := t.EntryAt.Add(s.pc.maxHorizon() + 48*time.Hour)
 	o := s.onchain
-	tag := fmt.Sprintf("call %d%s", t.CallID, s.trackPos)
-	reqStart := o.rpc.requests.Load()
+	tag := fmt.Sprintf("call %d%s", t.CallID, pos)
+	ctx, reqs := withReqCounter(ctx) // this call's own requests (other workers share the client)
 	ctx = withScanProgress(ctx, tag, 5*time.Second)
 	log.Printf("%s: %s, posted %s (%s ago), status %s",
 		tag, t.ContractAddress, t.EntryAt.UTC().Format("2006-01-02 15:04"), time.Since(t.EntryAt).Round(time.Minute), t.Status)
 	interrupted := false
-	stopBeat := s.heartbeat(ctx, tag, now, reqStart)
+	stopBeat := s.heartbeat(ctx, tag, now, reqs)
 	defer stopBeat()
 
 	var st *onchainState
@@ -64,7 +65,7 @@ func (s *scanner) trackOneOnchain(ctx context.Context, t *ScoutCallTracking) {
 				next = "next check " + t.NextCheckAt.Local().Format("2006-01-02 15:04")
 			}
 			log.Printf("%s: %s in %s, %d RPC requests — %s", tag, t.Status, time.Since(now).Round(100*time.Millisecond),
-				o.rpc.requests.Load()-reqStart, next)
+				reqs.Load(), next)
 		}
 		if st != nil {
 			t.Onchain, _ = json.Marshal(st)
@@ -324,7 +325,7 @@ var heartbeatEvery = 10 * time.Second
 // heartbeat logs, every heartbeatEvery, that the call is still being worked on
 // and which node request it is waiting for — so a slow node is visible instead
 // of looking like a hang. The returned func stops it.
-func (s *scanner) heartbeat(ctx context.Context, tag string, start time.Time, reqStart int64) func() {
+func (s *scanner) heartbeat(ctx context.Context, tag string, start time.Time, reqs *atomic.Int64) func() {
 	o := s.onchain
 	done := make(chan struct{})
 	go func() {
@@ -339,12 +340,12 @@ func (s *scanner) heartbeat(ctx context.Context, tag string, start time.Time, re
 			case <-t.C:
 				waiting := "between requests"
 				if w := o.rpc.waitingOn(); w != "" {
-					waiting = "waiting on Robinhood node: " + w
+					waiting = "Robinhood node busy with: " + w
 				} else if w := o.mainnet.waitingOn(); w != "" {
-					waiting = "waiting on Ethereum node: " + w
+					waiting = "Ethereum node busy with: " + w
 				}
 				log.Printf("%s: still working — %s elapsed, %d RPC requests so far; %s",
-					tag, time.Since(start).Round(time.Second), o.rpc.requests.Load()-reqStart, waiting)
+					tag, time.Since(start).Round(time.Second), reqs.Load(), waiting)
 			}
 		}
 	}()
