@@ -1,0 +1,11 @@
+pandas>=2.0
+numpy>=1.24
+scikit-learn>=1.4
+lightgbm>=4.0
+joblib>=1.3
+fastapi>=0.110
+uvicorn>=0.27
+pytest>=8.0
+httpx>=0.27          # needed by fastapi.testclient (tests only)
+# optional, only for `train.py --dsn postgres://...`:
+# psycopg[binary]>=3.1
