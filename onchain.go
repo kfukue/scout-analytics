@@ -312,6 +312,9 @@ type rpcClient struct {
 	parallel int                         // log chunks fetched at once per scan
 	slots    chan struct{}               // bounds the requests in flight
 
+	sfMu sync.Mutex
+	sf   map[string]*logFlight // identical eth_getLogs requests in flight: asked once, shared
+
 	// The log range adapts both ways: it halves when the node refuses or times
 	// out, and grows back towards maxChunk after a run of quick answers.
 	maxChunk   uint64
@@ -344,6 +347,15 @@ type rpcInflight struct {
 	since   time.Time
 	attempt int
 	lastErr string
+	url     string // which node
+}
+
+func (f *rpcInflight) String() string {
+	s := fmt.Sprintf("%s for %s", f.what, time.Since(f.since).Round(time.Second))
+	if f.attempt > 1 {
+		s += fmt.Sprintf(" (attempt %d, last error: %s)", f.attempt, f.lastErr)
+	}
+	return s
 }
 
 // waitingOn says what the client is waiting for right now ("" when idle).
@@ -430,6 +442,10 @@ func (c *rpcClient) call(ctx context.Context, out any, method string, params ...
 	var lastErr error
 	what, since := describeRPC(method, params), time.Now()
 	defer c.inflight.Store(nil)
+	slot := inflightSlotFrom(ctx) // this call's own "waiting on" marker (several calls share the client)
+	if slot != nil {
+		defer slot.Store(nil)
+	}
 	for attempt := 0; attempt < 4; attempt++ {
 		if err := c.wait(ctx); err != nil {
 			return err
@@ -442,7 +458,11 @@ func (c *rpcClient) call(ctx context.Context, out any, method string, params ...
 		if lastErr != nil {
 			f.lastErr = lastErr.Error()
 		}
+		f.url = c.url
 		c.inflight.Store(f)
+		if slot != nil {
+			slot.Store(f)
+		}
 		req, _ := http.NewRequestWithContext(ctx, http.MethodPost, c.url, bytes.NewReader(body))
 		req.Header.Set("Content-Type", "application/json")
 		select {
@@ -665,21 +685,62 @@ func (c *rpcClient) fetchLogs(ctx context.Context, address string, topics []any,
 			return logs, nil
 		}
 	}
-	logs, err := c.getLogs(ctx, address, topics, from, to)
-	if err != nil {
-		return nil, err
-	}
-	sort.SliceStable(logs, func(i, j int) bool {
-		if logs[i].block() != logs[j].block() {
-			return logs[i].block() < logs[j].block()
+	// Several workers often want the very same range at the same moment (repeat
+	// calls of one token sit next to each other in the queue): ask the node once.
+	fkey := logCacheKey(address, topics, from, to)
+	for {
+		c.sfMu.Lock()
+		if c.sf == nil {
+			c.sf = map[string]*logFlight{}
 		}
-		return logs[i].index() < logs[j].index()
-	})
-	// Only settled history is kept: a chunk that reaches the chain's tip may still grow.
-	if key != "" && to+1000 < c.head.Load() {
-		c.logs.put(key, logs)
+		fl, waiting := c.sf[fkey]
+		if !waiting {
+			fl = &logFlight{done: make(chan struct{})}
+			c.sf[fkey] = fl
+		}
+		c.sfMu.Unlock()
+		if waiting {
+			select {
+			case <-fl.done:
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+			if fl.err != nil && isCanceled(fl.err) && ctx.Err() == nil {
+				continue // the asker was interrupted, we were not: ask ourselves
+			}
+			return fl.logs, fl.err
+		}
+		logs, err := c.getLogs(ctx, address, topics, from, to)
+		if err == nil {
+			sort.SliceStable(logs, func(i, j int) bool {
+				if logs[i].block() != logs[j].block() {
+					return logs[i].block() < logs[j].block()
+				}
+				return logs[i].index() < logs[j].index()
+			})
+			// Only settled history is kept: a chunk that reaches the chain's tip may still grow.
+			if key != "" && to+1000 < c.head.Load() {
+				c.logs.put(key, logs)
+			}
+		}
+		fl.logs, fl.err = logs, err
+		c.sfMu.Lock()
+		delete(c.sf, fkey)
+		c.sfMu.Unlock()
+		close(fl.done)
+		return logs, err
 	}
-	return logs, nil
+}
+
+// logFlight is one eth_getLogs request that other scans are waiting on too.
+type logFlight struct {
+	done chan struct{}
+	logs []rpcLog
+	err  error
+}
+
+func isCanceled(err error) bool {
+	return errors.Is(err, context.Canceled)
 }
 
 // Progress reporting for long log scans (a 30-day window is ~26M blocks).

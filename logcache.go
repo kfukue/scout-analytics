@@ -85,3 +85,16 @@ func reqCounterFrom(ctx context.Context) *atomic.Int64 {
 	n, _ := ctx.Value(reqCounterKey{}).(*atomic.Int64)
 	return n
 }
+
+// Per-call "waiting on" marker, for the heartbeat line of that call.
+type inflightSlotKey struct{}
+
+func withInflightSlot(ctx context.Context) (context.Context, *atomic.Pointer[rpcInflight]) {
+	p := &atomic.Pointer[rpcInflight]{}
+	return context.WithValue(ctx, inflightSlotKey{}, p), p
+}
+
+func inflightSlotFrom(ctx context.Context) *atomic.Pointer[rpcInflight] {
+	p, _ := ctx.Value(inflightSlotKey{}).(*atomic.Pointer[rpcInflight])
+	return p
+}
