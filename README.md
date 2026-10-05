@@ -250,6 +250,10 @@ Only use the feature columns as model inputs; everything about the future is an 
 | `SCOUT_RPC_PARALLEL` | `8` | block ranges of one scan fetched from the node at the same time |
 | `SCOUT_RPC_MAX_INFLIGHT` | `64` | most requests in flight to the node at once (workers × ranges, capped here) |
 | `SCOUT_RPC_LOG_CACHE` | `300000` | swap logs kept in memory so repeat calls of a token are not scanned twice (`0` = off) |
+| `SCOUT_LATEST_REFRESH` | `on` | `off` = no latest-price pass (see below) |
+| `SCOUT_LATEST_REFRESH_RECENT` | `15m` | how often the latest price of a call younger than 30 days is read again (at least `1m`) |
+| `SCOUT_LATEST_REFRESH_OLD` | `24h` | the same for calls 30 days or older (at least `10m`) |
+| `SCOUT_LATEST_BATCH` | `200` | latest prices read per tracker cycle at most (1 – 10000) |
 
 Other commands: `-track` (tracker only, forever, no Telegram), `-track-once` (process what's due and exit).
 
@@ -301,6 +305,72 @@ Scores never filter deliveries. If the service is down or slower than
 `SCOUT_MODEL_TIMEOUT` (default `5s`), the call is delivered without the line.
 `scout_call_predictions_v` shows each score next to the real outcome.
 
+### Latest price (the return as of now)
+
+The horizon numbers stop at 30 days. So that an older call still shows where it stands
+today, the tracker also keeps a **latest price** for the first call of every tracked token
+(on-chain price source only; status `tracking` or `done`, with a pool and an entry price —
+never `repeat`, `pending`, `no_pool`, `error` or `gave_up`):
+
+| `scout_call_tracking` column | |
+|---|---|
+| `latest_price_usd` | the price, in the call's `price_unit` (like `entry_price_usd`) |
+| `latest_return_pct` | that price against `entry_late_price_usd` (against `entry_price_usd` when the late entry is missing) |
+| `latest_checked_at` | when the price was read; the price is "as of" this time |
+| `latest_trade_at` | time of the last trade the price comes from; for a dead token this can be weeks before `latest_checked_at` |
+
+All four are NULL until the first refresh. `scout_call_dataset_v` has `latest_price_usd`,
+`latest_return_pct` and `latest_checked_at` as its last three columns. They are **outcomes
+that keep moving**: never model inputs (`ml/` refuses every `latest_*` column as a feature).
+
+**What it reads.** A pool's price only changes with a trade, so the latest price is the
+price of the last swap at or before the newest block. A refresh reads the pool's swap logs
+from where the previous refresh stopped (the first time: from where the horizon scan stands)
+up to the newest block and keeps the last one; with no new swap the price stays what it was.
+For a USD-priced call it is multiplied by the quote asset's USD price at the start of the
+current hour — one lookup per hour for all calls together, so the USD value moves with ETH at
+most once an hour. Calls in another asset keep quote units (and are not shown on the website).
+
+**It does not touch horizon tracking.** The pass has its own cursor in the stored on-chain
+state (`latest_block`, `latest_price_q`, `latest_trade_block`) and writes only that and the
+four columns: the horizon scan position, running peak/low, results, candles, `status`,
+`next_check_at`, `attempts` and `updated_at` stay as they are, and no call is tracked again
+because of it.
+
+**Schedule.** A call is due when it has no latest price yet, or the last one is older than
+`SCOUT_LATEST_REFRESH_RECENT` (15 minutes; calls younger than 30 days) or
+`SCOUT_LATEST_REFRESH_OLD` (a day; calls 30 days or older). The pass runs in every tracker
+cycle **after** the horizon checks, through the same workers (`SCOUT_TRACK_WORKERS`), and
+takes at most `SCOUT_LATEST_BATCH` calls: those younger than 30 days first, then the ones
+not refreshed for the longest. Horizon work always goes first:
+
+- when the horizon batch of a cycle was full (more of it is waiting), only calls younger
+  than 30 days are refreshed in that cycle;
+- a pass that runs longer than `SCOUT_TRACK_INTERVAL` hands out no further calls; the rest
+  stays due and follows after the next horizon check;
+- `-track-once` runs one pass after the horizon checks.
+
+A call whose refresh fails (node error, no USD price for its quote asset) is left as it was
+and tried again after 30 minutes. Ctrl+C in the middle leaves the calls it was working on
+untouched. `SCOUT_LATEST_REFRESH=off` turns the whole pass off; the columns then keep their
+last values.
+
+**It adds node work.** Per call, in `eth_getLogs` requests (at the default
+`SCOUT_RPC_LOG_CHUNK=200000`, about 10 blocks per second, measured on the test chain):
+
+| | first refresh | every refresh after |
+|---|---|---|
+| a call past its 30-day horizon (e.g. 60 days old) | everything since the 30-day mark: about 130 for a 60-day-old call (26 million blocks), 4 – 5 more per further day of age | 5 – 6 (one day of blocks), once a day |
+| a call still being tracked (e.g. 2 days old) | from its last finished horizon to now: 5 – 6 for a 2-day-old call, up to about 100 for one just short of 30 days | 1 (15 minutes of blocks; 2 when the range crosses a chunk boundary), every 15 minutes |
+
+plus one `eth_blockNumber` per pass, one `eth_getBlockByNumber` per call whose last trade
+changed, and one USD lookup per quote asset and hour. So the **first passes after an
+upgrade are the expensive part**: 5,000 tokens that are 60 days old need about 650,000
+`eth_getLogs` requests in total (more when they are older), spread over at least 25 cycles
+of 200 calls (lower `SCOUT_LATEST_BATCH` to spread it further, or set `SCOUT_RPC_RPS`).
+After that a day costs about 5 requests per old token and about 100 per token younger than
+30 days.
+
 ### What the tracker logs
 
 ```
@@ -315,7 +385,12 @@ call 10126 [1/37]: scanning blocks 21726610 → 22164412: 46% (at 21926609, 12 e
 call 10126 [1/37]: tracking in 14s, 212 RPC requests — next check 2026-10-01 14:12
 tracking: processed 37 call(s) — pending 112, tracking 37, done 4, repeat 3120; more due now
 tracking: idle — tracking 149, done 4, repeat 3120; next check in 42m10s
+latest prices: 180 refreshed (12 changed) in 4.2s, 1,930 RPC requests, 5,430 waiting
 ```
+The `latest prices:` line is printed once per pass that had something to do: `changed` =
+calls with a trade since their price before, `waiting` = calls still due. Failed calls are
+counted on the same line with the first error (`; 3 failed, tried again after 30m0s (first:
+call 812: …)`), not one line each. A pass that takes long says every 30 seconds how far it is.
 `repeat` = later calls of a token already called, which are not tracked (see above); tracking
 rows of update posts stored by an earlier version are in this number too. The `posts:` line
 appears only when rows without a `post_kind` were classified (once, after upgrading).
@@ -497,7 +572,7 @@ scout_calls ──< scout_investigations >── scout_investigation_tools
 | `scout_call_metrics` | call (1:1) | MCap, Liq, Liq %, Tax buy/sell, Age, launchpad, Holders, Proof elite/good, live-buy counts and $ per tier, `parsed` (JSONB) |
 | `scout_call_live_buys` | live-buy line of a call | `call_id`, `position`, `tier` (elite/good), `amount_usd`, `wallet_display` |
 | `scout_calls_v` (view) | call + its parsed data | for ad-hoc queries |
-| `scout_call_tracking` | call (1:1) | pool, entry price (+ source), status, next check, current liquidity, `rugged` |
+| `scout_call_tracking` | call (1:1) | pool, entry price (+ source), status, next check, current liquidity, `rugged`; `latest_price_usd`, `latest_return_pct`, `latest_checked_at`, `latest_trade_at` (the latest-price pass) |
 | `scout_call_returns` | call × horizon | `horizon`, `price_usd`, `return_pct`, `max_gain_pct`, `max_drawdown_pct`, `last_trade_at` |
 | `scout_call_dataset_v` (view) | call | features + pivoted outcomes; what `-export-dataset` writes |
 | `scout_calls` | CA found in a @scoutrobinhood post | `message_id`, `message_date`, `message_text`, `urls`, `contract_address`, `chain`, `status` (`queued` → `scanned`/`failed`, or `duplicate`/`dropped`; `backfill` = imported from history; `update` = an update post, recorded only), `post_kind` (`call` / `update`; NULL = stored before the column existed, not classified yet) |
@@ -671,7 +746,14 @@ other sites):
   verdict could not be read counts as not scanned.
 - Every number is **in USD and measured from the entry 60 seconds after the post** (the
   `*_late_*` columns). A call tracked in another asset (no USD source for its pair) shows
-  "no USD price" instead of numbers. Sorting by Return or Peak lists the USD-priced calls only.
+  "no USD price" instead of numbers. Sorting by Return, Peak or Latest lists the USD-priced calls only.
+- **Latest %** (the column after "Worst drop %") is the return at the most recent price,
+  from the same entry, followed by how old the call was when that price was read:
+  `+35.2% · 60d` (`45m` under an hour, `30h` under two days, otherwise days). It comes from
+  the tracker's latest-price pass (about every 15 minutes for calls under 30 days old, once
+  a day for older ones) and does not change with the 1h … 30d buttons. `· quiet` is added
+  when the last trade is more than 7 days older than the reading (the price is then that of
+  an old trade); the tooltip gives both times. A dash means no latest price has been read yet.
 
 **Token names.** The tracker reads each token's own `name()` and `symbol()` from its contract
 and stores them in `scout_call_tracking.token_name` / `token_symbol_onchain` (on-chain price
@@ -717,10 +799,10 @@ returned and cannot be found by its own name or symbol:
 | Parameter | Values | Default | |
 |---|---|---|---|
 | `q` | text, up to 100 characters | *(none)* | part of the token name, symbol or contract address; case-insensitive (letters of any script, by the Unicode lower-case rule); `%` and `_` are ordinary characters |
-| `sort` | `date`, `return`, `peak` | `date` | empty values always come last; ties by call id |
+| `sort` | `date`, `return`, `peak`, `latest` | `date` | empty values always come last; ties by call id. `latest` = by `latest_return_pct` (the same for every `horizon`) |
 | `dir` | `desc`, `asc` | `desc` | |
 | `horizon` | `1h`, `1d`, `3d`, `7d`, `30d` | `1d` | which window `return_pct` / `peak_pct` / `drawdown_pct` are for |
-| `usd_only` | `1`, `0` | `1` when `sort` is `return` or `peak`, else `0` | `1` = only tokens whose first call has `price_unit = usd` |
+| `usd_only` | `1`, `0` | `1` when `sort` is `return`, `peak` or `latest`, else `0` | `1` = only tokens whose first call has `price_unit = usd` |
 | `verdict` | `clean`, `caution`, `red_flags`, `not_scanned` | *(none = all)* | the token's Perceptor verdict (see below). `clean` = no red flags found; `not_scanned` = no completed Perceptor report, or one whose verdict is `unknown` |
 | `page` | 1 … | `1` | |
 | `per` | 1 – 200 | `50` | |
@@ -737,7 +819,10 @@ Any other value or parameter → HTTP 400 with `{"error": "…"}`.
    "entry_price_usd": 0.0045, "return_pct": -20.0, "peak_pct": 100.0, "drawdown_pct": -50.0,
    "rugged": false, "tracking_status": "done", "perceptor_verdict": "clean",
    "perceptor_url": "https://www.perceptor.info/r/deb9d3118ec1480e985032f9472c87c0",
-   "call_count": 3, "last_call_date": "2026-10-02T09:12:00Z"}]}
+   "call_count": 3, "last_call_date": "2026-10-02T09:12:00Z",
+   "latest_return_pct": 35.2, "latest_price_usd": 0.006084,
+   "latest_at": "2026-11-30T14:31:10.52Z", "latest_trade_at": "2026-11-30T13:02:44Z",
+   "latest_age_seconds": 5184070}]}
 ```
 `call_count` = how many real calls of that token exist in total (1 or more; update posts are
 not counted); `last_call_date` = the date of the most recent one (equal to `message_date` when there is only one). Everything else
@@ -745,6 +830,16 @@ in the object belongs to the first call.
 `entry_price_usd` is the price 60 seconds after the post (the price at the post when that one
 is missing). `entry_price_usd`, `return_pct`, `peak_pct` and `drawdown_pct` are `null` unless
 `price_unit` is `usd`. `gmgn_url` is `null` for anything that is not a plain `0x…` address.
+
+`latest_return_pct` and `latest_price_usd` are the return (from the same entry) and the price
+as of the tracker's most recent reading, `latest_at` when it was read
+(`scout_call_tracking.latest_checked_at`), `latest_trade_at` the time of the trade that price
+comes from (`null` when unknown) and `latest_age_seconds` = `latest_at − message_date`: how
+old the call was at that moment. They do not depend on `horizon`. All five are `null` until
+the tracker has read a latest price for the call, and always for calls whose `price_unit` is
+not `usd`. A new reading changes the `ETag` of `/api/calls` (the age moves even when the
+price does not), so with the tracker running the list is "modified" about once per tracker
+cycle; `/api/summary` is not affected.
 
 `snapshot_at` = when the website last read the database (the same moment as `updated_at` of
 `/api/summary`). `verdict` in the response repeats the filter that was applied (`""` when none).

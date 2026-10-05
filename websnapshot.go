@@ -40,12 +40,14 @@ var webVerdictBuckets = map[string]uint8{
 	"not_scanned": webBucketNotScanned,
 }
 
-// Sort keys: 0 = date, then return and peak of each window.
+// Sort keys: 0 = date, then return and peak of each window, then the return
+// as of the latest price.
 const (
 	webSortKeyDate   = 0
 	webSortKeyReturn = 1
 	webSortKeyPeak   = 1 + len(ScoutWebHorizons)
-	webSortKeys      = 1 + 2*len(ScoutWebHorizons)
+	webSortKeyLatest = 1 + 2*len(ScoutWebHorizons)
+	webSortKeys      = 2 + 2*len(ScoutWebHorizons)
 )
 
 // Positions of a window's three numbers in ScoutWebRow.Perf.
@@ -130,7 +132,14 @@ func finite(p *float64) *float64 {
 // webCall is the row as sent to the page, without the numbers of a window
 // (those are added per request, see appendRow).
 func (c webConfig) webCall(r *ScoutWebRow) ScoutWebCall {
+	var latestAge *int64
+	if r.LatestAt != nil {
+		age := int64(r.LatestAt.Sub(r.MessageDate) / time.Second)
+		latestAge = &age
+	}
 	return ScoutWebCall{
+		LatestReturnPct: r.LatestReturn, LatestPriceUSD: r.LatestPrice,
+		LatestAt: r.LatestAt, LatestTradeAt: r.LatestTradeAt, LatestAgeSeconds: latestAge,
 		CallID: r.CallID, MessageID: r.MessageID, MessageDate: r.MessageDate,
 		PostURL:         postURL(r.ChannelUsername, r.MessageID),
 		ContractAddress: r.ContractAddress, TokenName: r.TokenName, TokenSymbol: r.TokenSymbol,
@@ -193,6 +202,19 @@ func newWebSnapshot(rows []ScoutWebRow, updatePosts int, prev *webSnapshot, cfg 
 			r.EntryPrice, r.HasPerf = nil, 0
 		}
 		r.EntryPrice = finite(r.EntryPrice)
+		// The latest price follows the same rule; without the time it was read
+		// (or a number JSON can carry) there is none.
+		r.LatestReturn, r.LatestPrice = finite(r.LatestReturn), finite(r.LatestPrice)
+		if !r.usd || r.LatestAt == nil || r.LatestReturn == nil {
+			r.LatestReturn, r.LatestPrice, r.LatestAt, r.LatestTradeAt = nil, nil, nil, nil
+		}
+		// in UTC like the other times, in place (the rows are ours to change)
+		if r.LatestAt != nil {
+			*r.LatestAt = r.LatestAt.UTC()
+		}
+		if r.LatestTradeAt != nil {
+			*r.LatestTradeAt = r.LatestTradeAt.UTC()
+		}
 		for j := range r.Perf {
 			if r.HasPerf&(1<<j) == 0 {
 				r.Perf[j] = 0
@@ -228,7 +250,7 @@ func newWebSnapshot(rows []ScoutWebRow, updatePosts int, prev *webSnapshot, cfg 
 	s.rowAt = make([]uint32, n+1)
 	s.rowCut = make([]uint32, n)
 	s.searchAt = make([]uint32, n+1)
-	s.rowJSON = make([]byte, 0, n*560)
+	s.rowJSON = make([]byte, 0, n*720)
 	s.search = make([]byte, 0, n*72)
 	var one bytes.Buffer // one encoded row
 	enc := json.NewEncoder(&one)
@@ -314,6 +336,22 @@ func hashWebRows(rows []ScoutWebRow, updatePosts int, gmgn string) string {
 		str(*p)
 	}
 	flt := func(v float64) { buf = binary.LittleEndian.AppendUint64(buf, math.Float64bits(v)) }
+	optFlt := func(p *float64) {
+		if p == nil {
+			buf = append(buf, 0)
+			return
+		}
+		buf = append(buf, 1)
+		flt(*p)
+	}
+	optTime := func(p *time.Time) {
+		if p == nil {
+			buf = append(buf, 0)
+			return
+		}
+		buf = append(buf, 1)
+		num(p.UnixNano())
+	}
 	num(int64(len(rows)))
 	num(int64(updatePosts))
 	str(gmgn)
@@ -329,12 +367,7 @@ func hashWebRows(rows []ScoutWebRow, updatePosts int, gmgn string) string {
 		opt(r.TokenName)
 		opt(r.TokenSymbol)
 		opt(r.PriceUnit)
-		if r.EntryPrice == nil {
-			buf = append(buf, 0)
-		} else {
-			buf = append(buf, 1)
-			flt(*r.EntryPrice)
-		}
+		optFlt(r.EntryPrice)
 		flags := byte(0)
 		if r.Tracked {
 			flags |= 1
@@ -355,6 +388,10 @@ func hashWebRows(rows []ScoutWebRow, updatePosts int, gmgn string) string {
 		opt(r.PerceptorURL)
 		num(int64(r.CallCount))
 		num(r.LastCallDate.UnixNano())
+		optFlt(r.LatestReturn)
+		optFlt(r.LatestPrice)
+		optTime(r.LatestAt)
+		optTime(r.LatestTradeAt)
 		h.Write(buf)
 	}
 	return hex.EncodeToString(h.Sum(nil)[:12])
@@ -394,31 +431,41 @@ func (s *webSnapshot) buildOrders(rows []ScoutWebRow) {
 	s.order[webSortKeyDate], s.nonNull[webSortKeyDate] = byDate, n
 
 	const per = webPerfPerRow
-	for key := 1; key < webSortKeys; key++ {
-		pi := (key - webSortKeyReturn) * webPerfPerHorizon // the window's return
-		if key >= webSortKeyPeak {
-			pi = (key-webSortKeyPeak)*webPerfPerHorizon + webPerfPeak
-		}
+	// byValue: the rows with a value, highest first (ties: higher call id
+	// first), then the rows without one, higher call id first.
+	byValue := func(key int, has func(i int) bool, val func(i int32) float64) {
 		ord := make([]int32, 0, n)
 		for i := 0; i < n; i++ {
-			if s.hasPerf[i]&(1<<pi) != 0 {
+			if has(i) {
 				ord = append(ord, int32(i))
 			}
 		}
 		slices.SortFunc(ord, func(a, b int32) int {
-			if c := pgFloatDesc(s.perf[int(a)*per+pi], s.perf[int(b)*per+pi]); c != 0 {
+			if c := pgFloatDesc(val(a), val(b)); c != 0 {
 				return c
 			}
 			return cmp.Compare(b, a)
 		})
 		s.nonNull[key] = len(ord)
 		for i := n - 1; i >= 0; i-- {
-			if s.hasPerf[i]&(1<<pi) == 0 {
+			if !has(i) {
 				ord = append(ord, int32(i))
 			}
 		}
 		s.order[key] = ord
 	}
+	for key := webSortKeyReturn; key < webSortKeyLatest; key++ {
+		pi := (key - webSortKeyReturn) * webPerfPerHorizon // the window's return
+		if key >= webSortKeyPeak {
+			pi = (key-webSortKeyPeak)*webPerfPerHorizon + webPerfPeak
+		}
+		byValue(key, func(i int) bool { return s.hasPerf[i]&(1<<pi) != 0 },
+			func(i int32) float64 { return s.perf[int(i)*per+pi] })
+	}
+	// the return as of the latest price (needed here only: the page gets it
+	// from the encoded row)
+	byValue(webSortKeyLatest, func(i int) bool { return rows[i].LatestReturn != nil },
+		func(i int32) float64 { return *rows[i].LatestReturn })
 }
 
 // webBitsPool: the "matches the search text" marks of one request.
@@ -461,6 +508,8 @@ func (s *webSnapshot) page(f ScoutWebCallsFilter, dst []int32) ([]int32, int, er
 		key = webSortKeyReturn + h
 	case "peak":
 		key = webSortKeyPeak + h
+	case "latest":
+		key = webSortKeyLatest // the same for every window
 	default:
 		return dst, 0, fmt.Errorf("unknown sort %q", f.Sort)
 	}

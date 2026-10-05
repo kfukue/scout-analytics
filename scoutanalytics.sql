@@ -321,6 +321,14 @@ CREATE INDEX IF NOT EXISTS scout_calls_lower_ca_first_idx ON scout_calls (lower(
 ALTER TABLE scout_call_tracking ADD COLUMN IF NOT EXISTS token_name           TEXT;
 ALTER TABLE scout_call_tracking ADD COLUMN IF NOT EXISTS token_symbol_onchain TEXT;
 
+-- Latest price of a tracked first call (on-chain source), kept up to date by the
+-- tracker's latest-price pass: about every 15 minutes for calls under 30 days
+-- old, once a day for older ones. NULL = not read yet.
+ALTER TABLE scout_call_tracking ADD COLUMN IF NOT EXISTS latest_price_usd  NUMERIC;      -- in price_unit, like entry_price_usd
+ALTER TABLE scout_call_tracking ADD COLUMN IF NOT EXISTS latest_return_pct NUMERIC;      -- vs entry_late_price_usd (entry_price_usd when that is NULL)
+ALTER TABLE scout_call_tracking ADD COLUMN IF NOT EXISTS latest_checked_at TIMESTAMPTZ;  -- when the price was read: it is "as of" this time
+ALTER TABLE scout_call_tracking ADD COLUMN IF NOT EXISTS latest_trade_at   TIMESTAMPTZ;  -- time of the last trade the price comes from
+
 -- Training dataset: one row per call = features known at call time + outcomes.
 DROP VIEW IF EXISTS scout_call_predictions_v;
 DROP VIEW IF EXISTS scout_call_dataset_v;
@@ -358,7 +366,10 @@ SELECT cv.call_id, cv.message_id, cv.message_date, cv.contract_address, cv.statu
        r.ret_1d, r.max_gain_1d, r.max_dd_1d, r.ret_late_1d, r.max_gain_late_1d, r.max_dd_late_1d,
        r.ret_3d, r.max_gain_3d, r.max_dd_3d, r.ret_late_3d, r.max_gain_late_3d, r.max_dd_late_3d,
        r.ret_7d, r.max_gain_7d, r.max_dd_7d, r.ret_late_7d, r.max_gain_late_7d, r.max_dd_late_7d,
-       r.ret_30d, r.max_gain_30d, r.max_dd_30d, r.ret_late_30d, r.max_gain_late_30d, r.max_dd_late_30d
+       r.ret_30d, r.max_gain_30d, r.max_dd_30d, r.ret_late_30d, r.max_gain_late_30d, r.max_dd_late_30d,
+       -- return as of the most recent price (an outcome, like the columns above: never a feature)
+       t.latest_price_usd::float8 AS latest_price_usd, t.latest_return_pct::float8 AS latest_return_pct,
+       t.latest_checked_at
 FROM scout_calls_v cv
 LEFT JOIN scout_call_tracking t ON t.call_id = cv.call_id
 LEFT JOIN scout_call_precall x ON x.call_id = cv.call_id

@@ -29,6 +29,7 @@ func syntheticWebRows(n int, seed int64) []ScoutWebRow {
 	verdicts := []string{levelClean, levelClean, levelCaution, levelRedFlags, levelUnknown}
 	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 	rows := make([]ScoutWebRow, n)
+	lrng := rand.New(rand.NewSource(seed + 1000)) // the latest price has its own source, so the rest stays as it was
 	for i := range rows {
 		r := &rows[i]
 		r.CallID = 10 + i*2
@@ -82,6 +83,25 @@ func syntheticWebRows(n int, seed int64) []ScoutWebRow {
 				r.Rugged = &yes
 			}
 		}
+		// a latest price: on most tracked rows (also the ones not in USD, which
+		// must not show it), few different values, now and then one that JSON
+		// cannot carry or one without the time it was read
+		if r.Tracked && lrng.Intn(4) != 0 {
+			ret := float64(lrng.Intn(60)-30) * 12.5
+			switch lrng.Intn(60) {
+			case 0:
+				ret = math.NaN()
+			case 1:
+				ret = math.Inf(1)
+			}
+			price := 0.001 * float64(1+lrng.Intn(900))
+			at := r.MessageDate.Add(time.Duration(1+lrng.Intn(90*24*60)) * time.Minute)
+			trade := at.Add(-time.Duration(lrng.Intn(20*24*60)) * time.Minute)
+			r.LatestReturn, r.LatestPrice, r.LatestAt, r.LatestTradeAt = &ret, &price, &at, &trade
+			if lrng.Intn(40) == 0 {
+				r.LatestAt = nil
+			}
+		}
 		if rng.Intn(4) == 0 {
 			r.PerceptorVerd = sp(verdicts[rng.Intn(len(verdicts))])
 			r.PerceptorURL = sp(fmt.Sprintf("https://www.perceptor.info/r/%032x", i))
@@ -123,6 +143,13 @@ func referencePage(rows []ScoutWebRow, f ScoutWebCallsFilter) (ids []int, total 
 	key := func(r *ScoutWebRow) (float64, bool) {
 		if f.Sort == "date" {
 			return float64(r.MessageDate.Unix()), true
+		}
+		if f.Sort == "latest" {
+			// shown (and so sorted) only with a USD price, the time it was read and a number JSON can carry
+			if r.PriceUnit == nil || *r.PriceUnit != "usd" || r.LatestAt == nil || finite(r.LatestReturn) == nil {
+				return 0, false
+			}
+			return *r.LatestReturn, true
 		}
 		i := h * webPerfPerHorizon
 		if f.Sort == "peak" {
@@ -212,7 +239,7 @@ func TestWebSnapshotPageMatchesReference(t *testing.T) {
 		raw := syntheticWebRows(n, int64(n)+1)
 		snap := mustWebSnapshot(t, cloneWebRows(raw), 3, nil)
 		checked := 0
-		for _, sortBy := range []string{"date", "return", "peak"} {
+		for _, sortBy := range []string{"date", "return", "peak", "latest"} {
 			for _, dir := range []string{"desc", "asc"} {
 				for _, hz := range ScoutWebHorizons {
 					for _, usdOnly := range []bool{false, true} {
@@ -233,7 +260,7 @@ func TestWebSnapshotPageMatchesReference(t *testing.T) {
 				}
 			}
 		}
-		if checked != 3*2*5*2*5*7*6 {
+		if checked != 4*2*5*2*5*7*6 {
 			t.Fatalf("checked %d combinations", checked)
 		}
 	}
@@ -430,6 +457,28 @@ func TestWebSnapshotVersion(t *testing.T) {
 	change("report", 5, func(rows []ScoutWebRow) { rows[5].PerceptorURL = sp("https://example.org/r") })
 	change("rugged", 5, func(rows []ScoutWebRow) { no := false; rows[0].Rugged = &no })
 	change("tracked", 5, func(rows []ScoutWebRow) { rows[0].Tracked = !rows[0].Tracked })
+	// the latest price: row 4 is priced in USD and has one
+	if r := raw[4]; r.PriceUnit == nil || *r.PriceUnit != "usd" || r.LatestAt == nil || finite(r.LatestReturn) == nil || r.LatestTradeAt == nil {
+		t.Fatalf("row 4 has no latest price to change: %+v", r)
+	}
+	change("latest return", 5, func(rows []ScoutWebRow) { v := *rows[4].LatestReturn + 0.5; rows[4].LatestReturn = &v })
+	change("latest price", 5, func(rows []ScoutWebRow) { v := *rows[4].LatestPrice * 2; rows[4].LatestPrice = &v })
+	change("latest read at", 5, func(rows []ScoutWebRow) { v := rows[4].LatestAt.Add(15 * time.Minute); rows[4].LatestAt = &v })
+	change("latest trade at", 5, func(rows []ScoutWebRow) { v := rows[4].LatestTradeAt.Add(-time.Hour); rows[4].LatestTradeAt = &v })
+	change("latest trade unknown", 5, func(rows []ScoutWebRow) { rows[4].LatestTradeAt = nil })
+	change("no latest price", 5, func(rows []ScoutWebRow) { rows[4].LatestAt = nil })
+	// … and one that the page does not show changes nothing: a latest price of a call not priced in USD
+	other := cloneWebRows(raw)
+	changed := false
+	for i := range other {
+		if r := &other[i]; r.PriceUnit != nil && *r.PriceUnit != "usd" && r.LatestReturn != nil {
+			v := *r.LatestReturn + 1
+			r.LatestReturn, changed = &v, true
+		}
+	}
+	if c := mustWebSnapshot(t, other, 5, a); !changed || c.version != a.version {
+		t.Fatalf("a latest price outside USD (changed %v): version %q, want %q", changed, c.version, a.version)
+	}
 }
 
 func TestParseWebRefresh(t *testing.T) {
@@ -623,6 +672,7 @@ func TestWebKeptAnswers(t *testing.T) {
 var benchWebQueries = []struct{ name, query string }{
 	{"default", ""},
 	{"sort_return", "sort=return"},
+	{"sort_latest", "sort=latest"},
 	{"q", "q=pe"},
 	{"verdict", "verdict=clean"},
 	{"q_verdict_peak", "q=pe&verdict=clean&sort=peak"},

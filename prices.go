@@ -42,6 +42,12 @@ type priceConfig struct {
 	Enabled   bool
 	Interval  time.Duration // tracker loop interval
 	Workers   int           // calls tracked at the same time (on-chain source)
+
+	// Latest-price pass (on-chain source; tracker_latest.go)
+	LatestOn     bool          // SCOUT_LATEST_REFRESH (off = no pass)
+	LatestRecent time.Duration // SCOUT_LATEST_REFRESH_RECENT: calls younger than 30 days
+	LatestOld    time.Duration // SCOUT_LATEST_REFRESH_OLD: calls 30 days or older
+	LatestBatch  int           // SCOUT_LATEST_BATCH: rows per cycle at most
 }
 
 type horizon struct {
@@ -90,6 +96,9 @@ func loadPriceConfig() (priceConfig, error) {
 			return pc, fmt.Errorf("SCOUT_TRACK_WORKERS=%q: want a number from 1 to 64", v)
 		}
 		pc.Workers = n
+	}
+	if err := pc.loadLatestConfig(); err != nil {
+		return pc, err
 	}
 	if v := env("SCOUT_RUG_LIQ_USD", ""); v != "" {
 		f, err := strconv.ParseFloat(v, 64)

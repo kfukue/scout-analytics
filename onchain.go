@@ -1046,6 +1046,12 @@ type onchainState struct {
 	RunMaxLateU float64 `json:"run_max_late_u,omitempty"`
 	RunMinLateU float64 `json:"run_min_late_u,omitempty"`
 	PreDone     bool    `json:"pre_done,omitempty"`
+
+	// Latest-price pass (tracker_latest.go): its own cursor, apart from the
+	// horizon scan above. Optional additions; they do not change the version.
+	LatestBlock      uint64  `json:"latest_block,omitempty"`       // price events read through this block
+	LatestPriceQ     float64 `json:"latest_price_q,omitempty"`     // pool price at LatestBlock, in quote units
+	LatestTradeBlock uint64  `json:"latest_trade_block,omitempty"` // block of the trade that price comes from
 }
 
 // onchainStateVersion: calls tracked with an older state are tracked again from

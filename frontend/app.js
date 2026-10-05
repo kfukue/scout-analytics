@@ -116,6 +116,42 @@
     return td;
   }
 
+  var QUIET_MS = 7 * 24 * 3600 * 1000; // last trade this much older than the reading: "quiet"
+
+  // Age of a call in the largest unit that reads well: 45m, 30h, 60d.
+  function fmtAge(seconds) {
+    if (!isNum(seconds)) { return ''; }
+    var s = Math.max(0, seconds);
+    if (s < 3600) { return Math.floor(s / 60) + 'm'; }
+    if (s < 2 * 86400) { return Math.floor(s / 3600) + 'h'; }
+    return Math.floor(s / 86400) + 'd';
+  }
+
+  // "Latest %": the return at the most recent price, then a quiet label with
+  // the age of the call when that price was read, e.g. "+35.2% · 60d".
+  function latestCell(c) {
+    var td = el('td', 'num latest');
+    var v = c.latest_return_pct;
+    if (!isNum(v)) { td.textContent = DASH; return td; }
+    var text = fmtPct(v);
+    var val = el('span', 'latest-val', text);
+    if (text !== '0.0%') { val.classList.add(v > 0 ? 'pos' : 'neg'); }
+    td.appendChild(val);
+
+    var readAt = new Date(c.latest_at).getTime();
+    var tradeAt = (typeof c.latest_trade_at === 'string') ? new Date(c.latest_trade_at).getTime() : NaN;
+    var quiet = !isNaN(readAt) && !isNaN(tradeAt) && readAt - tradeAt > QUIET_MS;
+    var age = fmtAge(c.latest_age_seconds);
+    var label = (age ? ' · ' + age : '') + (quiet ? ' · quiet' : '');
+    if (label) { td.appendChild(el('span', 'age', label)); }
+
+    var tip = [];
+    if (!isNaN(readAt)) { tip.push('Price as of ' + fmtDate(c.latest_at)); }
+    if (!isNaN(tradeAt)) { tip.push('last trade ' + fmtDate(c.latest_trade_at)); }
+    if (tip.length) { td.title = tip.join('; ') + (quiet ? ' (no recent trades)' : ''); }
+    return td;
+  }
+
   function shortAddress(ca) {
     ca = String(ca || '');
     if (ca.length <= 12) { return ca || DASH; }
@@ -161,13 +197,14 @@
       // tracked, but in another asset: no number here would be in dollars
       tr.appendChild(el('td', 'num', DASH));
       var td = el('td', 'center muted', 'no USD price');
-      td.colSpan = 3;
+      td.colSpan = 4; // return, peak, worst drop and latest
       tr.appendChild(td);
     } else {
       tr.appendChild(el('td', 'num', fmtPrice(c.entry_price_usd)));
       tr.appendChild(pctCell(c.return_pct));
       tr.appendChild(pctCell(c.peak_pct));
       tr.appendChild(pctCell(c.drawdown_pct));
+      tr.appendChild(latestCell(c));
     }
 
     // Latest Perceptor report of the token; a dash when it was never scanned
@@ -221,7 +258,9 @@
       hb[j].setAttribute('aria-pressed', hb[j].dataset.horizon === state.horizon ? 'true' : 'false');
     }
     $('explain').textContent = 'Return, peak and worst drop over ' + state.horizon +
-      ', in USD, measured from the price 60 seconds after the post.';
+      ', in USD, measured from the price 60 seconds after the post. Latest % is the return at the most recent' +
+      ' price, with the age of the call at that time; the ' + HORIZONS[0] + ' to ' + HORIZONS[HORIZONS.length - 1] +
+      ' buttons do not change it.';
   }
 
   function renderCalls(data) {

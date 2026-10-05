@@ -38,7 +38,7 @@ body {
   color: var(--text);
   font: 14px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
 }
-main { max-width: 1240px; margin: 0 auto; padding: 16px; }
+main { max-width: 1400px; margin: 0 auto; padding: 16px; }
 h1 { font-size: 20px; margin: 0 0 12px; }
 h2 { font-size: 14px; margin: 0; font-weight: 600; }
 p { margin: 0; }
@@ -109,7 +109,7 @@ button { font: inherit; color: inherit; }
 
 .table-wrap { overflow-x: auto; border: 1px solid var(--border); border-radius: 8px; }
 table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
-th, td { padding: 7px 10px; text-align: left; white-space: nowrap; border-bottom: 1px solid var(--border); }
+th, td { padding: 7px 8px; text-align: left; white-space: nowrap; border-bottom: 1px solid var(--border); }
 tbody tr:last-child td { border-bottom: 0; }
 tbody tr:hover { background: var(--row-hover); }
 th { background: var(--panel); font-weight: 600; font-size: 13px; }
@@ -118,7 +118,7 @@ td.center { text-align: center; }
 button.sort { background: none; border: 0; padding: 0; margin: 0; font-weight: 600; cursor: pointer; }
 button.sort:hover { text-decoration: underline; }
 th[aria-sort] button.sort { color: var(--accent); }
-.token { display: inline-block; max-width: 26ch; overflow: hidden; text-overflow: ellipsis; vertical-align: bottom; }
+.token { display: inline-block; max-width: 24ch; overflow: hidden; text-overflow: ellipsis; vertical-align: bottom; }
 .symbol { display: inline-block; max-width: 14ch; overflow: hidden; text-overflow: ellipsis; vertical-align: bottom; }
 th.calls, td.calls { width: 1%; padding-left: 4px; padding-right: 4px; text-align: center; }
 td.calls { color: var(--muted); }
@@ -126,6 +126,8 @@ td.calls { color: var(--muted); }
 .note { margin-top: 8px; }
 .pos { color: var(--pos); }
 .neg { color: var(--neg); }
+.age { color: var(--muted); font-size: 12px; }
+td.latest { cursor: default; }
 .flag { color: var(--neg); font-weight: 600; }
 /* Perceptor verdicts: different words, and red flags is the heaviest (bold, boxed) */
 .pv-clean { color: var(--pos); }
@@ -151,7 +153,7 @@ a.pv { text-decoration: underline; text-underline-offset: 2px; }
 @media (max-width: 520px) {
   main { padding: 12px; }
   #search { max-width: none; flex-basis: 100%; }
-  th, td { padding: 6px 8px; }
+  th, td { padding: 6px 7px; }
 }
 @media (prefers-reduced-motion: reduce) { .bar-fill { transition: none; } }
 

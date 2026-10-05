@@ -57,9 +57,12 @@ VIEW_COLUMNS = (IDENTITY + ["dex", "launchpad"] + NUMERIC_RAW
 # quote_asset is deliberately NOT here (allowed as a categorical feature).
 # token_name (the token contract's own name, for the website) is display text.
 # post_kind (call | update) only decides which rows are used at all.
+# latest_* (the price and return as of the tracker's most recent look) are
+# outcomes that keep moving after the call: never features.
+LATEST = ["latest_price_usd", "latest_return_pct", "latest_checked_at", "latest_trade_at"]
 FORBIDDEN_COLUMNS = (set(BOOKKEEPING) - {"quote_asset"} | set(IDENTITY)
-                     | {"pre_vol_unit", "token_name", "post_kind"})
-FORBIDDEN_PREFIXES = ("ret_", "max_gain_", "max_dd_")
+                     | {"pre_vol_unit", "token_name", "post_kind"} | set(LATEST))
+FORBIDDEN_PREFIXES = ("ret_", "max_gain_", "max_dd_", "latest_")
 
 # --- Derived features (built in features.build_features) -------------------
 DERIVED = (["liq_to_mcap", "live_usd_to_liq", "live_usd_to_mcap", "mcap_vs_called"]

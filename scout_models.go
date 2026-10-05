@@ -259,6 +259,13 @@ type ScoutWebRow struct {
 	PerceptorURL    *string
 	CallCount       int
 	LastCallDate    time.Time
+	// The tracker's latest-price pass (in PriceUnit; nil until the first refresh):
+	// return as of the most recent pool price, measured like Perf from the late
+	// entry; that price; when it was read; and the time of the trade behind it.
+	LatestReturn  *float64
+	LatestPrice   *float64
+	LatestAt      *time.Time
+	LatestTradeAt *time.Time
 
 	// worked out by the website when it builds its snapshot (websnapshot.go)
 	usd     bool  // priced in USD: only then are the numbers shown
@@ -292,13 +299,21 @@ type ScoutWebCall struct {
 	PerceptorURL    *string   `json:"perceptor_url"`     // report link (https only)
 	CallCount       int       `json:"call_count"`        // calls of this token in total (≥ 1)
 	LastCallDate    time.Time `json:"last_call_date"`    // most recent call of this token
+	// Return as of the most recent price (not tied to the horizon asked for);
+	// all five are nil until the tracker has read a latest price, and for calls
+	// not priced in USD.
+	LatestReturnPct  *float64   `json:"latest_return_pct"`
+	LatestPriceUSD   *float64   `json:"latest_price_usd"`
+	LatestAt         *time.Time `json:"latest_at"`          // when the price was read (it is "as of" this time)
+	LatestTradeAt    *time.Time `json:"latest_trade_at"`    // the last trade the price comes from
+	LatestAgeSeconds *int64     `json:"latest_age_seconds"` // age of the call at LatestAt
 }
 
 // ScoutWebCallsFilter selects a page of the call list (first calls only). Sort, Dir, Horizon and Verdict
 // must be values of the fixed lists below (parseWebCallsQuery checks them; the snapshot rejects anything else).
 type ScoutWebCallsFilter struct {
 	Q       string // substring of token name, symbol or contract address ("" = all)
-	Sort    string // date | return | peak
+	Sort    string // date | return | peak | latest
 	Dir     string // desc | asc
 	Horizon string // 1h | 1d | 3d | 7d | 30d
 	USDOnly bool   // only calls priced in USD

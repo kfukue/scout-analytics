@@ -9,9 +9,12 @@ from scout_ml.features import assert_no_leakage, build_features, learn_cat_level
 def test_guard_raises_on_any_forbidden_column():
     for col in ["ret_late_1d", "max_gain_7d", "max_dd_late_30d", "rugged", "tracking_status",
                 "entry_late_price_usd", "current_liquidity_usd", "price_unit", "pool_dex",
-                "post_kind"]:
+                "post_kind", "latest_price_usd", "latest_return_pct", "latest_checked_at",
+                "latest_trade_at", "latest_anything_added_later"]:
         with pytest.raises(ValueError, match="forbidden"):
             assert_no_leakage(["mcap_usd", col])
+    assert not [c for c in C.FEATURES if c.startswith("latest_")]
+    assert set(C.LATEST) <= C.FORBIDDEN_COLUMNS
     assert_no_leakage(C.FEATURES)              # the configured list itself is clean
     assert not C.is_forbidden("quote_asset")   # explicitly allowed
 

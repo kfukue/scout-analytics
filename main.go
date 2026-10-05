@@ -355,6 +355,9 @@ type scanner struct {
 	gecko   *geckoClient
 	onchain *onchainSource
 
+	latestMu    sync.Mutex
+	latestRetry map[int]time.Time // latest-price pass: call id → not before (after a failed refresh)
+
 	postMu      sync.Mutex
 	handled     map[string]bool // "msgID|ca" (and "msgID" for CA-less posts) already processed
 	sourceInput tg.InputChannelClass
@@ -1489,14 +1492,15 @@ func main() {
 			}
 			total := 0
 			for {
-				n := s.trackDue(ctx, 50)
+				n := s.trackDue(ctx, trackBatch)
 				total += n
-				if n < 50 || ctx.Err() != nil {
+				if n < trackBatch || ctx.Err() != nil {
 					break
 				}
 			}
 			s.logTrackingStatus(context.Background(), total)
 			s.fillTokenNames(ctx)
+			s.refreshLatest(ctx, false) // one pass: up to SCOUT_LATEST_BATCH latest prices
 			fmt.Printf("processed %d call(s)\n", total)
 		case *trackOnly:
 			if !s.pc.Enabled {
