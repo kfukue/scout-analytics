@@ -8,7 +8,8 @@ from scout_ml.features import assert_no_leakage, build_features, learn_cat_level
 
 def test_guard_raises_on_any_forbidden_column():
     for col in ["ret_late_1d", "max_gain_7d", "max_dd_late_30d", "rugged", "tracking_status",
-                "entry_late_price_usd", "current_liquidity_usd", "price_unit", "pool_dex"]:
+                "entry_late_price_usd", "current_liquidity_usd", "price_unit", "pool_dex",
+                "post_kind"]:
         with pytest.raises(ValueError, match="forbidden"):
             assert_no_leakage(["mcap_usd", col])
     assert_no_leakage(C.FEATURES)              # the configured list itself is clean

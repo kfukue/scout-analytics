@@ -36,6 +36,16 @@
   <section aria-label="Calls">
     <div class="controls">
       <input id="search" type="search" placeholder="Search token name or symbol" aria-label="Search token name or symbol" maxlength="100" autocomplete="off" spellcheck="false">
+      <label class="filter" for="verdict">
+        <span>Perceptor</span>
+        <select id="verdict" autocomplete="off">
+          <option value="" selected>All reports</option>
+          <option value="clean">No red flags found</option>
+          <option value="caution">Caution</option>
+          <option value="red_flags">Red flags</option>
+          <option value="not_scanned">Not scanned</option>
+        </select>
+      </label>
       <div id="horizons" class="segmented" role="group" aria-label="Performance window">
         <button type="button" data-horizon="1h" aria-pressed="false">1h</button>
         <button type="button" data-horizon="1d" aria-pressed="true">1d</button>
@@ -58,6 +68,7 @@
             <th scope="col" class="num" data-sort="return"><button type="button" class="sort">Return %</button></th>
             <th scope="col" class="num" data-sort="peak"><button type="button" class="sort">Peak %</button></th>
             <th scope="col" class="num">Worst drop %</th>
+            <th scope="col">Perceptor</th>
             <th scope="col">Status</th>
           </tr>
         </thead>
@@ -72,6 +83,22 @@
       <button type="button" id="next" disabled>Next</button>
       <span id="total" class="muted"></span>
     </nav>
+
+    <details class="legend" open>
+      <summary>What the statuses mean</summary>
+      <dl>
+        <div><dt>pending</dt><dd>Not processed yet.</dd></div>
+        <div><dt>tracking</dt><dd>Entry price found. The horizons that have passed are recorded; the tracker is waiting for the later ones.</dd></div>
+        <div><dt>done</dt><dd>All five horizons (1h, 1d, 3d, 7d, 30d) are recorded. A call needs to be 30 days old to get here.</dd></div>
+        <div><dt>no pool</dt><dd>No trading pool found for the token yet. Retried later.</dd></div>
+        <div><dt>error</dt><dd>Something failed, for example a node error. Retried later.</dd></div>
+        <div><dt>gave up</dt><dd>More than 30 days old and still no pool or no trades.</dd></div>
+        <div><dt><span class="flag">rugged</span></dt><dd>Shown after the status when the pool was drained or the price fell below 5% of entry.</dd></div>
+        <div id="legend-perceptor"><dt>Perceptor</dt><dd>The latest on-chain check of the token by the Perceptor bot; the words link to its report. <span class="pv pv-clean">no red flags</span> = the check found none. <span class="pv pv-caution">caution</span> = it found something to look at before buying. <span class="pv pv-red">red flags</span> = it found serious warning signs. Only calls picked up live are scanned: calls imported from history were never scanned, so they show a dash (–).</dd></div>
+        <div><dt>no USD price</dt><dd>The token trades against an asset with no dollar price, so no performance is shown.</dd></div>
+        <div><dt>–</dt><dd>No value yet: the horizon has not arrived, or the call is not tracked yet.</dd></div>
+      </dl>
+    </details>
   </section>
   <noscript><p class="notice">This page needs JavaScript.</p></noscript>
 </main>

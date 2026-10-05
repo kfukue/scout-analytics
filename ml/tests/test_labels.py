@@ -60,6 +60,20 @@ def test_usable_needs_usd_outcome_and_a_pool():
     assert np.isnan(L["runner_medium"][1])
 
 
+def test_update_posts_are_never_usable():
+    df = pd.DataFrame([
+        row(ret_late_7d=10, post_kind="call"),
+        row(ret_late_7d=10, post_kind="update"),   # tracked before it was known to be an update
+        row(ret_late_7d=10, post_kind=None),       # not classified yet: read as a call
+        row(ret_late_7d=None, entry_late_price_usd=None, tracking_status="repeat", post_kind="update")])
+    L = build_labels(df)
+    assert L["update"].tolist() == [False, True, False, True]
+    assert L["usable_medium"].tolist() == [True, False, True, False]
+    assert np.isnan(L["runner_medium"][1]) and np.isnan(L["net_ret_medium"][1])
+    # a dataset exported before the column existed has no update rows
+    assert not build_labels(df.drop(columns="post_kind"))["update"].any()
+
+
 def test_thresholds_come_from_config(monkeypatch):
     monkeypatch.setitem(BUCKETS["3day"], "runner", ("ret_late_3d", ">=", 10.0))
     assert build_labels(pd.DataFrame([row(ret_late_3d=12)]))["runner_3day"][0] == 1

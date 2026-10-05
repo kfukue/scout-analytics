@@ -54,6 +54,10 @@ Calls without a pool (`no_pool`, `gave_up`, or no late entry price) and rows
 whose prices are not in USD are excluded; the report says how many. The tracker
 follows only the first call of each token: later calls have `tracking_status =
 repeat` and no outcomes, so they are excluded too and counted on their own line.
+Update posts (`post_kind = update`, a "$TOKEN hit 3X ..." post about an earlier
+call) are not calls: they are excluded from training and simulation whatever
+else their row says, and counted on their own line ("excluded, update post (not
+a call)"). `post_kind` itself can never become a model input.
 
 ## Read the report
 

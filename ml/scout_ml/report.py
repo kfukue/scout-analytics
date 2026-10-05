@@ -32,6 +32,7 @@ def render(res: dict) -> str:
                   for b, r in res["buckets"].items()]),
            "## Data and exclusions\n",
            f"- rows read: {d['rows']} ({d['first_date']} to {d['last_date']})",
+           f"- excluded, update post (not a call): {d.get('update', 0)}",
            f"- excluded, no pool (never tradable; out of training and simulation): {d['no_pool']}",
            f"- excluded, repeat call not tracked (only the first call of each token is tracked): {d.get('repeat', 0)}",
            f"- excluded, price_unit not 'usd': {d['not_usd']}",

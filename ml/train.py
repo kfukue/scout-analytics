@@ -148,7 +148,8 @@ def train(df: pd.DataFrame, out_root, version: str | None = None) -> Path:
     df["message_date"] = pd.to_datetime(df["message_date"], utc=True, format="ISO8601")
     df = df.sort_values("message_date").reset_index(drop=True)
     L = build_labels(df)
-    eligible = ~L["no_pool"] & ~L["not_usd"]
+    call = ~L["update"]  # update posts are not calls: out of training, counted on their own
+    eligible = call & ~L["no_pool"] & ~L["not_usd"]
     cat_levels = learn_cat_levels(df[eligible])
     X_all = build_features(df, cat_levels)
 
@@ -157,8 +158,9 @@ def train(df: pd.DataFrame, out_root, version: str | None = None) -> Path:
     res = {"version": version, "buckets": {}, "data": {
         "rows": len(df), "first_date": df["message_date"].min().strftime("%Y-%m-%d"),
         "last_date": df["message_date"].max().strftime("%Y-%m-%d"),
-        "no_pool": int((L["no_pool"] & ~L["repeat"]).sum()), "repeat": int(L["repeat"].sum()),
-        "not_usd": int((~L["no_pool"] & L["not_usd"]).sum()),
+        "update": int(L["update"].sum()),
+        "no_pool": int((call & L["no_pool"] & ~L["repeat"]).sum()), "repeat": int((call & L["repeat"]).sum()),
+        "not_usd": int((call & ~L["no_pool"] & L["not_usd"]).sum()),
         "eligible": int(eligible.sum()),
         "coverage": {c: float(blank[c].notna().mean()) for c in raw_cols}}}
     reference = {}

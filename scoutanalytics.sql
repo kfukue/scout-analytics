@@ -30,6 +30,10 @@ CREATE TABLE IF NOT EXISTS scout_investigation_tools (
 -- One row per contract address found in a post of the watched channel
 -- (e.g. @scoutrobinhood). A post with 2 CAs = 2 rows. Re-calls of a CA that was
 -- already investigated are still recorded, with status = 'duplicate'.
+-- post_kind: 'call' = a real call; 'update' = a "$TOKEN hit 3X …" post about an
+-- earlier call (recorded with status = 'update'; not investigated, delivered or
+-- tracked, and never a token's first call). NULL = not classified yet (rows
+-- from before the column existed; the program fills them in), read as 'call'.
 CREATE TABLE IF NOT EXISTS scout_calls (
     id                SERIAL PRIMARY KEY,
     uuid              UUID         NOT NULL UNIQUE,
@@ -41,7 +45,7 @@ CREATE TABLE IF NOT EXISTS scout_calls (
     urls              TEXT[]       NOT NULL DEFAULT '{}',
     contract_address  TEXT         NOT NULL,
     chain             TEXT         NOT NULL,               -- evm | solana
-    status            TEXT         NOT NULL,               -- queued | duplicate | dropped | scanned | failed
+    status            TEXT         NOT NULL,               -- queued | duplicate | dropped | scanned | failed | backfill | update
     created_by        TEXT         NOT NULL,
     created_at        TIMESTAMPTZ  NOT NULL DEFAULT now(),
     updated_by        TEXT         NOT NULL,
@@ -50,6 +54,9 @@ CREATE TABLE IF NOT EXISTS scout_calls (
 );
 CREATE INDEX IF NOT EXISTS scout_calls_ca_idx   ON scout_calls (contract_address);
 CREATE INDEX IF NOT EXISTS scout_calls_date_idx ON scout_calls (message_date DESC);
+ALTER TABLE scout_calls ADD COLUMN IF NOT EXISTS post_kind TEXT;   -- call | update | NULL (not classified yet)
+-- finds the rows still to classify without reading the table
+CREATE INDEX IF NOT EXISTS scout_calls_post_kind_null_idx ON scout_calls (id) WHERE post_kind IS NULL;
 
 -- Data parsed from the call post (MCap, Liq, Tax, Age, Holders, Proof, …), one row per call.
 CREATE TABLE IF NOT EXISTS scout_call_metrics (
@@ -155,8 +162,16 @@ CREATE TABLE IF NOT EXISTS scout_delivery_investigations (
     PRIMARY KEY (delivery_id, investigation_id)
 );
 
+-- Views are dropped and created again on every start (dependents first), not
+-- replaced in place: CREATE OR REPLACE VIEW fails with "cannot drop columns from
+-- view" when the database holds a version of a view with different columns.
+DROP VIEW IF EXISTS scout_call_predictions_v;
+DROP VIEW IF EXISTS scout_call_dataset_v;
+DROP VIEW IF EXISTS scout_calls_v;
+DROP VIEW IF EXISTS scout_investigations_v;
+
 -- Convenience view: investigations with their tool and originating post.
-CREATE OR REPLACE VIEW scout_investigations_v AS
+CREATE VIEW scout_investigations_v AS
 SELECT i.id, i.call_id, t.code AS tool, t.bot_username, i.contract_address, i.request_text,
        i.requested_at, i.completed_at, i.status, i.verdict_level, i.verdict_label, i.ticker,
        i.verdict_summary, i.report_url, i.report_text, i.error,
@@ -169,12 +184,12 @@ JOIN scout_investigation_tools t ON t.id = i.tool_id
 LEFT JOIN scout_calls c ON c.id = i.call_id;
 
 -- Convenience view: each call with its parsed post data.
-CREATE OR REPLACE VIEW scout_calls_v AS
+CREATE VIEW scout_calls_v AS
 SELECT c.id AS call_id, c.channel_username, c.message_id, c.message_date, c.contract_address, c.chain, c.status,
        m.token_symbol, m.chain_name, m.called_at_mcap_usd, m.dex, m.mcap_usd, m.liq_usd, m.liq_pct,
        m.tax_buy_pct, m.tax_sell_pct, m.age_text, m.age_seconds, m.launchpad, m.holders,
        m.proof_elite, m.proof_good, m.live_buys_elite_count, m.live_buys_good_count,
-       m.live_buys_elite_usd, m.live_buys_good_usd
+       m.live_buys_elite_usd, m.live_buys_good_usd, c.post_kind
 FROM scout_calls c
 LEFT JOIN scout_call_metrics m ON m.call_id = c.id;
 
@@ -311,6 +326,7 @@ DROP VIEW IF EXISTS scout_call_predictions_v;
 DROP VIEW IF EXISTS scout_call_dataset_v;
 CREATE VIEW scout_call_dataset_v AS
 SELECT cv.call_id, cv.message_id, cv.message_date, cv.contract_address, cv.status AS call_status,
+       cv.post_kind,  -- call | update (not a call: leave it out of training) | NULL = not classified yet
        -- symbol as posted, else the one read from the token contract; the name is for display only
        COALESCE(NULLIF(cv.token_symbol, ''), NULLIF(t.token_symbol_onchain, '')) AS token_symbol,
        NULLIF(t.token_name, '') AS token_name, cv.dex, cv.launchpad,

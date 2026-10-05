@@ -93,8 +93,38 @@ func seedWebCall(t *testing.T, st *ScoutStore, base time.Time, w webSeed) int {
 
 type webFixture struct {
 	st  *ScoutStore
+	web *webServer
 	srv *httptest.Server
 	ids map[string]int // name → call id
+}
+
+// mustWebServer builds the website over st; its snapshot is loaded when st is set.
+func mustWebServer(t *testing.T, st *ScoutStore, cfg webConfig, static fs.FS) *webServer {
+	t.Helper()
+	ws, err := newWebServer(st, cfg, static)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st != nil {
+		if err := ws.refresh(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return ws
+}
+
+// webSummaryOf reads the website's counts the way the website does: from a
+// snapshot of the database as it is now.
+func webSummaryOf(ctx context.Context, st *ScoutStore) (*ScoutWebSummary, error) {
+	rows, updatePosts, err := st.SelectWebRows(ctx)
+	if err != nil {
+		return nil, err
+	}
+	snap, err := newWebSnapshot(rows, updatePosts, nil, webConfig{})
+	if err != nil {
+		return nil, err
+	}
+	return &snap.summary, nil
 }
 
 const (
@@ -142,7 +172,8 @@ func newWebFixture(t *testing.T, cfg webConfig) *webFixture {
 	if err != nil {
 		t.Fatal(err)
 	}
-	fx.srv = httptest.NewServer(newWebHandler(st, cfg, static))
+	fx.web = mustWebServer(t, st, cfg, static)
+	fx.srv = httptest.NewServer(fx.web)
 	t.Cleanup(fx.srv.Close)
 	return fx
 }
@@ -164,6 +195,7 @@ type webCallJSON struct {
 	Rugged          *bool    `json:"rugged"`
 	TrackingStatus  *string  `json:"tracking_status"`
 	Perceptor       *string  `json:"perceptor_verdict"`
+	PerceptorURL    *string  `json:"perceptor_url"`
 	CallCount       int      `json:"call_count"`
 	LastCallDate    string   `json:"last_call_date"`
 }
@@ -176,11 +208,19 @@ type webCallsJSON struct {
 	Sort    string        `json:"sort"`
 	Dir     string        `json:"dir"`
 	USDOnly bool          `json:"usd_only"`
+	Verdict string        `json:"verdict"`
+	At      string        `json:"snapshot_at"`
 	Calls   []webCallJSON `json:"calls"`
 }
 
+// get asks the website for path after bringing its snapshot up to date with
+// the database (the website itself does that every SCOUT_WEB_REFRESH), so a
+// test sees what it has just stored.
 func (fx *webFixture) get(t *testing.T, path string) (int, http.Header, []byte) {
 	t.Helper()
+	if err := fx.web.refresh(context.Background()); err != nil {
+		t.Fatalf("refresh: %v", err)
+	}
 	resp, err := http.Get(fx.srv.URL + path)
 	if err != nil {
 		t.Fatal(err)
@@ -252,10 +292,14 @@ func TestWebSummary(t *testing.T) {
 		t.Fatalf("updated_at %v (%v)", got["updated_at"], err)
 	}
 	delete(got, "updated_at")
+	if age, ok := got["snapshot_age_seconds"].(float64); !ok || age < 0 || age > 60 {
+		t.Fatalf("snapshot_age_seconds %v", got["snapshot_age_seconds"])
+	}
+	delete(got, "snapshot_age_seconds")
 	want := map[string]any{"imported": 9.0, "tracked": 5.0, "pending": 1.0, "tracking": 1.0, "done": 4.0,
 		"no_pool": 1.0, "error": 1.0, "gave_up": 1.0,
 		"no_usd_price": 2.0, // the VIRT-priced call, and the tracked call without a price unit
-		"total_calls":  9.0, "repeat_calls": 0.0}
+		"total_calls":  9.0, "repeat_calls": 0.0, "update_posts": 0.0}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("summary %v\nwant    %v", got, want)
 	}
@@ -339,7 +383,7 @@ func TestWebCallsOrderHorizonsAndFields(t *testing.T) {
 		a.ContractAddress != caAlpha || strOrNil(a.TokenName) != "Alpha Token" || strOrNil(a.TokenSymbol) != "ALPHA" ||
 		strOrNil(a.GMGNURL) != "https://gmgn.ai/robinhood/token/"+caAlpha || strOrNil(a.PriceUnit) != "usd" ||
 		fnum(a.EntryPriceUSD) != "0.003" || // the late entry
-		a.Rugged != nil || strOrNil(a.TrackingStatus) != "done" || a.Perceptor != nil ||
+		a.Rugged != nil || strOrNil(a.TrackingStatus) != "done" || a.Perceptor != nil || a.PerceptorURL != nil ||
 		a.CallCount != 1 || a.LastCallDate != a.MessageDate { // called once: the last call is the call
 		t.Fatalf("alpha %+v entry %s", a, fnum(a.EntryPriceUSD))
 	}
@@ -570,8 +614,9 @@ func TestWebOneRowPerToken(t *testing.T) {
 		t.Fatal(err)
 	}
 	delete(got, "updated_at")
+	delete(got, "snapshot_age_seconds")
 	want := map[string]any{"imported": 10.0, "tracked": 6.0, "pending": 1.0, "tracking": 1.0, "done": 5.0,
-		"no_pool": 1.0, "error": 1.0, "gave_up": 1.0, "no_usd_price": 2.0, "total_calls": 14.0, "repeat_calls": 4.0}
+		"no_pool": 1.0, "error": 1.0, "gave_up": 1.0, "no_usd_price": 2.0, "total_calls": 14.0, "repeat_calls": 4.0, "update_posts": 0.0}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("summary %v\nwant    %v", got, want)
 	}
@@ -745,7 +790,7 @@ func TestWebStaticFiles(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv := httptest.NewServer(newWebHandler(fx.st, webConfig{Dir: dir, GMGNTemplate: defaultGMGNTemplate}, static))
+	srv := httptest.NewServer(mustWebServer(t, fx.st, webConfig{Dir: dir, GMGNTemplate: defaultGMGNTemplate}, static))
 	defer srv.Close()
 	fetch := func(p string) (int, http.Header, string) {
 		resp, err := http.Get(srv.URL + p)
@@ -785,7 +830,7 @@ func TestWebServeShutsDownOnCancel(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
-	go func() { done <- serveWeb(ctx, ln, newWebHandler(nil, webConfig{}, static)) }()
+	go func() { done <- serveWeb(ctx, ln, mustWebServer(t, nil, webConfig{}, static)) }()
 	resp, err := http.Get("http://" + ln.Addr().String() + "/style.css")
 	if err != nil || resp.StatusCode != 200 {
 		t.Fatalf("GET: %v", err)
@@ -803,5 +848,174 @@ func TestWebServeShutsDownOnCancel(t *testing.T) {
 	if c, err := net.DialTimeout("tcp", ln.Addr().String(), time.Second); err == nil {
 		c.Close()
 		t.Fatal("still listening after shutdown")
+	}
+}
+
+const (
+	caDelta   = "0xdddddddddddddddddddddddddddddddddddddddd"
+	caOnlyUpd = "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+)
+
+// TestWebPerceptorVerdict: the verdict of a row is the token's latest completed
+// Perceptor report, whichever post of the token it was made for, and the
+// verdict filter works on that.
+func TestWebPerceptorVerdict(t *testing.T) {
+	fx := newWebFixture(t, webConfig{GMGNTemplate: defaultGMGNTemplate})
+	ctx := context.Background()
+	st := fx.st
+	base := time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)
+	perc := mustTool(t, st, "perceptor", "perceptor0xBot", "/scan {ca}", parserPerceptor, true)
+	other := mustTool(t, st, "salpha", "salphaBot", "{ca}", parserText, false)
+	report := func(n int) string { return fmt.Sprintf("https://www.perceptor.info/r/%032x", n) }
+	// inv stores one investigation; call "" = a scan that belongs to no post.
+	inv := func(tool int, call, ca string, at time.Duration, status, level string, url *string) {
+		t.Helper()
+		var callID *int
+		if call != "" {
+			id, ok := fx.ids[call]
+			if !ok {
+				t.Fatalf("no call %q", call)
+			}
+			callID = &id
+		}
+		if _, err := st.InsertScoutInvestigation(ctx, &ScoutInvestigation{CallID: callID, ToolID: tool, ContractAddress: ca,
+			RequestText: "/scan " + ca, RequestedAt: base.Add(at), Status: status, VerdictLevel: level,
+			VerdictLabel: strPtr(level), ReportURL: url}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// two more calls: a later post of beta, and a USD-priced token with the best 1d return
+	fx.ids["beta_again"] = seedWebCall(t, st, base, webSeed{Msg: 21, At: 30 * time.Hour, CA: caBeta, Name: sp("Beta Coin"), Status: TrackPending})
+	fx.ids["delta"] = seedWebCall(t, st, base, webSeed{Msg: 20, At: 20 * time.Hour, CA: caDelta, Name: sp("Delta Alpha"), PostSym: "DLT",
+		Status: TrackDone, Unit: "usd", Entry: 1, Returns: map[string][3]float64{"1h": {2, 3, -1}, "1d": {80, 90, -4}}})
+	// an update post of a token that has no call, with a report of its own
+	upd, err := st.InsertScoutCall(ctx, &ScoutCall{ChannelID: 777, ChannelUsername: "scoutrobinhood", MessageID: 40,
+		MessageDate: base.Add(60 * time.Hour), MessageText: updateText, ContractAddress: caOnlyUpd, Chain: "evm", Status: CallStatusUpdate})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fx.ids["only_upd"] = *upd
+
+	// alpha: scanned clean on its first call
+	inv(perc, "alpha", caAlpha, 1*time.Hour, investigationCompleted, levelClean, sp(report(1)))
+	// delta: scanned clean on its first call
+	inv(perc, "delta", caDelta, 20*time.Hour, investigationCompleted, levelClean, sp(report(2)))
+	// beta: the first call was imported from history; the later post was scanned
+	inv(perc, "beta_again", caBeta, 30*time.Hour, investigationCompleted, levelCaution, sp(report(3)))
+	// gamma: two scans, the later one decides. The later one is stored first (lower id)
+	// and with the address in lower-case letters.
+	inv(perc, "gamma", strings.ToLower(caGamma), 50*time.Hour, investigationCompleted, levelRedFlags, sp(report(4)))
+	inv(perc, "gamma", caGamma, 3*time.Hour, investigationCompleted, levelClean, sp(report(5)))
+	// … and a later scan that did not complete changes nothing
+	inv(perc, "gamma", caGamma, 70*time.Hour, "timeout", levelClean, sp(report(6)))
+	// virt: only scans that did not complete
+	inv(perc, "virt", caVirt, 4*time.Hour, "failed", levelRedFlags, sp(report(7)))
+	inv(perc, "virt", caVirt, 5*time.Hour, "rate_limited", levelUnknown, nil)
+	// xss: completed, but no verdict could be read
+	inv(perc, "xss", caXSS, 5*time.Hour, investigationCompleted, levelUnknown, sp(report(8)))
+	// sol: clean, with a report address that is not https
+	inv(perc, "sol", caSol, 6*time.Hour, investigationCompleted, levelClean, sp("http://www.perceptor.info/r/plain"))
+	// pct: a completed report of another tool is not a Perceptor report
+	inv(other, "pct", caPct, 7*time.Hour, investigationCompleted, levelRedFlags, sp("https://example.org/other"))
+	// err: a scan run by hand (no post), with a javascript: address
+	inv(perc, "", caErr, 90*time.Hour, investigationCompleted, levelCaution, sp("javascript:alert(1)"))
+	// the update post's own report
+	inv(perc, "only_upd", caOnlyUpd, 60*time.Hour, investigationCompleted, levelRedFlags, sp(report(9)))
+	// gave: never scanned
+
+	all := fx.wantOrder(t, "", "delta", "gave", "err", "pct", "sol", "xss", "virt", "gamma", "beta", "alpha")
+	if all.Total != 10 || all.Verdict != "" {
+		t.Fatalf("all: total %d verdict %q", all.Total, all.Verdict)
+	}
+	want := map[string][2]string{ // verdict, report address
+		"alpha": {levelClean, report(1)}, "delta": {levelClean, report(2)}, "beta": {levelCaution, report(3)},
+		"gamma": {levelRedFlags, report(4)}, "virt": {"<nil>", "<nil>"}, "xss": {levelUnknown, report(8)},
+		"sol": {levelClean, "<nil>"}, "pct": {"<nil>", "<nil>"}, "err": {levelCaution, "<nil>"}, "gave": {"<nil>", "<nil>"},
+	}
+	for i, k := range fx.keys(all.Calls) {
+		c := all.Calls[i]
+		if got := [2]string{strOrNil(c.Perceptor), strOrNil(c.PerceptorURL)}; got != want[k] {
+			t.Errorf("%s: perceptor_verdict, perceptor_url = %v, want %v", k, got, want[k])
+		}
+	}
+	// The row of beta is still its first call; only the verdict comes from the later post.
+	for i, k := range fx.keys(all.Calls) {
+		if c := all.Calls[i]; k == "beta" && (c.CallID != fx.ids["beta"] || c.MessageID != 2 || c.CallCount != 2) {
+			t.Errorf("beta row: %+v", c)
+		}
+	}
+	// The dataset view keeps its per-call meaning.
+	var viewFirst, viewLater *string
+	if err := st.Pool.QueryRow(ctx, `SELECT (SELECT perceptor_verdict FROM scout_call_dataset_v WHERE call_id = $1),
+		(SELECT perceptor_verdict FROM scout_call_dataset_v WHERE call_id = $2)`, fx.ids["beta"], fx.ids["beta_again"]).Scan(&viewFirst, &viewLater); err != nil {
+		t.Fatal(err)
+	}
+	if viewFirst != nil || strOrNil(viewLater) != levelCaution {
+		t.Errorf("scout_call_dataset_v.perceptor_verdict of beta's calls = %s, %s; want <nil>, caution", strOrNil(viewFirst), strOrNil(viewLater))
+	}
+
+	check := func(query string, total int, keys ...string) webCallsJSON {
+		t.Helper()
+		res := fx.wantOrder(t, query, keys...)
+		if res.Total != total {
+			t.Errorf("?%s: total %d, want %d", query, res.Total, total)
+		}
+		return res
+	}
+	// Each filter value: exactly its tokens.
+	for v, keys := range map[string][]string{
+		"clean":       {"delta", "sol", "alpha"},
+		"caution":     {"err", "beta"},
+		"red_flags":   {"gamma"},
+		"not_scanned": {"gave", "pct", "xss", "virt"},
+	} {
+		if res := check("verdict="+v, len(keys), keys...); res.Verdict != v {
+			t.Errorf("verdict=%s echoed as %q", v, res.Verdict)
+		}
+	}
+	// … combined with the search
+	check("verdict=clean&q=alpha", 2, "delta", "alpha") // "Delta Alpha", "Alpha Token"
+	check("verdict=caution&q=Beta", 1, "beta")
+	check("verdict=clean&q=Beta", 0)
+	check("verdict=red_flags&q=0x3333", 1, "gamma")
+	check("verdict=not_scanned&q="+url.QueryEscape("<img"), 1, "xss")
+	check("verdict=not_scanned&q="+caOnlyUpd, 0)
+	// … with the sort by return (USD-priced tokens only) and the window
+	if res := check("verdict=clean&sort=return", 2, "delta", "alpha"); !res.USDOnly || fnum(res.Calls[0].ReturnPct) != "80" {
+		t.Errorf("verdict=clean&sort=return: %+v", res)
+	}
+	check("verdict=clean&sort=return&dir=asc", 2, "alpha", "delta")
+	check("verdict=clean&sort=return&horizon=1h", 2, "alpha", "delta") // 5 %, 2 %
+	check("verdict=clean&sort=return&usd_only=0", 3, "delta", "alpha", "sol")
+	check("verdict=caution&sort=return", 1, "beta")
+	check("verdict=red_flags&sort=peak&horizon=1h", 1, "gamma")
+	check("verdict=not_scanned&sort=return", 0)
+	check("verdict=not_scanned&usd_only=1", 0)
+	check("sort=return", 4, "delta", "alpha", "beta", "gamma")
+	// … with paging
+	check("verdict=clean&per=2", 3, "delta", "sol")
+	check("verdict=clean&per=2&page=2", 3, "alpha")
+	check("verdict=clean&per=2&page=3", 3)
+	check("verdict=not_scanned&dir=asc&per=3", 4, "virt", "xss", "pct")
+
+	// The update post's report made no row, under any filter.
+	for _, q := range []string{"per=200", "verdict=red_flags", "usd_only=0&q=" + caOnlyUpd} {
+		for _, c := range fx.calls(t, q).Calls {
+			if strings.EqualFold(c.ContractAddress, caOnlyUpd) || c.CallID == fx.ids["only_upd"] {
+				t.Errorf("?%s lists the update post: %+v", q, c)
+			}
+		}
+	}
+
+	for _, bad := range []string{"verdict=bad", "verdict=", "verdict=CLEAN", "verdict=unknown", "verdict=red%20flags", "verdict=all",
+		"verdict=clean&verdict=caution", "verdict=clean%27%20OR%201=1", "verdict=not_scanned;--"} {
+		code, _, body := fx.get(t, "/api/calls?"+bad)
+		var e map[string]string
+		if code != 400 || json.Unmarshal(body, &e) != nil || e["error"] == "" {
+			t.Errorf("?%s: %d %s", bad, code, body)
+		}
+	}
+	if _, _, err := fx.web.snap.Load().page(ScoutWebCallsFilter{Sort: "date", Dir: "desc", Horizon: "1d", Page: 1, Per: 10, Verdict: "x' OR 1=1"}, nil); err == nil {
+		t.Error("the snapshot accepted an unknown verdict")
 	}
 }

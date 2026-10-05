@@ -14,6 +14,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -94,7 +95,8 @@ const scoutCallColumns = `
 	created_by,       -- 12
 	created_at,       -- 13
 	updated_by,       -- 14
-	updated_at        -- 15
+	updated_at,       -- 15
+	COALESCE(post_kind, '') -- 16
 `
 
 func scanScoutCall(row pgx.Row) (*ScoutCall, error) {
@@ -103,7 +105,7 @@ func scanScoutCall(row pgx.Row) (*ScoutCall, error) {
 	var u uuid.UUID
 	err := row.Scan(&id, &u, &c.ChannelID, &c.ChannelUsername, &c.MessageID, &c.MessageDate,
 		&c.MessageText, &c.URLs, &c.ContractAddress, &c.Chain, &c.Status,
-		&c.CreatedBy, &c.CreatedAt, &c.UpdatedBy, &c.UpdatedAt)
+		&c.CreatedBy, &c.CreatedAt, &c.UpdatedBy, &c.UpdatedAt, &c.PostKind)
 	if err != nil {
 		return nil, err
 	}
@@ -122,7 +124,8 @@ func (st *ScoutStore) InsertScoutCall(ctx context.Context, c *ScoutCall) (*int, 
 // UpsertScoutCall is InsertScoutCall that also reports whether a new row was
 // created. A call is the same call when channel + post + CA match, with the CA
 // compared case-insensitively (0xAbC… == 0xabc…). On a match, only the post
-// text/links and updated_at are refreshed; status and everything else is kept.
+// text/links, post_kind and updated_at are refreshed; status and everything else
+// is kept. post_kind is always worked out from the post text (postKind).
 func (st *ScoutStore) UpsertScoutCall(ctx context.Context, c *ScoutCall) (*int, bool, error) {
 	now := time.Now().UTC()
 	if c.UUID == "" {
@@ -137,13 +140,14 @@ func (st *ScoutStore) UpsertScoutCall(ctx context.Context, c *ScoutCall) (*int, 
 	if c.URLs == nil {
 		c.URLs = []string{}
 	}
+	c.PostKind = postKind(c.MessageText)
 	var id int
-	err := st.Pool.QueryRow(ctx, `UPDATE scout_calls SET message_text = $4, urls = $5, updated_at = $6
+	err := st.Pool.QueryRow(ctx, `UPDATE scout_calls SET message_text = $4, urls = $5, updated_at = $6, post_kind = $7
 		WHERE id = (SELECT id FROM scout_calls
 		            WHERE channel_id = $1 AND message_id = $2 AND lower(contract_address) = lower($3)
 		            ORDER BY id LIMIT 1)
 		RETURNING id`,
-		c.ChannelID, c.MessageID, c.ContractAddress, c.MessageText, c.URLs, now).Scan(&id)
+		c.ChannelID, c.MessageID, c.ContractAddress, c.MessageText, c.URLs, now, c.PostKind).Scan(&id)
 	if err == nil {
 		c.ID = &id
 		return &id, false, nil
@@ -154,19 +158,68 @@ func (st *ScoutStore) UpsertScoutCall(ctx context.Context, c *ScoutCall) (*int, 
 	var created bool
 	err = st.Pool.QueryRow(ctx, `INSERT INTO scout_calls (
 		uuid, channel_id, channel_username, message_id, message_date, message_text,
-		urls, contract_address, chain, status, created_by, created_at, updated_by, updated_at
-	) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+		urls, contract_address, chain, status, created_by, created_at, updated_by, updated_at, post_kind
+	) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
 	ON CONFLICT (channel_id, message_id, contract_address) DO UPDATE
-		SET message_text = EXCLUDED.message_text, urls = EXCLUDED.urls, updated_at = EXCLUDED.updated_at
+		SET message_text = EXCLUDED.message_text, urls = EXCLUDED.urls, updated_at = EXCLUDED.updated_at,
+		    post_kind = EXCLUDED.post_kind
 	RETURNING id, (xmax = 0)`,
 		c.UUID, c.ChannelID, c.ChannelUsername, c.MessageID, c.MessageDate, c.MessageText,
-		c.URLs, c.ContractAddress, c.Chain, c.Status, c.CreatedBy, now, c.UpdatedBy, now,
+		c.URLs, c.ContractAddress, c.Chain, c.Status, c.CreatedBy, now, c.UpdatedBy, now, c.PostKind,
 	).Scan(&id, &created)
 	if err != nil {
 		return nil, false, err
 	}
 	c.ID = &id
 	return &id, created, nil
+}
+
+// ClassifyPostKinds fills post_kind for the rows that do not have one yet (rows
+// stored before the column existed), from their stored message_text and with
+// the same rule as new posts (postKind). It works in batches and returns how
+// many rows became 'call' and 'update'. When no row is left it is one small
+// index lookup and writes nothing. Only post_kind is written: the status of
+// those rows stays as it was.
+func (st *ScoutStore) ClassifyPostKinds(ctx context.Context) (calls, updates int, err error) {
+	const batch = 1000
+	for {
+		rows, err := st.Pool.Query(ctx, `SELECT id, message_text FROM scout_calls WHERE post_kind IS NULL ORDER BY id LIMIT $1`, batch)
+		if err != nil {
+			return calls, updates, err
+		}
+		var ids []int32
+		var kinds []string
+		for rows.Next() {
+			var id int32
+			var text string
+			if err := rows.Scan(&id, &text); err != nil {
+				rows.Close()
+				return calls, updates, err
+			}
+			ids, kinds = append(ids, id), append(kinds, postKind(text))
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return calls, updates, err
+		}
+		if len(ids) == 0 {
+			return calls, updates, nil
+		}
+		if _, err := st.Pool.Exec(ctx, `UPDATE scout_calls c SET post_kind = v.kind
+			FROM unnest($1::int[], $2::text[]) AS v(id, kind) WHERE c.id = v.id AND c.post_kind IS NULL`, ids, kinds); err != nil {
+			return calls, updates, err
+		}
+		for _, k := range kinds {
+			if k == PostKindUpdate {
+				updates++
+			} else {
+				calls++
+			}
+		}
+		if len(ids) < batch {
+			return calls, updates, nil
+		}
+	}
 }
 
 // UpdateScoutCallStatus sets the status of a call.
@@ -710,12 +763,16 @@ func (st *ScoutStore) DueTracking(ctx context.Context, now time.Time, limit int)
 
 // MarkRepeatTracking makes the tracker follow only the first call of each token
 // (the website's rule: lowest message_date, then lowest scout_calls.id, contract
-// address compared without regard to letter case). In one statement it
+// address compared without regard to letter case; update posts are not calls
+// and are never a first call). In one statement it
 //   - sets status 'repeat' (and clears error) on every tracking row whose call is
 //     not the first call of its token and is still pending, tracking, no_pool,
 //     error or gave_up; 'done' rows keep their status and results;
+//   - sets status 'repeat' on every tracking row of an update post, whatever its
+//     status, except 'done';
 //   - puts a 'repeat' row whose call is the first call of its token (an older
-//     call was deleted) back to 'pending', due now.
+//     call was deleted, or the older row turned out to be an update post) back
+//     to 'pending', due now.
 //
 // Nothing is deleted: results already stored for a row stay. Returns the rows
 // changed; when everything is already in place it writes nothing.
@@ -725,8 +782,10 @@ func (st *ScoutStore) MarkRepeatTracking(ctx context.Context) (int, error) {
 		    next_check_at = CASE WHEN x.new_status = 'pending' THEN now() ELSE t.next_check_at END,
 		    attempts = CASE WHEN x.new_status = 'pending' THEN 0 ELSE t.attempts END
 		FROM (SELECT t2.call_id, CASE WHEN fc.id IS NULL THEN 'repeat' ELSE 'pending' END AS new_status
-		      FROM scout_call_tracking t2 LEFT JOIN `+webFirstCallsSQL+` fc ON fc.id = t2.call_id
+		      FROM scout_call_tracking t2 JOIN scout_calls c2 ON c2.id = t2.call_id
+		      LEFT JOIN `+webFirstCallsSQL+` fc ON fc.id = t2.call_id
 		      WHERE (fc.id IS NULL AND t2.status IN ('pending','tracking','no_pool','error','gave_up'))
+		         OR (c2.post_kind = 'update' AND t2.status NOT IN ('done','repeat'))
 		         OR (fc.id IS NOT NULL AND t2.status = 'repeat')) x
 		WHERE t.call_id = x.call_id`)
 	return int(tag.RowsAffected()), err
@@ -1084,129 +1143,111 @@ func (st *ScoutStore) PredictionsForCall(ctx context.Context, callID int) ([]Sco
 
 // The website shows one row per token: its first call. A token is a contract
 // address compared without regard to letter case; the first call is the one
-// with the lowest message_date, ties broken by the lowest id. This is a display
-// rule only: nothing is deleted, and the dataset view keeps one row per call.
+// with the lowest message_date, ties broken by the lowest id. Update posts
+// (post_kind = 'update') are not calls: they are never a first call and are not
+// counted; a row not classified yet (post_kind NULL) is read as a call. This is
+// a display rule only: nothing is deleted, and the dataset view keeps one row
+// per stored post and contract address.
 const (
+	// webRealCallSQL: the row is a real call, not an update post.
+	webRealCallSQL = `post_kind IS DISTINCT FROM 'update'`
 	// webFirstCallsSQL: the id of each token's first call.
 	webFirstCallsSQL = `(SELECT DISTINCT ON (lower(contract_address)) id, lower(contract_address) AS ca
-		FROM scout_calls ORDER BY lower(contract_address), message_date, id)`
+		FROM scout_calls WHERE ` + webRealCallSQL + ` ORDER BY lower(contract_address), message_date, id)`
 	// webCallCountsSQL: how often each token was called, and when last.
 	webCallCountsSQL = `(SELECT lower(contract_address) AS ca, count(*) AS call_count, max(message_date) AS last_call_date
-		FROM scout_calls GROUP BY lower(contract_address))`
+		FROM scout_calls WHERE ` + webRealCallSQL + ` GROUP BY lower(contract_address))`
+	// webPerceptorSQL: each token's latest completed Perceptor investigation
+	// (by contract address without regard to letter case, whichever post of the
+	// token it was run for). verdict is one of clean | caution | red_flags | unknown.
+	webPerceptorSQL = `(SELECT DISTINCT ON (lower(i.contract_address)) lower(i.contract_address) AS ca,
+		CASE WHEN i.verdict_level IN ('clean', 'caution', 'red_flags') THEN i.verdict_level ELSE 'unknown' END AS verdict,
+		i.report_url
+		FROM scout_investigations i JOIN scout_investigation_tools pt ON pt.id = i.tool_id AND pt.code = 'perceptor'
+		WHERE i.status = 'completed'
+		ORDER BY lower(i.contract_address), i.requested_at DESC, i.id DESC)`
+	webPerceptorJoinSQL = ` LEFT JOIN ` + webPerceptorSQL + ` p ON p.ca = fc.ca`
 )
 
-// WebSummary counts the first calls by the state of their tracking row, plus
-// all calls and the repeat calls the website leaves out.
-func (st *ScoutStore) WebSummary(ctx context.Context) (*ScoutWebSummary, error) {
-	var s ScoutWebSummary
-	err := st.Pool.QueryRow(ctx, `SELECT count(*), count(t.entry_price_usd),
-		count(*) FILTER (WHERE t.status = 'pending'), count(*) FILTER (WHERE t.status = 'tracking'),
-		count(*) FILTER (WHERE t.status = 'done'), count(*) FILTER (WHERE t.status = 'no_pool'),
-		count(*) FILTER (WHERE t.status = 'error'), count(*) FILTER (WHERE t.status = 'gave_up'),
-		count(*) FILTER (WHERE t.entry_price_usd IS NOT NULL AND t.price_unit IS DISTINCT FROM 'usd'),
-		(SELECT count(*) FROM scout_calls)
-		FROM `+webFirstCallsSQL+` fc LEFT JOIN scout_call_tracking t ON t.call_id = fc.id`).Scan(&s.Imported, &s.Tracked,
-		&s.Pending, &s.Tracking, &s.Done, &s.NoPool, &s.Error, &s.GaveUp, &s.NoUSDPrice, &s.TotalCalls)
-	if err != nil {
-		return nil, err
+// webRowsSQL loads the website's whole list in one statement: each token's
+// first call with its tracking row, the late-entry results of the five windows,
+// how often the token was called and its latest Perceptor report. It reads the
+// tables directly (not scout_call_dataset_v, whose per-row lookups the website
+// does not need). Ordered by call id.
+var webRowsSQL = `SELECT c.id, c.message_id, c.message_date, c.channel_username, c.contract_address,
+	NULLIF(t.token_name, ''), COALESCE(NULLIF(m.token_symbol, ''), NULLIF(t.token_symbol_onchain, '')),
+	t.price_unit, COALESCE(t.entry_late_price_usd, t.entry_price_usd)::float8, t.entry_price_usd IS NOT NULL,
+	t.rugged, t.status,
+	` + webReturnsPivotSQL("r.") + `,
+	p.verdict, p.report_url, n.call_count, n.last_call_date
+	FROM ` + webFirstCallsSQL + ` fc
+	JOIN scout_calls c ON c.id = fc.id
+	JOIN ` + webCallCountsSQL + ` n ON n.ca = fc.ca
+	LEFT JOIN scout_call_metrics m ON m.call_id = fc.id
+	LEFT JOIN scout_call_tracking t ON t.call_id = fc.id
+	LEFT JOIN (SELECT call_id, ` + webReturnsPivotSQL("") + `
+		FROM scout_call_returns WHERE status = 'done' GROUP BY call_id) r ON r.call_id = fc.id` + webPerceptorJoinSQL + `
+	ORDER BY c.id`
+
+// webReturnsPivotSQL lists the 15 result columns (window × return, peak,
+// drawdown; late entry) in the order of ScoutWebRow.Perf: with prefix "" as the
+// aggregates over scout_call_returns, otherwise as the columns of that subquery.
+func webReturnsPivotSQL(prefix string) string {
+	var cols []string
+	for _, h := range ScoutWebHorizons {
+		for _, c := range [3][2]string{{"ret", "return_late_pct"}, {"gain", "max_gain_late_pct"}, {"dd", "max_drawdown_late_pct"}} {
+			name := c[0] + "_" + h
+			if prefix != "" {
+				cols = append(cols, prefix+name)
+				continue
+			}
+			cols = append(cols, "max("+c[1]+") FILTER (WHERE horizon = '"+h+"')::float8 AS "+name)
+		}
 	}
-	s.RepeatCalls = s.TotalCalls - s.Imported
-	s.UpdatedAt = time.Now().UTC()
-	return &s, nil
+	return strings.Join(cols, ", ")
 }
 
-// The call list's SQL is assembled only from these fixed fragments, chosen by
-// whitelisted keys; every user-supplied value is a query parameter.
-var (
-	// horizon → return, peak, drawdown columns (late entry: 60 s after the post)
-	webHorizonColumns = map[string][3]string{
-		"1h":  {"d.ret_late_1h", "d.max_gain_late_1h", "d.max_dd_late_1h"},
-		"1d":  {"d.ret_late_1d", "d.max_gain_late_1d", "d.max_dd_late_1d"},
-		"3d":  {"d.ret_late_3d", "d.max_gain_late_3d", "d.max_dd_late_3d"},
-		"7d":  {"d.ret_late_7d", "d.max_gain_late_7d", "d.max_dd_late_7d"},
-		"30d": {"d.ret_late_30d", "d.max_gain_late_30d", "d.max_dd_late_30d"},
-	}
-	webSortDirs = map[string]string{"desc": "DESC", "asc": "ASC"}
-)
-
-// likeEscaper makes a search text literal inside a LIKE pattern (ESCAPE '!').
-var likeEscaper = strings.NewReplacer(`!`, `!!`, `%`, `!%`, `_`, `!_`)
-
-// SelectWebCalls returns one page of the call list and the number of rows that
-// match the filter. The list holds each token's first call only, so search,
-// sort, paging and the total all work on one row per token.
-func (st *ScoutStore) SelectWebCalls(ctx context.Context, f ScoutWebCallsFilter) ([]ScoutWebCall, int, error) {
-	cols, ok := webHorizonColumns[f.Horizon]
-	if !ok {
-		return nil, 0, fmt.Errorf("unknown horizon %q", f.Horizon)
-	}
-	dir, ok := webSortDirs[f.Dir]
-	if !ok {
-		return nil, 0, fmt.Errorf("unknown direction %q", f.Dir)
-	}
-	// Performance is shown in USD only: the numbers of other calls read as NULL
-	// (and so sort last).
-	usd := func(col string) string { return "CASE WHEN d.price_unit = 'usd' THEN " + col + " END" }
-	var sortExpr string
-	switch f.Sort {
-	case "date":
-		sortExpr = "d.message_date"
-	case "return":
-		sortExpr = usd(cols[0])
-	case "peak":
-		sortExpr = usd(cols[1])
-	default:
-		return nil, 0, fmt.Errorf("unknown sort %q", f.Sort)
-	}
-	if f.Page < 1 || f.Per < 1 {
-		return nil, 0, errors.New("page and per must be at least 1")
-	}
-
-	var where []string
-	var args []any
-	if f.USDOnly {
-		where = append(where, "d.price_unit = 'usd'")
-	}
-	if f.Q != "" {
-		args = append(args, "%"+likeEscaper.Replace(f.Q)+"%")
-		where = append(where, fmt.Sprintf(`(d.token_name ILIKE $%[1]d ESCAPE '!' OR d.token_symbol ILIKE $%[1]d ESCAPE '!'
-			OR d.contract_address ILIKE $%[1]d ESCAPE '!')`, len(args)))
-	}
-	cond := ""
-	if len(where) > 0 {
-		cond = " WHERE " + strings.Join(where, " AND ")
-	}
-
-	var total int
-	if err := st.Pool.QueryRow(ctx, `SELECT count(*) FROM scout_call_dataset_v d JOIN `+webFirstCallsSQL+` fc ON fc.id = d.call_id`+cond, args...).Scan(&total); err != nil {
+// SelectWebRows returns every row of the website's list (one per token: its
+// first call, in call id order) and the number of update posts. Both are read
+// in one read-only transaction, so they describe the same moment.
+func (st *ScoutStore) SelectWebRows(ctx context.Context) ([]ScoutWebRow, int, error) {
+	tx, err := st.Pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
+	if err != nil {
 		return nil, 0, err
 	}
-
-	q := `SELECT d.call_id, d.message_id, d.message_date, c.channel_username, d.contract_address,
-		d.token_name, d.token_symbol, d.price_unit,
-		` + usd("COALESCE(d.entry_late_price_usd, d.entry_price_usd)") + `,
-		` + usd(cols[0]) + `, ` + usd(cols[1]) + `, ` + usd(cols[2]) + `,
-		d.rugged, d.tracking_status, d.perceptor_verdict, n.call_count, n.last_call_date
-		FROM scout_call_dataset_v d JOIN ` + webFirstCallsSQL + ` fc ON fc.id = d.call_id
-		JOIN scout_calls c ON c.id = d.call_id
-		JOIN ` + webCallCountsSQL + ` n ON n.ca = fc.ca` + cond + `
-		ORDER BY ` + sortExpr + ` ` + dir + ` NULLS LAST, d.call_id ` + dir +
-		fmt.Sprintf(" LIMIT $%d OFFSET $%d", len(args)+1, len(args)+2)
-	args = append(args, f.Per, int64(f.Page-1)*int64(f.Per))
-	rows, err := st.Pool.Query(ctx, q, args...)
+	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
+	var updatePosts int
+	if err := tx.QueryRow(ctx, `SELECT count(*) FROM scout_calls WHERE post_kind = 'update'`).Scan(&updatePosts); err != nil {
+		return nil, 0, err
+	}
+	rows, err := tx.Query(ctx, webRowsSQL)
 	if err != nil {
 		return nil, 0, err
 	}
 	defer rows.Close()
-	out := []ScoutWebCall{}
+	out := []ScoutWebRow{}
+	var perf [len(ScoutWebHorizons) * 3]pgtype.Float8
 	for rows.Next() {
-		var c ScoutWebCall
-		if err := rows.Scan(&c.CallID, &c.MessageID, &c.MessageDate, &c.ChannelUsername, &c.ContractAddress,
-			&c.TokenName, &c.TokenSymbol, &c.PriceUnit, &c.EntryPriceUSD, &c.ReturnPct, &c.PeakPct, &c.DrawdownPct,
-			&c.Rugged, &c.TrackingStatus, &c.PerceptorVerd, &c.CallCount, &c.LastCallDate); err != nil {
+		var r ScoutWebRow
+		dest := []any{&r.CallID, &r.MessageID, &r.MessageDate, &r.ChannelUsername, &r.ContractAddress,
+			&r.TokenName, &r.TokenSymbol, &r.PriceUnit, &r.EntryPrice, &r.Tracked, &r.Rugged, &r.TrackingStatus}
+		for i := range perf {
+			dest = append(dest, &perf[i])
+		}
+		dest = append(dest, &r.PerceptorVerd, &r.PerceptorURL, &r.CallCount, &r.LastCallDate)
+		if err := rows.Scan(dest...); err != nil {
 			return nil, 0, err
 		}
-		out = append(out, c)
+		for i, v := range perf {
+			if v.Valid {
+				r.Perf[i] = v.Float64
+				r.HasPerf |= 1 << i
+			}
+		}
+		out = append(out, r)
 	}
-	return out, total, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, 0, err
+	}
+	return out, updatePosts, nil
 }

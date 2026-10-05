@@ -135,7 +135,7 @@ func TestMarkRepeatTracking(t *testing.T) {
 		t.Fatalf("dataset view: %d rows, %d repeat (%v)", viewRows, repeats, err)
 	}
 	// The website's counts are over first calls: none of them is a repeat.
-	sum, err := st.WebSummary(ctx)
+	sum, err := webSummaryOf(ctx, st)
 	if err != nil || sum.Imported != 3 || sum.Pending != 3 || sum.TotalCalls != 6 || sum.RepeatCalls != 3 {
 		t.Fatalf("web summary: %+v %v", sum, err)
 	}

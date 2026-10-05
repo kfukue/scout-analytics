@@ -9,6 +9,7 @@
   --accent-text: #ffffff;
   --pos: #12703a;
   --neg: #b3261e;
+  --warn: #8a5300;
   --track: #e3e6eb;
   --row-hover: #f1f3f6;
 }
@@ -23,6 +24,7 @@
     --accent-text: #0b1220;
     --pos: #56c57a;
     --neg: #ff8a80;
+    --warn: #e6b450;
     --track: #2a3039;
     --row-hover: #1c2128;
   }
@@ -36,7 +38,7 @@ body {
   color: var(--text);
   font: 14px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
 }
-main { max-width: 1120px; margin: 0 auto; padding: 16px; }
+main { max-width: 1240px; margin: 0 auto; padding: 16px; }
 h1 { font-size: 20px; margin: 0 0 12px; }
 h2 { font-size: 14px; margin: 0; font-weight: 600; }
 p { margin: 0; }
@@ -71,6 +73,18 @@ a:hover { text-decoration: underline; }
   min-width: 0;
   height: 34px;
   padding: 0 10px;
+  font: inherit;
+  color: var(--text);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+.filter { display: inline-flex; align-items: center; gap: 6px; min-width: 0; color: var(--muted); }
+.filter select {
+  height: 34px;
+  min-width: 0;
+  max-width: 100%;
+  padding: 0 6px;
   font: inherit;
   color: var(--text);
   background: var(--bg);
@@ -113,6 +127,11 @@ td.calls { color: var(--muted); }
 .pos { color: var(--pos); }
 .neg { color: var(--neg); }
 .flag { color: var(--neg); font-weight: 600; }
+/* Perceptor verdicts: different words, and red flags is the heaviest (bold, boxed) */
+.pv-clean { color: var(--pos); }
+.pv-caution { color: var(--warn); font-weight: 600; }
+.pv-red { color: var(--neg); font-weight: 700; border: 1px solid currentColor; border-radius: 4px; padding: 0 5px; }
+a.pv { text-decoration: underline; text-underline-offset: 2px; }
 
 .notice { padding: 10px 2px; color: var(--muted); }
 .notice.error { color: var(--neg); }
@@ -135,3 +154,12 @@ td.calls { color: var(--muted); }
   th, td { padding: 6px 8px; }
 }
 @media (prefers-reduced-motion: reduce) { .bar-fill { transition: none; } }
+
+/* Status legend under the table */
+.legend { margin-top: 14px; border: 1px solid var(--border); border-radius: 8px; background: var(--panel); padding: 8px 12px; font-size: 13px; }
+.legend summary { cursor: pointer; font-weight: 600; }
+.legend dl { margin: 8px 0 2px; display: grid; gap: 4px; }
+.legend dl > div { display: grid; grid-template-columns: 110px 1fr; gap: 10px; }
+.legend dt { color: var(--text); white-space: nowrap; }
+.legend dd { margin: 0; color: var(--muted); }
+@media (max-width: 480px) { .legend dl > div { grid-template-columns: 1fr; gap: 0; } .legend dt { font-weight: 600; } }
