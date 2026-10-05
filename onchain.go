@@ -19,6 +19,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode"
 
 	"golang.org/x/crypto/sha3"
 )
@@ -199,6 +200,7 @@ var (
 
 	selDecimals    = selectorOf("decimals()")
 	selSymbol      = selectorOf("symbol()")
+	selName        = selectorOf("name()")
 	selToken0      = selectorOf("token0()")
 	selToken1      = selectorOf("token1()")
 	selGetReserves = selectorOf("getReserves()")
@@ -334,11 +336,99 @@ type rpcClient struct {
 	times   map[uint64]int64 // block → timestamp
 	anchors []uint64         // sorted blocks with known timestamps
 	meta    map[string]tokenMeta
+	labels  map[string]tokenLabel // name()/symbol() as read from the contract, for display
 }
 
 type tokenMeta struct {
 	Decimals int
-	Symbol   string
+	Symbol   string // symbol(), or the start of the address when the token has none
+	Name     string // name(), cleaned; "" when the token has none
+}
+
+// tokenLabel is what a token contract says about itself, cleaned for storage
+// and display ("" = the contract has no such value).
+type tokenLabel struct {
+	Name   string
+	Symbol string
+}
+
+const (
+	maxTokenNameLen   = 100 // characters stored for a token name
+	maxTokenSymbolLen = 32  // characters stored for a token symbol
+)
+
+// cleanTokenText makes a string read from an arbitrary contract safe to store:
+// valid UTF-8, no control characters (and no text-direction overrides, which
+// can make a name display as something else), trimmed, at most max characters.
+func cleanTokenText(s string, max int) string {
+	s = strings.TrimRight(s, "\x00") // bytes32-style values are zero-padded
+	s = strings.ToValidUTF8(s, "")
+	s = strings.Map(func(r rune) rune {
+		switch {
+		case unicode.IsControl(r), r == unicode.ReplacementChar:
+			return -1
+		case r >= 0x202A && r <= 0x202E, r >= 0x2066 && r <= 0x2069, r == 0x200E, r == 0x200F:
+			return -1
+		}
+		return r
+	}, s)
+	s = strings.TrimSpace(s)
+	if rs := []rune(s); len(rs) > max {
+		s = strings.TrimSpace(string(rs[:max]))
+	}
+	return s
+}
+
+// isNoSuchValue: the contract answered, but has no such function or value (a
+// revert or an empty result) — as opposed to the node being unreachable.
+func isNoSuchValue(err error) bool {
+	if err == nil {
+		return false
+	}
+	var re *rpcError
+	if !errors.As(err, &re) {
+		return err.Error() == "empty result"
+	}
+	// A node that is busy or rate limiting also answers with a JSON-RPC error.
+	msg := strings.ToLower(re.Message)
+	for _, transient := range []string{"rate", "limit", "too many", "timeout", "timed out", "capacity", "busy", "try again", "unavailable", "overloaded"} {
+		if strings.Contains(msg, transient) {
+			return false
+		}
+	}
+	return true
+}
+
+// readTokenText calls a string getter (name() / symbol()). ok is false when the
+// node could not be asked (try again later); a token without the value gives "".
+func (c *rpcClient) readTokenText(ctx context.Context, addr, selector string, max int) (text string, ok bool) {
+	b, err := c.ethCall(ctx, addr, selector, 0)
+	if err != nil {
+		return "", isNoSuchValue(err)
+	}
+	return cleanTokenText(decodeString(b), max), true
+}
+
+// tokenLabel returns the token's own name and symbol (cached; two eth_calls for
+// a token not seen before). ok is false when the node could not be asked.
+func (c *rpcClient) tokenLabel(ctx context.Context, addr string) (tokenLabel, bool) {
+	addr = strings.ToLower(addr)
+	c.cacheMu.Lock()
+	l, hit := c.labels[addr]
+	c.cacheMu.Unlock()
+	if hit {
+		return l, true
+	}
+	name, ok1 := c.readTokenText(ctx, addr, selName, maxTokenNameLen)
+	sym, ok2 := c.readTokenText(ctx, addr, selSymbol, maxTokenSymbolLen)
+	if !ok1 || !ok2 {
+		return tokenLabel{}, false
+	}
+	l = tokenLabel{Name: name, Symbol: sym}
+	c.cacheMu.Lock()
+	c.labels[addr] = l
+	c.cacheMu.Unlock()
+	return l, true
 }
 
 // rpcInflight describes the request currently being waited on.
@@ -409,7 +499,7 @@ func newRPCClient(oc onchainConfig) *rpcClient {
 	}
 	c := &rpcClient{url: oc.RPCURL, http: &http.Client{Timeout: 60 * time.Second, Transport: tr},
 		gap: gap, minChunk: oc.MinLogChunk, slots: make(chan struct{}, oc.MaxInflight),
-		times: map[uint64]int64{}, meta: map[string]tokenMeta{}}
+		times: map[uint64]int64{}, meta: map[string]tokenMeta{}, labels: map[string]tokenLabel{}}
 	c.chunk.Store(oc.LogChunk)
 	c.maxChunk = oc.LogChunk
 	c.parallel = oc.Parallel
@@ -878,7 +968,7 @@ func decodeString(b []byte) string {
 	return strings.TrimRight(string(b), "\x00") // bytes32 symbol
 }
 
-// tokenInfo returns decimals and symbol (cached). Native ETH is the zero address.
+// tokenInfo returns decimals, symbol and name (cached). Native ETH is the zero address.
 func (c *rpcClient) tokenInfo(ctx context.Context, addr string) (tokenMeta, error) {
 	addr = strings.ToLower(addr)
 	if addr == zeroAddr {
@@ -895,13 +985,23 @@ func (c *rpcClient) tokenInfo(ctx context.Context, addr string) (tokenMeta, erro
 		return tokenMeta{}, fmt.Errorf("decimals(%s): %w", addr, err)
 	}
 	m := tokenMeta{Decimals: int(word(b, 0).Uint64()), Symbol: addr[:8]}
+	rawSym, symOK := "", false
 	if sb, err := c.ethCall(ctx, addr, selSymbol, 0); err == nil {
-		if s := strings.TrimSpace(decodeString(sb)); s != "" && len(s) <= 32 {
+		rawSym, symOK = decodeString(sb), true
+		if s := strings.TrimSpace(rawSym); s != "" && len(s) <= 32 {
 			m.Symbol = s
 		}
+	} else {
+		symOK = isNoSuchValue(err)
 	}
+	// name() is optional: a token without one (or a node error) never fails this.
+	name, nameOK := c.readTokenText(ctx, addr, selName, maxTokenNameLen)
+	m.Name = name
 	c.cacheMu.Lock()
 	c.meta[addr] = m
+	if symOK && nameOK { // both really answered: the fill pass need not ask again
+		c.labels[addr] = tokenLabel{Name: name, Symbol: cleanTokenText(rawSym, maxTokenSymbolLen)}
+	}
 	c.cacheMu.Unlock()
 	return m, nil
 }

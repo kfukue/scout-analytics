@@ -157,7 +157,8 @@ def train(df: pd.DataFrame, out_root, version: str | None = None) -> Path:
     res = {"version": version, "buckets": {}, "data": {
         "rows": len(df), "first_date": df["message_date"].min().strftime("%Y-%m-%d"),
         "last_date": df["message_date"].max().strftime("%Y-%m-%d"),
-        "no_pool": int(L["no_pool"].sum()), "not_usd": int((~L["no_pool"] & L["not_usd"]).sum()),
+        "no_pool": int((L["no_pool"] & ~L["repeat"]).sum()), "repeat": int(L["repeat"].sum()),
+        "not_usd": int((~L["no_pool"] & L["not_usd"]).sum()),
         "eligible": int(eligible.sum()),
         "coverage": {c: float(blank[c].notna().mean()) for c in raw_cols}}}
     reference = {}

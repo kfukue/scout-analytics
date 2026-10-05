@@ -184,7 +184,8 @@ CREATE TABLE IF NOT EXISTS scout_call_tracking (
     contract_address      TEXT         NOT NULL,
     entry_at              TIMESTAMPTZ  NOT NULL,          -- when the call was posted
     priority              SMALLINT     NOT NULL DEFAULT 0, -- 0 = live call, 1 = backfilled history
-    status                TEXT         NOT NULL,          -- pending | tracking | done | no_pool | error | gave_up
+    status                TEXT         NOT NULL,          -- pending | tracking | done | no_pool | error | gave_up | repeat
+                                                          -- repeat = a later call of a token whose first call is tracked; not tracked itself
     pool_address          TEXT,
     pool_name             TEXT,
     pool_dex              TEXT,
@@ -297,13 +298,22 @@ CREATE INDEX IF NOT EXISTS scout_call_predictions_ca_idx   ON scout_call_predict
 -- one bucket row per call and model version (rows without a bucket are not limited)
 CREATE UNIQUE INDEX IF NOT EXISTS scout_call_predictions_bucket_uq ON scout_call_predictions (call_id, model_version, bucket);
 CREATE INDEX IF NOT EXISTS scout_calls_ca_date_idx ON scout_calls (contract_address, message_date);
+-- website: the first call of each token (address compared without regard to letter case)
+CREATE INDEX IF NOT EXISTS scout_calls_lower_ca_first_idx ON scout_calls (lower(contract_address), message_date, id);
+
+-- Token name and symbol read from the token contract (name() / symbol()), for
+-- display. NULL = not looked up yet; '' = the contract has none (not asked again).
+ALTER TABLE scout_call_tracking ADD COLUMN IF NOT EXISTS token_name           TEXT;
+ALTER TABLE scout_call_tracking ADD COLUMN IF NOT EXISTS token_symbol_onchain TEXT;
 
 -- Training dataset: one row per call = features known at call time + outcomes.
 DROP VIEW IF EXISTS scout_call_predictions_v;
 DROP VIEW IF EXISTS scout_call_dataset_v;
 CREATE VIEW scout_call_dataset_v AS
 SELECT cv.call_id, cv.message_id, cv.message_date, cv.contract_address, cv.status AS call_status,
-       cv.token_symbol, cv.dex, cv.launchpad,
+       -- symbol as posted, else the one read from the token contract; the name is for display only
+       COALESCE(NULLIF(cv.token_symbol, ''), NULLIF(t.token_symbol_onchain, '')) AS token_symbol,
+       NULLIF(t.token_name, '') AS token_name, cv.dex, cv.launchpad,
        cv.called_at_mcap_usd::float8 AS called_at_mcap_usd, cv.mcap_usd::float8 AS mcap_usd,
        cv.liq_usd::float8 AS liq_usd, cv.liq_pct::float8 AS liq_pct,
        cv.tax_buy_pct::float8 AS tax_buy_pct, cv.tax_sell_pct::float8 AS tax_sell_pct,

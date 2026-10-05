@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"regexp"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -18,6 +19,7 @@ import (
 // Performance tracker: for every call, find its pool, the entry price at the
 // call time, and the return / peak gain / drawdown after each horizon
 // (1h, 1d, 3d, 7d, 30d). Runs inside the listener (or alone with -track).
+// Only the first call of each token is tracked; later calls get status "repeat".
 // ---------------------------------------------------------------------------
 
 // trackLoop processes due tracking rows every PriceCfg.Interval.
@@ -39,6 +41,7 @@ func (s *scanner) trackLoop(ctx context.Context) {
 			return
 		}
 		s.logTrackingStatus(ctx, n)
+		s.fillTokenNames(ctx)
 		if n == 50 {
 			continue // more are waiting: keep going without the pause
 		}
@@ -61,8 +64,33 @@ func horizonNames(hs []horizon) string {
 	return s
 }
 
+// commas writes n with thousands separators: 3120 → "3,120".
+func commas(n int) string {
+	s := fmt.Sprint(n)
+	neg := strings.HasPrefix(s, "-")
+	s = strings.TrimPrefix(s, "-")
+	for i := len(s) - 3; i > 0; i -= 3 {
+		s = s[:i] + "," + s[i:]
+	}
+	if neg {
+		return "-" + s
+	}
+	return s
+}
+
 // trackDue processes up to limit due calls; returns how many were processed.
+// Only the first call of each token is tracked (see MarkRepeatTracking).
 func (s *scanner) trackDue(ctx context.Context, limit int) int {
+	// Only the first call of each token is tracked: later calls are set aside
+	// before the due rows are read (one statement; writes nothing when all is in place).
+	if n, err := s.db.MarkRepeatTracking(ctx); err != nil {
+		log.Printf("tracking: repeat calls: %v", err)
+		if ctx.Err() != nil {
+			return 0
+		}
+	} else if n > 0 {
+		log.Printf("tracking: %s repeat call(s) skipped — only the first call of each token is tracked", commas(n))
+	}
 	rows, err := s.db.DueTracking(ctx, time.Now(), limit)
 	if err != nil {
 		log.Printf("tracking: %v", err)
@@ -119,7 +147,7 @@ func (s *scanner) logTrackingStatus(ctx context.Context, processed int) {
 		return
 	}
 	var parts []string
-	for _, st := range []string{TrackPending, TrackTracking, TrackDone, TrackNoPool, TrackError, TrackGaveUp} {
+	for _, st := range []string{TrackPending, TrackTracking, TrackDone, TrackNoPool, TrackError, TrackGaveUp, TrackRepeat} {
 		if counts[st] > 0 {
 			parts = append(parts, fmt.Sprintf("%s %d", st, counts[st]))
 		}
@@ -142,6 +170,64 @@ func (s *scanner) logTrackingStatus(ctx context.Context, processed int) {
 		log.Printf("tracking: idle — %s; %s", summary, next)
 	}
 }
+
+// tokenNameBatch is how many distinct tokens one fill pass looks up.
+const tokenNameBatch = 200
+
+// fillTokenNames stores the name and symbol that token contracts report
+// (name() / symbol()) for calls that have none yet, for display on the website.
+// It touches only those two columns: tracking status, schedule and the on-chain
+// state are left alone, so no call is tracked again because of it. A token
+// without a name gets "" and is not asked again. Returns the tokens filled.
+func (s *scanner) fillTokenNames(ctx context.Context) int {
+	if s.db == nil || !s.pc.Enabled || s.pc.Source != "onchain" || s.onchain == nil || ctx.Err() != nil {
+		return 0
+	}
+	// Repeat calls of a token already looked up: copied in the database, no node request.
+	copied, err := s.db.CopyKnownTokenNames(ctx)
+	if err != nil {
+		log.Printf("token names: %v", err)
+		return 0
+	}
+	cas, err := s.db.ContractsMissingTokenName(ctx, tokenNameBatch)
+	if err != nil {
+		log.Printf("token names: %v", err)
+		return 0
+	}
+	tokens, named, rows := 0, 0, copied
+	for _, ca := range cas {
+		if ctx.Err() != nil {
+			break
+		}
+		var l tokenLabel
+		if evmAddrRe.MatchString(ca) { // anything else cannot have an on-chain name here
+			var ok bool
+			if l, ok = s.onchain.rpc.tokenLabel(ctx, ca); !ok {
+				if ctx.Err() == nil {
+					log.Printf("token names: the node did not answer for %s — the rest is tried again on the next pass", ca)
+				}
+				break
+			}
+		}
+		n, err := s.db.SetTokenName(ctx, ca, l.Name, l.Symbol)
+		if err != nil {
+			log.Printf("token names: save %s: %v", ca, err)
+			break
+		}
+		tokens++
+		rows += n
+		if l.Name != "" {
+			named++
+		}
+	}
+	if tokens > 0 || copied > 0 {
+		log.Printf("token names: looked up %d token(s) (%d with a name, %d without), %d call(s) updated", tokens, named, tokens-named, rows)
+	}
+	return tokens
+}
+
+// evmAddrRe matches exactly one EVM address.
+var evmAddrRe = regexp.MustCompile(`^0x[0-9a-fA-F]{40}$`)
 
 func backoff(attempts int) time.Duration {
 	d := 15 * time.Minute
