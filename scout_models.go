@@ -23,6 +23,7 @@ const (
 	TrackNoPool   = "no_pool"  // price source doesn't know the token yet; retried
 	TrackError    = "error"    // last attempt failed; retried with back-off
 	TrackGaveUp   = "gave_up"  // no pool / no price data well after the last horizon
+	TrackRepeat   = "repeat"   // a later call of a token whose first call is tracked; not tracked itself
 )
 
 // Investigation statuses.
@@ -198,3 +199,62 @@ type ScoutCallTracking struct {
 
 // TableName returns the table name for this model.
 func (ScoutCallTracking) TableName() string { return "scout_call_tracking" }
+
+// ScoutWebSummary is the import/tracking progress shown on the website. The
+// website shows one row per token (its first call), so every count except
+// TotalCalls and RepeatCalls is over first calls only, with the state taken
+// from that call's scout_call_tracking row (the page works out the percentages).
+type ScoutWebSummary struct {
+	Imported    int       `json:"imported"`     // first calls = distinct tokens called
+	Tracked     int       `json:"tracked"`      // first calls with an entry price
+	Pending     int       `json:"pending"`      // first calls by status …
+	Tracking    int       `json:"tracking"`     //
+	Done        int       `json:"done"`         //
+	NoPool      int       `json:"no_pool"`      //
+	Error       int       `json:"error"`        //
+	GaveUp      int       `json:"gave_up"`      //
+	NoUSDPrice  int       `json:"no_usd_price"` // tracked first calls whose price_unit is not usd
+	TotalCalls  int       `json:"total_calls"`  // every call, repeats included
+	RepeatCalls int       `json:"repeat_calls"` // TotalCalls − Imported: calls the website does not list
+	UpdatedAt   time.Time `json:"updated_at"`   // server time
+}
+
+// ScoutWebCall is one row of the website's call list (from scout_call_dataset_v):
+// the first call of a token. CallCount and LastCallDate describe all calls of
+// that token (contract address compared without regard to letter case).
+// The performance numbers are in USD, from the entry 60 seconds after the post,
+// for the horizon that was asked for; they are nil for calls not priced in USD.
+type ScoutWebCall struct {
+	CallID          int       `json:"call_id"`
+	MessageID       int       `json:"message_id"`
+	MessageDate     time.Time `json:"message_date"`
+	PostURL         *string   `json:"post_url"`
+	ContractAddress string    `json:"contract_address"`
+	TokenName       *string   `json:"token_name"`
+	TokenSymbol     *string   `json:"token_symbol"`
+	GMGNURL         *string   `json:"gmgn_url"`
+	PriceUnit       *string   `json:"price_unit"`
+	EntryPriceUSD   *float64  `json:"entry_price_usd"`
+	ReturnPct       *float64  `json:"return_pct"`
+	PeakPct         *float64  `json:"peak_pct"`
+	DrawdownPct     *float64  `json:"drawdown_pct"`
+	Rugged          *bool     `json:"rugged"`
+	TrackingStatus  *string   `json:"tracking_status"`
+	PerceptorVerd   *string   `json:"perceptor_verdict"`
+	CallCount       int       `json:"call_count"`     // calls of this token in total (≥ 1)
+	LastCallDate    time.Time `json:"last_call_date"` // most recent call of this token
+
+	ChannelUsername string `json:"-"` // for PostURL
+}
+
+// ScoutWebCallsFilter selects a page of the call list (first calls only). Sort, Dir and Horizon
+// must be values of the fixed lists below (SelectWebCalls rejects anything else).
+type ScoutWebCallsFilter struct {
+	Q       string // substring of token name, symbol or contract address ("" = all)
+	Sort    string // date | return | peak
+	Dir     string // desc | asc
+	Horizon string // 1h | 1d | 3d | 7d | 30d
+	USDOnly bool   // only calls priced in USD
+	Page    int    // 1-based
+	Per     int    // rows per page
+}

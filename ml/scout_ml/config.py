@@ -25,6 +25,7 @@ BUCKETS = {
 }
 LABELS = ("runner", "collapse")
 NO_POOL_STATUSES = ("no_pool", "gave_up")  # calls we could never have traded
+REPEAT_STATUS = "repeat"  # a later call of a token: the tracker follows the first call only
 
 # --- Columns of scout_call_dataset_v, in view order ------------------------
 _WINDOWS = ("5m", "15m", "60m")
@@ -53,7 +54,9 @@ VIEW_COLUMNS = (IDENTITY + ["dex", "launchpad"] + NUMERIC_RAW
 # --- Leakage guard ---------------------------------------------------------
 # Outcomes and bookkeeping are only known after the post; ids are not signal.
 # quote_asset is deliberately NOT here (allowed as a categorical feature).
-FORBIDDEN_COLUMNS = set(BOOKKEEPING) - {"quote_asset"} | set(IDENTITY) | {"pre_vol_unit"}
+# token_name (the token contract's own name, for the website) is display text.
+FORBIDDEN_COLUMNS = (set(BOOKKEEPING) - {"quote_asset"} | set(IDENTITY)
+                     | {"pre_vol_unit", "token_name"})
 FORBIDDEN_PREFIXES = ("ret_", "max_gain_", "max_dd_")
 
 # --- Derived features (built in features.build_features) -------------------

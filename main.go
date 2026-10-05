@@ -1397,6 +1397,7 @@ func main() {
 	testNotify := flag.Bool("test-notify", false, "send one test message to SCOUT_NOTIFY_PEER and exit")
 	postFlag := flag.String("post", "", "process specific @scoutrobinhood post id(s), e.g. 10002 or 10002,10005: show what was found, investigate and deliver, then exit")
 	listenOnly := flag.Bool("listen-only", false, "listener without the performance tracker: new calls are still scanned, delivered and queued for tracking; run -track in another terminal to compute performance")
+	webOnly := flag.Bool("web", false, "run only the read-only website and its JSON API (no Telegram), forever; address from SCOUT_WEB_ADDR (default :8090)")
 	listChats := flag.Bool("list-chats", false, "print your groups/channels with their ids (for SCOUT_NOTIFY_PEER), then exit")
 	flag.Parse()
 
@@ -1439,7 +1440,7 @@ func main() {
 	}
 
 	// Modes that need only the database (no Telegram login).
-	if *exportPath != "" || *trackOnly || *trackOnce {
+	if *exportPath != "" || *trackOnly || *trackOnce || *webOnly {
 		if s.db == nil {
 			log.Fatal("these modes need the database (SCOUT_DB=off is set)")
 		}
@@ -1470,12 +1471,17 @@ func main() {
 				}
 			}
 			s.logTrackingStatus(context.Background(), total)
+			s.fillTokenNames(ctx)
 			fmt.Printf("processed %d call(s)\n", total)
 		case *trackOnly:
 			if !s.pc.Enabled {
 				log.Fatal("SCOUT_TRACK_PERFORMANCE=false")
 			}
 			s.trackLoop(ctx)
+		case *webOnly:
+			if err := runWeb(ctx, s.db, loadWebConfig()); err != nil {
+				log.Fatalf("web: %v", err)
+			}
 		}
 		return
 	}

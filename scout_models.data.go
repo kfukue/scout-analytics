@@ -708,6 +708,30 @@ func (st *ScoutStore) DueTracking(ctx context.Context, now time.Time, limit int)
 	return out, rows.Err()
 }
 
+// MarkRepeatTracking makes the tracker follow only the first call of each token
+// (the website's rule: lowest message_date, then lowest scout_calls.id, contract
+// address compared without regard to letter case). In one statement it
+//   - sets status 'repeat' (and clears error) on every tracking row whose call is
+//     not the first call of its token and is still pending, tracking, no_pool,
+//     error or gave_up; 'done' rows keep their status and results;
+//   - puts a 'repeat' row whose call is the first call of its token (an older
+//     call was deleted) back to 'pending', due now.
+//
+// Nothing is deleted: results already stored for a row stay. Returns the rows
+// changed; when everything is already in place it writes nothing.
+func (st *ScoutStore) MarkRepeatTracking(ctx context.Context) (int, error) {
+	tag, err := st.Pool.Exec(ctx, `UPDATE scout_call_tracking t
+		SET status = x.new_status, error = NULL, updated_at = now(),
+		    next_check_at = CASE WHEN x.new_status = 'pending' THEN now() ELSE t.next_check_at END,
+		    attempts = CASE WHEN x.new_status = 'pending' THEN 0 ELSE t.attempts END
+		FROM (SELECT t2.call_id, CASE WHEN fc.id IS NULL THEN 'repeat' ELSE 'pending' END AS new_status
+		      FROM scout_call_tracking t2 LEFT JOIN `+webFirstCallsSQL+` fc ON fc.id = t2.call_id
+		      WHERE (fc.id IS NULL AND t2.status IN ('pending','tracking','no_pool','error','gave_up'))
+		         OR (fc.id IS NOT NULL AND t2.status = 'repeat')) x
+		WHERE t.call_id = x.call_id`)
+	return int(tag.RowsAffected()), err
+}
+
 // TrackingStats returns how many calls are in each tracking status and when the
 // next check is due (nil if nothing is scheduled).
 func (st *ScoutStore) TrackingStats(ctx context.Context) (map[string]int, *time.Time, error) {
@@ -771,6 +795,48 @@ func (st *ScoutStore) SaveTracking(ctx context.Context, t *ScoutCallTracking) er
 		t.EntryPriceUSD, t.EntryPriceSource, t.CurrentPriceUSD, t.CurrentLiquidityUSD,
 		t.Rugged, t.NextCheckAt.UTC(), t.LastCheckedAt, t.Attempts, t.Error, t.PriceUnit, onchainJSON, t.EntryLatePriceUSD)
 	return err
+}
+
+// ContractsMissingTokenName returns up to limit distinct contract addresses
+// that have a tracking row without a token name yet, newest calls first.
+func (st *ScoutStore) ContractsMissingTokenName(ctx context.Context, limit int) ([]string, error) {
+	rows, err := st.Pool.Query(ctx, `SELECT min(contract_address) FROM scout_call_tracking
+		WHERE token_name IS NULL GROUP BY lower(contract_address)
+		ORDER BY max(call_id) DESC LIMIT $1`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var ca string
+		if err := rows.Scan(&ca); err != nil {
+			return nil, err
+		}
+		out = append(out, ca)
+	}
+	return out, rows.Err()
+}
+
+// CopyKnownTokenNames fills the token name of calls whose token was already
+// looked up for another call. Returns the rows filled.
+func (st *ScoutStore) CopyKnownTokenNames(ctx context.Context) (int, error) {
+	tag, err := st.Pool.Exec(ctx, `UPDATE scout_call_tracking t
+		SET token_name = k.token_name, token_symbol_onchain = k.token_symbol_onchain
+		FROM (SELECT DISTINCT ON (lower(contract_address)) lower(contract_address) AS ca, token_name, token_symbol_onchain
+		      FROM scout_call_tracking WHERE token_name IS NOT NULL
+		      ORDER BY lower(contract_address), call_id DESC) k
+		WHERE t.token_name IS NULL AND lower(t.contract_address) = k.ca`)
+	return int(tag.RowsAffected()), err
+}
+
+// SetTokenName stores a token's on-chain name and symbol on every call of that
+// contract ("" = the contract has none). Only these two columns change: status,
+// schedule, on-chain state and updated_at stay as they are. Returns the rows updated.
+func (st *ScoutStore) SetTokenName(ctx context.Context, ca, name, symbol string) (int, error) {
+	tag, err := st.Pool.Exec(ctx, `UPDATE scout_call_tracking SET token_name = $2, token_symbol_onchain = $3
+		WHERE lower(contract_address) = lower($1)`, ca, name, symbol)
+	return int(tag.RowsAffected()), err
 }
 
 // UpsertReturn stores the result for one horizon.
@@ -1010,4 +1076,137 @@ func (st *ScoutStore) PredictionsForCall(ctx context.Context, callID int) ([]Sco
 		out = append(out, p)
 	}
 	return out, rows.Err()
+}
+
+// ---------------------------------------------------------------------------
+// Website (read-only): import progress and the call list
+// ---------------------------------------------------------------------------
+
+// The website shows one row per token: its first call. A token is a contract
+// address compared without regard to letter case; the first call is the one
+// with the lowest message_date, ties broken by the lowest id. This is a display
+// rule only: nothing is deleted, and the dataset view keeps one row per call.
+const (
+	// webFirstCallsSQL: the id of each token's first call.
+	webFirstCallsSQL = `(SELECT DISTINCT ON (lower(contract_address)) id, lower(contract_address) AS ca
+		FROM scout_calls ORDER BY lower(contract_address), message_date, id)`
+	// webCallCountsSQL: how often each token was called, and when last.
+	webCallCountsSQL = `(SELECT lower(contract_address) AS ca, count(*) AS call_count, max(message_date) AS last_call_date
+		FROM scout_calls GROUP BY lower(contract_address))`
+)
+
+// WebSummary counts the first calls by the state of their tracking row, plus
+// all calls and the repeat calls the website leaves out.
+func (st *ScoutStore) WebSummary(ctx context.Context) (*ScoutWebSummary, error) {
+	var s ScoutWebSummary
+	err := st.Pool.QueryRow(ctx, `SELECT count(*), count(t.entry_price_usd),
+		count(*) FILTER (WHERE t.status = 'pending'), count(*) FILTER (WHERE t.status = 'tracking'),
+		count(*) FILTER (WHERE t.status = 'done'), count(*) FILTER (WHERE t.status = 'no_pool'),
+		count(*) FILTER (WHERE t.status = 'error'), count(*) FILTER (WHERE t.status = 'gave_up'),
+		count(*) FILTER (WHERE t.entry_price_usd IS NOT NULL AND t.price_unit IS DISTINCT FROM 'usd'),
+		(SELECT count(*) FROM scout_calls)
+		FROM `+webFirstCallsSQL+` fc LEFT JOIN scout_call_tracking t ON t.call_id = fc.id`).Scan(&s.Imported, &s.Tracked,
+		&s.Pending, &s.Tracking, &s.Done, &s.NoPool, &s.Error, &s.GaveUp, &s.NoUSDPrice, &s.TotalCalls)
+	if err != nil {
+		return nil, err
+	}
+	s.RepeatCalls = s.TotalCalls - s.Imported
+	s.UpdatedAt = time.Now().UTC()
+	return &s, nil
+}
+
+// The call list's SQL is assembled only from these fixed fragments, chosen by
+// whitelisted keys; every user-supplied value is a query parameter.
+var (
+	// horizon → return, peak, drawdown columns (late entry: 60 s after the post)
+	webHorizonColumns = map[string][3]string{
+		"1h":  {"d.ret_late_1h", "d.max_gain_late_1h", "d.max_dd_late_1h"},
+		"1d":  {"d.ret_late_1d", "d.max_gain_late_1d", "d.max_dd_late_1d"},
+		"3d":  {"d.ret_late_3d", "d.max_gain_late_3d", "d.max_dd_late_3d"},
+		"7d":  {"d.ret_late_7d", "d.max_gain_late_7d", "d.max_dd_late_7d"},
+		"30d": {"d.ret_late_30d", "d.max_gain_late_30d", "d.max_dd_late_30d"},
+	}
+	webSortDirs = map[string]string{"desc": "DESC", "asc": "ASC"}
+)
+
+// likeEscaper makes a search text literal inside a LIKE pattern (ESCAPE '!').
+var likeEscaper = strings.NewReplacer(`!`, `!!`, `%`, `!%`, `_`, `!_`)
+
+// SelectWebCalls returns one page of the call list and the number of rows that
+// match the filter. The list holds each token's first call only, so search,
+// sort, paging and the total all work on one row per token.
+func (st *ScoutStore) SelectWebCalls(ctx context.Context, f ScoutWebCallsFilter) ([]ScoutWebCall, int, error) {
+	cols, ok := webHorizonColumns[f.Horizon]
+	if !ok {
+		return nil, 0, fmt.Errorf("unknown horizon %q", f.Horizon)
+	}
+	dir, ok := webSortDirs[f.Dir]
+	if !ok {
+		return nil, 0, fmt.Errorf("unknown direction %q", f.Dir)
+	}
+	// Performance is shown in USD only: the numbers of other calls read as NULL
+	// (and so sort last).
+	usd := func(col string) string { return "CASE WHEN d.price_unit = 'usd' THEN " + col + " END" }
+	var sortExpr string
+	switch f.Sort {
+	case "date":
+		sortExpr = "d.message_date"
+	case "return":
+		sortExpr = usd(cols[0])
+	case "peak":
+		sortExpr = usd(cols[1])
+	default:
+		return nil, 0, fmt.Errorf("unknown sort %q", f.Sort)
+	}
+	if f.Page < 1 || f.Per < 1 {
+		return nil, 0, errors.New("page and per must be at least 1")
+	}
+
+	var where []string
+	var args []any
+	if f.USDOnly {
+		where = append(where, "d.price_unit = 'usd'")
+	}
+	if f.Q != "" {
+		args = append(args, "%"+likeEscaper.Replace(f.Q)+"%")
+		where = append(where, fmt.Sprintf(`(d.token_name ILIKE $%[1]d ESCAPE '!' OR d.token_symbol ILIKE $%[1]d ESCAPE '!'
+			OR d.contract_address ILIKE $%[1]d ESCAPE '!')`, len(args)))
+	}
+	cond := ""
+	if len(where) > 0 {
+		cond = " WHERE " + strings.Join(where, " AND ")
+	}
+
+	var total int
+	if err := st.Pool.QueryRow(ctx, `SELECT count(*) FROM scout_call_dataset_v d JOIN `+webFirstCallsSQL+` fc ON fc.id = d.call_id`+cond, args...).Scan(&total); err != nil {
+		return nil, 0, err
+	}
+
+	q := `SELECT d.call_id, d.message_id, d.message_date, c.channel_username, d.contract_address,
+		d.token_name, d.token_symbol, d.price_unit,
+		` + usd("COALESCE(d.entry_late_price_usd, d.entry_price_usd)") + `,
+		` + usd(cols[0]) + `, ` + usd(cols[1]) + `, ` + usd(cols[2]) + `,
+		d.rugged, d.tracking_status, d.perceptor_verdict, n.call_count, n.last_call_date
+		FROM scout_call_dataset_v d JOIN ` + webFirstCallsSQL + ` fc ON fc.id = d.call_id
+		JOIN scout_calls c ON c.id = d.call_id
+		JOIN ` + webCallCountsSQL + ` n ON n.ca = fc.ca` + cond + `
+		ORDER BY ` + sortExpr + ` ` + dir + ` NULLS LAST, d.call_id ` + dir +
+		fmt.Sprintf(" LIMIT $%d OFFSET $%d", len(args)+1, len(args)+2)
+	args = append(args, f.Per, int64(f.Page-1)*int64(f.Per))
+	rows, err := st.Pool.Query(ctx, q, args...)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+	out := []ScoutWebCall{}
+	for rows.Next() {
+		var c ScoutWebCall
+		if err := rows.Scan(&c.CallID, &c.MessageID, &c.MessageDate, &c.ChannelUsername, &c.ContractAddress,
+			&c.TokenName, &c.TokenSymbol, &c.PriceUnit, &c.EntryPriceUSD, &c.ReturnPct, &c.PeakPct, &c.DrawdownPct,
+			&c.Rugged, &c.TrackingStatus, &c.PerceptorVerd, &c.CallCount, &c.LastCallDate); err != nil {
+			return nil, 0, err
+		}
+		out = append(out, c)
+	}
+	return out, total, rows.Err()
 }

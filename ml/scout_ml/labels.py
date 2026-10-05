@@ -4,7 +4,7 @@ import operator
 import numpy as np
 import pandas as pd
 
-from .config import BUCKETS, LABELS, NO_POOL_STATUSES
+from .config import BUCKETS, LABELS, NO_POOL_STATUSES, REPEAT_STATUS
 from .features import num, text
 
 _OPS = {">=": operator.ge, ">": operator.gt, "<=": operator.le, "<": operator.lt}
@@ -27,11 +27,13 @@ def to_bool(s: pd.Series) -> pd.Series:
 
 
 def build_labels(df: pd.DataFrame) -> pd.DataFrame:
-    """Per row: `no_pool`, `not_usd`, and for each bucket `usable_<b>`,
+    """Per row: `no_pool`, `repeat` (the part of `no_pool` that is an untracked
+    repeat call, reported separately), `not_usd`, and for each bucket `usable_<b>`,
     `runner_<b>`, `collapse_<b>` (NaN where unusable) and `net_ret_<b>`."""
     out = pd.DataFrame(index=df.index)
     out["no_pool"] = (num(df, "entry_late_price_usd").isna()
                       | text(df, "tracking_status").isin(NO_POOL_STATUSES))
+    out["repeat"] = out["no_pool"] & (text(df, "tracking_status") == REPEAT_STATUS)
     out["not_usd"] = text(df, "price_unit") != "usd"
     rugged = to_bool(df["rugged"]) if "rugged" in df.columns else pd.Series(False, index=df.index)
     buy, sell = num(df, "tax_buy_pct"), num(df, "tax_sell_pct")

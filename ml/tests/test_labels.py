@@ -50,10 +50,13 @@ def test_usable_needs_usd_outcome_and_a_pool():
         row(ret_late_7d=10, price_unit="native"),
         row(ret_late_7d=None),
         row(ret_late_7d=10, entry_late_price_usd=None),
-        row(ret_late_7d=10, tracking_status="gave_up")])
+        row(ret_late_7d=10, tracking_status="gave_up"),
+        row(ret_late_7d=None, entry_late_price_usd=None, tracking_status="repeat"),  # untracked repeat call
+        row(ret_late_7d=10, tracking_status="repeat")])  # set aside after it was tracked: results kept
     L = build_labels(df)
-    assert L["usable_medium"].tolist() == [True, False, False, False, False]
-    assert L["no_pool"].tolist() == [False, False, False, True, True]
+    assert L["usable_medium"].tolist() == [True, False, False, False, False, False, True]
+    assert L["no_pool"].tolist() == [False, False, False, True, True, True, False]
+    assert L["repeat"].tolist() == [False, False, False, False, False, True, False]
     assert np.isnan(L["runner_medium"][1])
 
 

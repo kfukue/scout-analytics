@@ -102,6 +102,25 @@ is enough**, as long as it serves old event logs (`eth_getLogs`); an archive nod
    only reads the new block range.
 5. After the last horizon: **rugged** = price < 5% of entry, or pool liquidity < $500 (v2/v3).
 
+**Only the first call of each token is tracked.** The channel often calls the same token
+again; following every repeat would cost days of node time for the same price history. The
+first call is the one the website shows: the earliest `message_date` of a contract address
+(compared without regard to letter case), the lowest `scout_calls.id` when two share a date.
+At the start of every tracker cycle the later calls get `scout_call_tracking.status = 'repeat'`
+(“a later call of a token whose first call is tracked; not tracked itself”) and are never
+picked up; the log says so once (`tracking: 3,120 repeat call(s) skipped — …`) and the status
+line shows `repeat N`. Nothing is deleted: a repeat call keeps its rows in `scout_calls` and in
+`scout_call_dataset_v` (with `tracking_status = 'repeat'`, and no outcomes unless it was
+tracked before), and a repeat that was already `done` stays `done` with its results. If an
+older call of a token is imported later (a newest-first backfill), it becomes the tracked one
+and the previous first call becomes `repeat`; if a first call is deleted, the next call of
+that token goes back to `pending` by itself.
+
+To track repeats again you would set those rows back to `pending`
+(`UPDATE scout_call_tracking SET status = 'pending', next_check_at = now() WHERE status = 'repeat'`)
+— but the tracker marks them `repeat` again on its next cycle, so this needs a build
+without that step; there is no setting for it.
+
 **ETH price from your Ethereum archive node (recommended):** ETH/USD is the same on every
 chain, so it can be read from Chainlink's ETH/USD feed on Ethereum mainnet. Point the scanner
 at an Ethereum **archive** node (e.g. Erigon):
@@ -239,6 +258,7 @@ Scores never filter deliveries. If the service is down or slower than
 ### What the tracker logs
 
 ```
+tracking: 3,120 repeat call(s) skipped — only the first call of each token is tracked
 tracking: 37 call(s) due now
 call 10126 [1/37]: 0x129b…, posted 2026-09-28 14:02 (70h ago), status pending
 call 10126 [1/37]: pool found: uniswap-v3 0x…, paired with WETH (entry block 21300412)
@@ -246,9 +266,10 @@ call 10126 [1/37]: entry price $0.0031 (1.03e-06 WETH × $3010, Chainlink on Eth
 call 10126 [1/37]: +1h → 0.0052 (+67.7%), peak +120.4%, low -8.1%
 call 10126 [1/37]: scanning blocks 21726610 → 22164412: 46% (at 21926609, 12 events so far)
 call 10126 [1/37]: tracking in 14s, 212 RPC requests — next check 2026-10-01 14:12
-tracking: processed 37 call(s) — pending 112, tracking 37, done 4; more due now
-tracking: idle — tracking 149, done 4; next check in 42m10s
+tracking: processed 37 call(s) — pending 112, tracking 37, done 4, repeat 3120; more due now
+tracking: idle — tracking 149, done 4, repeat 3120; next check in 42m10s
 ```
+`repeat` = later calls of a token already called, which are not tracked (see above).
 
 Long block scans print a progress line every few seconds, and a status line is
 printed after every cycle (every `SCOUT_TRACK_INTERVAL`, even when idle), so a
@@ -487,6 +508,110 @@ DB integration tests (use a THROWAWAY database; they drop and recreate the scout
 ```
 SCOUT_TEST_DATABASE_URL=postgres://postgres@localhost:5432/scout_test?sslmode=disable go test ./telegrambot/scoutanalytics
 ```
+
+## Website
+
+A small read-only page that shows how far the import/tracking is and lists every token the
+channel called, with the performance of its first call. It runs as **its own process**, next to the listener and the tracker, and
+needs only the database (no Telegram login, same as `-track`):
+
+```bash
+./scoutanalytics -web          # or: go run ./telegrambot/scoutanalytics -web
+# → website on http://[::]:8090 …   open http://<this machine>:8090/
+```
+
+| Setting | Default | |
+|---|---|---|
+| `SCOUT_WEB_ADDR` | `:8090` | address to listen on. `:8090` = every network interface; `127.0.0.1:8090` = this machine only |
+| `SCOUT_GMGN_URL` | `https://gmgn.ai/robinhood/token/{ca}` | link behind the token name / symbol; `{ca}` is replaced by the contract address |
+| `SCOUT_WEB_DIR` | *(empty)* | serve the page from this folder instead of the copy built into the program (edit `frontend/` without rebuilding) |
+
+**It is read-only and has no login.** The server only answers `GET` (anything else → 405) and
+runs `SELECT`s; anyone who can reach the address can see the calls. Put it behind your own
+firewall / reverse proxy, or bind it to `127.0.0.1`, if that is not what you want. Like every
+other mode it applies the schema at startup (`SCOUT_DB_AUTO_MIGRATE`), and it reads the same
+`.env` (so `API_ID` / `API_HASH` must be present, although no Telegram connection is made).
+
+The page (`frontend/index.html`, `app.js`, `style.css`; plain JavaScript, nothing loaded from
+other sites):
+
+- **One row per token.** The channel often calls the same token several times, sometimes
+  within the same minute. The page shows each token once: its **first call** (the earliest
+  `message_date`; when two posts have the same time, the one stored first, i.e. the lowest
+  `scout_calls.id`). Tokens are told apart by contract address, ignoring upper/lower case.
+  Search, sorting, the window, paging and every count work on that one-row-per-token list.
+  This is a display rule of the website only: nothing is deleted, and `scout_call_dataset_v`,
+  the tracker and the model export still have one row per call.
+- **Import progress** — `tracked / imported calls tracked (x %)`, then Pending, No pool, Errors
+  (error + gave up) and No USD price, each with its share of the imported calls; all of these
+  count first calls only, with the state of the first call. Below: "One row per token (its
+  first call). N repeat calls are not shown." Refreshes every 30 seconds.
+- **Calls** — Date (links to the post), Token and Symbol (link to GMGN), Calls (`×N` when the
+  token was called N > 1 times, empty otherwise; hover for "Called N times, last on …"),
+  Entry $, Return %, Peak %, Worst drop %, Status. Search by token name, symbol or address; pick the window
+  (1h, 1d, 3d, 7d, 30d); click Date / Return / Peak to sort, click again to reverse. 50 per page.
+- Every number is **in USD and measured from the entry 60 seconds after the post** (the
+  `*_late_*` columns). A call tracked in another asset (no USD source for its pair) shows
+  "no USD price" instead of numbers. Sorting by Return or Peak lists the USD-priced calls only.
+
+**Token names.** The tracker reads each token's own `name()` and `symbol()` from its contract
+and stores them in `scout_call_tracking.token_name` / `token_symbol_onchain` (on-chain price
+source only). After every tracker cycle (`-track`, `-track-once`, or the listener's built-in
+tracker) it fills up to 200 tokens that have none yet: two small node requests per token,
+nothing is tracked again because of it, and a token without a name is stored as empty and not
+asked again. So after an upgrade the names appear on the page as the tracker runs; until then
+the page shows the shortened address. `scout_call_dataset_v` gained `token_name`, and its
+`token_symbol` is now the symbol from the post, or the on-chain one when the post has none.
+Names come from arbitrary contracts: control characters are removed, the length is capped
+(100 / 32 characters), and the page only ever shows them as text.
+
+### API
+
+`GET /api/summary` — counts over first calls (one per token), each with the state of its
+`scout_call_tracking` row:
+
+```json
+{"imported": 4210, "tracked": 3105, "pending": 820, "tracking": 410, "done": 2695,
+ "no_pool": 240, "error": 30, "gave_up": 15, "no_usd_price": 62,
+ "total_calls": 5120, "repeat_calls": 910, "updated_at": "2026-10-02T14:30:00Z"}
+```
+`imported` = first calls = distinct tokens called, `tracked` = those with an entry price,
+`pending` … `gave_up` = those by status, `no_usd_price` = tracked ones whose `price_unit` is
+not `usd`. `total_calls` = every row of `scout_calls`, repeats included; `repeat_calls` =
+`total_calls − imported`, the calls the page does not list.
+
+`GET /api/calls` — one page of first calls, one row per token (from `scout_call_dataset_v`);
+`q`, `sort`, `usd_only`, paging and `total` all apply to that list, so a repeat call is never
+returned and cannot be found by its own name or symbol:
+
+| Parameter | Values | Default | |
+|---|---|---|---|
+| `q` | text, up to 100 characters | *(none)* | part of the token name, symbol or contract address; case-insensitive; `%` and `_` are ordinary characters |
+| `sort` | `date`, `return`, `peak` | `date` | empty values always come last; ties by call id |
+| `dir` | `desc`, `asc` | `desc` | |
+| `horizon` | `1h`, `1d`, `3d`, `7d`, `30d` | `1d` | which window `return_pct` / `peak_pct` / `drawdown_pct` are for |
+| `usd_only` | `1`, `0` | `1` when `sort` is `return` or `peak`, else `0` | `1` = only tokens whose first call has `price_unit = usd` |
+| `page` | 1 … | `1` | |
+| `per` | 1 – 200 | `50` | |
+
+Any other value or parameter → HTTP 400 with `{"error": "…"}`.
+
+```json
+{"total": 3105, "page": 1, "per": 50, "horizon": "1d", "sort": "date", "dir": "desc", "usd_only": false,
+ "calls": [{"call_id": 812, "message_id": 10002, "message_date": "2026-10-01T14:30:00Z",
+   "post_url": "https://t.me/scoutrobinhood/10002",
+   "contract_address": "0x…", "token_name": "Malfoid", "token_symbol": "MALFOID",
+   "gmgn_url": "https://gmgn.ai/robinhood/token/0x…", "price_unit": "usd",
+   "entry_price_usd": 0.0045, "return_pct": -20.0, "peak_pct": 100.0, "drawdown_pct": -50.0,
+   "rugged": false, "tracking_status": "done", "perceptor_verdict": "clean",
+   "call_count": 3, "last_call_date": "2026-10-02T09:12:00Z"}]}
+```
+`call_count` = how many calls of that token exist in total (1 or more); `last_call_date` = the
+date of the most recent one (equal to `message_date` when there is only one). Everything else
+in the object belongs to the first call.
+`entry_price_usd` is the price 60 seconds after the post (the price at the post when that one
+is missing). `entry_price_usd`, `return_pct`, `peak_pct` and `drawdown_pct` are `null` unless
+`price_unit` is `usd`. `gmgn_url` is `null` for anything that is not a plain `0x…` address.
 
 ## State / logs
 

@@ -51,7 +51,9 @@ How it validates (no random splits):
 - walk-forward: train up to week N, test on week N+1, for every week.
 
 Calls without a pool (`no_pool`, `gave_up`, or no late entry price) and rows
-whose prices are not in USD are excluded; the report says how many.
+whose prices are not in USD are excluded; the report says how many. The tracker
+follows only the first call of each token: later calls have `tracking_status =
+repeat` and no outcomes, so they are excluded too and counted on their own line.
 
 ## Read the report
 

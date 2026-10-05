@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<meta name="referrer" content="no-referrer">
+<title>Scout calls</title>
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="style.css">
+<script src="app.js" defer></script>
+</head>
+<body>
+<main>
+  <h1>Scout calls</h1>
+
+  <section class="panel" aria-labelledby="progress-title">
+    <div class="panel-head">
+      <h2 id="progress-title">Import progress</h2>
+      <span id="summary-updated" class="muted"></span>
+    </div>
+    <p id="summary-headline" class="headline">Loading…</p>
+    <div id="summary-bar" class="bar" role="progressbar" aria-labelledby="progress-title" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+      <div id="summary-bar-fill" class="bar-fill"></div>
+    </div>
+    <dl id="summary-stats" class="stats">
+      <div><dt>Pending</dt><dd id="stat-pending">–</dd></div>
+      <div><dt>No pool</dt><dd id="stat-nopool">–</dd></div>
+      <div><dt>Errors</dt><dd id="stat-errors">–</dd></div>
+      <div><dt>No USD price</dt><dd id="stat-nousd">–</dd></div>
+    </dl>
+    <p id="summary-note" class="muted small note"></p>
+    <p id="summary-error" class="notice" role="status" hidden></p>
+  </section>
+
+  <section aria-label="Calls">
+    <div class="controls">
+      <input id="search" type="search" placeholder="Search token name or symbol" aria-label="Search token name or symbol" maxlength="100" autocomplete="off" spellcheck="false">
+      <div id="horizons" class="segmented" role="group" aria-label="Performance window">
+        <button type="button" data-horizon="1h" aria-pressed="false">1h</button>
+        <button type="button" data-horizon="1d" aria-pressed="true">1d</button>
+        <button type="button" data-horizon="3d" aria-pressed="false">3d</button>
+        <button type="button" data-horizon="7d" aria-pressed="false">7d</button>
+        <button type="button" data-horizon="30d" aria-pressed="false">30d</button>
+      </div>
+    </div>
+    <p id="explain" class="muted small"></p>
+
+    <div class="table-wrap" tabindex="0" role="region" aria-label="Calls table">
+      <table>
+        <thead>
+          <tr>
+            <th scope="col" data-sort="date"><button type="button" class="sort">Date</button></th>
+            <th scope="col">Token</th>
+            <th scope="col">Symbol</th>
+            <th scope="col" class="calls">Calls</th>
+            <th scope="col" class="num">Entry $</th>
+            <th scope="col" class="num" data-sort="return"><button type="button" class="sort">Return %</button></th>
+            <th scope="col" class="num" data-sort="peak"><button type="button" class="sort">Peak %</button></th>
+            <th scope="col" class="num">Worst drop %</th>
+            <th scope="col">Status</th>
+          </tr>
+        </thead>
+        <tbody id="rows"></tbody>
+      </table>
+    </div>
+    <p id="table-msg" class="notice" role="status">Loading…</p>
+
+    <nav class="pager" aria-label="Pages">
+      <button type="button" id="prev" disabled>Previous</button>
+      <span id="page-info">Page 1 of 1</span>
+      <button type="button" id="next" disabled>Next</button>
+      <span id="total" class="muted"></span>
+    </nav>
+  </section>
+  <noscript><p class="notice">This page needs JavaScript.</p></noscript>
+</main>
+</body>
+</html>
