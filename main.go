@@ -438,6 +438,16 @@ func (s *scanner) onChannelPost(msg *tg.Message) {
 		}
 		return
 	}
+	// An update post ("$TOKEN hit 3X …") is about an earlier call: it is recorded
+	// and nothing else. It stays out of s.seen, so a later real call of the
+	// token is still investigated.
+	if postKind(msg.Message) == PostKindUpdate {
+		for _, ca := range fresh {
+			log.Printf("post %d: update for %s (not a call), skipping", msg.ID, ca)
+			s.recordCall(msg, ca, urls, CallStatusUpdate)
+		}
+		return
+	}
 	for _, ca := range fresh {
 		if !s.seen.markNew(ca) {
 			log.Printf("post %d: %s already scanned, skipping", msg.ID, ca)
@@ -689,7 +699,8 @@ func (s *scanner) findCallMessage(ctx context.Context, ca string) (*tg.Message, 
 	return pickCallMessage(res, ca, s.cfg.Chains), nil
 }
 
-// pickCallMessage returns the newest message that really contains the CA.
+// pickCallMessage returns the newest message that really contains the CA; a
+// real call is preferred over an update post ("$TOKEN hit 3X …").
 func pickCallMessage(res tg.MessagesMessagesClass, ca string, chains map[string]bool) *tg.Message {
 	var msgs []tg.MessageClass
 	switch m := res.(type) {
@@ -701,14 +712,19 @@ func pickCallMessage(res tg.MessagesMessagesClass, ca string, chains map[string]
 		msgs = m.Messages
 	}
 	var best *tg.Message
+	bestCall := false
 	for _, mc := range msgs {
 		m, ok := mc.(*tg.Message)
 		if !ok {
 			continue
 		}
+		isCall := postKind(m.Message) == PostKindCall
 		for _, found := range extractCAs(m.Message, postURLs(m), chains) {
-			if caKey(found) == caKey(ca) && (best == nil || m.ID > best.ID) {
-				best = m
+			if caKey(found) != caKey(ca) {
+				continue
+			}
+			if best == nil || (isCall && !bestCall) || (isCall == bestCall && m.ID > best.ID) {
+				best, bestCall = m, isCall
 			}
 		}
 	}
@@ -889,10 +905,16 @@ func (s *scanner) recordCall(msg *tg.Message, ca string, urls []string, status s
 }
 
 // recordCallInfo records a call (idempotent) plus its parsed data and price
-// tracking row; created reports whether the call was new.
+// tracking row; created reports whether the call was new. An update post is
+// recorded with status "update" whatever status was asked for, and gets no
+// parsed data and no tracking row.
 func (s *scanner) recordCallInfo(msg *tg.Message, ca string, urls []string, status string) (*int, bool) {
 	if s.db == nil {
 		return nil, false
+	}
+	update := postKind(msg.Message) == PostKindUpdate
+	if update {
+		status = CallStatusUpdate
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -910,6 +932,9 @@ func (s *scanner) recordCallInfo(msg *tg.Message, ca string, urls []string, stat
 	if err != nil {
 		log.Printf("db: insert scout_calls %s: %v", ca, err)
 		return nil, false
+	}
+	if update {
+		return id, created
 	}
 	if meta := metaOf(msg.Message); meta != nil {
 		if err := s.db.UpsertCallMetrics(ctx, *id, meta); err != nil {
@@ -1479,6 +1504,7 @@ func main() {
 			}
 			s.trackLoop(ctx)
 		case *webOnly:
+			classifyPosts(ctx, s.db)
 			if err := runWeb(ctx, s.db, loadWebConfig()); err != nil {
 				log.Fatalf("web: %v", err)
 			}
@@ -1493,8 +1519,8 @@ func main() {
 		s.listOnly = true // no delivery target needed
 		if err := run(ctx, s, func(ctx context.Context) error {
 			st, err := s.backfill(ctx, *backfillFrom, *backfillTo, *backfillMax)
-			fmt.Printf("backfill: %d posts read, %d calls, %d CAs (%d new, %d already recorded)\n",
-				st.Posts, st.Calls, st.CAs, st.New, st.Existing)
+			fmt.Printf("backfill: %d posts read, %d calls, %d CAs (%d new, %d already recorded), %d update post(s) (not calls)\n",
+				st.Posts, st.Calls, st.CAs, st.New, st.Existing, st.Updates)
 			if err == nil && s.pc.Enabled {
 				fmt.Println("their performance is filled in by the tracker (running listener, or -track / -track-once)")
 			}
@@ -1578,6 +1604,13 @@ func main() {
 					fmt.Printf("parsed call data:\n%s\n%s\n\n", pretty, meta.SummaryLine())
 				} else {
 					fmt.Print("parsed call data: none (post isn't in the call format)\n\n")
+				}
+				if postKind(m.Message) == PostKindUpdate {
+					fmt.Print("post kind: update (about an earlier call, not a call) — recorded, not investigated\n\n")
+					for _, ca := range cas {
+						s.recordCall(m, ca, urls, CallStatusUpdate)
+					}
+					continue
 				}
 				for _, ca := range cas {
 					s.seen.markNew(ca)

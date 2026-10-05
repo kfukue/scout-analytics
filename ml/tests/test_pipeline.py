@@ -43,6 +43,31 @@ def test_end_to_end_training_artifacts(trained):
         assert needle in report, needle
 
 
+def test_update_posts_are_excluded_and_counted_on_their_own_line(synthetic_df, tmp_path, monkeypatch):
+    assert "- excluded, update post (not a call): 0" in render_report_for(synthetic_df, tmp_path / "a", monkeypatch)
+    df = synthetic_df.copy()
+    df["post_kind"] = "call"
+    df.loc[df.index[:50], "post_kind"] = "update"
+    df.loc[df.index[50:60], "post_kind"] = None  # not classified yet: a call
+    vdir = tmp_path / "b" / "v"
+    report = render_report_for(df, tmp_path / "b", monkeypatch)
+    assert "- excluded, update post (not a call): 50" in report
+    plain = json.loads((tmp_path / "a" / "v" / "meta.json").read_text())["data"]
+    data = json.loads((vdir / "meta.json").read_text())["data"]
+    assert data["update"] == 50 and data["rows"] == plain["rows"]
+    # every row is in exactly one line of the report
+    for d in (plain, data):
+        assert d["update"] + d["no_pool"] + d["repeat"] + d["not_usd"] + d["eligible"] == d["rows"]
+    assert data["eligible"] < plain["eligible"]
+
+
+def render_report_for(df, root, monkeypatch):
+    """Run train() with no bucket to train (fast): only the data section matters."""
+    monkeypatch.setattr(C, "BUCKETS", {})
+    out = train_mod.train(df, root, version="v")
+    return (out / "report.md").read_text()
+
+
 def _client(monkeypatch, model_dir):
     monkeypatch.setenv("SCOUT_MODEL_DIR", str(model_dir))
     import serve

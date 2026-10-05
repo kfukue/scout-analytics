@@ -16,10 +16,31 @@
     no_pool: 'no pool', error: 'error', gave_up: 'gave up'
   };
 
-  var state = { q: '', sort: 'date', dir: 'desc', horizon: '1d', page: 1 };
+  // Perceptor verdict of a token → words shown and style. The words differ, so
+  // colour is never the only cue.
+  var VERDICT_TEXT = {
+    clean: { text: 'no red flags', cls: 'pv pv-clean' },
+    caution: { text: 'caution', cls: 'pv pv-caution' },
+    red_flags: { text: 'red flags', cls: 'pv pv-red' }
+  };
+  var VERDICT_FILTERS = ['', 'clean', 'caution', 'red_flags', 'not_scanned'];
+
+  var state = { q: '', sort: 'date', dir: 'desc', horizon: '1d', verdict: '', page: 1 };
   var loadedOnce = false;
-  var requestSeq = 0;
   var searchTimer = null;
+  // The request for the list that is on its way (null = none). A new request
+  // cancels it, and only the answer to the newest request is ever shown, so an
+  // answer to an older question never replaces a newer one.
+  var callsAbort = null;
+  var requestSeq = 0;
+  // What the table shows: the address it was loaded from, the ETag of that
+  // answer and a signature of its rows. A refresh that comes back "not
+  // modified" (304), or with the same rows, leaves the table as it is.
+  var shown = { url: '', etag: '', sig: '', data: null };
+  var callsErrorShown = false;
+  var summaryEtag = '';
+  var refreshTimer = null;
+  var lastRefresh = 0;
 
   function $(id) { return document.getElementById(id); }
 
@@ -149,6 +170,19 @@
       tr.appendChild(pctCell(c.drawdown_pct));
     }
 
+    // Latest Perceptor report of the token; a dash when it was never scanned
+    // (or the report had no readable verdict).
+    var tdPerc = el('td');
+    var pv = Object.prototype.hasOwnProperty.call(VERDICT_TEXT, c.perceptor_verdict) ? VERDICT_TEXT[c.perceptor_verdict] : null;
+    if (pv) {
+      var pvNode = linkOrText(c.perceptor_url, pv.text, pv.cls);
+      if (pvNode.tagName === 'A') { pvNode.title = 'Open the Perceptor report'; }
+      tdPerc.appendChild(pvNode);
+    } else {
+      tdPerc.textContent = DASH;
+    }
+    tr.appendChild(tdPerc);
+
     var tdStatus = el('td');
     var st = c.tracking_status;
     tdStatus.appendChild(document.createTextNode(st ? (STATUS_TEXT[st] || String(st)) : DASH));
@@ -209,37 +243,75 @@
 
     if (calls.length === 0) {
       if (state.page > pages) { state.page = pages; loadCalls(false); return; }
-      setMessage(state.q ? 'No calls match this search.' : 'No calls yet.', false);
+      setMessage(state.q ? 'No calls match this search.' : (state.verdict ? 'No calls match this filter.' : 'No calls yet.'), false);
     } else {
       setMessage('', false);
     }
   }
 
-  function fetchJSON(url) {
-    return fetch(url, { headers: { 'Accept': 'application/json' }, cache: 'no-store' }).then(function (r) {
+  // Asks for JSON. With an etag the server may answer 304 ("what you have is
+  // still current"): then data is null. at = when the server last read the
+  // database (X-Snapshot-At).
+  function fetchJSON(url, etag, signal) {
+    var headers = { 'Accept': 'application/json' };
+    if (etag) { headers['If-None-Match'] = etag; }
+    return fetch(url, { headers: headers, cache: 'no-store', signal: signal }).then(function (r) {
+      var meta = { etag: r.headers.get('ETag') || '', at: r.headers.get('X-Snapshot-At') || '' };
+      if (r.status === 304) {
+        // read the (empty) body so the browser counts the request as finished
+        return r.text().then(function () { return { data: null, etag: etag, at: meta.at }; });
+      }
       if (!r.ok) { throw new Error('HTTP ' + r.status); }
-      return r.json();
+      return r.json().then(function (data) { return { data: data, etag: meta.etag, at: meta.at }; });
     });
+  }
+
+  // Everything of an answer that the table shows (not the time it was read).
+  function callsSignature(d) {
+    return JSON.stringify([d.total, d.page, d.per, d.horizon, d.sort, d.dir, d.usd_only, d.verdict, d.calls]);
   }
 
   // quiet = background refresh: no "Loading…", and the rows stay if it fails.
   function loadCalls(quiet) {
+    if (callsAbort) { callsAbort.abort(); }
+    var ctl = (typeof AbortController === 'function') ? new AbortController() : null;
+    callsAbort = ctl;
     var seq = ++requestSeq;
     var p = new URLSearchParams();
     if (state.q) { p.set('q', state.q); }
     p.set('sort', state.sort);
     p.set('dir', state.dir);
     p.set('horizon', state.horizon);
+    if (state.verdict) { p.set('verdict', state.verdict); }
     p.set('page', String(state.page));
     p.set('per', String(PER_PAGE));
+    var url = 'api/calls?' + p.toString();
     if (!quiet && !loadedOnce) { setMessage('Loading…', false); }
-    fetchJSON('api/calls?' + p.toString()).then(function (data) {
-      if (seq !== requestSeq) { return; } // a newer request is on its way
+    // only ask "has it changed?" about the very list the table shows
+    var etag = (shown.data && shown.url === url) ? shown.etag : '';
+    var mine = function () { return seq === requestSeq; };
+    fetchJSON(url, etag, ctl ? ctl.signal : undefined).then(function (res) {
+      if (!mine()) { return; } // a newer request has taken over
+      callsAbort = null;
       loadedOnce = true;
-      renderCalls(data);
+      var hadError = callsErrorShown;
+      callsErrorShown = false;
+      if (res.data === null) {
+        // not modified: the table is current
+        if (hadError) { renderCalls(shown.data); }
+        return;
+      }
+      var sig = callsSignature(res.data);
+      var same = shown.data !== null && shown.url === url && shown.sig === sig;
+      shown = { url: url, etag: res.etag, sig: sig, data: res.data };
+      if (same && !hadError) { return; } // same rows: nothing to draw
+      renderCalls(res.data);
     }).catch(function (err) {
-      if (seq !== requestSeq) { return; }
+      if (!mine()) { return; } // cancelled by a newer request
+      callsAbort = null;
+      if (err && err.name === 'AbortError') { return; }
       var what = err && err.message ? ' (' + err.message + ')' : '';
+      callsErrorShown = true;
       setMessage(loadedOnce
         ? 'Could not refresh the calls' + what + '. Showing the last loaded rows.'
         : 'Could not load the calls' + what + '.', true);
@@ -268,17 +340,29 @@
     stat('stat-nousd', s.no_usd_price || 0);
 
     var repeats = isNum(s.repeat_calls) && s.repeat_calls > 0 ? s.repeat_calls : 0;
-    $('summary-note').textContent = 'One row per token (its first call).' + (repeats > 0
-      ? ' ' + fmtInt(repeats) + (repeats === 1 ? ' repeat call is' : ' repeat calls are') + ' not shown.' : '');
+    var updates = isNum(s.update_posts) && s.update_posts > 0 ? s.update_posts : 0;
+    var hidden = [];
+    if (repeats > 0) { hidden.push(fmtInt(repeats) + (repeats === 1 ? ' repeat call' : ' repeat calls')); }
+    if (updates > 0) { hidden.push(fmtInt(updates) + (updates === 1 ? ' update post' : ' update posts')); }
+    $('summary-note').textContent = 'One row per token (its first call).' + (hidden.length
+      ? ' ' + hidden.join(' and ') + (repeats + updates === 1 ? ' is' : ' are') + ' not shown.' : '');
 
-    var when = new Date(s.updated_at);
-    if (isNaN(when.getTime())) { when = new Date(); }
-    $('summary-updated').textContent = 'Updated ' + fmtTime(when);
+    showUpdated(s.updated_at);
+  }
+
+  // "Updated hh:mm:ss": when the server last read the database.
+  function showUpdated(iso) {
+    var when = new Date(iso);
+    if (!isNaN(when.getTime())) { $('summary-updated').textContent = 'Updated ' + fmtTime(when); }
     $('summary-error').hidden = true;
   }
 
   function loadSummary() {
-    fetchJSON('api/summary').then(renderSummary).catch(function (err) {
+    fetchJSON('api/summary', summaryEtag).then(function (res) {
+      if (res.data === null) { showUpdated(res.at); return; } // the counts have not changed
+      summaryEtag = res.etag;
+      renderSummary(res.data);
+    }).catch(function (err) {
       var e = $('summary-error');
       e.hidden = false;
       e.classList.add('error');
@@ -326,6 +410,14 @@
       }, DEBOUNCE_MS);
     });
 
+    $('verdict').addEventListener('change', function (ev) {
+      var v = ev.target.value;
+      if (VERDICT_FILTERS.indexOf(v) < 0 || v === state.verdict) { return; }
+      state.verdict = v;
+      state.page = 1;
+      loadCalls(false);
+    });
+
     $('prev').addEventListener('click', function () {
       if (state.page > 1) { state.page--; loadCalls(false); }
     });
@@ -336,12 +428,36 @@
   }
 
   bind();
+  // a reload can keep the old choice in the select: start from "All reports"
+  $('verdict').value = '';
   renderHeaders();
   loadSummary();
   loadCalls(false);
-  setInterval(function () {
-    if (document.hidden) { return; }
+
+  // Background refresh every 30 seconds, but not while the tab is hidden. When
+  // the tab is shown again and the last refresh is older than that, refresh at once.
+  function refresh() {
+    lastRefresh = Date.now();
     loadSummary();
     loadCalls(true);
-  }, REFRESH_MS);
+    scheduleRefresh(REFRESH_MS);
+  }
+
+  function scheduleRefresh(ms) {
+    clearTimeout(refreshTimer);
+    refreshTimer = setTimeout(function () {
+      refreshTimer = null;
+      if (document.hidden) { return; } // picked up again by visibilitychange
+      refresh();
+    }, ms);
+  }
+
+  document.addEventListener('visibilitychange', function () {
+    if (document.hidden) { return; }
+    var age = Date.now() - lastRefresh;
+    if (age >= REFRESH_MS) { refresh(); } else if (refreshTimer === null) { scheduleRefresh(REFRESH_MS - age); }
+  });
+
+  lastRefresh = Date.now();
+  scheduleRefresh(REFRESH_MS);
 })();

@@ -78,9 +78,24 @@ func commas(n int) string {
 	return s
 }
 
+// classifyPosts fills post_kind for rows that do not have it yet and logs one
+// line when it classified any.
+func classifyPosts(ctx context.Context, st *ScoutStore) {
+	calls, updates, err := st.ClassifyPostKinds(ctx)
+	if calls+updates > 0 {
+		log.Printf("posts: %s call(s), %s update(s) classified", commas(calls), commas(updates))
+	}
+	if err != nil && ctx.Err() == nil {
+		log.Printf("posts: classifying old posts: %v", err)
+	}
+}
+
 // trackDue processes up to limit due calls; returns how many were processed.
 // Only the first call of each token is tracked (see MarkRepeatTracking).
 func (s *scanner) trackDue(ctx context.Context, limit int) int {
+	// Posts stored before post_kind existed are classified first (one small
+	// lookup when none is left), so update posts are set aside below.
+	classifyPosts(ctx, s.db)
 	// Only the first call of each token is tracked: later calls are set aside
 	// before the due rows are read (one statement; writes nothing when all is in place).
 	if n, err := s.db.MarkRepeatTracking(ctx); err != nil {
@@ -389,14 +404,23 @@ func (s *scanner) firstCheckAt(entry time.Time) time.Time {
 type backfillStats struct {
 	Posts, Calls, CAs int
 	New, Existing     int // CAs newly recorded vs. already in the DB (re-runs are safe)
+	Updates           int // update posts with a CA: recorded, but not calls (in none of the numbers above except Posts)
 }
 
-// backfillMessage records the calls in one historical post.
+// backfillMessage records the calls in one historical post. An update post is
+// recorded with status "update" and no tracking row, and counted on its own.
 func (s *scanner) backfillMessage(m *tg.Message, st *backfillStats) {
 	st.Posts++
 	urls := postURLs(m)
 	cas := extractCAs(m.Message, urls, s.cfg.Chains)
 	if len(cas) == 0 {
+		return
+	}
+	if postKind(m.Message) == PostKindUpdate {
+		st.Updates++
+		for _, ca := range cas {
+			s.recordCallInfo(m, ca, urls, CallStatusUpdate)
+		}
 		return
 	}
 	st.Calls++
@@ -444,8 +468,8 @@ func (s *scanner) backfill(ctx context.Context, fromID, toID, maxPosts int) (bac
 			}
 			s.backfillMessage(m, &st)
 		}
-		log.Printf("backfill: down to post %d — %d posts, %d calls, %d CAs (%d new, %d already recorded)",
-			msgs[0].ID, st.Posts, st.Calls, st.CAs, st.New, st.Existing)
+		log.Printf("backfill: down to post %d — %d posts, %d calls, %d CAs (%d new, %d already recorded), %d update post(s)",
+			msgs[0].ID, st.Posts, st.Calls, st.CAs, st.New, st.Existing, st.Updates)
 		if msgs[0].ID <= 1 {
 			return st, nil
 		}

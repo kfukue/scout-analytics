@@ -4,7 +4,7 @@ import operator
 import numpy as np
 import pandas as pd
 
-from .config import BUCKETS, LABELS, NO_POOL_STATUSES, REPEAT_STATUS
+from .config import BUCKETS, LABELS, NO_POOL_STATUSES, REPEAT_STATUS, UPDATE_KIND
 from .features import num, text
 
 _OPS = {">=": operator.ge, ">": operator.gt, "<=": operator.le, "<": operator.lt}
@@ -27,10 +27,12 @@ def to_bool(s: pd.Series) -> pd.Series:
 
 
 def build_labels(df: pd.DataFrame) -> pd.DataFrame:
-    """Per row: `no_pool`, `repeat` (the part of `no_pool` that is an untracked
-    repeat call, reported separately), `not_usd`, and for each bucket `usable_<b>`,
+    """Per row: `update` (an update post, not a call: never usable), `no_pool`,
+    `repeat` (the part of `no_pool` that is an untracked repeat call, reported
+    separately), `not_usd`, and for each bucket `usable_<b>`,
     `runner_<b>`, `collapse_<b>` (NaN where unusable) and `net_ret_<b>`."""
     out = pd.DataFrame(index=df.index)
+    out["update"] = text(df, "post_kind") == UPDATE_KIND
     out["no_pool"] = (num(df, "entry_late_price_usd").isna()
                       | text(df, "tracking_status").isin(NO_POOL_STATUSES))
     out["repeat"] = out["no_pool"] & (text(df, "tracking_status") == REPEAT_STATUS)
@@ -39,7 +41,7 @@ def build_labels(df: pd.DataFrame) -> pd.DataFrame:
     buy, sell = num(df, "tax_buy_pct"), num(df, "tax_sell_pct")
     for b, cfg in BUCKETS.items():
         needed = {cfg["runner"][0], cfg["collapse"][0], cfg["ret_col"]}
-        usable = ~out["no_pool"] & ~out["not_usd"]
+        usable = ~out["update"] & ~out["no_pool"] & ~out["not_usd"]
         for col in needed:
             usable &= num(df, col).notna()
         out[f"usable_{b}"] = usable

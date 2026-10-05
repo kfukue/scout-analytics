@@ -1,0 +1,590 @@
+package main
+
+import (
+	"bytes"
+	"cmp"
+	"crypto/sha256"
+	"encoding/binary"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"math"
+	"slices"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+)
+
+// ---------------------------------------------------------------------------
+// Website snapshot: the whole list (one row per token) held in memory, so a
+// request never waits for the database. The data of a snapshot is never
+// changed after it is built; the server swaps in a new one after every refresh.
+// ---------------------------------------------------------------------------
+
+// Perceptor filter buckets of a row.
+const (
+	webBucketClean uint8 = iota
+	webBucketCaution
+	webBucketRedFlags
+	webBucketNotScanned // no completed report, or one without a readable verdict
+	webBuckets
+)
+
+// verdict filter → bucket
+var webVerdictBuckets = map[string]uint8{
+	"clean":       webBucketClean,
+	"caution":     webBucketCaution,
+	"red_flags":   webBucketRedFlags,
+	"not_scanned": webBucketNotScanned,
+}
+
+// Sort keys: 0 = date, then return and peak of each window.
+const (
+	webSortKeyDate   = 0
+	webSortKeyReturn = 1
+	webSortKeyPeak   = 1 + len(ScoutWebHorizons)
+	webSortKeys      = 1 + 2*len(ScoutWebHorizons)
+)
+
+// Positions of a window's three numbers in ScoutWebRow.Perf.
+const (
+	webPerfReturn = iota
+	webPerfPeak
+	webPerfDrawdown
+	webPerfPerHorizon
+	webPerfPerRow = len(ScoutWebHorizons) * webPerfPerHorizon
+)
+
+var _ [webPerfPerRow]float64 = ScoutWebRow{}.Perf // the two sizes must agree
+
+func webHorizonIndex(h string) (int, bool) {
+	for i, name := range ScoutWebHorizons {
+		if name == h {
+			return i, true
+		}
+	}
+	return 0, false
+}
+
+// webSnapshot is the website's data at one moment, laid out for answering
+// requests: a few large blocks without pointers (cheap for the garbage
+// collector, compact in memory) instead of one object per row. Row i of every
+// block is the token with the i-th lowest first-call id.
+type webSnapshot struct {
+	n   int
+	ids []int32 // call id
+	// flags: the Perceptor filter bucket (webBucket…) and webFlagUSD
+	flags []uint8
+	// perf[i*15+j] is ScoutWebRow.Perf[j] of row i (USD-priced rows only); bit j
+	// of hasPerf[i] says the value is there.
+	perf    []float64
+	hasPerf []uint16
+	// rowJSON holds every row as it is sent, already encoded, without the three
+	// numbers of the window: row i is rowJSON[rowAt[i]:rowAt[i+1]], and the
+	// numbers go in at rowCut[i].
+	rowJSON []byte
+	rowAt   []uint32
+	rowCut  []uint32
+	// search holds, per row, the lower-cased name, symbol and address, each
+	// followed by a zero byte (which no search text contains); row i is
+	// search[searchAt[i]:searchAt[i+1]].
+	search   []byte
+	searchAt []uint32
+	// order[k] lists the rows sorted by key k, descending, the way the list is
+	// shown: rows with a value first (highest first, ties by the higher call
+	// id), then the rows without one (higher call id first). nonNull[k] is the
+	// number of rows with a value. The ascending order is each of the two parts
+	// read backwards, so it needs no list of its own.
+	order   [webSortKeys][]int32
+	nonNull [webSortKeys]int
+	// counts[u][b]: rows in filter bucket b (webBuckets = all); u = 1 counts
+	// the USD-priced rows only.
+	counts  [2][webBuckets + 1]int
+	summary ScoutWebSummary // UpdatedAt and SnapshotAgeSeconds are filled in per answer
+	// summaryTag is a hash of the counts alone: /api/summary stays "not
+	// modified" while only rows change.
+	summaryTag string
+	// version is a hash of the content (and of the settings that shape a row):
+	// two snapshots with the same rows and counts have the same version,
+	// whenever they were loaded.
+	version  string
+	loadedAt time.Time
+	took     time.Duration
+	// answers already encoded for this snapshot (nil = none are kept); the one
+	// part of a snapshot that still changes after it is put in place
+	answers *webAnswers
+}
+
+const webFlagUSD = 0x80 // in webSnapshot.flags, next to the bucket
+
+// finite drops values JSON cannot carry (NaN, ±Inf).
+func finite(p *float64) *float64 {
+	if p == nil || math.IsNaN(*p) || math.IsInf(*p, 0) {
+		return nil
+	}
+	return p
+}
+
+// webCall is the row as sent to the page, without the numbers of a window
+// (those are added per request, see appendRow).
+func (c webConfig) webCall(r *ScoutWebRow) ScoutWebCall {
+	return ScoutWebCall{
+		CallID: r.CallID, MessageID: r.MessageID, MessageDate: r.MessageDate,
+		PostURL:         postURL(r.ChannelUsername, r.MessageID),
+		ContractAddress: r.ContractAddress, TokenName: r.TokenName, TokenSymbol: r.TokenSymbol,
+		GMGNURL:   c.gmgnURL(r.ContractAddress),
+		PriceUnit: r.PriceUnit, EntryPriceUSD: r.EntryPrice,
+		Rugged: r.Rugged, TrackingStatus: r.TrackingStatus,
+		PerceptorVerd: r.PerceptorVerd, PerceptorURL: r.PerceptorURL,
+		CallCount: r.CallCount, LastCallDate: r.LastCallDate,
+	}
+}
+
+// webRowNumbersJSON is how the three numbers of a window look in an encoded
+// ScoutWebCall that has none; appendRow puts the real ones in its place.
+const webRowNumbersJSON = `,"return_pct":null,"peak_pct":null,"drawdown_pct":null,`
+
+// newWebSnapshot builds a snapshot from the rows of ScoutStore.SelectWebRows
+// (which it takes over and changes in place). When the content is the same as
+// prev's, the blocks already built for prev are used again.
+func newWebSnapshot(rows []ScoutWebRow, updatePosts int, prev *webSnapshot, cfg webConfig) (*webSnapshot, error) {
+	n := len(rows)
+	if n > math.MaxInt32 {
+		return nil, fmt.Errorf("%d rows are more than the website can hold", n)
+	}
+	s := &webSnapshot{n: n}
+	sum := &s.summary
+	sum.UpdatePosts = updatePosts
+	for i := range rows {
+		r := &rows[i]
+		r.MessageDate, r.LastCallDate = r.MessageDate.UTC(), r.LastCallDate.UTC()
+		r.usd = r.PriceUnit != nil && *r.PriceUnit == "usd"
+
+		sum.Imported++
+		sum.TotalCalls += r.CallCount
+		if r.Tracked {
+			sum.Tracked++
+			if !r.usd {
+				sum.NoUSDPrice++
+			}
+		}
+		if r.TrackingStatus != nil {
+			switch *r.TrackingStatus {
+			case TrackPending:
+				sum.Pending++
+			case TrackTracking:
+				sum.Tracking++
+			case TrackDone:
+				sum.Done++
+			case TrackNoPool:
+				sum.NoPool++
+			case TrackError:
+				sum.Error++
+			case TrackGaveUp:
+				sum.GaveUp++
+			}
+		}
+
+		// Performance is shown in USD only: the numbers of other calls are not
+		// there at all (and so sort last).
+		if !r.usd {
+			r.EntryPrice, r.HasPerf = nil, 0
+		}
+		r.EntryPrice = finite(r.EntryPrice)
+		for j := range r.Perf {
+			if r.HasPerf&(1<<j) == 0 {
+				r.Perf[j] = 0
+			}
+		}
+		if r.PerceptorURL != nil && !strings.HasPrefix(*r.PerceptorURL, "https://") {
+			r.PerceptorURL = nil // the page only links to https addresses
+		}
+		r.verdict = webBucketNotScanned
+		if r.PerceptorVerd != nil {
+			if b, ok := webVerdictBuckets[*r.PerceptorVerd]; ok {
+				r.verdict = b
+			}
+		}
+	}
+	sum.RepeatCalls = sum.TotalCalls - sum.Imported
+	counts := sha256.Sum256([]byte(fmt.Sprint(sum.Imported, sum.Tracked, sum.Pending, sum.Tracking, sum.Done, sum.NoPool,
+		sum.Error, sum.GaveUp, sum.NoUSDPrice, sum.TotalCalls, sum.RepeatCalls, sum.UpdatePosts)))
+	s.summaryTag = hex.EncodeToString(counts[:12])
+
+	s.version = hashWebRows(rows, updatePosts, cfg.GMGNTemplate)
+	if prev != nil && prev.version == s.version {
+		// Same content: keep prev's blocks (and let the rows just read go).
+		same := *prev
+		same.summary, same.summaryTag, same.answers = s.summary, s.summaryTag, nil
+		return &same, nil
+	}
+
+	s.ids = make([]int32, n)
+	s.flags = make([]uint8, n)
+	s.hasPerf = make([]uint16, n)
+	s.perf = make([]float64, n*webPerfPerRow)
+	s.rowAt = make([]uint32, n+1)
+	s.rowCut = make([]uint32, n)
+	s.searchAt = make([]uint32, n+1)
+	s.rowJSON = make([]byte, 0, n*560)
+	s.search = make([]byte, 0, n*72)
+	var one bytes.Buffer // one encoded row
+	enc := json.NewEncoder(&one)
+	marker := []byte(webRowNumbersJSON)
+	for i := range rows {
+		r := &rows[i]
+		if r.CallID > math.MaxInt32 || (i > 0 && r.CallID <= rows[i-1].CallID) {
+			return nil, fmt.Errorf("call ids out of order or too large at row %d (id %d)", i, r.CallID)
+		}
+		s.ids[i] = int32(r.CallID)
+		s.flags[i] = r.verdict
+		s.counts[0][r.verdict]++
+		s.counts[0][webBuckets]++
+		if r.usd {
+			s.flags[i] |= webFlagUSD
+			s.counts[1][r.verdict]++
+			s.counts[1][webBuckets]++
+		}
+		s.hasPerf[i] = r.HasPerf
+		copy(s.perf[i*webPerfPerRow:], r.Perf[:])
+
+		one.Reset()
+		call := cfg.webCall(r)
+		if err := enc.Encode(&call); err != nil {
+			return nil, fmt.Errorf("call %d: %w", r.CallID, err)
+		}
+		row := bytes.TrimSuffix(one.Bytes(), []byte("\n"))
+		// The place of the numbers. A name or symbol cannot contain this text:
+		// in JSON its quotes are written with a backslash.
+		cut := bytes.Index(row, marker)
+		if cut < 0 || bytes.Contains(row[cut+len(marker):], marker) {
+			return nil, fmt.Errorf("call %d: unexpected row encoding", r.CallID)
+		}
+		s.rowJSON = append(s.rowJSON, row[:cut]...)
+		s.rowCut[i] = uint32(len(s.rowJSON))
+		s.rowJSON = append(s.rowJSON, row[cut+len(marker):]...)
+
+		if r.TokenName != nil {
+			s.search = append(s.search, strings.ToLower(*r.TokenName)...)
+		}
+		s.search = append(s.search, 0)
+		if r.TokenSymbol != nil {
+			s.search = append(s.search, strings.ToLower(*r.TokenSymbol)...)
+		}
+		s.search = append(s.search, 0)
+		s.search = append(s.search, strings.ToLower(r.ContractAddress)...)
+		s.search = append(s.search, 0)
+		if len(s.rowJSON) > math.MaxUint32 || len(s.search) > math.MaxUint32 {
+			return nil, errors.New("the list is too large for the website's snapshot")
+		}
+		s.rowAt[i+1], s.searchAt[i+1] = uint32(len(s.rowJSON)), uint32(len(s.search))
+	}
+	// give back what the two growing blocks reserved beyond their content
+	s.rowJSON, s.search = trimBlock(s.rowJSON), trimBlock(s.search)
+	s.buildOrders(rows)
+	return s, nil
+}
+
+// trimBlock returns b without spare room: as it is when little is spare, else a copy.
+func trimBlock(b []byte) []byte {
+	if cap(b)-len(b) <= len(b)/4 {
+		return slices.Clip(b)
+	}
+	return bytes.Clone(b)
+}
+
+// hashWebRows returns the content version of a prepared row list; gmgn is the
+// link template that goes into every row.
+func hashWebRows(rows []ScoutWebRow, updatePosts int, gmgn string) string {
+	h := sha256.New()
+	buf := make([]byte, 0, 1024)
+	num := func(v int64) { buf = binary.LittleEndian.AppendUint64(buf, uint64(v)) }
+	str := func(s string) {
+		buf = binary.LittleEndian.AppendUint32(buf, uint32(len(s)))
+		buf = append(buf, s...)
+	}
+	opt := func(p *string) {
+		if p == nil {
+			buf = append(buf, 0)
+			return
+		}
+		buf = append(buf, 1)
+		str(*p)
+	}
+	flt := func(v float64) { buf = binary.LittleEndian.AppendUint64(buf, math.Float64bits(v)) }
+	num(int64(len(rows)))
+	num(int64(updatePosts))
+	str(gmgn)
+	h.Write(buf)
+	for i := range rows {
+		r := &rows[i]
+		buf = buf[:0]
+		num(int64(r.CallID))
+		num(int64(r.MessageID))
+		num(r.MessageDate.UnixNano())
+		str(r.ChannelUsername)
+		str(r.ContractAddress)
+		opt(r.TokenName)
+		opt(r.TokenSymbol)
+		opt(r.PriceUnit)
+		if r.EntryPrice == nil {
+			buf = append(buf, 0)
+		} else {
+			buf = append(buf, 1)
+			flt(*r.EntryPrice)
+		}
+		flags := byte(0)
+		if r.Tracked {
+			flags |= 1
+		}
+		if r.Rugged != nil {
+			flags |= 2
+			if *r.Rugged {
+				flags |= 4
+			}
+		}
+		buf = append(buf, flags)
+		opt(r.TrackingStatus)
+		buf = binary.LittleEndian.AppendUint16(buf, r.HasPerf)
+		for _, v := range r.Perf {
+			flt(v)
+		}
+		opt(r.PerceptorVerd)
+		opt(r.PerceptorURL)
+		num(int64(r.CallCount))
+		num(r.LastCallDate.UnixNano())
+		h.Write(buf)
+	}
+	return hex.EncodeToString(h.Sum(nil)[:12])
+}
+
+// pgFloatDesc orders two float8 values the way PostgreSQL's ORDER BY … DESC
+// does: NaN counts as larger than every number, and equal to itself.
+func pgFloatDesc(a, b float64) int {
+	an, bn := math.IsNaN(a), math.IsNaN(b)
+	switch {
+	case an && bn:
+		return 0
+	case an:
+		return -1
+	case bn:
+		return 1
+	}
+	return cmp.Compare(b, a)
+}
+
+// buildOrders fills order and nonNull. Rows are in call id order, so a higher
+// position is a higher call id.
+func (s *webSnapshot) buildOrders(rows []ScoutWebRow) {
+	n := s.n
+	dates := make([]int64, n)
+	byDate := make([]int32, n)
+	for i := range rows {
+		dates[i] = rows[i].MessageDate.UnixNano()
+		byDate[i] = int32(i)
+	}
+	slices.SortFunc(byDate, func(a, b int32) int {
+		if c := cmp.Compare(dates[b], dates[a]); c != 0 {
+			return c
+		}
+		return cmp.Compare(b, a)
+	})
+	s.order[webSortKeyDate], s.nonNull[webSortKeyDate] = byDate, n
+
+	const per = webPerfPerRow
+	for key := 1; key < webSortKeys; key++ {
+		pi := (key - webSortKeyReturn) * webPerfPerHorizon // the window's return
+		if key >= webSortKeyPeak {
+			pi = (key-webSortKeyPeak)*webPerfPerHorizon + webPerfPeak
+		}
+		ord := make([]int32, 0, n)
+		for i := 0; i < n; i++ {
+			if s.hasPerf[i]&(1<<pi) != 0 {
+				ord = append(ord, int32(i))
+			}
+		}
+		slices.SortFunc(ord, func(a, b int32) int {
+			if c := pgFloatDesc(s.perf[int(a)*per+pi], s.perf[int(b)*per+pi]); c != 0 {
+				return c
+			}
+			return cmp.Compare(b, a)
+		})
+		s.nonNull[key] = len(ord)
+		for i := n - 1; i >= 0; i-- {
+			if s.hasPerf[i]&(1<<pi) == 0 {
+				ord = append(ord, int32(i))
+			}
+		}
+		s.order[key] = ord
+	}
+}
+
+// webBitsPool: the "matches the search text" marks of one request.
+var webBitsPool = sync.Pool{New: func() any { return new([]uint64) }}
+
+// markMatches sets bit i of bits for every row i whose name, symbol or address
+// contains q (lower-cased, not empty, without a zero byte).
+func (s *webSnapshot) markMatches(q string, bits []uint64) {
+	needle := []byte(q)
+	row, from := 0, 0
+	for from < len(s.search) {
+		i := bytes.Index(s.search[from:], needle)
+		if i < 0 {
+			return
+		}
+		at := uint32(from + i)
+		for s.searchAt[row+1] <= at {
+			row++
+		}
+		bits[row>>6] |= 1 << (row & 63)
+		row++ // one match is enough: on to the next row
+		from = int(s.searchAt[row])
+	}
+}
+
+// page appends to dst the rows (positions) of one page of the list, in order,
+// and returns them with the number of rows that match the filter. The list
+// holds each token's first call only, so search, sort, paging and the total all
+// work on one row per token.
+func (s *webSnapshot) page(f ScoutWebCallsFilter, dst []int32) ([]int32, int, error) {
+	h, ok := webHorizonIndex(f.Horizon)
+	if !ok {
+		return dst, 0, fmt.Errorf("unknown horizon %q", f.Horizon)
+	}
+	var key int
+	switch f.Sort {
+	case "date":
+		key = webSortKeyDate
+	case "return":
+		key = webSortKeyReturn + h
+	case "peak":
+		key = webSortKeyPeak + h
+	default:
+		return dst, 0, fmt.Errorf("unknown sort %q", f.Sort)
+	}
+	if f.Dir != "desc" && f.Dir != "asc" {
+		return dst, 0, fmt.Errorf("unknown direction %q", f.Dir)
+	}
+	if f.Page < 1 || f.Per < 1 {
+		return dst, 0, errors.New("page and per must be at least 1")
+	}
+	bucket := webBuckets // all
+	if f.Verdict != "" {
+		b, ok := webVerdictBuckets[f.Verdict]
+		if !ok {
+			return dst, 0, fmt.Errorf("unknown verdict %q", f.Verdict)
+		}
+		bucket = b
+	}
+	q := strings.ToLower(f.Q)
+	if strings.IndexByte(q, 0) >= 0 {
+		return dst, 0, errors.New("the search text is not valid")
+	}
+
+	order, nn, n := s.order[key], s.nonNull[key], s.n
+	asc := f.Dir == "asc"
+	skip := (f.Page - 1) * f.Per
+	base := len(dst)
+	// which flags a row must have: mask picks the bits that count, want their values
+	var mask, want uint8
+	if f.USDOnly {
+		mask, want = webFlagUSD, webFlagUSD
+	}
+	if bucket != webBuckets {
+		mask, want = mask|^uint8(webFlagUSD), want|bucket
+	}
+
+	total, known := 0, false
+	var bits []uint64
+	if q == "" {
+		// without a search text the total is already counted: stop at the end of the page
+		u := 0
+		if f.USDOnly {
+			u = 1
+		}
+		total, known = s.counts[u][bucket], true
+		if skip >= total {
+			return dst, total, nil
+		}
+	} else {
+		bp := webBitsPool.Get().(*[]uint64)
+		defer webBitsPool.Put(bp)
+		words := (n + 63) / 64
+		if cap(*bp) < words {
+			*bp = make([]uint64, words)
+		}
+		bits = (*bp)[:words]
+		clear(bits)
+		s.markMatches(q, bits)
+	}
+	start, matched := 0, 0
+	if known && mask == 0 { // every row matches: jump to the page
+		start, matched = skip, skip
+	}
+	for i := start; i < n; i++ {
+		pos := order[i]
+		if asc {
+			if i < nn {
+				pos = order[nn-1-i]
+			} else {
+				pos = order[n-1-(i-nn)]
+			}
+		}
+		if s.flags[pos]&mask != want {
+			continue
+		}
+		if bits != nil && bits[pos>>6]&(1<<(pos&63)) == 0 {
+			continue
+		}
+		if matched >= skip && len(dst)-base < f.Per {
+			dst = append(dst, pos)
+		}
+		matched++
+		if known && len(dst)-base == f.Per {
+			break
+		}
+	}
+	if !known {
+		total = matched
+	}
+	return dst, total, nil
+}
+
+// appendJSONFloat appends v the way encoding/json writes a float64.
+func appendJSONFloat(b []byte, v float64) []byte {
+	format := byte('f')
+	if abs := math.Abs(v); abs != 0 && (abs < 1e-6 || abs >= 1e21) {
+		format = 'e'
+	}
+	b = strconv.AppendFloat(b, v, format, -1, 64)
+	if format == 'e' {
+		// e-09 → e-9, as encoding/json does
+		if n := len(b); n >= 4 && b[n-4] == 'e' && (b[n-3] == '-' || b[n-3] == '+') && b[n-2] == '0' {
+			b[n-2] = b[n-1]
+			b = b[:n-1]
+		}
+	}
+	return b
+}
+
+// appendRow appends row pos as JSON (a ScoutWebCall) with the numbers of
+// window h; a number that is missing, or that JSON cannot carry, is null.
+func (s *webSnapshot) appendRow(b []byte, pos int32, h int) []byte {
+	const per = webPerfPerRow
+	num := func(b []byte, k int) []byte {
+		j := h*webPerfPerHorizon + k
+		v := s.perf[int(pos)*per+j]
+		if s.hasPerf[pos]&(1<<j) == 0 || math.IsNaN(v) || math.IsInf(v, 0) {
+			return append(b, "null"...)
+		}
+		return appendJSONFloat(b, v)
+	}
+	b = append(b, s.rowJSON[s.rowAt[pos]:s.rowCut[pos]]...)
+	b = num(append(b, `,"return_pct":`...), webPerfReturn)
+	b = num(append(b, `,"peak_pct":`...), webPerfPeak)
+	b = num(append(b, `,"drawdown_pct":`...), webPerfDrawdown)
+	b = append(b, ',')
+	return append(b, s.rowJSON[s.rowCut[pos]:s.rowAt[pos+1]]...)
+}

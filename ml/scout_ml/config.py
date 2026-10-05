@@ -26,6 +26,7 @@ BUCKETS = {
 LABELS = ("runner", "collapse")
 NO_POOL_STATUSES = ("no_pool", "gave_up")  # calls we could never have traded
 REPEAT_STATUS = "repeat"  # a later call of a token: the tracker follows the first call only
+UPDATE_KIND = "update"  # post_kind of a "$TOKEN hit 3X ..." post about an earlier call: not a call
 
 # --- Columns of scout_call_dataset_v, in view order ------------------------
 _WINDOWS = ("5m", "15m", "60m")
@@ -55,8 +56,9 @@ VIEW_COLUMNS = (IDENTITY + ["dex", "launchpad"] + NUMERIC_RAW
 # Outcomes and bookkeeping are only known after the post; ids are not signal.
 # quote_asset is deliberately NOT here (allowed as a categorical feature).
 # token_name (the token contract's own name, for the website) is display text.
+# post_kind (call | update) only decides which rows are used at all.
 FORBIDDEN_COLUMNS = (set(BOOKKEEPING) - {"quote_asset"} | set(IDENTITY)
-                     | {"pre_vol_unit", "token_name"})
+                     | {"pre_vol_unit", "token_name", "post_kind"})
 FORBIDDEN_PREFIXES = ("ret_", "max_gain_", "max_dd_")
 
 # --- Derived features (built in features.build_features) -------------------
