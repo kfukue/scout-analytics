@@ -152,17 +152,17 @@ func syntheticWebRows(n int, seed int64) []ScoutWebRow {
 }
 
 // refMcaps works out the two market caps of a raw row (as ScoutStore.SelectWebRows
-// returns it) the obvious way: call = called-at, else Mcap; latest = (Mcap, else
-// called-at) × latest price ÷ price at the post; nil unless every input is a
-// finite number above zero, the row is priced in USD and has a latest price
-// that is shown.
+// returns it) the obvious way: call = the first valid of called-at and Mcap;
+// latest = (the first valid of Mcap and called-at) × latest price ÷ price at the
+// post; valid = a finite number above zero. nil unless the row is priced in USD
+// (and, for latest, has a latest price that is shown).
 func refMcaps(r *ScoutWebRow) (call, latest *float64) {
 	if r.PriceUnit == nil || *r.PriceUnit != "usd" {
 		return nil, nil
 	}
 	ok := func(p *float64) bool { return p != nil && *p > 0 && !math.IsInf(*p, 0) } // NaN > 0 is false
 	c := r.CalledAtMcap
-	if c == nil {
+	if !ok(c) {
 		c = r.PostMcap
 	}
 	if ok(c) {
@@ -170,7 +170,7 @@ func refMcaps(r *ScoutWebRow) (call, latest *float64) {
 		call = &v
 	}
 	b := r.PostMcap
-	if b == nil {
+	if !ok(b) {
 		b = r.CalledAtMcap
 	}
 	if r.LatestAt != nil && finite(r.LatestReturn) != nil && ok(r.LatestPrice) && ok(b) && ok(r.PostPrice) {
@@ -232,6 +232,9 @@ func referencePage(rows []ScoutWebRow, f ScoutWebCallsFilter) (ids []int, total 
 		i := h * webPerfPerHorizon
 		if f.Sort == "peak" {
 			i++
+		}
+		if w, ok := map[string]int{"return_1h": 0, "return_1d": 1, "return_3d": 2, "return_7d": 3, "return_30d": 4}[f.Sort]; ok {
+			i = w * webPerfPerHorizon // that window's return, whatever the horizon
 		}
 		if r.PriceUnit == nil || *r.PriceUnit != "usd" || r.HasPerf&(1<<i) == 0 {
 			return 0, false
@@ -317,7 +320,7 @@ func TestWebSnapshotPageMatchesReference(t *testing.T) {
 		raw := syntheticWebRows(n, int64(n)+1)
 		snap := mustWebSnapshot(t, cloneWebRows(raw), 3, nil)
 		checked := 0
-		for _, sortBy := range []string{"date", "return", "peak", "latest", "call_mc", "latest_mc"} {
+		for _, sortBy := range []string{"date", "return", "peak", "latest", "call_mc", "latest_mc", "return_1h", "return_1d", "return_3d", "return_7d", "return_30d"} {
 			for _, dir := range []string{"desc", "asc"} {
 				for _, hz := range ScoutWebHorizons {
 					for _, usdOnly := range []bool{false, true} {
@@ -338,7 +341,7 @@ func TestWebSnapshotPageMatchesReference(t *testing.T) {
 				}
 			}
 		}
-		if checked != 6*2*5*2*5*7*6 {
+		if checked != 11*2*5*2*5*7*6 {
 			t.Fatalf("checked %d combinations", checked)
 		}
 		// the market caps sent are the ones worked out the obvious way
@@ -349,6 +352,21 @@ func TestWebSnapshotPageMatchesReference(t *testing.T) {
 			if fnum(c.CallMcapUSD) != fnum(wantCall) || fnum(c.LatestMcapUSD) != fnum(wantLatest) {
 				t.Fatalf("n=%d row %d: call_mcap_usd %s latest_mcap_usd %s, want %s %s", n, i,
 					fnum(c.CallMcapUSD), fnum(c.LatestMcapUSD), fnum(wantCall), fnum(wantLatest))
+			}
+			// … and so are the five window returns: each window's return, USD only
+			for h, got := range []*float64{c.Return1hPct, c.Return1dPct, c.Return3dPct, c.Return7dPct, c.Return30dPct} {
+				var want *float64
+				j := h * webPerfPerHorizon
+				if r := &raw[i]; r.PriceUnit != nil && *r.PriceUnit == "usd" && r.HasPerf&(1<<j) != 0 {
+					want = finite(&r.Perf[j])
+				}
+				if fnum(got) != fnum(want) {
+					t.Fatalf("n=%d row %d window %s: %s, want %s", n, i, ScoutWebHorizons[h], fnum(got), fnum(want))
+				}
+				// the same number return_pct has for that window
+				if r := sentCall(t, snap, i, h); fnum(r.ReturnPct) != fnum(got) {
+					t.Fatalf("n=%d row %d window %s: return_pct %s, window field %s", n, i, ScoutWebHorizons[h], fnum(r.ReturnPct), fnum(got))
+				}
 			}
 			if wantCall != nil {
 				withCall++
@@ -368,6 +386,10 @@ func TestWebSnapshotPageMatchesReference(t *testing.T) {
 		{Sort: "CALL_MC", Dir: "desc", Horizon: "1d", Page: 1, Per: 10},
 		{Sort: "latest_mcap_usd", Dir: "desc", Horizon: "1d", Page: 1, Per: 10},
 		{Sort: "latest_mc", Dir: "up", Horizon: "1d", Page: 1, Per: 10},
+		{Sort: "return_2d", Dir: "desc", Horizon: "1d", Page: 1, Per: 10},
+		{Sort: "return_", Dir: "desc", Horizon: "1d", Page: 1, Per: 10},
+		{Sort: "Return_1h", Dir: "desc", Horizon: "1d", Page: 1, Per: 10},
+		{Sort: "return_1h", Dir: "desc", Horizon: "2d", Page: 1, Per: 10},
 		{Sort: "date", Dir: "up", Horizon: "1d", Page: 1, Per: 10},
 		{Sort: "date", Dir: "desc", Horizon: "2d", Page: 1, Per: 10},
 		{Sort: "date", Dir: "desc", Horizon: "1d", Page: 0, Per: 10},
@@ -411,6 +433,15 @@ func TestWebSnapshotRowRules(t *testing.T) {
 	if h := sentCall(t, snap, 0, 0); h.ReturnPct != nil || fnum(h.PeakPct) != "7" || h.DrawdownPct != nil {
 		t.Fatalf("1h of the usd row %+v", h)
 	}
+	// the window returns: 1h has none, 1d is NaN (none), 3d none; the same in every window asked for
+	for h := range ScoutWebHorizons {
+		if w := sentCall(t, snap, 0, h).windows(); w != "null null null null null" {
+			t.Fatalf("windows of the usd row at %s: %s", ScoutWebHorizons[h], w)
+		}
+	}
+	if w := sentCall(t, snap, 1, 1).windows(); w != "null null null null null" { // 999 and 1999 are not in USD
+		t.Fatalf("windows of the non-usd row: %s", w)
+	}
 	b := sentCall(t, snap, 1, 1)
 	if b.EntryPriceUSD != nil || b.ReturnPct != nil || b.PeakPct != nil || b.DrawdownPct != nil || strOrNil(b.PriceUnit) != "VIRT" ||
 		b.PostURL != nil || b.GMGNURL != nil || strOrNil(b.Perceptor) != levelUnknown || strOrNil(b.PerceptorURL) != "https://www.perceptor.info/r/x" {
@@ -448,12 +479,14 @@ func TestWebSnapshotRowRules(t *testing.T) {
 		{"both (Mcap line first; at-post price, not the late entry)", usd, f(40000), f(50000), f(0.002), f(0.003), f(10), f(0.004), &at, "40000", "100000"},
 		{"no called-at", usd, nil, f(50000), f(0.002), nil, f(10), f(0.001), &at, "50000", "25000"},
 		{"no Mcap line", usd, f(40000), nil, f(0.002), nil, f(10), f(0.001), &at, "40000", "20000"},
-		{"called-at 0: no fallback", usd, f(0), f(50000), f(0.002), nil, f(10), f(0.004), &at, "null", "100000"},
-		{"called-at negative", usd, f(-1), f(50000), f(0.002), nil, f(10), f(0.004), &at, "null", "100000"},
-		{"called-at NaN", usd, f(nan), nil, f(0.002), nil, f(10), f(0.004), &at, "null", "null"},
-		{"called-at +Inf", usd, f(inf), nil, f(0.002), nil, f(10), f(0.004), &at, "null", "null"},
-		{"Mcap line 0", usd, f(40000), f(0), f(0.002), nil, f(10), f(0.004), &at, "40000", "null"},
-		{"Mcap line -Inf", usd, f(40000), f(math.Inf(-1)), f(0.002), nil, f(10), f(0.004), &at, "40000", "null"},
+		{"called-at 0: the Mcap line", usd, f(0), f(50000), f(0.002), nil, f(10), f(0.004), &at, "50000", "100000"},
+		{"called-at negative: the Mcap line", usd, f(-1), f(50000), f(0.002), nil, f(10), f(0.004), &at, "50000", "100000"},
+		{"called-at NaN, no Mcap line", usd, f(nan), nil, f(0.002), nil, f(10), f(0.004), &at, "null", "null"},
+		{"called-at +Inf, no Mcap line", usd, f(inf), nil, f(0.002), nil, f(10), f(0.004), &at, "null", "null"},
+		{"called-at NaN: the Mcap line", usd, f(nan), f(60000), f(0.002), nil, f(10), f(0.004), &at, "60000", "120000"},
+		{"Mcap line 0: called-at for the estimate", usd, f(40000), f(0), f(0.002), nil, f(10), f(0.004), &at, "40000", "80000"},
+		{"Mcap line -Inf: called-at for the estimate", usd, f(40000), f(math.Inf(-1)), f(0.002), nil, f(10), f(0.004), &at, "40000", "80000"},
+		{"both invalid", usd, f(-5), f(0), f(0.002), nil, f(10), f(0.004), &at, "null", "null"},
 		{"no price at the post (late entry only)", usd, f(40000), f(50000), nil, f(0.003), f(10), f(0.004), &at, "40000", "null"},
 		{"price at the post 0", usd, f(40000), f(50000), f(0), nil, f(10), f(0.004), &at, "40000", "null"},
 		{"price at the post NaN", usd, f(40000), f(50000), f(nan), nil, f(10), f(0.004), &at, "40000", "null"},
@@ -492,10 +525,10 @@ func TestWebSnapshotRowRules(t *testing.T) {
 	}
 	// by value (ties: the higher call id first), the rows without one last in both directions
 	for q, want := range map[[2]string]string{
-		{"call_mc", "desc"}:   "[118 101 117 116 115 114 113 112 111 110 109 108 107 102 100 121 120 119 106 105 104 103]",
-		{"call_mc", "asc"}:    "[100 102 107 108 109 110 111 112 113 114 115 116 117 101 118 103 104 105 106 119 120 121]",
-		{"latest_mc", "desc"}: "[104 103 100 101 102 121 120 119 118 117 116 115 114 113 112 111 110 109 108 107 106 105]",
-		{"latest_mc", "asc"}:  "[102 101 100 103 104 105 106 107 108 109 110 111 112 113 114 115 116 117 118 119 120 121]",
+		{"call_mc", "desc"}:   "[120 107 104 103 101 119 118 117 116 115 114 113 112 111 109 108 102 100 123 122 121 110 106 105]",
+		{"call_mc", "asc"}:    "[100 102 108 109 111 112 113 114 115 116 117 118 119 101 103 104 107 120 105 106 110 121 122 123]",
+		{"latest_mc", "desc"}: "[107 104 103 100 109 108 101 102 123 122 121 120 119 118 117 116 115 114 113 112 111 110 106 105]",
+		{"latest_mc", "asc"}:  "[102 101 108 109 100 103 104 107 105 106 110 111 112 113 114 115 116 117 118 119 120 121 122 123]",
 	} {
 		ids, total := pageIDs(t, msnap, ScoutWebCallsFilter{Sort: q[0], Dir: q[1], Horizon: "1d", Page: 1, Per: 50})
 		if fmt.Sprint(ids) != want || total != len(cases) {
@@ -624,6 +657,18 @@ func TestWebSnapshotVersion(t *testing.T) {
 	change("last call", 5, func(rows []ScoutWebRow) { rows[4].LastCallDate = rows[4].LastCallDate.Add(time.Second) })
 	change("date", 5, func(rows []ScoutWebRow) { rows[4].MessageDate = rows[4].MessageDate.Add(time.Microsecond) })
 	change("a 30d number", 5, func(rows []ScoutWebRow) { rows[4].Perf[14], rows[4].HasPerf = 1.25, rows[4].HasPerf|1<<14 })
+	change("a 1h return", 5, func(rows []ScoutWebRow) { rows[4].Perf[0], rows[4].HasPerf = rows[4].Perf[0]+0.25, rows[4].HasPerf|1 })
+	seven := -1 // a USD row with a 7d return
+	for i := range raw {
+		if r := &raw[i]; r.PriceUnit != nil && *r.PriceUnit == "usd" && r.HasPerf&(1<<(3*webPerfPerHorizon)) != 0 && !math.IsNaN(r.Perf[3*webPerfPerHorizon]) {
+			seven = i
+			break
+		}
+	}
+	if seven < 0 {
+		t.Fatal("no row with a 7d return")
+	}
+	change("a 7d return removed", 5, func(rows []ScoutWebRow) { rows[seven].HasPerf &^= 1 << (3 * webPerfPerHorizon) })
 	change("unit", 5, func(rows []ScoutWebRow) { rows[4].PriceUnit = sp("eth") })
 	change("verdict", 5, func(rows []ScoutWebRow) { rows[5].PerceptorVerd = sp("clean!") })
 	change("report", 5, func(rows []ScoutWebRow) { rows[5].PerceptorURL = sp("https://example.org/r") })
@@ -890,6 +935,9 @@ var benchWebQueries = []struct{ name, query string }{
 	{"sort_latest", "sort=latest"},
 	{"sort_call_mc", "sort=call_mc"},
 	{"sort_latest_mc", "sort=latest_mc"},
+	{"sort_return_1h", "sort=return_1h"},
+	{"sort_return_7d", "sort=return_7d"},
+	{"sort_return_30d_asc", "sort=return_30d&dir=asc&horizon=7d"},
 	{"q", "q=pe"},
 	{"verdict", "verdict=clean"},
 	{"q_verdict_peak", "q=pe&verdict=clean&sort=peak"},

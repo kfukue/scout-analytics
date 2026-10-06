@@ -17,8 +17,12 @@
   <section class="panel" aria-labelledby="progress-title">
     <div class="panel-head">
       <h2 id="progress-title">Import progress</h2>
-      <span id="summary-updated" class="muted"></span>
+      <div class="panel-tools">
+        <span id="summary-updated" class="muted"></span>
+        <button type="button" id="refresh-now" class="btn">Refresh now</button>
+      </div>
     </div>
+    <p id="refresh-msg" class="notice small" role="status" hidden></p>
     <p id="summary-headline" class="headline">Loading…</p>
     <div id="summary-bar" class="bar" role="progressbar" aria-labelledby="progress-title" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
       <div id="summary-bar-fill" class="bar-fill"></div>
@@ -46,12 +50,15 @@
           <option value="not_scanned">Not scanned</option>
         </select>
       </label>
-      <div id="horizons" class="segmented" role="group" aria-label="Performance window">
-        <button type="button" data-horizon="1h" aria-pressed="false">1h</button>
-        <button type="button" data-horizon="1d" aria-pressed="true">1d</button>
-        <button type="button" data-horizon="3d" aria-pressed="false">3d</button>
-        <button type="button" data-horizon="7d" aria-pressed="false">7d</button>
-        <button type="button" data-horizon="30d" aria-pressed="false">30d</button>
+      <div class="window-pick">
+        <span id="horizons-label" class="muted">Peak / worst drop over</span>
+        <div id="horizons" class="segmented compact" role="group" aria-labelledby="horizons-label">
+          <button type="button" data-horizon="1h" aria-pressed="false">1h</button>
+          <button type="button" data-horizon="1d" aria-pressed="true">1d</button>
+          <button type="button" data-horizon="3d" aria-pressed="false">3d</button>
+          <button type="button" data-horizon="7d" aria-pressed="false">7d</button>
+          <button type="button" data-horizon="30d" aria-pressed="false">30d</button>
+        </div>
       </div>
     </div>
     <p id="explain" class="muted small"></p>
@@ -64,15 +71,19 @@
             <th scope="col">Token</th>
             <th scope="col">Symbol</th>
             <th scope="col" class="calls">Calls</th>
-            <th scope="col" class="num">Entry $</th>
-            <th scope="col" class="num" data-sort="call_mc"><button type="button" class="sort">Call MC</button></th>
-            <th scope="col" class="num" data-sort="return"><button type="button" class="sort">Return %</button></th>
-            <th scope="col" class="num" data-sort="peak"><button type="button" class="sort">Peak %</button></th>
-            <th scope="col" class="num">Worst drop %</th>
-            <th scope="col" class="num" data-sort="latest"><button type="button" class="sort">Latest %</button></th>
-            <th scope="col" class="num" data-sort="latest_mc"><button type="button" class="sort">Latest MC</button></th>
             <th scope="col">Perceptor</th>
             <th scope="col">Status</th>
+            <th scope="col" class="num">Entry $</th>
+            <th scope="col" class="num" data-sort="call_mc"><button type="button" class="sort">Call MC</button></th>
+            <th scope="col" class="num" data-sort="latest_mc"><button type="button" class="sort">Latest MC</button></th>
+            <th scope="col" class="num" data-sort="latest"><button type="button" class="sort">Latest %</button></th>
+            <th scope="col" class="num" data-sort="peak" data-window="1"><button type="button" class="sort">Peak %</button></th>
+            <th scope="col" class="num" id="th-drawdown" data-window="1">Worst drop %</th>
+            <th scope="col" class="num win first" data-sort="return_1h" title="Return % over 1h"><button type="button" class="sort">1h</button></th>
+            <th scope="col" class="num win" data-sort="return_1d" title="Return % over 1d"><button type="button" class="sort">1d</button></th>
+            <th scope="col" class="num win" data-sort="return_3d" title="Return % over 3d"><button type="button" class="sort">3d</button></th>
+            <th scope="col" class="num win" data-sort="return_7d" title="Return % over 7d"><button type="button" class="sort">7d</button></th>
+            <th scope="col" class="num win" data-sort="return_30d" title="Return % over 30d"><button type="button" class="sort">30d</button></th>
           </tr>
         </thead>
         <tbody id="rows"></tbody>
@@ -98,11 +109,13 @@
         <div><dt>gave up</dt><dd>More than 30 days old and still no pool or no trades.</dd></div>
         <div><dt><span class="flag">rugged</span></dt><dd>Shown after the status when the pool was drained or the price fell below 5% of entry.</dd></div>
         <div id="legend-perceptor"><dt>Perceptor</dt><dd>The latest on-chain check of the token by the Perceptor bot; the words link to its report. <span class="pv pv-clean">no red flags</span> = the check found none. <span class="pv pv-caution">caution</span> = it found something to look at before buying. <span class="pv pv-red">red flags</span> = it found serious warning signs. Only calls picked up live are scanned: calls imported from history were never scanned, so they show a dash (–).</dd></div>
-        <div id="legend-latest"><dt>Latest %</dt><dd>The return at the most recent price, measured from the same entry (60 seconds after the post), followed by how old the call was when that price was read, for example <span class="age">45m</span>, <span class="age">30h</span> or <span class="age">60d</span>. It is refreshed about every 15 minutes for calls under 30 days old and once a day for older ones. The 1h to 30d buttons do not affect it. <span class="age">quiet</span> = no trade in the 7 days before the price was read, so it is the price of an older trade. Hover over the number for the exact times.</dd></div>
-        <div id="legend-call-mc"><dt>Call MC</dt><dd>The market cap given in the call post: its "called at" figure, or its Mcap line when there is none. Hover over the number for the exact amount.</dd></div>
-        <div id="legend-latest-mc"><dt>Latest MC</dt><dd>An estimate, not a reading: the market cap in the post (its Mcap line, or the "called at" figure when there is none) × the latest price ÷ the price at the post. It assumes the token supply has not changed since the call. A dash (–) when the post gave no market cap or there is no latest price yet.</dd></div>
+        <div id="legend-latest"><dt>Latest %</dt><dd>The return at the most recent price, measured from the same entry (60 seconds after the post), followed by how old the call was when that price was read, for example <span class="age">45m</span>, <span class="age">30h</span> or <span class="age">60d</span>. It is refreshed about every 15 minutes for calls under 30 days old and once a day for older ones. The window selector does not affect it. <span class="age">quiet</span> = no trade in the 7 days before the price was read, so it is the price of an older trade. Hover over the number for the exact times.</dd></div>
+        <div id="legend-windows"><dt>1h, 1d, 3d, 7d, 30d</dt><dd>The return over that window, in USD, measured from the price 60 seconds after the post (not the price in the post). A dash (–) until the window has passed and been recorded. Click a column to sort by it.</dd></div>
+        <div id="legend-peak"><dt>Peak %, Worst drop %</dt><dd>The highest and the lowest price within the window chosen with the "Peak / worst drop over" selector (1h to 30d), from the same entry. Only these two columns follow the selector.</dd></div>
+        <div id="legend-call-mc"><dt>Call MC</dt><dd>The market cap given in the call post: its "called at" figure, or its Mcap line when there is none or it is not a usable number (zero or below). Hover over the number for the exact amount.</dd></div>
+        <div id="legend-latest-mc"><dt>Latest MC</dt><dd>An estimate, not a reading: the market cap in the post (its Mcap line, or the "called at" figure when there is none or it is not usable) × the latest price ÷ the price at the post. It assumes the token supply has not changed since the call. A dash (–) when the post gave no market cap or there is no latest price yet.</dd></div>
         <div><dt>no USD price</dt><dd>The token trades against an asset with no dollar price, so no performance is shown.</dd></div>
-        <div><dt>–</dt><dd>No value yet: the horizon has not arrived, or the call is not tracked yet.</dd></div>
+        <div><dt>–</dt><dd>No value yet: the window has not arrived, or the call is not tracked yet.</dd></div>
       </dl>
     </details>
   </section>

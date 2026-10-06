@@ -257,6 +257,58 @@ Only use the feature columns as model inputs; everything about the future is an 
 
 Other commands: `-track` (tracker only, forever, no Telegram), `-track-once` (process what's due and exit).
 
+### Retry calls without a pool now (`-retry-no-pool`)
+
+A call whose pool was not found is `no_pool` and is tried again every 6 h by itself; once it
+is past its last horizon + 48 h a failed try makes it `gave_up`, and it is never tried again.
+After pool discovery learns something new (e.g. when Pons V2 support ships), make the
+tracker try those calls right away:
+
+```bash
+./scoutanalytics -retry-no-pool -retry-dry-run                                    # look first: what would be reset
+./scoutanalytics -retry-no-pool -retry-gave-up -retry-launchpad pons_v2 -retry-dry-run
+./scoutanalytics -retry-no-pool -retry-gave-up -retry-launchpad pons_v2           # do it
+```
+```
+retry: first calls with status no_pool + gave_up, launchpad or dex = ponsv2
+retry: 3 call(s) to reset to pending — no_pool 2, gave_up 1
+  launchpad            dex                  status      calls
+  Other                PONS_v2              no_pool         1
+  Pons V2              -                    no_pool         1
+  pons v2              -                    gave_up         1
+retry: 3 row(s) updated; a running tracker (-track or the listener) picks them up on its next cycle, or run -track-once
+```
+It needs only the database (no Telegram, no node) and exits. The summary (by status and by
+the post's launchpad / DEX) is printed before anything changes; the reset uses the same
+selection, in one transaction. A running `-track` (or listener) picks the rows up on its
+next cycle (`SCOUT_TRACK_INTERVAL`, after the batch it is working on); no restart needed.
+
+- **`-retry-no-pool`**: first calls with tracking status `no_pool` → `pending`, due now,
+  `attempts` 0, error cleared. Their priority is kept, so live calls still go first.
+- **`-retry-gave-up`**: also `gave_up` calls. A `gave_up` call without an entry price also
+  loses its saved pool and on-chain state, so the next check starts with a fresh pool
+  discovery (a call that gave up on a pool without trades would otherwise read the same pool
+  again). Each reset call gets one real try; an old call that still has no pool or no trades
+  is `gave_up` again right after it.
+- **`-retry-launchpad pons_v2,longxyz`**: only calls whose `launchpad` or `dex` (as parsed
+  from the post) is one of these. Compared ignoring case, spaces and punctuation, so
+  `pons_v2` matches `Pons V2` and `PONS-V2`, but not `Pons`: run the dry run without a
+  filter first to see the values as stored.
+- **`-retry-dry-run`**: print the summary only.
+
+Never touched: `repeat` rows, update posts, later calls of a token, and rows that are
+`pending`, `tracking`, `done` or `error`. Nothing is tracked again that is `done`.
+
+**Node load:** every reset call costs a pool discovery — a few seconds of node time and a
+few `eth_getLogs`, more for a call that still has no pool (its search window is widened
+up to four times before it gives up) — plus the normal scan if a pool is found. Thousands of
+reset calls are worked off 50 per tracker cycle (`SCOUT_TRACK_WORKERS` at a time), so they
+spread over many cycles; use `-retry-launchpad` to reset only the calls the new support helps.
+While those full batches last, the latest-price pass refreshes only calls younger than 30
+days (see "Latest price"), so older calls' latest prices wait until the backlog is done.
+If a row was being worked on by the running tracker at that moment, the tracker may save it
+back as `no_pool`; run the command again for those.
+
 To split the work over two processes (so the tracker can be restarted without
 interrupting the listener), run the listener with `-listen-only` and the tracker
 with `-track`. New calls are still queued for tracking by the listener.
@@ -686,8 +738,10 @@ needs only the database (no Telegram login, same as `-track`):
 | `SCOUT_WEB_DIR` | *(empty)* | serve the page from this folder instead of the copy built into the program (edit `frontend/` without rebuilding) |
 | `SCOUT_WEB_REFRESH` | `15s` | how often the website reads the list again from the database (a duration such as `10s` or `1m`; at least `2s`, a smaller value is raised to `2s`, an unreadable one falls back to `15s`, both with a warning) |
 
-**It is read-only and has no login.** The server only answers `GET` (anything else → 405) and
-runs `SELECT`s; anyone who can reach the address can see the calls. Put it behind your own
+**It is read-only and has no login.** The server only answers `GET` (anything else → 405),
+with one exception: `POST /api/refresh`, the "Refresh now" button, which makes the website read
+the database at once (only `POST` there; see the API below). It only runs `SELECT`s; anyone
+who can reach the address can see the calls and press the button. Put it behind your own
 firewall / reverse proxy, or bind it to `127.0.0.1`, if that is not what you want. Like every
 other mode it applies the schema at startup (`SCOUT_DB_AUTO_MIGRATE`), and it reads the same
 `.env` (so `API_ID` / `API_HASH` must be present, although no Telegram connection is made).
@@ -698,11 +752,12 @@ progress panel) and keeps it in memory as a *snapshot*. Every request for the li
 counts is answered from that snapshot: search, filter, sort and paging happen in memory and
 **no request waits for the database**. In the background the website reads the list again
 every `SCOUT_WEB_REFRESH` (15 seconds by default) and swaps the new snapshot in at once;
-requests under way finish on the old one.
+requests under way finish on the old one. The **Refresh now** button on the page does the same
+read on demand (see below).
 
 - **What you see can be up to `SCOUT_WEB_REFRESH` old** (plus the fraction of a second the
   read takes). A call stored by the listener, or a result written by the tracker, shows on the
-  page after the next refresh. "Updated hh:mm:ss" in the progress panel is the time the
+  page after the next refresh, or at once after **Refresh now**. "Updated hh:mm:ss" in the progress panel is the time the
   website last read the database, not the time the page asked.
 - **If the database cannot be read**, the website keeps answering from the snapshot it has and
   logs `web: could not refresh the snapshot: …` (at most one line a minute) until it works
@@ -714,8 +769,8 @@ requests under way finish on the old one.
   `scout_call_metrics`, `scout_call_returns` and `scout_investigations` (not through
   `scout_call_dataset_v`, whose per-row lookups the page does not need). On the test machine
   (2 cores) it takes about 0.3 seconds for 12,000 tokens (22,600 posts). No new table or index.
-- **Memory**: under 1 KB per token for the snapshot (about 9 MB for 12,000 tokens, about
-  80 MB for 100,000), on top of the program itself; while a refresh runs, the rows just read
+- **Memory**: about 1 KB per token for the snapshot (about 10 MB for 12,000 tokens, about
+  90 MB for 100,000; the five window returns in every row added about 110 bytes a token), on top of the program itself; while a refresh runs, the rows just read
   are in memory next to it for a moment. The whole process measured 40–55 MB with 12,000
   tokens (peak 78 MB under a load test).
 
@@ -763,11 +818,30 @@ other sites):
   first call). N repeat calls and M update posts are not shown." (a part whose number is 0 is
   left out). Refreshes every 30 seconds; "Updated hh:mm:ss" is when the website last read the
   database.
-- **Calls** — Date (links to the post), Token and Symbol (link to GMGN), Calls (`×N` when the
-  token was called N > 1 times, empty otherwise; hover for "Called N times, last on …"),
-  Entry $, Call MC, Return %, Peak %, Worst drop %, Latest %, Latest MC, Perceptor, Status. Search by
-  token name, symbol or address; pick the window (1h, 1d, 3d, 7d, 30d); click Date / Call MC /
-  Return / Peak / Latest / Latest MC to sort, click again to reverse. 50 per page.
+- **Refresh now** (next to "Updated") makes the website read the database at once — the same
+  read the background loop does every `SCOUT_WEB_REFRESH` — and then reloads the progress and
+  the list. The button is disabled while it works. A press shortly after another one (within
+  5 seconds of the end of the read it caused) does not read again: the page says "Pressed less
+  than 5 seconds ago; showing the data read at hh:mm:ss" and shows that data. Presses from several tabs at the same
+  moment, or while the background loop is reading, share one read. If the database cannot be
+  read (or does not answer within 15 seconds) the page shows a short notice, "Could not
+  refresh: … Still showing the data read at hh:mm:ss.", and keeps the rows it has.
+- **Calls** — the columns, in this order:
+  Date (links to the post) | Token | Symbol (both link to GMGN) | Calls (`×N` when the token was
+  called N > 1 times, empty otherwise; hover for "Called N times, last on …") | Perceptor |
+  Status | Entry $ | Call MC | Latest MC | Latest % | Peak % | Worst drop % | 1h | 1d | 3d | 7d | 30d.
+  - **1h, 1d, 3d, 7d, 30d** are the return over each window (the number the old single
+    "Return %" column showed for that window), all five side by side. A dash until the window
+    has passed and been recorded.
+  - **Peak % and Worst drop %** are for one window, picked with the small **"Peak / worst drop
+    over"** selector (1h … 30d) above the table; their headers name it, e.g. "Peak % (7d)". The
+    selector changes only these two columns.
+  - **Sorting:** click Date, Call MC, Latest MC, Latest %, Peak % (for the selected window) or
+    any of 1h … 30d; click again to reverse. ▲/▼ shows the column and direction (also as
+    `aria-sort`). Rows without a value are always last; ties by call id. Worst drop % is not
+    sortable.
+  - Search by token name, symbol or address. 50 per page. On a narrow screen the table scrolls
+    sideways inside its box; the page itself does not.
 - **Perceptor** — the column shows the verdict of the token's Perceptor report as words:
   "no red flags", "caution", "red flags" (linked to the report, in a new tab), or "–" when
   there is none. The "Perceptor" select next to the search box filters the list: All reports,
@@ -781,23 +855,24 @@ other sites):
   A scan that failed, timed out or was rate-limited does not count, and a report whose
   verdict could not be read counts as not scanned.
 - Every number is **in USD and measured from the entry 60 seconds after the post** (the
-  `*_late_*` columns). A call tracked in another asset (no USD source for its pair) shows
-  "no USD price" instead of numbers (and a dash in both market cap columns). Sorting by Return,
-  Peak, Latest, Call MC or Latest MC lists the USD-priced calls only.
-- **Latest %** (the column after "Worst drop %") is the return at the most recent price,
+  `*_late_*` columns). A call tracked in another asset (no USD source for its pair) shows a
+  dash for Entry $, Call MC and Latest MC and one "no USD price" cell across Latest % … 30d.
+  Sorting by anything but Date lists the USD-priced calls only.
+- **Latest %** (the column after "Latest MC") is the return at the most recent price,
   from the same entry, followed by how old the call was when that price was read:
   `+35.2% · 60d` (`45m` under an hour, `30h` under two days, otherwise days). It comes from
   the tracker's latest-price pass (about every 15 minutes for calls under 30 days old, once
-  a day for older ones) and does not change with the 1h … 30d buttons. `· quiet` is added
+  a day for older ones) and does not change with the window selector. `· quiet` is added
   when the last trade is more than 7 days older than the reading (the price is then that of
   an old trade); the tooltip gives both times. A dash means no latest price has been read yet.
 - **Call MC** (after "Entry $") is the market cap given in the call post: its "called at"
-  figure, or its "📈 Mcap" line when the post has no "called at" (`scout_call_metrics`).
-  **Latest MC** (after "Latest %") is an **estimate**, since the latest market cap is not
-  stored: the post's market cap (the Mcap line first, else "called at") × the latest price ÷
-  the price at the post. It assumes the token supply has not changed. Both are written
-  compactly (`$850`, `$45.2k`, `$1.3M`, `$2.1B`); hover for the exact amount. A dash when the
-  post gave no usable market cap, when there is no latest price (Latest MC), and for calls not
+  figure, or its "📈 Mcap" line when the post has no usable "called at" (missing, zero or
+  below, or not a finite number) (`scout_call_metrics`).
+  **Latest MC** (after "Call MC") is an **estimate**, since the latest market cap is not
+  stored: the post's market cap (the Mcap line first, else "called at", by the same rule) ×
+  the latest price ÷ the price at the post. It assumes the token supply has not changed. Both are written
+  compactly (`$850`, `$45.2k`, `$1.3M`, `$2.1B`); hover for the exact amount. A dash when
+  neither figure of the post is usable, when there is no latest price (Latest MC), and for calls not
   priced in USD. The legend under the table says that Latest MC is an estimate and how it is
   worked out.
 
@@ -814,7 +889,7 @@ Names come from arbitrary contracts: control characters are removed, the length 
 
 ### API
 
-Both endpoints answer from the snapshot (see above) and send `ETag`, `Cache-Control: no-cache`,
+The two `GET` endpoints answer from the snapshot (see above) and send `ETag`, `Cache-Control: no-cache`,
 `Vary: Accept-Encoding` and `X-Snapshot-At` (when the database was last read, RFC 3339). Send
 the `ETag` back as `If-None-Match` to get `304 Not Modified` while the data is unchanged. The
 `ETag` is a weak one (`W/"…"`): the same `ETag` means the same data; only the time stamps in
@@ -845,10 +920,10 @@ returned and cannot be found by its own name or symbol:
 | Parameter | Values | Default | |
 |---|---|---|---|
 | `q` | text, up to 100 characters | *(none)* | part of the token name, symbol or contract address; case-insensitive (letters of any script, by the Unicode lower-case rule); `%` and `_` are ordinary characters |
-| `sort` | `date`, `return`, `peak`, `latest`, `call_mc`, `latest_mc` | `date` | empty values always come last (in both directions); ties by call id, in the direction asked for. `latest` = by `latest_return_pct`, `call_mc` = by `call_mcap_usd`, `latest_mc` = by `latest_mcap_usd` (these three are the same for every `horizon`) |
+| `sort` | `date`, `return`, `peak`, `latest`, `call_mc`, `latest_mc`, `return_1h`, `return_1d`, `return_3d`, `return_7d`, `return_30d` | `date` | empty values always come last (in both directions); ties by call id, in the direction asked for. `return` / `peak` = by `return_pct` / `peak_pct` of the `horizon` asked for. `return_1h` … `return_30d` = by that window's return (`return_1h_pct` …), whatever the `horizon`. `latest` = by `latest_return_pct`, `call_mc` = by `call_mcap_usd`, `latest_mc` = by `latest_mcap_usd` (these are the same for every `horizon`) |
 | `dir` | `desc`, `asc` | `desc` | |
-| `horizon` | `1h`, `1d`, `3d`, `7d`, `30d` | `1d` | which window `return_pct` / `peak_pct` / `drawdown_pct` are for |
-| `usd_only` | `1`, `0` | `1` when `sort` is `return`, `peak`, `latest`, `call_mc` or `latest_mc`, else `0` | `1` = only tokens whose first call has `price_unit = usd` |
+| `horizon` | `1h`, `1d`, `3d`, `7d`, `30d` | `1d` | which window `return_pct` / `peak_pct` / `drawdown_pct` (and `sort=return` / `peak`) are for; the page sets it with its Peak / worst drop selector |
+| `usd_only` | `1`, `0` | `1` for every `sort` but `date`, else `0` | `1` = only tokens whose first call has `price_unit = usd` |
 | `verdict` | `clean`, `caution`, `red_flags`, `not_scanned` | *(none = all)* | the token's Perceptor verdict (see below). `clean` = no red flags found; `not_scanned` = no completed Perceptor report, or one whose verdict is `unknown` |
 | `page` | 1 … | `1` | |
 | `per` | 1 – 200 | `50` | |
@@ -863,7 +938,8 @@ Any other value or parameter → HTTP 400 with `{"error": "…"}`.
    "contract_address": "0x…", "token_name": "Malfoid", "token_symbol": "MALFOID",
    "gmgn_url": "https://gmgn.ai/robinhood/token/0x…", "price_unit": "usd",
    "entry_price_usd": 0.0045, "return_pct": -20.0, "peak_pct": 100.0, "drawdown_pct": -50.0,
-   "rugged": false, "tracking_status": "done", "perceptor_verdict": "clean",
+   "return_1h_pct": 12.5, "return_1d_pct": -20.0, "return_3d_pct": 40.1, "return_7d_pct": null,
+   "return_30d_pct": null, "rugged": false, "tracking_status": "done", "perceptor_verdict": "clean",
    "perceptor_url": "https://www.perceptor.info/r/deb9d3118ec1480e985032f9472c87c0",
    "call_count": 3, "last_call_date": "2026-10-02T09:12:00Z",
    "latest_return_pct": 35.2, "latest_price_usd": 0.006084,
@@ -874,7 +950,12 @@ Any other value or parameter → HTTP 400 with `{"error": "…"}`.
 not counted); `last_call_date` = the date of the most recent one (equal to `message_date` when there is only one). Everything else
 in the object belongs to the first call.
 `entry_price_usd` is the price 60 seconds after the post (the price at the post when that one
-is missing). `entry_price_usd`, `return_pct`, `peak_pct` and `drawdown_pct` are `null` unless
+is missing). `return_pct`, `peak_pct` and `drawdown_pct` are for the `horizon` asked for.
+`return_1h_pct`, `return_1d_pct`, `return_3d_pct`, `return_7d_pct` and `return_30d_pct` are the
+return of each window, whatever the `horizon`: each is exactly the `return_pct` the same row
+has when that window is asked for (`null` until the window is recorded). The page shows these
+five as its 1h … 30d columns; `return_pct` is kept for older clients. `entry_price_usd`,
+`return_pct`, `peak_pct`, `drawdown_pct` and the five window returns are `null` unless
 `price_unit` is `usd`. `gmgn_url` is `null` for anything that is not a plain `0x…` address.
 
 `latest_return_pct` and `latest_price_usd` are the return (from the same entry) and the price
@@ -890,18 +971,18 @@ cycle; `/api/summary` is not affected.
 `call_mcap_usd` and `latest_mcap_usd` are the last two fields of a call (in USD, from
 `scout_call_metrics` of the first call and its `scout_call_tracking` row):
 
-- `call_mcap_usd` = `COALESCE(called_at_mcap_usd, mcap_usd)`: the market cap at the call as
-  given in the post.
-- `latest_mcap_usd` = `COALESCE(mcap_usd, called_at_mcap_usd) × latest_price_usd ÷
-  entry_price_usd`, where `entry_price_usd` is the tracking row's price **at the post**
+- `call_mcap_usd` = the first **valid** of `called_at_mcap_usd`, `mcap_usd`: the market cap at
+  the call as given in the post. Valid = present, above zero and a finite number; so a "called
+  at" of 0, a negative one or `NaN` falls back to the Mcap line.
+- `latest_mcap_usd` = (the first valid of `mcap_usd`, `called_at_mcap_usd`) × `latest_price_usd`
+  ÷ `entry_price_usd`, where `entry_price_usd` is the tracking row's price **at the post**
   (not the late entry the `entry_price_usd` field of the response shows; the post's market cap
   is a post-time figure). An **estimate** that assumes the token supply has not changed; the
   latest market cap itself is not stored.
 
-Both are `null` when the call's `price_unit` is not `usd`, and when an input (the market cap
-`COALESCE` picked, the latest price or the price at the post) is missing, zero, negative or
-not finite, or the result is not finite. `COALESCE` only skips a missing value: a "called at"
-of 0 gives `call_mcap_usd = null`, not the Mcap line. `latest_mcap_usd` is also `null` whenever
+Both are `null` when the call's `price_unit` is not `usd`, when neither market cap of the post
+is valid, when the latest price or the price at the post is missing, zero, negative or not
+finite, or when the result is not finite. `latest_mcap_usd` is also `null` whenever
 `latest_price_usd` is (no latest price yet). Like the latest price, they do not depend on
 `horizon`, and a change to either value changes the `ETag` of `/api/calls`.
 
@@ -915,6 +996,40 @@ that contract address, upper/lower case ignored — not only the listed call's o
 history (only live calls are scanned). `perceptor_url` is also `null` when the stored link
 does not start with `https://`. This is a rule of the website only:
 `scout_call_dataset_v.perceptor_verdict` is unchanged and still belongs to the single call.
+
+`POST /api/refresh` — "Refresh now": the website reads the database at once (the same read
+as the background refresh), puts the new snapshot in place and then answers. No parameters
+and no body; it is the only address that takes `POST`, and it takes nothing else (`GET`,
+`HEAD`, … → 405 with `Allow: POST`), so links, prefetchers and crawlers cannot trigger it.
+
+```json
+{"refreshed": true, "rate_limited": false, "snapshot_at": "2026-10-02T14:30:05.412Z", "snapshot_age_seconds": 0}
+```
+`refreshed` = the database was read for this request; `rate_limited` = it was not, because
+of the limit below, and `snapshot_at` is the snapshot as it already was. Afterwards ask
+`/api/summary` and `/api/calls` again (the page does): their `ETag`s change only if the data did.
+
+- **One read at a time.** There is never more than one read of the database: a press while a
+  read is under way — started by another press or by the background refresh — waits for that
+  read and gets its result (`refreshed: true`), and the background refresh likewise waits for
+  a read a press started.
+- **Rate limit.** A press within **5 seconds of the end of the last read a press started**
+  (whoever pressed) does not read; it answers at once with `rate_limited: true`. A failed read
+  counts too. Joining a read under way is not limited, and the background refresh is not
+  affected by the limit.
+- **Timeout.** A press waits at most 15 seconds; the read itself is given up after 60 seconds
+  (as every read). A slow read goes on after the press gave up and is put in place when it
+  ends; a later press joins it.
+- **Errors.** The snapshot is kept as it was and keeps being served. `503` = the database could
+  not be read, `504` = it did not answer within 15 seconds; the body is
+  `{"error": "…", "snapshot_at": "…"}` (`snapshot_at` = the data still shown; absent before
+  the first snapshot). The details go to the log (`web: could not refresh the snapshot: …`).
+- **Same site only.** A request whose `Origin` header is present and names another host (or
+  another port, or `null`) is refused with `403` before anything is read. Browsers send
+  `Origin` with every `POST`, so a page of another site cannot press the button; a request
+  without `Origin` (curl) is accepted. The check compares `Origin` with the `Host` header: a
+  reverse proxy in front of the website must pass `Host` through unchanged, or every press
+  gets `403`.
 
 ## State / logs
 

@@ -148,6 +148,87 @@ func TestWebSnapshotRefresh(t *testing.T) {
 	}
 }
 
+// TestWebRefreshButton: "Refresh now" (POST /api/refresh) shows a call stored
+// after the last snapshot at once, without waiting for the background loop
+// (which does not run here); on a database error the old snapshot stays.
+func TestWebRefreshButton(t *testing.T) {
+	fx := newWebFixture(t, webConfig{GMGNTemplate: defaultGMGNTemplate})
+	ctx := context.Background()
+	post := func(hdr ...string) (int, http.Header, []byte) {
+		t.Helper()
+		req, err := http.NewRequest("POST", fx.srv.URL+"/api/refresh", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for i := 0; i+1 < len(hdr); i += 2 {
+			req.Header.Set(hdr[i], hdr[i+1])
+		}
+		resp, err := rawClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		b, _ := io.ReadAll(resp.Body)
+		return resp.StatusCode, resp.Header, b
+	}
+	before := fx.rawCalls(t, "")
+	id := seedWebCall(t, fx.st, webBase, webSeed{Msg: 50, At: 100 * time.Hour, CA: caNew, Name: sp("Brand New"), PostSym: "NEW",
+		Status: TrackDone, Unit: "usd", Entry: 1, Returns: map[string][3]float64{"1h": {3, 4, -1}, "7d": {77, 88, -9}}})
+	fx.ids["new"] = id
+	if r := fx.rawCalls(t, "q=Brand"); r.Total != 0 {
+		t.Fatalf("the new call shows before the press: %+v", r)
+	}
+	time.Sleep(5 * time.Millisecond) // the snapshot time has millisecond steps
+	code, hdr, body := post("Origin", fx.srv.URL)
+	var res webRefreshResponse
+	if err := json.Unmarshal(body, &res); err != nil || code != 200 || !res.Refreshed || res.RateLimited || hdr.Get("X-Snapshot-At") == "" {
+		t.Fatalf("POST /api/refresh: %d %s", code, body)
+	}
+	after := fx.rawCalls(t, "")
+	if after.Total != before.Total+1 || after.Calls[0].CallID != id || after.At == before.At || after.At != res.SnapshotAt.Format(time.RFC3339Nano) {
+		t.Fatalf("after the press: total %d (before %d), first %d, at %s (press %s)", after.Total, before.Total, after.Calls[0].CallID, after.At, res.SnapshotAt)
+	}
+	if w := after.Calls[0].windows(); w != "3 null null 77 null" {
+		t.Fatalf("the new call's windows: %s", w)
+	}
+	fx.wantOrder(t, "sort=return_7d", "new", "alpha", "gamma", "beta") // 77, 10, then none (higher call id first)
+
+	// pressed again at once: no read, the same snapshot
+	snap := fx.web.snap.Load()
+	if code, _, body := post(); code != 200 || !strings.Contains(string(body), `"rate_limited":true`) || fx.web.snap.Load() != snap {
+		t.Fatalf("second press: %d %s", code, body)
+	}
+	// from another site: refused
+	if code, _, _ := post("Origin", "http://evil.example"); code != 403 {
+		t.Fatalf("other origin: %d", code)
+	}
+
+	// the database fails: an error, and the old snapshot stays
+	fx.web.flightMu.Lock()
+	fx.web.lastManual = time.Time{}
+	fx.web.flightMu.Unlock()
+	_, hdr1, calls1 := fx.raw(t, "/api/calls")
+	old := fx.web.snap.Load()
+	if _, err := fx.st.Pool.Exec(ctx, `DROP TABLE IF EXISTS scout_call_returns_gone`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fx.st.Pool.Exec(ctx, `ALTER TABLE scout_call_returns RENAME TO scout_call_returns_gone`); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if _, err := fx.st.Pool.Exec(ctx, `ALTER TABLE scout_call_returns_gone RENAME TO scout_call_returns`); err != nil {
+			t.Fatal(err)
+		}
+	}()
+	code, _, body = post()
+	if code != 503 || !strings.Contains(string(body), `"error"`) || !strings.Contains(string(body), `"snapshot_at"`) || strings.Contains(string(body), "scout_call_returns") {
+		t.Fatalf("press with a missing table: %d %s", code, body)
+	}
+	if code, hdr2, calls2 := fx.raw(t, "/api/calls"); fx.web.snap.Load() != old || code != 200 || !bytes.Equal(calls1, calls2) || hdr2.Get("ETag") != hdr1.Get("ETag") {
+		t.Fatalf("after the failed press: %d", code)
+	}
+}
+
 func (fx *webFixture) rawCalls(t *testing.T, query string) webCallsJSON {
 	t.Helper()
 	code, _, body := fx.raw(t, "/api/calls?"+query)
@@ -292,6 +373,7 @@ func TestWebETag(t *testing.T) {
 	seen := map[string]string{calls: "/api/calls"}
 	for _, other := range []string{"q=a", "q=b", "sort=return", "sort=peak", "sort=return&usd_only=0", "dir=asc", "horizon=1h", "horizon=30d",
 		"sort=call_mc", "sort=latest_mc", "sort=call_mc&dir=asc", "sort=latest_mc&usd_only=0",
+		"sort=return_1h", "sort=return_30d&dir=asc", "sort=return_1h&horizon=7d", "sort=return_1d", "sort=return_1d&usd_only=0",
 		"usd_only=1", "verdict=clean", "verdict=not_scanned", "page=2", "per=10", "per=10&page=2", "q=a&verdict=clean"} {
 		e := etagOf("/api/calls?" + other)
 		if prev, dup := seen[e]; dup {
@@ -405,7 +487,7 @@ func TestWebETag(t *testing.T) {
 // and only for them.
 func TestWebGzip(t *testing.T) {
 	fx := newWebFixture(t, webConfig{GMGNTemplate: defaultGMGNTemplate})
-	for _, p := range []string{"/api/calls", "/api/calls?sort=return&usd_only=0", "/", "/app.js", "/style.css"} {
+	for _, p := range []string{"/api/calls", "/api/calls?sort=return&usd_only=0", "/", "/app.js", "/style.css", "/favicon.svg"} {
 		code, plainHdr, plain := fx.raw(t, p)
 		if code != 200 || plainHdr.Get("Content-Encoding") != "" || plainHdr.Get("Vary") != "Accept-Encoding" || len(plain) < webGzipMinBytes ||
 			plainHdr.Get("Content-Length") != fmt.Sprint(len(plain)) {
@@ -434,8 +516,9 @@ func TestWebGzip(t *testing.T) {
 	if !bytes.Equal(viaDefault, viaRaw) {
 		t.Fatalf("gzip and plain differ:\n%s\n%s", viaDefault, viaRaw)
 	}
-	// Small answers, errors and images are sent as they are.
-	for _, p := range []string{"/api/summary", "/api/calls?sort=x", "/api/nope", "/favicon.svg", "/missing.js"} {
+	// Small answers, errors and missing files are sent as they are. (SVG is
+	// text and is compressed above; real images are not, see pic.png below.)
+	for _, p := range []string{"/api/summary", "/api/calls?sort=x", "/api/nope", "/missing.js"} {
 		if _, hdr, body := fx.raw(t, p, "Accept-Encoding", "gzip"); hdr.Get("Content-Encoding") != "" || len(body) == 0 {
 			t.Errorf("%s: Content-Encoding %q, %d bytes", p, hdr.Get("Content-Encoding"), len(body))
 		}

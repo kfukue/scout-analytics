@@ -52,7 +52,8 @@ func TestWebMarketCaps(t *testing.T) {
 	}
 	tagBefore, sumBefore := etagOf("/api/calls?sort=call_mc"), etagOf("/api/summary")
 
-	// a USD-priced token whose post had a called-at of 0 and an Mcap line (stored through the seed)
+	// a USD-priced token whose post had a called-at of 0 and an Mcap line (stored through the seed):
+	// the called-at figure is not usable, so both columns use the Mcap line
 	zero, three := 0.0, 3000.0
 	fx.ids["delta"] = seedWebCall(t, fx.st, base, webSeed{Msg: 20, At: 20 * time.Hour, CA: caDelta, Name: sp("Delta"), Status: TrackDone,
 		Unit: "usd", Entry: 2, CalledMC: &zero, MC: &three})
@@ -65,7 +66,7 @@ func TestWebMarketCaps(t *testing.T) {
 	setLatest("beta", 0.75) // 1,200,000 × 0.75 ÷ 1.5 = 600,000
 	// gamma: only a called-at figure, and no latest price
 	setMC("gamma", 40000.0, nil)
-	// delta: called-at 0 (no fallback for the call column), Mcap line 3,000
+	// delta: called-at 0 (not usable: the call column falls back to the Mcap line, 3,000)
 	setLatest("delta", 4) // 3,000 × 4 ÷ 2 = 6,000
 	// not priced in USD: never shown
 	setMC("virt", 9000000.0, 9000000.0)
@@ -76,11 +77,11 @@ func TestWebMarketCaps(t *testing.T) {
 	setMC("xss", "NaN", "NaN")
 
 	usdKeys := "alpha beta gamma delta"
-	res := fx.wantOrder(t, "sort=call_mc", "beta", "gamma", "alpha", "delta") // 1.2M; 40k, 40k (higher call id first); none
+	res := fx.wantOrder(t, "sort=call_mc", "beta", "gamma", "alpha", "delta") // 1.2M; 40k, 40k (higher call id first); 3k
 	if !res.USDOnly || res.Sort != "call_mc" || res.Dir != "desc" || res.Total != 4 {
 		t.Fatalf("sort=call_mc (%s): %+v", usdKeys, res)
 	}
-	fx.wantOrder(t, "sort=call_mc&dir=asc", "alpha", "gamma", "beta", "delta")
+	fx.wantOrder(t, "sort=call_mc&dir=asc", "delta", "alpha", "gamma", "beta")
 	res = fx.wantOrder(t, "sort=latest_mc", "beta", "alpha", "delta", "gamma") // 600k, 100k, 6k; none
 	if !res.USDOnly || res.Sort != "latest_mc" || res.Total != 4 {
 		t.Fatalf("sort=latest_mc: %+v", res)
@@ -92,7 +93,7 @@ func TestWebMarketCaps(t *testing.T) {
 	}
 	fx.wantOrder(t, "sort=latest_mc&usd_only=0&dir=asc", "delta", "alpha", "beta", "gamma", "virt", "xss", "sol", "pct", "err", "gave")
 	fx.wantOrder(t, "sort=call_mc&usd_only=0", "beta", "gamma", "alpha", "delta", "gave", "err", "pct", "sol", "xss", "virt")
-	fx.wantOrder(t, "sort=call_mc&usd_only=0&dir=asc", "alpha", "gamma", "beta", "virt", "xss", "sol", "pct", "err", "gave", "delta")
+	fx.wantOrder(t, "sort=call_mc&usd_only=0&dir=asc", "delta", "alpha", "gamma", "beta", "virt", "xss", "sol", "pct", "err", "gave")
 	// the window does not matter for these sorts, the other filters do
 	fx.wantOrder(t, "sort=call_mc&horizon=30d", "beta", "gamma", "alpha", "delta")
 	fx.wantOrder(t, "sort=latest_mc&q=a&per=2", "beta", "alpha")
@@ -106,7 +107,7 @@ func TestWebMarketCaps(t *testing.T) {
 	}
 	near := func(p *float64, want float64) bool { return p != nil && math.Abs(*p-want) <= 1e-9*want }
 	for k, w := range map[string][2]float64{ // call, latest (-1 = none)
-		"alpha": {40000, 100000}, "beta": {1200000, 600000}, "gamma": {40000, -1}, "delta": {-1, 6000},
+		"alpha": {40000, 100000}, "beta": {1200000, 600000}, "gamma": {40000, -1}, "delta": {3000, 6000},
 		"virt": {-1, -1}, "pct": {-1, -1}, "xss": {-1, -1}, "sol": {-1, -1}, "err": {-1, -1}, "gave": {-1, -1},
 	} {
 		c := by[k]
@@ -163,12 +164,22 @@ func TestWebMarketCaps(t *testing.T) {
 	}
 	fx.wantOrder(t, "sort=latest_mc", "beta", "alpha", "delta", "gamma")
 
-	// a called-at figure that is not a number: no call column (no fallback), the estimate still from the Mcap line
+	// a called-at figure that is not a number: the call column falls back to the Mcap line, the estimate starts from it anyway
 	setMC("beta", "NaN", 1200000.0)
-	if b := fx.calls(t, "q=Beta").Calls[0]; b.CallMcapUSD != nil || !near(b.LatestMcapUSD, 600000) {
+	if b := fx.calls(t, "q=Beta").Calls[0]; !near(b.CallMcapUSD, 1200000) || !near(b.LatestMcapUSD, 600000) {
 		t.Fatalf("beta with a NaN called-at: %s %s", fnum(b.CallMcapUSD), fnum(b.LatestMcapUSD))
 	}
-	fx.wantOrder(t, "sort=call_mc", "alpha", "gamma", "delta", "beta")
+	fx.wantOrder(t, "sort=call_mc", "beta", "alpha", "gamma", "delta") // 1.2M, 45k, 40k, 3k
+	// a Mcap line of 0: the estimate falls back to the called-at figure
+	setMC("beta", 900000.0, 0.0)
+	if b := fx.calls(t, "q=Beta").Calls[0]; !near(b.CallMcapUSD, 900000) || !near(b.LatestMcapUSD, 450000) { // 900,000 × 0.75 ÷ 1.5
+		t.Fatalf("beta with a Mcap line of 0: %s %s", fnum(b.CallMcapUSD), fnum(b.LatestMcapUSD))
+	}
+	// neither figure usable: no value
+	setMC("beta", -1.0, "NaN")
+	if b := fx.calls(t, "q=Beta").Calls[0]; b.CallMcapUSD != nil || b.LatestMcapUSD != nil {
+		t.Fatalf("beta without a usable market cap: %s %s", fnum(b.CallMcapUSD), fnum(b.LatestMcapUSD))
+	}
 
 	// the query string: usd_only defaults on for both sorts, like return, peak and latest
 	for q, want := range map[string]bool{"sort=call_mc": true, "sort=latest_mc": true, "sort=call_mc&usd_only=0": false,

@@ -277,8 +277,9 @@ type ScoutWebRow struct {
 	usd     bool  // priced in USD: only then are the numbers shown
 	verdict uint8 // webBucket…: where the Perceptor filter puts the token
 	// callMcap: CalledAtMcap, else PostMcap. latestMcap: an estimate,
-	// (PostMcap, else CalledAtMcap) × LatestPrice ÷ PostPrice. Both nil unless
-	// every input is there, positive and finite and the call is priced in USD.
+	// (PostMcap, else CalledAtMcap) × LatestPrice ÷ PostPrice. "Else" = when the
+	// first is missing, zero, negative or not finite. Both nil unless every input
+	// is there, positive and finite and the call is priced in USD.
 	// They point into mcapVals (set by setWebMcaps).
 	callMcap   *float64
 	latestMcap *float64
@@ -288,8 +289,9 @@ type ScoutWebRow struct {
 // ScoutWebCall is one row of the website's call list as sent to the page:
 // the first call of a token. CallCount and LastCallDate describe all real calls
 // (update posts left out) of that token (contract address compared without regard to letter case).
-// The performance numbers are in USD, from the entry 60 seconds after the post,
-// for the horizon that was asked for; they are nil for calls not priced in USD.
+// The performance numbers are in USD, from the entry 60 seconds after the post:
+// ReturnPct, PeakPct and DrawdownPct for the horizon that was asked for, the
+// Return…Pct fields for every window; they are nil for calls not priced in USD.
 // PerceptorVerd and PerceptorURL are the token's latest completed Perceptor
 // report (any post of the token), nil when it was never scanned.
 type ScoutWebCall struct {
@@ -306,12 +308,20 @@ type ScoutWebCall struct {
 	ReturnPct       *float64  `json:"return_pct"`
 	PeakPct         *float64  `json:"peak_pct"`
 	DrawdownPct     *float64  `json:"drawdown_pct"`
-	Rugged          *bool     `json:"rugged"`
-	TrackingStatus  *string   `json:"tracking_status"`
-	PerceptorVerd   *string   `json:"perceptor_verdict"` // clean | caution | red_flags | unknown
-	PerceptorURL    *string   `json:"perceptor_url"`     // report link (https only)
-	CallCount       int       `json:"call_count"`        // calls of this token in total (≥ 1)
-	LastCallDate    time.Time `json:"last_call_date"`    // most recent call of this token
+	// The return of each window (late entry, USD), whatever the horizon asked
+	// for: the number ReturnPct has for that window. nil until the window is
+	// recorded, and for calls not priced in USD.
+	Return1hPct    *float64  `json:"return_1h_pct"`
+	Return1dPct    *float64  `json:"return_1d_pct"`
+	Return3dPct    *float64  `json:"return_3d_pct"`
+	Return7dPct    *float64  `json:"return_7d_pct"`
+	Return30dPct   *float64  `json:"return_30d_pct"`
+	Rugged         *bool     `json:"rugged"`
+	TrackingStatus *string   `json:"tracking_status"`
+	PerceptorVerd  *string   `json:"perceptor_verdict"` // clean | caution | red_flags | unknown
+	PerceptorURL   *string   `json:"perceptor_url"`     // report link (https only)
+	CallCount      int       `json:"call_count"`        // calls of this token in total (≥ 1)
+	LastCallDate   time.Time `json:"last_call_date"`    // most recent call of this token
 	// Return as of the most recent price (not tied to the horizon asked for);
 	// all five are nil until the tracker has read a latest price, and for calls
 	// not priced in USD.
@@ -323,9 +333,10 @@ type ScoutWebCall struct {
 	// Market cap at the call, from the post ("called at", else the "Mcap"
 	// line), and an estimate of the market cap at the latest price: the post's
 	// market cap ("Mcap" line, else "called at") × latest price ÷ price at the
-	// post (assumes the token supply has not changed). nil when an input is
-	// missing, zero, negative or not finite, and for calls not priced in USD;
-	// LatestMcapUSD also when there is no latest price.
+	// post (assumes the token supply has not changed). "Else" = when the first
+	// figure is missing, zero, negative or not finite. nil when no figure or
+	// price is usable, and for calls not priced in USD; LatestMcapUSD also when
+	// there is no latest price.
 	CallMcapUSD   *float64 `json:"call_mcap_usd"`
 	LatestMcapUSD *float64 `json:"latest_mcap_usd"`
 }
@@ -334,7 +345,7 @@ type ScoutWebCall struct {
 // must be values of the fixed lists below (parseWebCallsQuery checks them; the snapshot rejects anything else).
 type ScoutWebCallsFilter struct {
 	Q       string // substring of token name, symbol or contract address ("" = all)
-	Sort    string // date | return | peak | latest | call_mc | latest_mc
+	Sort    string // date | return | peak | latest | call_mc | latest_mc | return_1h … return_30d
 	Dir     string // desc | asc
 	Horizon string // 1h | 1d | 3d | 7d | 30d
 	USDOnly bool   // only calls priced in USD

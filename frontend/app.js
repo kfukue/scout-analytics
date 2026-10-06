@@ -11,6 +11,12 @@
   var REFRESH_MS = 30000;
   var DEBOUNCE_MS = 300;
   var HORIZONS = ['1h', '1d', '3d', '7d', '30d'];
+  // The window columns, in the order of HORIZONS: the field of each row and
+  // the sort value of its header.
+  var WINDOW_FIELDS = ['return_1h_pct', 'return_1d_pct', 'return_3d_pct', 'return_7d_pct', 'return_30d_pct'];
+  // Cells after Latest MC that "no USD price" spans: Latest %, Peak %, Worst
+  // drop % and the five windows. Must match the headers in index.html.
+  var NO_USD_SPAN = 3 + HORIZONS.length;
   var STATUS_TEXT = {
     pending: 'pending', tracking: 'tracking', done: 'done',
     no_pool: 'no pool', error: 'error', gave_up: 'gave up'
@@ -41,6 +47,7 @@
   var summaryEtag = '';
   var refreshTimer = null;
   var lastRefresh = 0;
+  var refreshing = false; // "Refresh now" is waiting for the server
 
   function $(id) { return document.getElementById(id); }
 
@@ -214,25 +221,6 @@
     }
     tr.appendChild(tdCalls);
 
-    var unit = c.price_unit;
-    if (typeof unit === 'string' && unit !== '' && unit !== 'usd') {
-      // tracked, but in another asset: no number here would be in dollars
-      tr.appendChild(el('td', 'num', DASH)); // entry
-      tr.appendChild(el('td', 'num', DASH)); // call market cap
-      var td = el('td', 'center muted', 'no USD price');
-      td.colSpan = 4; // return, peak, worst drop and latest
-      tr.appendChild(td);
-      tr.appendChild(el('td', 'num', DASH)); // latest market cap
-    } else {
-      tr.appendChild(el('td', 'num', fmtPrice(c.entry_price_usd)));
-      tr.appendChild(mcapCell(c.call_mcap_usd, 'Market cap in the post'));
-      tr.appendChild(pctCell(c.return_pct));
-      tr.appendChild(pctCell(c.peak_pct));
-      tr.appendChild(pctCell(c.drawdown_pct));
-      tr.appendChild(latestCell(c));
-      tr.appendChild(mcapCell(c.latest_mcap_usd, 'Estimate (market cap in the post × latest price ÷ price at the post)'));
-    }
-
     // Latest Perceptor report of the token; a dash when it was never scanned
     // (or the report had no readable verdict).
     var tdPerc = el('td');
@@ -254,6 +242,30 @@
       tdStatus.appendChild(el('span', 'flag', 'rugged'));
     }
     tr.appendChild(tdStatus);
+
+    var unit = c.price_unit;
+    if (typeof unit === 'string' && unit !== '' && unit !== 'usd') {
+      // tracked, but in another asset: no number here would be in dollars
+      tr.appendChild(el('td', 'num', DASH)); // entry
+      tr.appendChild(el('td', 'num', DASH)); // call market cap
+      tr.appendChild(el('td', 'num', DASH)); // latest market cap
+      var td = el('td', 'center muted', 'no USD price');
+      td.colSpan = NO_USD_SPAN; // latest, peak, worst drop and the windows
+      tr.appendChild(td);
+    } else {
+      tr.appendChild(el('td', 'num', fmtPrice(c.entry_price_usd)));
+      tr.appendChild(mcapCell(c.call_mcap_usd, 'Market cap in the post'));
+      tr.appendChild(mcapCell(c.latest_mcap_usd, 'Estimate (market cap in the post × latest price ÷ price at the post)'));
+      tr.appendChild(latestCell(c));
+      tr.appendChild(pctCell(c.peak_pct));
+      tr.appendChild(pctCell(c.drawdown_pct));
+      for (var w = 0; w < WINDOW_FIELDS.length; w++) {
+        var wc = pctCell(c[WINDOW_FIELDS[w]]);
+        wc.classList.add('win');
+        if (w === 0) { wc.classList.add('first'); }
+        tr.appendChild(wc);
+      }
+    }
     return tr;
   }
 
@@ -265,28 +277,37 @@
     m.classList.toggle('error', !!isError);
   }
 
+  // The label of a header: Peak % and Worst drop % name the window chosen.
+  function headerLabel(base, th) {
+    return th.dataset.window ? base + ' (' + state.horizon + ')' : base;
+  }
+
   function renderHeaders() {
     var ths = document.querySelectorAll('th[data-sort]');
     for (var i = 0; i < ths.length; i++) {
       var th = ths[i];
       var btn = th.querySelector('button');
       if (!btn.dataset.label) { btn.dataset.label = btn.textContent; }
+      var label = headerLabel(btn.dataset.label, th);
       if (th.dataset.sort === state.sort) {
         th.setAttribute('aria-sort', state.dir === 'asc' ? 'ascending' : 'descending');
-        btn.textContent = btn.dataset.label + ' ' + (state.dir === 'asc' ? '▲' : '▼');
+        btn.textContent = label + ' ' + (state.dir === 'asc' ? '▲' : '▼');
       } else {
         th.removeAttribute('aria-sort');
-        btn.textContent = btn.dataset.label;
+        btn.textContent = label;
       }
     }
+    var dd = $('th-drawdown');
+    if (!dd.dataset.label) { dd.dataset.label = dd.textContent; }
+    dd.textContent = headerLabel(dd.dataset.label, dd);
     var hb = document.querySelectorAll('#horizons button');
     for (var j = 0; j < hb.length; j++) {
       hb[j].setAttribute('aria-pressed', hb[j].dataset.horizon === state.horizon ? 'true' : 'false');
     }
-    $('explain').textContent = 'Return, peak and worst drop over ' + state.horizon +
-      ', in USD, measured from the price 60 seconds after the post. Latest % is the return at the most recent' +
-      ' price, with the age of the call at that time; the ' + HORIZONS[0] + ' to ' + HORIZONS[HORIZONS.length - 1] +
-      ' buttons do not change it.';
+    $('explain').textContent = 'All numbers in USD, measured from the price 60 seconds after the post. ' +
+      HORIZONS.join(', ') + ' = the return over that window. Peak % and Worst drop % are over ' + state.horizon +
+      ' (the selector changes only these two). Latest % is the return at the most recent price, with the age of the' +
+      ' call at that time.';
   }
 
   function renderCalls(data) {
@@ -436,7 +457,74 @@
     });
   }
 
+  var refreshMsgTimer = null;
+
+  // A notice under the progress; one that is not an error goes away by itself.
+  function setRefreshMessage(text, isError) {
+    var m = $('refresh-msg');
+    clearTimeout(refreshMsgTimer);
+    m.textContent = text || '';
+    m.hidden = !text;
+    m.classList.toggle('error', !!isError);
+    if (text && !isError) {
+      refreshMsgTimer = setTimeout(function () { setRefreshMessage('', false); }, 8000);
+    }
+  }
+
+  // Short notice for a failed "Refresh now"; the server's own text is not shown.
+  function refreshErrorText(status, data) {
+    var why = status === 504 ? 'the database did not answer in time'
+      : status === 503 ? 'the database could not be read'
+        : status === 403 ? 'the request was refused'
+          : status === 0 ? 'no answer from the website' : 'HTTP ' + status;
+    var at = data && typeof data.snapshot_at === 'string' ? new Date(data.snapshot_at) : null;
+    return 'Could not refresh: ' + why + '.' +
+      (at && !isNaN(at.getTime()) ? ' Still showing the data read at ' + fmtTime(at) + '.' : '');
+  }
+
+  // "Refresh now": the website reads the database at once, then the page asks
+  // for the progress and the list again. The server reads at most once per 5
+  // seconds for this button and lets presses share a read under way.
+  function refreshNow() {
+    if (refreshing) { return; }
+    refreshing = true;
+    var btn = $('refresh-now');
+    btn.disabled = true;
+    btn.textContent = 'Refreshing…';
+    setRefreshMessage('', false);
+    var done = function () {
+      refreshing = false;
+      btn.disabled = false;
+      btn.textContent = 'Refresh now';
+    };
+    fetch('api/refresh', { method: 'POST', headers: { 'Accept': 'application/json' }, cache: 'no-store', credentials: 'same-origin' })
+      .then(function (r) {
+        return r.json().then(function (d) { return d; }, function () { return null; }).then(function (d) {
+          return { status: r.status, ok: r.ok, data: d };
+        });
+      })
+      .then(function (res) {
+        var d = res.data;
+        if (!res.ok || !d || typeof d !== 'object') {
+          setRefreshMessage(refreshErrorText(res.ok ? 0 : res.status, d), true);
+          return;
+        }
+        if (typeof d.snapshot_at === 'string') { showUpdated(d.snapshot_at); }
+        if (d.rate_limited === true) {
+          // no new read: the last press was under 5 seconds ago (its read may have failed)
+          var at = typeof d.snapshot_at === 'string' ? new Date(d.snapshot_at) : null;
+          setRefreshMessage('Pressed less than 5 seconds ago; showing the data read at ' +
+            (at && !isNaN(at.getTime()) ? fmtTime(at) : DASH) + '.', false);
+        }
+        refresh(); // the progress and the list, from the new snapshot
+      })
+      .catch(function () { setRefreshMessage(refreshErrorText(0, null), true); })
+      .then(done, done);
+  }
+
   function bind() {
+    $('refresh-now').addEventListener('click', refreshNow);
+
     var ths = document.querySelectorAll('th[data-sort]');
     Array.prototype.forEach.call(ths, function (th) {
       th.querySelector('button').addEventListener('click', function () {
