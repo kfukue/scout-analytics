@@ -64,6 +64,13 @@ type onchainConfig struct {
 
 	EntryDelay time.Duration // realistic entry: the pool price this long after the post (default 60s)
 
+	// Pons V2 launchpad (onchain_pons.go): its factory (SCOUT_PONS_FACTORY,
+	// "" = Pons tokens are not recognised) and the hook of its graduated v4
+	// pools (SCOUT_PONS_HOOK, "" = any hook). Lower case; "off" in the
+	// variable gives "".
+	PonsFactory string
+	PonsHook    string
+
 	// RugLiqUSD: a pool whose quote side (the ETH/WETH, USDG, stock token …
 	// it holds, valued in USD) is below this many USD is rugged
 	// (SCOUT_RUG_LIQ_USD, default 500; 0 = the USD check is off, an empty pool
@@ -105,6 +112,8 @@ func loadOnchainConfig() (onchainConfig, error) {
 		MainnetRPS:      0,
 		MainnetFeeds:    map[string]string{"eth": mainnetEthUsdFeed},
 		EntryDelay:      envDur("SCOUT_ENTRY_DELAY", 60*time.Second),
+		PonsFactory:     ponsAddrEnv("SCOUT_PONS_FACTORY", defaultPonsFactory),
+		PonsHook:        ponsAddrEnv("SCOUT_PONS_HOOK", defaultPonsHook),
 	}
 	if oc.EntryDelay < 0 {
 		return oc, fmt.Errorf("SCOUT_ENTRY_DELAY: want a duration >= 0")
@@ -1291,7 +1300,7 @@ func (c *rpcClient) tokenInfo(ctx context.Context, addr string) (tokenMeta, erro
 
 // onchainState is persisted per call (scout_call_tracking.onchain).
 type onchainState struct {
-	Kind       string `json:"kind"`              // v2 | v3 | v4
+	Kind       string `json:"kind"`              // v2 | v3 | v4 | pons (a Pons V2 bonding curve, then its v4 pool)
 	Pool       string `json:"pool"`              // pair/pool address, or the v4 PoolManager
 	PoolID     string `json:"pool_id,omitempty"` // v4 pool id
 	TokenIs0   bool   `json:"token_is_0"`
@@ -1343,7 +1352,20 @@ type onchainState struct {
 	// price at entry is known.
 	EntryLiqQ float64 `json:"entry_liq_q,omitempty"`
 
-	warnedJump bool // the 1e6× backstop was logged for this call in this run (not stored)
+	// Pons V2 (onchain_pons.go). Kind "pons": Pool and Curve are the token's
+	// bonding curve; after the graduation PoolID and TokenIs0 describe its v4
+	// pool on the PoolManager. Curve trades count up to PonsDone, v4 swaps from
+	// PonsGrad on. A call that came after the graduation is a plain "v4" state
+	// that keeps these fields for display. Optional additions; no version change.
+	Token    string `json:"token,omitempty"`           // the token (to find its PoolGraduated event)
+	Curve    string `json:"pons_curve,omitempty"`      // the token's bonding curve
+	PonsDone uint64 `json:"pons_curve_done,omitempty"` // block of CurveCompleted (0 = still on the curve, as far as known)
+	PonsGrad uint64 `json:"pons_grad_block,omitempty"` // block of PoolGraduated = the v4 pool's Initialize (0 = no pool yet)
+	PonsSeen uint64 `json:"pons_grad_seen,omitempty"`  // PoolGraduated searched for through this block (while not found)
+	Hook     string `json:"pons_hook,omitempty"`       // the hook of the graduated v4 pool (the Pons hook)
+
+	warnedJump  bool // the 1e6× backstop was logged for this call in this run (not stored)
+	ponsChecked bool // graduated() was asked since this state was loaded (not stored)
 }
 
 // onchainStateVersion: calls tracked with an older state are tracked again from
@@ -1397,6 +1419,19 @@ func (o *onchainSource) discoverWith(ctx context.Context, token string, entryBlo
 	tm, err := o.rpc.tokenInfo(ctx, token)
 	if err != nil {
 		return nil, err
+	}
+	// A Pons V2 token names its bonding curve itself (quote assets never are one).
+	if accept == nil {
+		curve, quote, err := o.ponsCurveOfToken(ctx, token)
+		if err != nil {
+			return nil, err
+		}
+		if curve != "" {
+			st, ok, err := o.discoverPons(ctx, token, tm, entryBlock, curve, quote)
+			if err != nil || ok {
+				return st, err
+			}
+		}
 	}
 	latest, err := o.rpc.blockNumber(ctx)
 	if err != nil {
@@ -1472,6 +1507,20 @@ func (o *onchainSource) discoverWith(ctx context.Context, token string, entryBlo
 			ok, err = o.resolveV2V3(ctx, st, token, c.addr)
 			if ok && accept != nil && !accept(st.Quote) {
 				ok = false
+			}
+			if err == nil && !ok && accept == nil {
+				// A counterparty that answers like the token's Pons curve (in
+				// case the token itself does not name it).
+				quote, pons, perr := o.ponsCurveFor(ctx, token, c.addr)
+				if perr != nil {
+					return nil, perr
+				}
+				if pons {
+					ps, handled, perr := o.discoverPons(ctx, token, tm, entryBlock, c.addr, quote)
+					if perr != nil || handled {
+						return ps, perr
+					}
+				}
 			}
 		}
 		if err != nil {
@@ -1638,7 +1687,13 @@ func (st *onchainState) eventOfLog(l rpcLog) poolEvent {
 	if !st.TokenIs0 {
 		d0, d1 = st.QuoteDec, st.TokenDec
 	}
-	switch st.Kind {
+	switch st.logKind(l) {
+	case "curve":
+		// A bonding curve has no LP to pull and its real reserve starts at
+		// zero: the liquidity is unknown (never "empty"), so no liquidity rug
+		// check fires on the curve. CurveCompleted has no price.
+		ev.price = st.curvePrice(l)
+		return ev
 	case "v2":
 		r0, r1 := word(data, 0), word(data, 1)
 		tok, quo := r0, r1
@@ -1723,7 +1778,7 @@ func (st *onchainState) implausible(p float64, block uint64) bool {
 
 // poolRef names the pool: the v4 pool id, or the pool address.
 func (st *onchainState) poolRef() string {
-	if st.Kind == "v4" {
+	if st.Kind == "v4" || (st.Kind == "pons" && st.PoolID != "") {
 		return st.PoolID
 	}
 	return st.Pool
@@ -1735,6 +1790,8 @@ func (st *onchainState) logFilter() (string, []any) {
 		return st.Pool, []any{topicSyncV2}
 	case "v4":
 		return st.Pool, []any{topicSwapV4, st.PoolID}
+	case "pons": // the curve only; scanLogs adds the v4 pool after the graduation
+		return st.Pool, []any{[]any{topicCurveBuy, topicCurveSell}}
 	}
 	return st.Pool, []any{topicSwapV3}
 }
@@ -1747,8 +1804,7 @@ func (o *onchainSource) scan(ctx context.Context, st *onchainState, to uint64, o
 	if to <= st.ScanBlock {
 		return nil
 	}
-	addr, topics := st.logFilter()
-	err := o.rpc.getLogsChunked(ctx, addr, topics, st.ScanBlock+1, to, func(l rpcLog) {
+	err := o.scanLogs(ctx, st, st.ScanBlock+1, to, func(l rpcLog) {
 		if st.RugBlock > 0 && l.block() >= st.RugBlock {
 			return // the pool was drained: nothing from the rug on counts
 		}
@@ -1799,7 +1855,6 @@ func (o *onchainSource) scan(ctx context.Context, st *onchainState, to uint64, o
 // event's liquidity is kept in EntryLiqQ for the USD check once the quote's
 // USD price at entry is known.
 func (o *onchainSource) entryPrice(ctx context.Context, st *onchainState, latest uint64) error {
-	addr, topics := st.logFilter()
 	setEntry := func(p float64, block uint64, ev poolEvent, scanTo uint64) {
 		st.EntryPriceQ, st.LastPriceQ, st.LastPriceBlock = p, p, block
 		st.RunMaxQ, st.RunMinQ, st.ScanBlock = p, p, scanTo
@@ -1824,7 +1879,7 @@ func (o *onchainSource) entryPrice(ctx context.Context, st *onchainState, latest
 		var lastBlock uint64
 		var lastEv poolEvent
 		drainedAt = 0
-		if err := o.rpc.getLogsChunked(ctx, addr, topics, from, st.EntryBlock, func(l rpcLog) {
+		if err := o.scanLogs(ctx, st, from, st.EntryBlock, func(l rpcLog) {
 			ev := st.eventOfLog(l)
 			if ev.drained {
 				drainedAt = l.block()
@@ -1855,7 +1910,7 @@ func (o *onchainSource) entryPrice(ctx context.Context, st *onchainState, latest
 	var first float64
 	var firstBlock uint64
 	var firstEv poolEvent
-	if err := o.rpc.getLogsChunked(ctx, addr, topics, st.EntryBlock+1, to, func(l rpcLog) {
+	if err := o.scanLogs(ctx, st, st.EntryBlock+1, to, func(l rpcLog) {
 		if first == 0 {
 			if ev := st.eventOfLog(l); ev.price > 0 {
 				first, firstBlock, firstEv = ev.price, l.block(), ev
@@ -2170,10 +2225,12 @@ func (o *onchainSource) ethFromPool(ctx context.Context, block uint64) (float64,
 
 // liquidityUSD: the pool's quote side in USD = the quote asset the pool
 // holds (balanceOf, every range of a v3 pool and uncollected fees included) ×
-// qUSD. v2/v3 only: v4 pools share one contract. Compared with
-// SCOUT_RUG_LIQ_USD as it is; current_liquidity_usd stores poolDepthUSD of it.
+// qUSD. v2/v3 only: v4 pools share one contract, and a Pons bonding curve has
+// no LP (its real reserve starts at zero; it is never a rug by liquidity).
+// Compared with SCOUT_RUG_LIQ_USD as it is; current_liquidity_usd stores
+// poolDepthUSD of it.
 func (o *onchainSource) liquidityUSD(ctx context.Context, st *onchainState, qUSD float64) (float64, bool) {
-	if st.Kind == "v4" || st.Quote == zeroAddr {
+	if st.Kind == "v4" || st.Kind == "pons" || st.Quote == zeroAddr {
 		return 0, false
 	}
 	b, err := o.rpc.ethCall(ctx, st.Quote, selBalanceOf+strings.TrimPrefix(addrTopic(st.Pool), "0x"), 0)

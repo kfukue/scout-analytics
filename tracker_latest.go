@@ -51,6 +51,42 @@ const (
 	latestStateKeyRugLiq = "rug_liq_usd" // onchainState.RugLiquidityUSD
 )
 
+// A Pons V2 graduation the pass finds is stored as well (onchainState fields),
+// so the horizon scan and later passes follow the token to its v4 pool.
+const (
+	latestStateKeyPonsDone = "pons_curve_done"
+	latestStateKeyPonsGrad = "pons_grad_block"
+	latestStateKeyPonsSeen = "pons_grad_seen"
+	latestStateKeyPoolID   = "pool_id"
+	latestStateKeyTokenIs0 = "token_is_0"
+	latestStateKeyPonsHook = "pons_hook"
+)
+
+// ponsPatch: the Pons graduation fields that changed from before to after,
+// as state keys (nil = none).
+func ponsPatch(before, after *onchainState) map[string]any {
+	if after.Kind != "pons" {
+		return nil
+	}
+	p := map[string]any{}
+	if after.PonsDone != before.PonsDone {
+		p[latestStateKeyPonsDone] = after.PonsDone
+	}
+	if after.PonsSeen != before.PonsSeen {
+		p[latestStateKeyPonsSeen] = after.PonsSeen
+	}
+	if after.PoolID != before.PoolID {
+		p[latestStateKeyPonsGrad] = after.PonsGrad
+		p[latestStateKeyPoolID] = after.PoolID
+		p[latestStateKeyTokenIs0] = after.TokenIs0
+		p[latestStateKeyPonsHook] = after.Hook
+	}
+	if len(p) == 0 {
+		return nil
+	}
+	return p
+}
+
 // latestRetryAfter: a row whose refresh failed is left alone for this long
 // (remembered in memory only), so rows that keep failing cannot use up every
 // pass while others wait.
@@ -335,9 +371,9 @@ func (s *scanner) latestOne(ctx context.Context, t *ScoutCallTracking, head uint
 	events := false
 	var rugBlock uint64
 	var rugLiq *float64
+	loaded := st // to see what a Pons graduation found changed
 	if head > from {
-		addr, topics := st.logFilter()
-		if err := o.rpc.getLogsChunked(ctx, addr, topics, from+1, head, func(l rpcLog) {
+		if err := o.scanLogs(ctx, &st, from+1, head, func(l rpcLog) {
 			if rugBlock > 0 {
 				return // drained: nothing after the rug counts
 			}
@@ -361,6 +397,9 @@ func (s *scanner) latestOne(ctx context.Context, t *ScoutCallTracking, head uint
 		log.Printf("call %d: pool quote side under $%.0f at block %d — rugged, latest return -100%%", t.CallID, o.cfg.RugLiqUSD, rugBlock)
 		patch := map[string]any{latestStateKeyBlock: to, latestStateKeyPrice: priceQ, latestStateKeyTrades: tradeBlock,
 			latestStateKeyRug: rugBlock}
+		for k, v := range ponsPatch(&loaded, &st) {
+			patch[k] = v
+		}
 		var depth *float64 // current_liquidity_usd: the pool's depth, 2 × the quote side
 		if rugLiq != nil {
 			patch[latestStateKeyRugLiq] = *rugLiq // the state keeps the quote side
@@ -400,7 +439,11 @@ func (s *scanner) latestOne(ctx context.Context, t *ScoutCallTracking, head uint
 	if st.LatestBlock != 0 {
 		changed = tradeBlock != st.LatestTradeBlock
 	}
-	patch, err := json.Marshal(map[string]any{latestStateKeyBlock: to, latestStateKeyPrice: priceQ, latestStateKeyTrades: tradeBlock})
+	fields := map[string]any{latestStateKeyBlock: to, latestStateKeyPrice: priceQ, latestStateKeyTrades: tradeBlock}
+	for k, v := range ponsPatch(&loaded, &st) {
+		fields[k] = v
+	}
+	patch, err := json.Marshal(fields)
 	if err != nil {
 		return false, err
 	}
