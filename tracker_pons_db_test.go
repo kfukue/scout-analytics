@@ -179,8 +179,19 @@ func TestTrackerPonsCurveRugRules(t *testing.T) {
 
 // The curve closes after the last horizon: the latest pass follows the token
 // to its v4 pool, stores what it found, and still follows it when its cursor
-// is past the graduation and the state no longer knows it.
+// is past the graduation and the state no longer knows it: on an archive node,
+// and on a full node (no historical state) where the graduation is beyond the
+// price look-back and is found in the event logs, without the PoolManager-wide
+// swap scan.
 func TestTrackerPonsGraduationAfterLastHorizon(t *testing.T) {
+	for _, full := range []bool{false, true} {
+		t.Run(map[bool]string{false: "archive", true: "full node"}[full], func(t *testing.T) {
+			testTrackerPonsGraduationAfterLastHorizon(t, full)
+		})
+	}
+}
+
+func testTrackerPonsGraduationAfterLastHorizon(t *testing.T, fullNode bool) {
 	st := testStore(t)
 	ctx := context.Background()
 	if err := st.Migrate(ctx); err != nil {
@@ -200,6 +211,9 @@ func TestTrackerPonsGraduationAfterLastHorizon(t *testing.T) {
 	fp.graduate(grad, defaultPonsHook)
 	fp.swap(c.at(35*ltDay), 5e-8, 18)
 
+	if fullNode {
+		t.Setenv("SCOUT_PRICE_LOOKBACK_BLOCKS", ponsFarLookback) // the graduation is far beyond it
+	}
 	s := ltScanner(t, st, f.srv.URL)
 	s.onChannelPost(postAt(1, c.entry, fp.token))
 	c.id = *(<-s.queue).CallID
@@ -238,11 +252,22 @@ func TestTrackerPonsGraduationAfterLastHorizon(t *testing.T) {
 	fp.swap(f.head()+100, 8e-8, 18)
 	f.advance(9000)
 	ltMakeDue(t, st, "25 hours")
+	if fullNode {
+		f.mu.Lock()
+		f.fullNode = true // from here on, no historical state
+		f.mu.Unlock()
+	}
 	if res := s.refreshLatest(ctx, false); res.Refreshed != 1 || res.Failed != 0 {
 		t.Fatalf("second pass: %+v", res)
 	}
 	if lc := ltRead(t, st, c.id); !ltNear(lc.Price, 8e-8*ltETH) {
 		t.Fatalf("latest after losing the graduation: got %v, want $%v; state %+v head %d", rugF(lc.Price), 8e-8*ltETH, ltState(t, st, c.id), f.head())
+	}
+	if os := ltState(t, st, c.id); os.PonsDone != closeB || os.PoolID != fp.poolID || os.PonsGrad != grad {
+		t.Fatalf("state after the second pass: got closed %d pool %s from %d, want %d %s %d", os.PonsDone, os.PoolID, os.PonsGrad, closeB, fp.poolID, grad)
+	}
+	if n := f.pmSwapScans(); n != 0 {
+		t.Fatalf("got %d PoolManager-wide swap scans, want 0", n)
 	}
 }
 

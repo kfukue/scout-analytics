@@ -1776,6 +1776,9 @@ func (s *scanner) registerTools(ctx context.Context) error {
 // every step, to verify the RPC node, pool discovery and USD conversion.
 func runPriceCheck(ctx context.Context, cfg *config, token, at string) error {
 	o := newOnchainSource(cfg.Price.Onchain)
+	// Long log scans (e.g. a month of v4 swaps, or a graduation search over the
+	// whole history) print a progress line every 5 s, so the check never looks stuck.
+	ctx = withScanProgress(ctx, "price-check "+token, 5*time.Second)
 	when := time.Now().Add(-time.Hour)
 	if at != "" {
 		if d, err := parseHorizon(at); err == nil {

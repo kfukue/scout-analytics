@@ -43,10 +43,49 @@ type fakeChain struct {
 	// answer it with a JSON-RPC error (non-empty return) or sleep. Called without
 	// f.mu held, possibly from several requests at once.
 	logsHook func(addr string, from, to uint64) string
-	fullNode bool     // no historical state: eth_call at old blocks fails
-	callTags []string // block tag of every eth_call received
+	fullNode bool           // no historical state: eth_call at old blocks fails
+	callTags []string       // block tag of every eth_call received
+	queries  []fakeLogQuery // every eth_getLogs the chain answered (address, topics, range)
 	count    map[string]int
 	srv      *httptest.Server
+}
+
+// fakeLogQuery is one eth_getLogs request as the chain received it.
+type fakeLogQuery struct {
+	addr     string
+	topics   []any
+	from, to uint64
+}
+
+// pmSwapScans counts the eth_getLogs for every v4 swap on the PoolManager
+// (topics exactly [Swap], no pool id): the generic counterparty search, very
+// slow on a real full node.
+func (f *fakeChain) pmSwapScans() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	n := 0
+	for _, q := range f.queries {
+		if q.addr != tPM || len(q.topics) != 1 {
+			continue
+		}
+		if s, ok := q.topics[0].(string); ok && strings.EqualFold(s, topicSwapV4) {
+			n++
+		}
+	}
+	return n
+}
+
+// queriesTo counts the eth_getLogs asked of one address.
+func (f *fakeChain) queriesTo(addr string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	n := 0
+	for _, q := range f.queries {
+		if q.addr == strings.ToLower(addr) {
+			n++
+		}
+	}
+	return n
 }
 
 func newFakeChain(t *testing.T, age time.Duration) *fakeChain {
@@ -122,6 +161,7 @@ func (f *fakeChain) serve(w http.ResponseWriter, r *http.Request) {
 		}
 		json.Unmarshal(req.Params[0], &q)
 		from, to := num(q.FromBlock), num(q.ToBlock)
+		f.queries = append(f.queries, fakeLogQuery{addr: strings.ToLower(q.Address), topics: q.Topics, from: from, to: to})
 		if f.maxRange > 0 && to-from+1 > f.maxRange {
 			fail("block range too large")
 			return
