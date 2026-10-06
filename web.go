@@ -47,12 +47,17 @@ const (
 	defaultWebRefresh   = 15 * time.Second
 	minWebRefresh       = 2 * time.Second
 	webSnapshotTimeout  = 60 * time.Second // one read of the database
-	webSlowSnapshot     = time.Second      // a slower read is logged
-	webErrorLogEvery    = time.Minute      // at most one "refresh failed" line per this
-	webGzipMinBytes     = 1024             // smaller answers are sent as they are
-	webAnswersMax       = 200              // answers of /api/calls kept per snapshot …
-	webAnswersMaxBytes  = 8 << 20          // … and their size together, uncompressed
-	webDiskGzipMaxBytes = 4 << 20          // SCOUT_WEB_DIR: larger files are not compressed
+	// "Refresh now" (POST /api/refresh): at most one read of the database it
+	// starts per webManualRefreshEvery, counted from the end of the last one; a
+	// request waits at most webManualRefreshWait for the read (which goes on).
+	webManualRefreshEvery = 5 * time.Second
+	webManualRefreshWait  = 15 * time.Second
+	webSlowSnapshot       = time.Second // a slower read is logged
+	webErrorLogEvery      = time.Minute // at most one "refresh failed" line per this
+	webGzipMinBytes       = 1024        // smaller answers are sent as they are
+	webAnswersMax         = 200         // answers of /api/calls kept per snapshot …
+	webAnswersMaxBytes    = 8 << 20     // … and their size together, uncompressed
+	webDiskGzipMaxBytes   = 4 << 20     // SCOUT_WEB_DIR: larger files are not compressed
 )
 
 type webConfig struct {
@@ -311,7 +316,7 @@ func parseWebCallsQuery(v url.Values) (ScoutWebCallsFilter, error) {
 		*dst = n
 		return nil
 	}
-	if err := oneOf("sort", &f.Sort, "date", "return", "peak", "latest"); err != nil {
+	if err := oneOf("sort", &f.Sort, webSortNames...); err != nil {
 		return f, err
 	}
 	if err := oneOf("dir", &f.Dir, "desc", "asc"); err != nil {
@@ -321,7 +326,7 @@ func parseWebCallsQuery(v url.Values) (ScoutWebCallsFilter, error) {
 		return f, err
 	}
 	usdOnly := "0"
-	if f.Sort == "return" || f.Sort == "peak" || f.Sort == "latest" {
+	if f.Sort != "date" { // every other sort: only USD-priced calls have the value
 		usdOnly = "1"
 	}
 	if err := oneOf("usd_only", &usdOnly, "1", "0"); err != nil {
@@ -613,17 +618,47 @@ type webServer struct {
 
 	snap atomic.Pointer[webSnapshot] // what requests read; nil until the first refresh
 
-	refreshMu sync.Mutex // one refresh at a time; guards the fields below
+	// readRows reads the list from the database (ScoutStore.SelectWebRows;
+	// tests put a fake in its place). nil = no database.
+	readRows func(context.Context) ([]ScoutWebRow, int, error)
+	// life is the context the reads run under: cancelled when the website
+	// stops, never by a single request (runWeb sets it; Background otherwise).
+	life context.Context
+
+	// flightMu guards the read under way and the "Refresh now" limit. Every
+	// read of the database goes through startRefreshLocked, so there is never
+	// more than one at a time: the background loop and "Refresh now" join the
+	// read under way instead of starting another.
+	flightMu   sync.Mutex
+	inflight   *webRefreshCall
+	lastManual time.Time // when the last read started by "Refresh now" ended
+	// manualWait: how long POST /api/refresh waits for the read
+	// (webManualRefreshWait; shorter in tests)
+	manualWait time.Duration
+	joins      atomic.Int64 // waits that joined a read already under way
+
+	refreshMu sync.Mutex // held by the read itself; guards the fields below
 	errLog    logLimiter
 	failing   bool
 	lastRows  int // rows of the last snapshot (−1 = none yet)
 }
 
-// newWebServer builds the site: GET /api/summary, GET /api/calls and the page.
-// The API answers 503 until refresh has succeeded once.
+// webRefreshCall is one read of the database; done is closed when it has
+// ended, err is its result (set before done is closed).
+type webRefreshCall struct {
+	done   chan struct{}
+	err    error
+	manual bool // started by "Refresh now"
+}
+
+// newWebServer builds the site: GET /api/summary, GET /api/calls, POST
+// /api/refresh and the page. The API answers 503 until refresh has succeeded once.
 func newWebServer(st *ScoutStore, cfg webConfig, static fs.FS) (*webServer, error) {
 	s := &webServer{st: st, cfg: cfg, static: static, mux: http.NewServeMux(), lastRows: -1,
-		errLog: logLimiter{every: webErrorLogEvery}}
+		errLog: logLimiter{every: webErrorLogEvery}, life: context.Background(), manualWait: webManualRefreshWait}
+	if st != nil {
+		s.readRows = st.SelectWebRows
+	}
 	if cfg.Dir == "" {
 		files, err := loadWebStatic(static)
 		if err != nil {
@@ -633,6 +668,7 @@ func newWebServer(st *ScoutStore, cfg webConfig, static fs.FS) (*webServer, erro
 	}
 	s.mux.HandleFunc("/api/summary", s.handleSummary)
 	s.mux.HandleFunc("/api/calls", s.handleCalls)
+	s.mux.HandleFunc(webRefreshPath, s.handleRefresh)
 	s.mux.HandleFunc("/api/", func(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusNotFound, "no such endpoint")
 	})
@@ -640,29 +676,80 @@ func newWebServer(st *ScoutStore, cfg webConfig, static fs.FS) (*webServer, erro
 	return s, nil
 }
 
+// webRefreshPath is the one address that takes POST (and only POST).
+const webRefreshPath = "/api/refresh"
+
 func (s *webServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	webSecurityHeaders(w.Header())
-	if r.Method != http.MethodGet {
-		w.Header().Set("Allow", http.MethodGet)
-		writeJSONError(w, http.StatusMethodNotAllowed, "only GET is supported")
+	method := http.MethodGet
+	if r.URL.Path == webRefreshPath {
+		method = http.MethodPost
+	}
+	if r.Method != method {
+		w.Header().Set("Allow", method)
+		writeJSONError(w, http.StatusMethodNotAllowed, "only "+method+" is supported here")
 		return
 	}
 	s.mux.ServeHTTP(w, r)
 }
 
-// refresh reads the list from the database and puts the new snapshot in place
-// of the old one. On an error the old snapshot stays and keeps being served.
-// It is also what the tests call to bring the website up to date at once.
+// refresh brings the snapshot up to date: it reads the list from the database
+// and puts the new snapshot in place of the old one, or, when a read is
+// already under way, waits for that one instead of starting another. On an
+// error the old snapshot stays and keeps being served. The background loop
+// uses it, and so do the tests to bring the website up to date at once.
+// ctx only limits the wait: the read itself runs under s.life.
 func (s *webServer) refresh(ctx context.Context) error {
+	s.flightMu.Lock()
+	c := s.startRefreshLocked(false)
+	s.flightMu.Unlock()
+	return c.wait(ctx)
+}
+
+// startRefreshLocked returns the read under way, or starts one. flightMu is held.
+func (s *webServer) startRefreshLocked(manual bool) *webRefreshCall {
+	if c := s.inflight; c != nil {
+		s.joins.Add(1)
+		return c
+	}
+	c := &webRefreshCall{done: make(chan struct{}), manual: manual}
+	s.inflight = c
+	go func() {
+		err := s.readSnapshot(s.life)
+		s.flightMu.Lock()
+		c.err = err
+		s.inflight = nil
+		if c.manual {
+			s.lastManual = time.Now()
+		}
+		s.flightMu.Unlock()
+		close(c.done)
+	}()
+	return c
+}
+
+// wait waits for the read to end, or for ctx.
+func (c *webRefreshCall) wait(ctx context.Context) error {
+	select {
+	case <-c.done:
+		return c.err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// readSnapshot reads the list from the database and puts the new snapshot in
+// place of the old one. Only startRefreshLocked calls it, one at a time.
+func (s *webServer) readSnapshot(ctx context.Context) error {
 	s.refreshMu.Lock()
 	defer s.refreshMu.Unlock()
-	if s.st == nil {
+	if s.readRows == nil {
 		return errors.New("no database")
 	}
 	ctx, cancel := context.WithTimeout(ctx, webSnapshotTimeout)
 	defer cancel()
 	start := time.Now()
-	rows, updatePosts, err := s.st.SelectWebRows(ctx)
+	rows, updatePosts, err := s.readRows(ctx)
 	if err != nil {
 		s.failing = true
 		// one line a minute at most; none when the program is stopping, and none
@@ -764,6 +851,87 @@ func (s *webServer) handleSummary(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, r, http.StatusOK, &sum)
 }
 
+// webRefreshResponse is the body of POST /api/refresh.
+type webRefreshResponse struct {
+	// Refreshed: the database was read for this request (by this request, or
+	// by the read under way that it waited for).
+	Refreshed bool `json:"refreshed"`
+	// RateLimited: no read, because a read started by "Refresh now" ended less
+	// than webManualRefreshEvery ago; the answer describes the snapshot as it is.
+	RateLimited        bool      `json:"rate_limited"`
+	SnapshotAt         time.Time `json:"snapshot_at"` // when the database was last read
+	SnapshotAgeSeconds float64   `json:"snapshot_age_seconds"`
+}
+
+// sameOrigin reports whether a request may trigger a read: it has no Origin
+// header (browsers send one with every POST, so this is not a page of another
+// site), or exactly one naming this very host.
+func sameOrigin(r *http.Request) bool {
+	origin := r.Header.Values("Origin")
+	if len(origin) == 0 {
+		return true
+	}
+	if len(origin) != 1 {
+		return false
+	}
+	u, err := url.Parse(origin[0])
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.User != nil ||
+		u.Path != "" || u.RawQuery != "" || u.Fragment != "" {
+		return false // also "null", which sandboxed pages and some redirects send
+	}
+	return strings.EqualFold(u.Host, r.Host)
+}
+
+// handleRefresh is "Refresh now": POST /api/refresh reads the database at once
+// (the same read the background loop does) and answers when the new snapshot
+// is in place. A press while a read is under way waits for that read; a press
+// less than webManualRefreshEvery after the end of the last read that
+// "Refresh now" started gets the snapshot as it is, without a read.
+func (s *webServer) handleRefresh(w http.ResponseWriter, r *http.Request) {
+	if !sameOrigin(r) {
+		writeJSONError(w, http.StatusForbidden, "requests from other sites are not accepted")
+		return
+	}
+	if r.URL.RawQuery != "" {
+		writeJSONError(w, http.StatusBadRequest, "this endpoint takes no parameters")
+		return
+	}
+	s.flightMu.Lock()
+	var c *webRefreshCall
+	limited := s.inflight == nil && !s.lastManual.IsZero() && time.Since(s.lastManual) < webManualRefreshEvery
+	if !limited {
+		c = s.startRefreshLocked(true)
+	}
+	s.flightMu.Unlock()
+
+	var err error
+	if c != nil {
+		ctx, cancel := context.WithTimeout(r.Context(), s.manualWait)
+		err = c.wait(ctx)
+		cancel()
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	snap := s.snap.Load()
+	if snap != nil {
+		w.Header().Set("X-Snapshot-At", snap.loadedAt.Format(time.RFC3339))
+	}
+	if err != nil || snap == nil {
+		// the details are in the log (refresh logs them); the page gets a short notice
+		status, msg := http.StatusServiceUnavailable, "could not read the database"
+		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+			status, msg = http.StatusGatewayTimeout, "the database did not answer in time"
+		}
+		body := map[string]any{"error": msg}
+		if snap != nil {
+			body["snapshot_at"] = snap.loadedAt
+		}
+		writeJSON(w, nil, status, body)
+		return
+	}
+	writeJSON(w, nil, http.StatusOK, &webRefreshResponse{Refreshed: !limited, RateLimited: limited, SnapshotAt: snap.loadedAt,
+		SnapshotAgeSeconds: max(0, float64(time.Since(snap.loadedAt).Milliseconds()/100)/10)})
+}
+
 // callsETag: the snapshot's version plus what was asked. Two ways of writing
 // the same question (order of the parameters, defaults left out, letter case
 // of the search text) get the same ETag.
@@ -860,6 +1028,7 @@ func runWeb(ctx context.Context, st *ScoutStore, cfg webConfig) error {
 	if err != nil {
 		return err
 	}
+	srv.life = ctx // reads stop when the website stops, not when a request ends
 	if err := srv.refresh(ctx); err != nil {
 		return fmt.Errorf("could not read the calls from the database for the first snapshot: %w", err)
 	}

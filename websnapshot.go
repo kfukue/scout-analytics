@@ -41,14 +41,32 @@ var webVerdictBuckets = map[string]uint8{
 }
 
 // Sort keys: 0 = date, then return and peak of each window, then the return
-// as of the latest price.
+// as of the latest price, the market cap at the call and the estimated market
+// cap at the latest price.
 const (
-	webSortKeyDate   = 0
-	webSortKeyReturn = 1
-	webSortKeyPeak   = 1 + len(ScoutWebHorizons)
-	webSortKeyLatest = 1 + 2*len(ScoutWebHorizons)
-	webSortKeys      = 2 + 2*len(ScoutWebHorizons)
+	webSortKeyDate     = 0
+	webSortKeyReturn   = 1
+	webSortKeyPeak     = 1 + len(ScoutWebHorizons)
+	webSortKeyLatest   = 1 + 2*len(ScoutWebHorizons)
+	webSortKeyCallMC   = 2 + 2*len(ScoutWebHorizons)
+	webSortKeyLatestMC = 3 + 2*len(ScoutWebHorizons)
+	webSortKeys        = 4 + 2*len(ScoutWebHorizons)
 )
+
+// webSortNames are the values of the sort parameter of /api/calls. return and
+// peak are for the window asked for (horizon); return_1h … return_30d are the
+// return of one window each, whatever the horizon.
+var webSortNames = []string{"date", "return", "peak", "latest", "call_mc", "latest_mc",
+	"return_1h", "return_1d", "return_3d", "return_7d", "return_30d"}
+
+// webReturnSorts: sort=return_<window> → the index of the window.
+var webReturnSorts = func() map[string]int {
+	m := map[string]int{}
+	for i, h := range ScoutWebHorizons {
+		m["return_"+h] = i
+	}
+	return m
+}()
 
 // Positions of a window's three numbers in ScoutWebRow.Perf.
 const (
@@ -129,15 +147,72 @@ func finite(p *float64) *float64 {
 	return p
 }
 
-// webCall is the row as sent to the page, without the numbers of a window
-// (those are added per request, see appendRow).
+// positive returns p when it is a finite number above zero, else nil.
+func positive(p *float64) *float64 {
+	if p = finite(p); p == nil || *p <= 0 {
+		return nil
+	}
+	return p
+}
+
+// firstPositive returns the first of a and b that is a finite number above
+// zero, else nil.
+func firstPositive(a, b *float64) *float64 {
+	if a = positive(a); a != nil {
+		return a
+	}
+	return positive(b)
+}
+
+// setWebMcaps works out the two market caps of a prepared row (r.usd and
+// r.LatestPrice already follow the website's rules) into r.callMcap and
+// r.latestMcap:
+//
+//	call   = called_at_mcap_usd, else mcap_usd
+//	latest = (mcap_usd, else called_at_mcap_usd) × latest price ÷ price at the post
+//
+// "else" picks the second when the first is not a valid figure: missing, zero,
+// negative or not finite. The result is nil when neither figure is valid, when
+// the latest price or the price at the post is not a finite number above zero,
+// when the result is not, and for calls not priced in USD. The values are kept
+// in the row itself (no allocation per row).
+func setWebMcaps(r *ScoutWebRow) {
+	r.callMcap, r.latestMcap = nil, nil
+	if !r.usd {
+		return
+	}
+	if call := firstPositive(r.CalledAtMcap, r.PostMcap); call != nil {
+		r.mcapVals[0] = *call
+		r.callMcap = &r.mcapVals[0]
+	}
+	base := firstPositive(r.PostMcap, r.CalledAtMcap)
+	if base != nil && positive(r.LatestPrice) != nil && positive(r.PostPrice) != nil {
+		if v := *base * *r.LatestPrice / *r.PostPrice; v > 0 && !math.IsInf(v, 0) { // > 0 is false for NaN
+			r.mcapVals[1] = v
+			r.latestMcap = &r.mcapVals[1]
+		}
+	}
+}
+
+// webCall is the row as sent to the page, without the numbers of the window
+// asked for (those are added per request, see appendRow). The return of every
+// window is in it (Return1hPct … Return30dPct). r is a prepared row: its Perf
+// holds nothing for calls not priced in USD.
 func (c webConfig) webCall(r *ScoutWebRow) ScoutWebCall {
 	var latestAge *int64
 	if r.LatestAt != nil {
 		age := int64(r.LatestAt.Sub(r.MessageDate) / time.Second)
 		latestAge = &age
 	}
+	ret := func(h int) *float64 {
+		j := h*webPerfPerHorizon + webPerfReturn
+		if !r.usd || r.HasPerf&(1<<j) == 0 {
+			return nil
+		}
+		return finite(&r.Perf[j])
+	}
 	return ScoutWebCall{
+		Return1hPct: ret(0), Return1dPct: ret(1), Return3dPct: ret(2), Return7dPct: ret(3), Return30dPct: ret(4),
 		LatestReturnPct: r.LatestReturn, LatestPriceUSD: r.LatestPrice,
 		LatestAt: r.LatestAt, LatestTradeAt: r.LatestTradeAt, LatestAgeSeconds: latestAge,
 		CallID: r.CallID, MessageID: r.MessageID, MessageDate: r.MessageDate,
@@ -148,6 +223,7 @@ func (c webConfig) webCall(r *ScoutWebRow) ScoutWebCall {
 		Rugged: r.Rugged, TrackingStatus: r.TrackingStatus,
 		PerceptorVerd: r.PerceptorVerd, PerceptorURL: r.PerceptorURL,
 		CallCount: r.CallCount, LastCallDate: r.LastCallDate,
+		CallMcapUSD: r.callMcap, LatestMcapUSD: r.latestMcap,
 	}
 }
 
@@ -215,6 +291,8 @@ func newWebSnapshot(rows []ScoutWebRow, updatePosts int, prev *webSnapshot, cfg 
 		if r.LatestTradeAt != nil {
 			*r.LatestTradeAt = r.LatestTradeAt.UTC()
 		}
+		// the market caps: after the rules of the latest price above, which they follow
+		setWebMcaps(r)
 		for j := range r.Perf {
 			if r.HasPerf&(1<<j) == 0 {
 				r.Perf[j] = 0
@@ -250,7 +328,7 @@ func newWebSnapshot(rows []ScoutWebRow, updatePosts int, prev *webSnapshot, cfg 
 	s.rowAt = make([]uint32, n+1)
 	s.rowCut = make([]uint32, n)
 	s.searchAt = make([]uint32, n+1)
-	s.rowJSON = make([]byte, 0, n*720)
+	s.rowJSON = make([]byte, 0, n*880) // about 810 bytes a row
 	s.search = make([]byte, 0, n*72)
 	var one bytes.Buffer // one encoded row
 	enc := json.NewEncoder(&one)
@@ -392,6 +470,9 @@ func hashWebRows(rows []ScoutWebRow, updatePosts int, gmgn string) string {
 		optFlt(r.LatestPrice)
 		optTime(r.LatestAt)
 		optTime(r.LatestTradeAt)
+		// the market caps as shown (worked out by newWebSnapshot), not their inputs
+		optFlt(r.callMcap)
+		optFlt(r.latestMcap)
 		h.Write(buf)
 	}
 	return hex.EncodeToString(h.Sum(nil)[:12])
@@ -466,6 +547,11 @@ func (s *webSnapshot) buildOrders(rows []ScoutWebRow) {
 	// from the encoded row)
 	byValue(webSortKeyLatest, func(i int) bool { return rows[i].LatestReturn != nil },
 		func(i int32) float64 { return *rows[i].LatestReturn })
+	// the two market caps (nil unless shown)
+	byValue(webSortKeyCallMC, func(i int) bool { return rows[i].callMcap != nil },
+		func(i int32) float64 { return *rows[i].callMcap })
+	byValue(webSortKeyLatestMC, func(i int) bool { return rows[i].latestMcap != nil },
+		func(i int32) float64 { return *rows[i].latestMcap })
 }
 
 // webBitsPool: the "matches the search text" marks of one request.
@@ -510,8 +596,16 @@ func (s *webSnapshot) page(f ScoutWebCallsFilter, dst []int32) ([]int32, int, er
 		key = webSortKeyPeak + h
 	case "latest":
 		key = webSortKeyLatest // the same for every window
+	case "call_mc":
+		key = webSortKeyCallMC // also not tied to the window
+	case "latest_mc":
+		key = webSortKeyLatestMC
 	default:
-		return dst, 0, fmt.Errorf("unknown sort %q", f.Sort)
+		w, ok := webReturnSorts[f.Sort] // return_1h … return_30d: one window, whatever the horizon
+		if !ok {
+			return dst, 0, fmt.Errorf("unknown sort %q", f.Sort)
+		}
+		key = webSortKeyReturn + w
 	}
 	if f.Dir != "desc" && f.Dir != "asc" {
 		return dst, 0, fmt.Errorf("unknown direction %q", f.Dir)

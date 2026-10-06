@@ -33,6 +33,9 @@ type webSeed struct {
 	Entry   float64 // entry_price_usd (0 = NULL)
 	Late    float64 // entry_late_price_usd (0 = NULL)
 	Rugged  *bool
+	// market caps parsed from the post (scout_call_metrics; nil = NULL)
+	CalledMC *float64 // called_at_mcap_usd
+	MC       *float64 // mcap_usd
 	// horizon → late return, late peak, late drawdown
 	Returns map[string][3]float64
 }
@@ -56,8 +59,9 @@ func seedWebCall(t *testing.T, st *ScoutStore, base time.Time, w webSeed) int {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if w.PostSym != "" {
-		if _, err := st.Pool.Exec(ctx, `INSERT INTO scout_call_metrics (call_id, token_symbol, created_by, updated_by) VALUES ($1,$2,'t','t')`, *id, w.PostSym); err != nil {
+	if w.PostSym != "" || w.CalledMC != nil || w.MC != nil {
+		if _, err := st.Pool.Exec(ctx, `INSERT INTO scout_call_metrics (call_id, token_symbol, called_at_mcap_usd, mcap_usd, created_by, updated_by)
+			VALUES ($1,$2,$3,$4,'t','t')`, *id, strPtr(w.PostSym), w.CalledMC, w.MC); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -192,6 +196,11 @@ type webCallJSON struct {
 	ReturnPct       *float64 `json:"return_pct"`
 	PeakPct         *float64 `json:"peak_pct"`
 	DrawdownPct     *float64 `json:"drawdown_pct"`
+	Return1hPct     *float64 `json:"return_1h_pct"`
+	Return1dPct     *float64 `json:"return_1d_pct"`
+	Return3dPct     *float64 `json:"return_3d_pct"`
+	Return7dPct     *float64 `json:"return_7d_pct"`
+	Return30dPct    *float64 `json:"return_30d_pct"`
 	Rugged          *bool    `json:"rugged"`
 	TrackingStatus  *string  `json:"tracking_status"`
 	Perceptor       *string  `json:"perceptor_verdict"`
@@ -204,6 +213,9 @@ type webCallJSON struct {
 	LatestAt         *string  `json:"latest_at"`
 	LatestTradeAt    *string  `json:"latest_trade_at"`
 	LatestAgeSeconds *int64   `json:"latest_age_seconds"`
+
+	CallMcapUSD   *float64 `json:"call_mcap_usd"`
+	LatestMcapUSD *float64 `json:"latest_mcap_usd"`
 }
 
 type webCallsJSON struct {
@@ -274,6 +286,11 @@ func (fx *webFixture) wantOrder(t *testing.T, query string, want ...string) webC
 		t.Fatalf("?%s: order %v, want %v", query, got, want)
 	}
 	return res
+}
+
+// windows returns the five window returns of a row, as text.
+func (c webCallJSON) windows() string {
+	return fmt.Sprint(fnum(c.Return1hPct), " ", fnum(c.Return1dPct), " ", fnum(c.Return3dPct), " ", fnum(c.Return7dPct), " ", fnum(c.Return30dPct))
 }
 
 func fnum(p *float64) string {
@@ -356,6 +373,24 @@ func TestWebCallsOrderHorizonsAndFields(t *testing.T) {
 	// 3d: only alpha has it; the others are NULL and tie → by call id, in the sort direction.
 	fx.wantOrder(t, "sort=return&horizon=3d", "alpha", "gamma", "beta")
 	fx.wantOrder(t, "sort=return&horizon=3d&dir=asc", "alpha", "beta", "gamma")
+	// One window each, whatever the horizon asked for (which only picks peak and worst drop).
+	for _, h := range []string{"", "&horizon=1d", "&horizon=30d"} {
+		fx.wantOrder(t, "sort=return_1h"+h, "beta", "alpha", "gamma")
+		fx.wantOrder(t, "sort=return_1h&dir=asc"+h, "gamma", "alpha", "beta")
+		fx.wantOrder(t, "sort=return_1d"+h, "alpha", "beta", "gamma")
+		fx.wantOrder(t, "sort=return_1d&dir=asc"+h, "beta", "alpha", "gamma")
+		fx.wantOrder(t, "sort=return_3d"+h, "alpha", "gamma", "beta")
+		fx.wantOrder(t, "sort=return_3d&dir=asc"+h, "alpha", "beta", "gamma")
+		fx.wantOrder(t, "sort=return_7d"+h, "alpha", "gamma", "beta")
+		fx.wantOrder(t, "sort=return_30d&dir=asc"+h, "alpha", "beta", "gamma")
+	}
+	if r := fx.wantOrder(t, "sort=return_1h&horizon=30d", "beta", "alpha", "gamma"); !r.USDOnly || r.Total != 3 || r.Sort != "return_1h" || r.Horizon != "30d" ||
+		fnum(r.Calls[0].PeakPct) != "null" || fnum(r.Calls[1].PeakPct) != "150" || fnum(r.Calls[1].ReturnPct) != "-90" {
+		t.Fatalf("sort=return_1h&horizon=30d %+v", r)
+	}
+	if r := fx.wantOrder(t, "sort=return_1h&usd_only=0", "beta", "alpha", "gamma", "gave", "err", "pct", "sol", "xss", "virt"); r.USDOnly || r.Total != 9 {
+		t.Fatalf("sort=return_1h&usd_only=0 %+v", r)
+	}
 	// usd_only explicit: all calls; the non-USD call's 999% does not count, it sorts with the NULLs.
 	if r := fx.wantOrder(t, "sort=return&usd_only=0", "alpha", "beta", "gave", "err", "pct", "sol", "xss", "virt", "gamma"); r.USDOnly || r.Total != 9 {
 		t.Fatalf("usd_only=0 %+v", r)
@@ -363,6 +398,36 @@ func TestWebCallsOrderHorizonsAndFields(t *testing.T) {
 	fx.wantOrder(t, "sort=return&usd_only=0&dir=asc", "beta", "alpha", "gamma", "virt", "xss", "sol", "pct", "err", "gave")
 	if r := fx.wantOrder(t, "usd_only=1", "gamma", "beta", "alpha"); !r.USDOnly || r.Total != 3 {
 		t.Fatalf("usd_only=1 %+v", r)
+	}
+	// Market caps: no call here has one (TestWebMarketCaps has the values), so
+	// the USD rows all sort as "no value": by call id, in the direction asked for.
+	for _, s := range []string{"call_mc", "latest_mc"} {
+		if r := fx.wantOrder(t, "sort="+s, "gamma", "beta", "alpha"); !r.USDOnly || r.Total != 3 || r.Sort != s {
+			t.Fatalf("sort=%s %+v", s, r)
+		}
+		fx.wantOrder(t, "sort="+s+"&dir=asc", "alpha", "beta", "gamma")
+		if r := fx.wantOrder(t, "sort="+s+"&usd_only=0", "gave", "err", "pct", "sol", "xss", "virt", "gamma", "beta", "alpha"); r.USDOnly || r.Total != 9 {
+			t.Fatalf("sort=%s&usd_only=0 %+v", s, r)
+		}
+		for _, c := range fx.calls(t, "sort="+s+"&usd_only=0").Calls {
+			if c.CallMcapUSD != nil || c.LatestMcapUSD != nil {
+				t.Fatalf("a market cap without one in the post: %+v", c)
+			}
+		}
+	}
+
+	// The five window returns are in every row, whatever the horizon, and are
+	// the numbers return_pct has for each window.
+	for _, h := range ScoutWebHorizons {
+		for _, c := range fx.calls(t, "per=200&horizon="+h).Calls {
+			want := map[int]string{fx.ids["alpha"]: "5 50 -30 10 -90", fx.ids["beta"]: "9 -20 null null null", fx.ids["gamma"]: "1 null null null null"}[c.CallID]
+			if want == "" {
+				want = "null null null null null" // virt (not USD), and the rest without numbers
+			}
+			if c.windows() != want {
+				t.Fatalf("horizon %s, call %d: windows %s, want %s", h, c.CallID, c.windows(), want)
+			}
+		}
 	}
 
 	// Each horizon reads its own late-entry columns.
@@ -645,6 +710,8 @@ func TestWebBadRequestsAndMethods(t *testing.T) {
 	fx := newWebFixture(t, webConfig{GMGNTemplate: defaultGMGNTemplate})
 	for _, bad := range []string{
 		"sort=price", "sort=", "sort=DATE", "sort=return%20desc", "sort=date&sort=return",
+		"sort=mc", "sort=CALL_MC", "sort=call_mcap", "sort=call_mcap_usd", "sort=latest_mc%20desc", "sort=latest_mcap_usd", "sort=call_mc&sort=latest_mc",
+		"sort=return_2d", "sort=return_", "sort=RETURN_1H", "sort=return_1h_pct", "sort=return_1d%20", "sort=return_7d&sort=return_30d", "sort=drawdown", "sort=1h",
 		"dir=up", "dir=", "dir=DESC", "dir=asc;--",
 		"horizon=2d", "horizon=", "horizon=1D", "horizon=1d%27", "horizon=30d%20OR%201=1",
 		"usd_only=yes", "usd_only=true", "usd_only=", "usd_only=2",
@@ -666,19 +733,42 @@ func TestWebBadRequestsAndMethods(t *testing.T) {
 	if code, _, body := fx.get(t, "/api/nope"); code != 404 || !strings.Contains(string(body), `"error"`) {
 		t.Errorf("unknown endpoint: %d %s", code, body)
 	}
-	for _, m := range []string{"POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"} {
-		for _, p := range []string{"/api/calls", "/api/summary", "/", "/app.js"} {
+	reads := 0
+	read := fx.web.readRows
+	fx.web.readRows = func(ctx context.Context) ([]ScoutWebRow, int, error) { reads++; return read(ctx) }
+	for _, m := range []string{"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"} {
+		for _, p := range []string{"/api/calls", "/api/summary", "/", "/app.js", "/api/refresh", "/api/refresh/", "/api/refresh?x=1"} {
+			allow := "GET"
+			if strings.HasPrefix(p, "/api/refresh") && !strings.HasPrefix(p, "/api/refresh/") {
+				allow = "POST" // the one address that is not GET
+			}
+			if m == allow {
+				continue
+			}
 			req, _ := http.NewRequest(m, fx.srv.URL+p, strings.NewReader("x=1"))
 			resp, err := http.DefaultClient.Do(req)
 			if err != nil {
 				t.Fatal(err)
 			}
 			resp.Body.Close()
-			if resp.StatusCode != http.StatusMethodNotAllowed || resp.Header.Get("Allow") != "GET" {
+			if resp.StatusCode != http.StatusMethodNotAllowed || resp.Header.Get("Allow") != allow {
 				t.Errorf("%s %s: %d (Allow %q)", m, p, resp.StatusCode, resp.Header.Get("Allow"))
 			}
 		}
 	}
+	if reads != 0 {
+		t.Fatalf("a refused method read the database %d times", reads)
+	}
+	// POST /api/refresh with a parameter is a bad request, and reads nothing
+	resp, err := http.Post(fx.srv.URL+"/api/refresh?x=1", "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 400 || reads != 0 {
+		t.Fatalf("POST /api/refresh?x=1: %d, %d reads", resp.StatusCode, reads)
+	}
+	fx.web.readRows = read
 	// Nothing was written or dropped.
 	if r := fx.calls(t, ""); r.Total != 9 {
 		t.Fatalf("calls left: %d", r.Total)
