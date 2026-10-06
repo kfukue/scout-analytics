@@ -727,6 +727,15 @@ const trackingColumns = `call_id, contract_address, entry_at, priority, status, 
 	current_liquidity_usd::float8, rugged, next_check_at, last_checked_at, attempts, error, price_unit, onchain,
 	entry_late_price_usd::float8`
 
+// trackingColumnsT is trackingColumns for a query that calls the table t.
+var trackingColumnsT = func() string {
+	cols := strings.Split(trackingColumns, ",")
+	for i, c := range cols {
+		cols[i] = "t." + strings.TrimSpace(c)
+	}
+	return strings.Join(cols, ", ")
+}()
+
 func scanTracking(row pgx.Row) (*ScoutCallTracking, error) {
 	var t ScoutCallTracking
 	var onchain []byte
@@ -853,6 +862,81 @@ func (st *ScoutStore) SaveTracking(ctx context.Context, t *ScoutCallTracking) er
 		t.CallID, t.Status, t.PoolAddress, t.PoolName, t.PoolDex, t.PoolCreatedAt,
 		t.EntryPriceUSD, t.EntryPriceSource, t.CurrentPriceUSD, t.CurrentLiquidityUSD,
 		t.Rugged, t.NextCheckAt.UTC(), t.LastCheckedAt, t.Attempts, t.Error, t.PriceUnit, onchainJSON, t.EntryLatePriceUSD)
+	return err
+}
+
+// latestDueSQL: the tracking rows the latest-price pass may refresh, and which
+// of them are due. A row qualifies when it is a token's first real call with
+// status tracking or done, an entry price and a current on-chain state with a
+// pool. It is due when it has no latest price yet, or the last one was read at
+// or before its cut-off: $2 for calls posted after $1 (younger than 30 days),
+// $3 for older ones.
+var latestDueSQL = ` FROM scout_call_tracking t JOIN ` + webFirstCallsSQL + ` fc ON fc.id = t.call_id
+	WHERE t.status IN ('tracking','done') AND t.entry_price_usd IS NOT NULL AND t.onchain IS NOT NULL
+	  AND COALESCE(t.onchain->>'pool', '') <> '' AND COALESCE((t.onchain->>'entry_price_q')::float8, 0) > 0
+	  AND COALESCE((t.onchain->>'v')::int, 0) >= ` + strconv.Itoa(onchainStateVersion) + `
+	  AND (t.latest_checked_at IS NULL OR t.latest_checked_at <=
+	       CASE WHEN t.entry_at > $1::timestamptz THEN $2::timestamptz ELSE $3::timestamptz END)`
+
+// DueLatest returns up to limit rows whose latest price is due: calls younger
+// than recentAge first, then the ones not refreshed for the longest (never
+// refreshed first). A young call is due when its price is older than recent,
+// an older one when it is older than old. recentOnly leaves the older calls
+// out; skip lists call ids to leave out (rows that failed a moment ago).
+func (st *ScoutStore) DueLatest(ctx context.Context, now time.Time, recent, old, recentAge time.Duration, recentOnly bool, skip []int, limit int) ([]ScoutCallTracking, error) {
+	if skip == nil {
+		skip = []int{}
+	}
+	now = now.UTC()
+	rows, err := st.Pool.Query(ctx, `SELECT `+trackingColumnsT+latestDueSQL+`
+		AND (NOT $4::boolean OR t.entry_at > $1::timestamptz) AND t.call_id <> ALL($5::int[])
+		ORDER BY (t.entry_at > $1::timestamptz) DESC, t.latest_checked_at NULLS FIRST, t.call_id
+		LIMIT $6`, now.Add(-recentAge), now.Add(-recent), now.Add(-old), recentOnly, skip, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []ScoutCallTracking
+	for rows.Next() {
+		t, err := scanTracking(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, *t)
+	}
+	return out, rows.Err()
+}
+
+// CountDueLatest returns how many rows are waiting for a latest price (due now).
+func (st *ScoutStore) CountDueLatest(ctx context.Context, now time.Time, recent, old, recentAge time.Duration) (int, error) {
+	var n int
+	now = now.UTC()
+	err := st.Pool.QueryRow(ctx, `SELECT count(*)`+latestDueSQL, now.Add(-recentAge), now.Add(-recent), now.Add(-old)).Scan(&n)
+	return n, err
+}
+
+// ScoutLatestPrice is what one refresh of the latest-price pass stores.
+type ScoutLatestPrice struct {
+	CallID    int
+	Price     float64    // in the call's price_unit
+	ReturnPct *float64   // vs the late entry; nil when there is no usable entry price
+	CheckedAt time.Time  // when the price was read
+	TradeAt   *time.Time // time of the trade behind the price; nil = as stored before
+	// State holds the pass's own keys of the on-chain state (latest_block,
+	// latest_price_q, latest_trade_block) as a JSON object. They are merged into
+	// the stored state: every other key stays as it is.
+	State []byte
+}
+
+// SaveLatestPrice writes the four latest_* columns and merges the pass's cursor
+// into the on-chain state. Nothing else of the row changes: status, schedule,
+// attempts, horizon scan progress and updated_at stay as they are.
+func (st *ScoutStore) SaveLatestPrice(ctx context.Context, p ScoutLatestPrice) error {
+	_, err := st.Pool.Exec(ctx, `UPDATE scout_call_tracking SET
+		latest_price_usd = $2, latest_return_pct = $3, latest_checked_at = $4,
+		latest_trade_at = COALESCE($5, latest_trade_at), onchain = onchain || $6::jsonb
+		WHERE call_id = $1 AND onchain IS NOT NULL`,
+		p.CallID, p.Price, p.ReturnPct, p.CheckedAt.UTC(), p.TradeAt, string(p.State))
 	return err
 }
 
@@ -1170,8 +1254,9 @@ const (
 )
 
 // webRowsSQL loads the website's whole list in one statement: each token's
-// first call with its tracking row, the late-entry results of the five windows,
-// how often the token was called and its latest Perceptor report. It reads the
+// first call with its tracking row (and its latest price), the late-entry
+// results of the five windows, how often the token was called and its latest
+// Perceptor report. It reads the
 // tables directly (not scout_call_dataset_v, whose per-row lookups the website
 // does not need). Ordered by call id.
 var webRowsSQL = `SELECT c.id, c.message_id, c.message_date, c.channel_username, c.contract_address,
@@ -1179,7 +1264,8 @@ var webRowsSQL = `SELECT c.id, c.message_id, c.message_date, c.channel_username,
 	t.price_unit, COALESCE(t.entry_late_price_usd, t.entry_price_usd)::float8, t.entry_price_usd IS NOT NULL,
 	t.rugged, t.status,
 	` + webReturnsPivotSQL("r.") + `,
-	p.verdict, p.report_url, n.call_count, n.last_call_date
+	p.verdict, p.report_url, n.call_count, n.last_call_date,
+	t.latest_return_pct::float8, t.latest_price_usd::float8, t.latest_checked_at, t.latest_trade_at
 	FROM ` + webFirstCallsSQL + ` fc
 	JOIN scout_calls c ON c.id = fc.id
 	JOIN ` + webCallCountsSQL + ` n ON n.ca = fc.ca
@@ -1234,7 +1320,8 @@ func (st *ScoutStore) SelectWebRows(ctx context.Context) ([]ScoutWebRow, int, er
 		for i := range perf {
 			dest = append(dest, &perf[i])
 		}
-		dest = append(dest, &r.PerceptorVerd, &r.PerceptorURL, &r.CallCount, &r.LastCallDate)
+		dest = append(dest, &r.PerceptorVerd, &r.PerceptorURL, &r.CallCount, &r.LastCallDate,
+			&r.LatestReturn, &r.LatestPrice, &r.LatestAt, &r.LatestTradeAt)
 		if err := rows.Scan(dest...); err != nil {
 			return nil, 0, err
 		}

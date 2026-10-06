@@ -22,6 +22,10 @@ import (
 // Only the first call of each token is tracked; later calls get status "repeat".
 // ---------------------------------------------------------------------------
 
+// trackBatch is how many due calls one cycle of horizon tracking takes. A full
+// batch means more are waiting.
+const trackBatch = 50
+
 // trackLoop processes due tracking rows every PriceCfg.Interval.
 func (s *scanner) trackLoop(ctx context.Context) {
 	if s.db == nil || !s.pc.Enabled {
@@ -29,6 +33,12 @@ func (s *scanner) trackLoop(ctx context.Context) {
 	}
 	if s.pc.Source == "onchain" {
 		log.Printf("performance tracking on: %s via %s; %d call(s) at a time", horizonNames(s.pc.Horizons), s.onchain.describe(), max(s.pc.Workers, 1))
+		if s.pc.LatestOn {
+			log.Printf("latest prices on: refreshed every %s for calls under 30 days old, every %s for older ones; at most %s call(s) per cycle (SCOUT_LATEST_REFRESH=off turns this off)",
+				s.pc.LatestRecent, s.pc.LatestOld, commas(s.pc.LatestBatch))
+		} else {
+			log.Printf("latest prices off (SCOUT_LATEST_REFRESH=off)")
+		}
 	} else {
 		log.Printf("performance tracking on: %s via %s (network %q, %d req/min)",
 			horizonNames(s.pc.Horizons), s.pc.BaseURL, s.pc.Network, s.pc.RPM)
@@ -36,13 +46,11 @@ func (s *scanner) trackLoop(ctx context.Context) {
 	t := time.NewTicker(s.pc.Interval)
 	defer t.Stop()
 	for {
-		n := s.trackDue(ctx, 50)
+		more := s.trackCycle(ctx, trackBatch)
 		if ctx.Err() != nil {
 			return
 		}
-		s.logTrackingStatus(ctx, n)
-		s.fillTokenNames(ctx)
-		if n == 50 {
+		if more {
 			continue // more are waiting: keep going without the pause
 		}
 		select {
@@ -51,6 +59,24 @@ func (s *scanner) trackLoop(ctx context.Context) {
 		case <-t.C:
 		}
 	}
+}
+
+// trackCycle is one round of the tracker: the horizon checks that are due (up
+// to batch), the status line, token names, then the latest prices. more says
+// the horizon batch was full, so more of that work is waiting.
+func (s *scanner) trackCycle(ctx context.Context, batch int) (more bool) {
+	n := s.trackDue(ctx, batch)
+	if ctx.Err() != nil {
+		return false
+	}
+	more = n == batch
+	s.logTrackingStatus(ctx, n)
+	s.fillTokenNames(ctx)
+	// Latest prices come after the horizon work of the cycle. While a full
+	// horizon batch says more of that is waiting, only calls younger than 30
+	// days are refreshed; the older ones wait for a quieter cycle.
+	s.refreshLatest(ctx, more)
+	return more
 }
 
 func horizonNames(hs []horizon) string {

@@ -15,7 +15,9 @@ For each holding bucket there are two yes/no models:
 
 Outcomes are the `*_late_*` columns (entry 60 s after the post), reduced by
 buy and sell tax. Thresholds, feature lists and pass gates are in
-`scout_ml/config.py`.
+`scout_ml/config.py`. The view's `latest_*` columns (price and return as of the
+tracker's most recent look) are outcomes that keep moving: they are never
+features, and the leakage guard refuses any column whose name starts with `latest_`.
 
 ## Install
 

@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"log"
 	"math"
 	"math/big"
 	"net/http"
@@ -12,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -36,8 +39,12 @@ type fakeChain struct {
 	logs     []fakeLog
 	calls    map[string]func(block uint64) (string, bool) // "to|selector"
 	maxRange uint64                                       // eth_getLogs block-range cap (0 = none)
-	fullNode bool                                         // no historical state: eth_call at old blocks fails
-	callTags []string                                     // block tag of every eth_call received
+	// logsHook (optional) sees every eth_getLogs before the chain does and may
+	// answer it with a JSON-RPC error (non-empty return) or sleep. Called without
+	// f.mu held, possibly from several requests at once.
+	logsHook func(addr string, from, to uint64) string
+	fullNode bool     // no historical state: eth_call at old blocks fails
+	callTags []string // block tag of every eth_call received
 	count    map[string]int
 	srv      *httptest.Server
 }
@@ -51,6 +58,12 @@ func newFakeChain(t *testing.T, age time.Duration) *fakeChain {
 	return f
 }
 
+func (f *fakeChain) setLogsHook(h func(addr string, from, to uint64) string) {
+	f.mu.Lock()
+	f.logsHook = h
+	f.mu.Unlock()
+}
+
 // blockAtTime: the last block with timestamp <= ts.
 func (f *fakeChain) blockAtTime(ts time.Time) uint64 { return uint64(ts.Unix()-f.t0)*10 + 10 }
 
@@ -61,6 +74,19 @@ func (f *fakeChain) serve(w http.ResponseWriter, r *http.Request) {
 		Params []json.RawMessage `json:"params"`
 	}
 	json.NewDecoder(r.Body).Decode(&req)
+	f.mu.Lock()
+	hook := f.logsHook
+	f.mu.Unlock()
+	if req.Method == "eth_getLogs" && hook != nil && len(req.Params) == 1 {
+		var q struct{ Address, FromBlock, ToBlock string }
+		json.Unmarshal(req.Params[0], &q)
+		from, _ := strconv.ParseUint(strings.TrimPrefix(q.FromBlock, "0x"), 16, 64)
+		to, _ := strconv.ParseUint(strings.TrimPrefix(q.ToBlock, "0x"), 16, 64)
+		if msg := hook(strings.ToLower(q.Address), from, to); msg != "" {
+			json.NewEncoder(w).Encode(map[string]any{"jsonrpc": "2.0", "id": req.ID, "error": map[string]any{"code": -32000, "message": msg}})
+			return
+		}
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.count[req.Method]++
@@ -293,51 +319,325 @@ func TestBlockAt(t *testing.T) {
 	}
 }
 
-func TestGetLogsChunkedAdapts(t *testing.T) {
-	f := newFakeChain(t, 24*time.Hour)
-	f.maxRange = 5000
-	pool := "0x00000000000000000000000000000000000000c1"
-	for b := uint64(1000); b <= 60000; b += 7000 {
-		f.swapV3(pool, b, fmt.Sprintf("0x%x", b), sqrtX96(1))
-	}
-	o := testOnchain(t, f, map[string]string{"SCOUT_RPC_LOG_CHUNK": "200000"})
-	var blocks []uint64
-	err := o.rpc.getLogsChunked(context.Background(), pool, []any{topicSwapV3}, 1, 60000, func(l rpcLog) { blocks = append(blocks, l.block()) })
-	if err != nil || len(blocks) != 9 {
-		t.Fatalf("got %d logs, %v", len(blocks), err)
-	}
-	for i := 1; i < len(blocks); i++ {
-		if blocks[i] <= blocks[i-1] {
-			t.Fatalf("not in order: %v", blocks)
+// rangeLog records the eth_getLogs ranges a fake chain was asked for.
+type rangeLog struct {
+	mu   sync.Mutex
+	asks []rangeAsk
+}
+
+type rangeAsk struct {
+	addr     string
+	from, to uint64
+	refused  bool
+}
+
+func (r *rangeLog) add(a rangeAsk) {
+	r.mu.Lock()
+	r.asks = append(r.asks, a)
+	r.mu.Unlock()
+}
+
+func (r *rangeLog) list(addr string) []rangeAsk {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var out []rangeAsk
+	for _, a := range r.asks {
+		if addr == "" || a.addr == addr {
+			out = append(out, a)
 		}
 	}
-	if c := o.rpc.chunk.Load(); c > 5000 {
-		t.Fatalf("chunk not reduced: %d", c)
+	return out
+}
+
+// captureRangeLog sends the standard logger to a buffer for the rest of the test and
+// prints every range-size line (no rate limit).
+func captureRangeLog(t *testing.T) *syncBuf {
+	var buf syncBuf
+	prevOut, prevEvery := log.Writer(), rangeNoteEvery
+	log.SetOutput(&buf)
+	rangeNoteEvery = 0
+	t.Cleanup(func() { log.SetOutput(prevOut); rangeNoteEvery = prevEvery })
+	return &buf
+}
+
+func fastRetries(t *testing.T) {
+	old := rpcRetryBase
+	rpcRetryBase = time.Millisecond
+	t.Cleanup(func() { rpcRetryBase = old })
+}
+
+// A node that refuses big ranges over one busy stretch of blocks: the scan goes
+// smaller there, and back up to SCOUT_RPC_LOG_CHUNK once past it.
+func TestGetLogsRangeShrinksOnRefusalAndGrowsBack(t *testing.T) {
+	buf := captureRangeLog(t)
+	f := newFakeChain(t, 10*24*time.Hour)
+	pool := "0x00000000000000000000000000000000000000c1"
+	var want []uint64
+	for b := uint64(1000); b <= 3_000_000; b += 7001 {
+		f.swapV3(pool, b, fmt.Sprintf("0x%x", b), sqrtX96(1))
+		want = append(want, b)
 	}
-	small := o.rpc.chunk.Load()
-	scan := func(n int) {
-		for i := 0; i < n; i++ {
-			if err := o.rpc.getLogsChunked(context.Background(), pool, []any{topicSwapV3}, 1, 60000, func(rpcLog) {}); err != nil {
-				t.Fatal(err)
+	var rl rangeLog
+	f.setLogsHook(func(addr string, from, to uint64) string {
+		refuse := from <= 100_000 && to-from+1 > 5000 // busy stretch: at most 5000 blocks per request
+		rl.add(rangeAsk{addr, from, to, refuse})
+		if refuse {
+			return "query returned more than 10000 results"
+		}
+		return ""
+	})
+	o := testOnchain(t, f, map[string]string{"SCOUT_RPC_LOG_CHUNK": "200000"})
+	ctx := withScanProgress(context.Background(), "call 1 [1/1]", 0)
+	var got []uint64
+	if err := o.rpc.getLogsChunked(ctx, pool, []any{topicSwapV3}, 1, 3_000_000, func(l rpcLog) { got = append(got, l.block()) }); err != nil {
+		t.Fatal(err)
+	}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("got %d logs, want %d (in block order)", len(got), len(want))
+	}
+	asks := rl.list(pool)
+	refusals := 0
+	for _, a := range asks {
+		if n := a.to - a.from + 1; n > 200_000 {
+			t.Fatalf("asked for %d blocks, above SCOUT_RPC_LOG_CHUNK", n)
+		}
+		if a.refused {
+			refusals++
+		}
+	}
+	if refusals == 0 {
+		t.Fatalf("%d refusals", refusals)
+	}
+	// Back to full-size ranges well before the end of the scan.
+	for _, a := range asks {
+		if a.from >= 2_000_000 && (a.refused || (a.to-a.from+1 != 200_000 && a.to != 3_000_000)) {
+			t.Fatalf("range did not grow back: asked for %d-%d", a.from, a.to)
+		}
+	}
+	t.Logf("%d requests for 3M blocks, %d of them refused", len(asks), refusals)
+	if len(asks) > 200 { // 960 at the smallest size
+		t.Fatalf("%d requests for 3M blocks: grew back too slowly", len(asks))
+	}
+	out := buf.String()
+	for _, w := range []string{
+		"call 1 [1/1]: eth_getLogs blocks 1-199999 (199999 blocks) refused as too large (rpc error -32000: query returned more than 10000 results); this scan continues with 100000-block ranges (max 200000)",
+		"call 1 [1/1]: eth_getLogs ranges back up to 200000 blocks (max 200000)",
+		"200000-block ranges)",
+	} {
+		if !strings.Contains(out, w) {
+			t.Fatalf("log is missing %q:\n%s", w, out)
+		}
+	}
+	// A new scan (here of another pool, outside the busy stretch) starts at the configured size.
+	other := "0x00000000000000000000000000000000000000c2"
+	if err := o.rpc.getLogsChunked(context.Background(), other, []any{topicSwapV3}, 200_000, 599_999, func(rpcLog) {}); err != nil {
+		t.Fatal(err)
+	}
+	if a := rl.list(other); len(a) != 2 || a[0].to-a[0].from+1 != 200_000 || a[1].to-a[1].from+1 != 200_000 {
+		t.Fatalf("new scan asked for %+v", a)
+	}
+}
+
+// Passing trouble is retried at the same size and never makes the ranges
+// smaller: client time-outs that call()'s own retries get past, one "request
+// timed out" from the node, rate limits and a busy node.
+func TestGetLogsTimeoutsDoNotShrinkRange(t *testing.T) {
+	buf := captureRangeLog(t)
+	fastRetries(t)
+	f := newFakeChain(t, 10*24*time.Hour)
+	pool := "0x00000000000000000000000000000000000000c1"
+	var want []uint64
+	for b := uint64(5000); b <= 1_000_000; b += 90_001 {
+		f.swapV3(pool, b, fmt.Sprintf("0x%x", b), sqrtX96(1))
+		want = append(want, b)
+	}
+	var rl rangeLog
+	var n atomic.Int64
+	f.setLogsHook(func(addr string, from, to uint64) string {
+		rl.add(rangeAsk{addr: addr, from: from, to: to})
+		switch n.Add(1) {
+		case 1, 2: // slower than the client waits: a transport timeout
+			time.Sleep(300 * time.Millisecond)
+		case 3:
+			return "request timed out"
+		case 4:
+			return "rate limit exceeded, too many requests"
+		case 5:
+			return "server busy, try again later"
+		}
+		return ""
+	})
+	o := testOnchain(t, f, map[string]string{"SCOUT_RPC_LOG_CHUNK": "200000", "SCOUT_RPC_PARALLEL": "1"})
+	o.rpc.http.Timeout = 100 * time.Millisecond
+	var got []uint64
+	if err := o.rpc.getLogsChunked(context.Background(), pool, []any{topicSwapV3}, 1, 1_000_000, func(l rpcLog) { got = append(got, l.block()) }); err != nil {
+		t.Fatal(err)
+	}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+	asks := rl.list(pool)
+	for _, a := range asks {
+		if (a.to+1)%200_000 != 0 && a.to != 1_000_000 {
+			t.Fatalf("range shrank after a timeout: asked for %d-%d", a.from, a.to)
+		}
+	}
+	if len(asks) != 6+5 { // 6 ranges, the first one asked 6 times (2 timeouts, 3 busy answers)
+		t.Fatalf("%d requests: %+v", len(asks), asks)
+	}
+	if strings.Contains(buf.String(), "refused") || o.rpc.splits.Load() != 0 {
+		t.Fatalf("a timeout was treated as a refusal:\n%s", buf.String())
+	}
+	// A node that stays busy or rate limiting fails the scan (it is tried again
+	// next cycle from its saved cursor) instead of shrinking the range: each
+	// range is asked logsRetries times at full size, never in halves.
+	for _, msg := range []string{"rate limit exceeded", "server busy, try again later", "too many requests",
+		"rate limit exceeded: request timed out", "service temporarily unavailable"} {
+		var busy rangeLog
+		f.setLogsHook(func(addr string, from, to uint64) string {
+			busy.add(rangeAsk{addr: addr, from: from, to: to})
+			return msg
+		})
+		err := o.rpc.getLogsChunked(context.Background(), pool, []any{topicSwapV3}, 1, 1_000_000, func(rpcLog) {})
+		if err == nil || !strings.Contains(err.Error(), msg) {
+			t.Fatalf("%q: want that error back, got %v", msg, err)
+		}
+		if o.rpc.splits.Load() != 0 {
+			t.Fatalf("%q split a range", msg)
+		}
+		asks := busy.list(pool)
+		if len(asks) != logsRetries {
+			t.Fatalf("%q: %d requests, want %d", msg, len(asks), logsRetries)
+		}
+		for _, a := range asks {
+			if a.from != 1 || a.to != 199_999 {
+				t.Fatalf("%q: asked for %d-%d", msg, a.from, a.to)
 			}
 		}
 	}
-	// The size that just failed is not retried right away, however many quick answers follow …
-	scan(3)
-	if c := o.rpc.chunk.Load(); c != small {
-		t.Fatalf("chunk moved to %d while the failed size is still fresh", c)
+}
+
+// A refusal in one call's scan does not shrink another call's ranges.
+func TestGetLogsRefusalStaysWithItsScan(t *testing.T) {
+	captureRangeLog(t)
+	f := newFakeChain(t, 10*24*time.Hour)
+	busy, quiet := "0x00000000000000000000000000000000000000b1", "0x00000000000000000000000000000000000000b2"
+	var rl rangeLog
+	f.setLogsHook(func(addr string, from, to uint64) string {
+		refuse := addr == busy && to-from+1 > 5000
+		rl.add(rangeAsk{addr, from, to, refuse})
+		if refuse {
+			return "Log response size exceeded. You can make eth_getLogs requests with up to a 5K block range"
+		}
+		time.Sleep(time.Millisecond) // keep both scans running side by side
+		return ""
+	})
+	o := testOnchain(t, f, map[string]string{"SCOUT_RPC_LOG_CHUNK": "200000", "SCOUT_RPC_PARALLEL": "2"})
+	var wg sync.WaitGroup
+	errs := make([]error, 2)
+	for i, addr := range []string{busy, quiet} {
+		wg.Add(1)
+		go func(i int, addr string) {
+			defer wg.Done()
+			ctx := withScanProgress(context.Background(), fmt.Sprintf("call %d [%d/2]", i+1, i+1), time.Hour)
+			errs[i] = o.rpc.getLogsChunked(ctx, addr, []any{topicSwapV3}, 1, 1_999_999, func(rpcLog) {})
+		}(i, addr)
 	}
-	// … but once that wait is over (and the node copes), the range grows back to the configured size.
-	old := chunkRetryAfter
-	chunkRetryAfter = 0
-	defer func() { chunkRetryAfter = old }()
-	o.rpc.ceilingEnd.Store(0)
-	f.mu.Lock()
-	f.maxRange = 0
-	f.mu.Unlock()
-	scan(40)
-	if c := o.rpc.chunk.Load(); c != 200000 {
-		t.Fatalf("chunk did not grow back: %d", c)
+	wg.Wait()
+	if errs[0] != nil || errs[1] != nil {
+		t.Fatal(errs)
+	}
+	if len(rl.list(busy)) < 20 {
+		t.Fatalf("busy scan: %d requests", len(rl.list(busy)))
+	}
+	for _, a := range rl.list(quiet) {
+		if a.to-a.from+1 < 199_999 {
+			t.Fatalf("quiet scan shrank to %d blocks while the other scan was refused", a.to-a.from+1)
+		}
+	}
+	if q := len(rl.list(quiet)); q != 10 {
+		t.Fatalf("quiet scan made %d requests, want 10", q)
+	}
+}
+
+// What counts as "too large", what as a passing error.
+func TestClassifyLogsErr(t *testing.T) {
+	rpc := func(msg string) error { return &rpcError{Code: -32000, Message: msg} }
+	for msg, want := range map[string]logsErrKind{
+		"block range too large":                               logsTooLarge,
+		"query returned more than 10000 results":              logsTooLarge,
+		"exceed maximum block range: 50000":                   logsTooLarge,
+		"Log response size exceeded.":                         logsTooLarge,
+		"eth_getLogs is limited to a 10,000 range":            logsTooLarge,
+		"rate limit exceeded":                                 logsBusy,
+		"project ID request rate exceeded":                    logsBusy,
+		"too many requests":                                   logsBusy,
+		"request timed out":                                   logsTimedOut,
+		"Request Timed Out":                                   logsTimedOut,
+		"Query timeout exceeded. Consider reducing the range": logsTimedOut,
+		"context deadline exceeded":                           logsTimedOut,
+		"rate limit exceeded: request timed out":              logsBusy,
+		"server busy, request timed out":                      logsBusy,
+		"server is busy":                                      logsBusy,
+		"header not found":                                    logsBusy,
+		"something odd happened":                              logsUnexplained,
+	} {
+		if got := classifyLogsErr(rpc(msg)); got != want {
+			t.Errorf("%q: got %d, want %d", msg, got, want)
+		}
+	}
+	if classifyLogsErr(fmt.Errorf("eth_getLogs: %w", errResponseTooLarge)) != logsTooLarge {
+		t.Error("cut-off response")
+	}
+	if classifyLogsErr(fmt.Errorf("eth_getLogs: %w", context.DeadlineExceeded)) != logsClientTimeout {
+		t.Error("client time-out (after call's retries)")
+	}
+	if classifyLogsErr(errors.New("connection reset")) != logsOther || classifyLogsErr(context.Canceled) != logsOther {
+		t.Error("other transport errors are retried by call, not split")
+	}
+}
+
+// An answer bigger than the client reads is a "result too large": the range is
+// split instead of failing the scan; an error the node does not explain is
+// asked again once, then treated the same.
+func TestGetLogsSplitsOversizedAndUnexplained(t *testing.T) {
+	captureRangeLog(t)
+	fastRetries(t)
+	old := maxResponseBytes
+	maxResponseBytes = 3000
+	t.Cleanup(func() { maxResponseBytes = old })
+	f := newFakeChain(t, 2*24*time.Hour)
+	pool := "0x00000000000000000000000000000000000000c1"
+	var want []uint64
+	for b := uint64(10); b <= 3200; b += 70 {
+		f.swapV3(pool, b, fmt.Sprintf("0x%x", b), sqrtX96(1))
+		want = append(want, b)
+	}
+	o := testOnchain(t, f, map[string]string{"SCOUT_RPC_LOG_CHUNK": "3200"})
+	var got []uint64
+	if err := o.rpc.getLogsChunked(context.Background(), pool, []any{topicSwapV3}, 1, 3200, func(l rpcLog) { got = append(got, l.block()) }); err != nil {
+		t.Fatal(err)
+	}
+	if fmt.Sprint(got) != fmt.Sprint(want) || o.rpc.splits.Load() == 0 {
+		t.Fatalf("got %d logs (want %d), %d splits", len(got), len(want), o.rpc.splits.Load())
+	}
+
+	var rl rangeLog
+	f.setLogsHook(func(addr string, from, to uint64) string {
+		odd := to-from+1 > 50_000
+		rl.add(rangeAsk{addr, from, to, odd})
+		if odd {
+			return "something odd happened"
+		}
+		return ""
+	})
+	o2 := testOnchain(t, f, map[string]string{"SCOUT_RPC_LOG_CHUNK": "200000", "SCOUT_RPC_PARALLEL": "1"})
+	if err := o2.rpc.getLogsChunked(context.Background(), pool, []any{topicSwapV3}, 200_000, 399_999, func(rpcLog) {}); err != nil {
+		t.Fatal(err)
+	}
+	asks := rl.list(pool)
+	if len(asks) < 4 || asks[0] != asks[1] || asks[2].to-asks[2].from+1 != 100_000 {
+		t.Fatalf("want the same range asked twice, then halves: %+v", asks[:min(len(asks), 4)])
 	}
 }
 
@@ -746,5 +1046,231 @@ func TestRobinhoodBlockConvertedToMainnetBlock(t *testing.T) {
 	}
 	if _, _, _, err := o2.mainnetBlockFor(ctx, f.blockAtTime(time.Now().Add(-5*time.Hour))); err != nil {
 		t.Fatalf("a block older than the stale node's tip should still convert: %v", err)
+	}
+}
+
+// slowLogsNode imitates a Nitro / geth node on blocks outside its log index:
+// eth_getLogs below indexedFrom costs perBlock for every block in the range,
+// and a range that would take longer than limit is answered with the node's
+// own JSON-RPC error "request timed out" after limit. From indexedFrom on
+// (indexed blocks) every range is answered at once. Times are scaled down:
+// 1 µs per block and a 30 ms limit stand for ~1 ms and ~30 s on the real node.
+func slowLogsNode(rl *rangeLog, indexedFrom uint64, perBlock, limit time.Duration) func(addr string, from, to uint64) string {
+	return func(addr string, from, to uint64) string {
+		if from >= indexedFrom {
+			rl.add(rangeAsk{addr: addr, from: from, to: to})
+			return ""
+		}
+		cost := time.Duration(to-from+1) * perBlock
+		if cost > limit {
+			rl.add(rangeAsk{addr, from, to, true})
+			time.Sleep(limit)
+			return "request timed out"
+		}
+		rl.add(rangeAsk{addr: addr, from: from, to: to})
+		time.Sleep(cost)
+		return ""
+	}
+}
+
+// (a) A node that times out on ranges above 30000 blocks: each size is asked
+// twice before it is split, the scan settles at 25000 blocks (the largest
+// halving of SCOUT_RPC_LOG_CHUNK that works), and a grown size that times out
+// is asked once, not twice, and tried ever more rarely.
+func TestGetLogsNodeTimeoutSplitsAndSettles(t *testing.T) {
+	buf := captureRangeLog(t)
+	fastRetries(t)
+	f := newFakeChain(t, 10*24*time.Hour)
+	pool := "0x00000000000000000000000000000000000000c1"
+	var want []uint64
+	for b := uint64(5000); b < 1_500_000; b += 50_001 {
+		f.swapV3(pool, b, fmt.Sprintf("0x%x", b), sqrtX96(1))
+		want = append(want, b)
+	}
+	var rl rangeLog
+	f.setLogsHook(slowLogsNode(&rl, math.MaxUint64, time.Microsecond, 30*time.Millisecond))
+	o := testOnchain(t, f, map[string]string{"SCOUT_RPC_LOG_CHUNK": "200000", "SCOUT_RPC_PARALLEL": "1"})
+	ctx := withScanProgress(context.Background(), "call 2 [1/1]", 0)
+	var got []uint64
+	if err := o.rpc.getLogsChunked(ctx, pool, []any{topicSwapV3}, 0, 1_499_999, func(l rpcLog) { got = append(got, l.block()) }); err != nil {
+		t.Fatal(err)
+	}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("got %d logs, want %d (in block order)", len(got), len(want))
+	}
+	asks := rl.list(pool)
+	// The way down: 200000, 100000 and 50000 blocks, each asked twice.
+	if len(asks) < 6 {
+		t.Fatalf("%d requests", len(asks))
+	}
+	for i, n := range []uint64{200_000, 200_000, 100_000, 100_000, 50_000, 50_000} {
+		if a := asks[i]; !a.refused || a.from != 0 || a.to-a.from+1 != n {
+			t.Fatalf("request %d: %+v, want blocks 0-%d timed out", i+1, a, n-1)
+		}
+	}
+	answered, probes := 0, map[uint64]int{}
+	for _, a := range asks[6:] {
+		n := a.to - a.from + 1
+		switch {
+		case !a.refused && n == 25_000:
+			answered++
+		case a.refused && n == 50_000:
+			probes[a.from]++
+		default:
+			t.Fatalf("after settling: asked for %d-%d (%d blocks, timed out %v)", a.from, a.to, n, a.refused)
+		}
+	}
+	if answered != 60 {
+		t.Fatalf("%d ranges of 25000 blocks answered, want 60", answered)
+	}
+	// Grow-back tries after 3, 6, 12 and 24 answered ranges: 4 in 60 ranges, each asked once.
+	if len(probes) < 1 || len(probes) > 5 {
+		t.Fatalf("%d grow-back tries: %v", len(probes), probes)
+	}
+	for from, n := range probes {
+		if n != 1 {
+			t.Fatalf("grow-back try at block %d asked %d times", from, n)
+		}
+	}
+	out := buf.String()
+	for _, w := range []string{
+		"call 2 [1/1]: eth_getLogs blocks 0-199999 (200000 blocks) timed out on the node (2 tries) (rpc error -32000: request timed out); this scan continues with 100000-block ranges (max 200000)",
+		"call 2 [1/1]: eth_getLogs blocks 0-49999 (50000 blocks) timed out on the node (2 tries) (rpc error -32000: request timed out); this scan continues with 25000-block ranges (max 200000)",
+		"call 2 [1/1]: eth_getLogs ranges back up to 50000 blocks (max 200000) after 3 answered ranges",
+		"(50000 blocks) timed out on the node (rpc error -32000: request timed out); this scan continues with 25000-block ranges",
+		"call 2 [1/1]: eth_getLogs ranges back up to 50000 blocks (max 200000) after 6 answered ranges",
+	} {
+		if !strings.Contains(out, w) {
+			t.Fatalf("log is missing %q:\n%s", w, out)
+		}
+	}
+	if strings.Contains(out, "refused as too large") {
+		t.Fatalf("a time-out was reported as too large:\n%s", out)
+	}
+}
+
+// (a) The same with a node that never answers big ranges at all (no JSON-RPC
+// error, the client's own time limit runs out): once call()'s retries are used
+// up, the range is split instead of failing the scan.
+func TestGetLogsClientTimeoutSplits(t *testing.T) {
+	buf := captureRangeLog(t)
+	fastRetries(t)
+	f := newFakeChain(t, 10*24*time.Hour)
+	pool := "0x00000000000000000000000000000000000000c1"
+	var want []uint64
+	for b := uint64(500); b < 64_000; b += 3001 {
+		f.swapV3(pool, b, fmt.Sprintf("0x%x", b), sqrtX96(1))
+		want = append(want, b)
+	}
+	var rl rangeLog
+	f.setLogsHook(func(addr string, from, to uint64) string {
+		slow := to-from+1 > 4000
+		rl.add(rangeAsk{addr, from, to, slow})
+		if slow {
+			time.Sleep(200 * time.Millisecond)
+		}
+		return ""
+	})
+	o := testOnchain(t, f, map[string]string{"SCOUT_RPC_LOG_CHUNK": "16000", "SCOUT_RPC_PARALLEL": "1"})
+	o.rpc.http.Timeout = 40 * time.Millisecond
+	var got []uint64
+	if err := o.rpc.getLogsChunked(context.Background(), pool, []any{topicSwapV3}, 0, 63_999, func(l rpcLog) { got = append(got, l.block()) }); err != nil {
+		t.Fatal(err)
+	}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+	asks := rl.list(pool)
+	// 16000 and 8000 blocks: each asked 4 times by call(), then split.
+	for i := 0; i < 8; i++ {
+		n := uint64(16_000)
+		if i >= 4 {
+			n = 8000
+		}
+		if a := asks[i]; a.from != 0 || a.to-a.from+1 != n {
+			t.Fatalf("request %d: %+v", i+1, a)
+		}
+	}
+	for _, a := range asks[8:] {
+		if n := a.to - a.from + 1; !a.refused && n != 4000 {
+			t.Fatalf("answered a %d-block range", n)
+		}
+	}
+	if !strings.Contains(buf.String(), "eth_getLogs blocks 0-15999 (16000 blocks) got no answer in time (client time-out)") {
+		t.Fatalf("log:\n%s", buf.String())
+	}
+}
+
+// (b) Old blocks the node reads slowly (outside its log index), then indexed
+// blocks it answers at once: the scan goes small over the slow stretch and is
+// back at SCOUT_RPC_LOG_CHUNK soon after it, without waiting out the long
+// grow-back pause the slow stretch built up.
+func TestGetLogsSlowStretchThenIndexed(t *testing.T) {
+	buf := captureRangeLog(t)
+	fastRetries(t)
+	f := newFakeChain(t, 10*24*time.Hour)
+	pool := "0x00000000000000000000000000000000000000c1"
+	var want []uint64
+	for b := uint64(5000); b < 6_200_000; b += 77_777 {
+		f.swapV3(pool, b, fmt.Sprintf("0x%x", b), sqrtX96(1))
+		want = append(want, b)
+	}
+	const indexedFrom = 3_000_000 // long enough for the grow-back pause to reach 96 ranges
+	var rl rangeLog
+	f.setLogsHook(slowLogsNode(&rl, indexedFrom, time.Microsecond, 30*time.Millisecond))
+	o := testOnchain(t, f, map[string]string{"SCOUT_RPC_LOG_CHUNK": "200000"}) // 8 ranges at a time
+	var got []uint64
+	if err := o.rpc.getLogsChunked(context.Background(), pool, []any{topicSwapV3}, 0, 6_199_999, func(l rpcLog) { got = append(got, l.block()) }); err != nil {
+		t.Fatal(err)
+	}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("got %d logs, want %d (in block order)", len(got), len(want))
+	}
+	asks := rl.list(pool)
+	for _, a := range asks {
+		n := a.to - a.from + 1
+		if a.from < indexedFrom && !a.refused && n > 30_000 {
+			t.Fatalf("slow stretch answered %d blocks", n)
+		}
+		if a.from >= indexedFrom+1_800_000 && n != 200_000 {
+			t.Fatalf("indexed blocks: asked for %d-%d (%d blocks), want %d", a.from, a.to, n, 200_000)
+		}
+	}
+	if !strings.Contains(buf.String(), "ranges back up to 200000 blocks (max 200000)") {
+		t.Fatalf("log:\n%s", buf.String())
+	}
+	t.Logf("%d requests for 6.2M blocks", len(asks))
+}
+
+// (d) Ranges are not split below the smallest size: a range of that size that
+// still times out fails the scan, with a log line that says so.
+func TestGetLogsTimeoutAtSmallestRange(t *testing.T) {
+	buf := captureRangeLog(t)
+	fastRetries(t)
+	f := newFakeChain(t, 10*24*time.Hour)
+	pool := "0x00000000000000000000000000000000000000c1"
+	var rl rangeLog
+	f.setLogsHook(func(addr string, from, to uint64) string {
+		rl.add(rangeAsk{addr, from, to, true})
+		return "request timed out"
+	})
+	o := testOnchain(t, f, map[string]string{"SCOUT_RPC_LOG_CHUNK": "800", "SCOUT_RPC_PARALLEL": "1"})
+	if o.rpc.minChunk != 200 {
+		t.Fatalf("smallest range %d", o.rpc.minChunk)
+	}
+	ctx := withScanProgress(context.Background(), "call 3 [1/1]", time.Hour)
+	err := o.rpc.getLogsChunked(ctx, pool, []any{topicSwapV3}, 0, 9999, func(rpcLog) {})
+	if err == nil || !strings.Contains(err.Error(), "eth_getLogs 0-199: rpc error -32000: request timed out") {
+		t.Fatalf("want the time-out at blocks 0-199, got %v", err)
+	}
+	var sizes []uint64
+	for _, a := range rl.list(pool) {
+		sizes = append(sizes, a.to-a.from+1)
+	}
+	if fmt.Sprint(sizes) != "[800 800 400 400 200 200]" {
+		t.Fatalf("asked for %v", sizes)
+	}
+	if w := "call 3 [1/1]: eth_getLogs blocks 0-199 (200 blocks) timed out on the node (2 tries) at the smallest range size (200 blocks); this scan stops here (rpc error -32000: request timed out)"; !strings.Contains(buf.String(), w) {
+		t.Fatalf("log is missing %q:\n%s", w, buf.String())
 	}
 }

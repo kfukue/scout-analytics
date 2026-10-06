@@ -355,6 +355,9 @@ type scanner struct {
 	gecko   *geckoClient
 	onchain *onchainSource
 
+	latestMu    sync.Mutex
+	latestRetry map[int]time.Time // latest-price pass: call id → not before (after a failed refresh)
+
 	postMu      sync.Mutex
 	handled     map[string]bool // "msgID|ca" (and "msgID" for CA-less posts) already processed
 	sourceInput tg.InputChannelClass
@@ -1489,14 +1492,15 @@ func main() {
 			}
 			total := 0
 			for {
-				n := s.trackDue(ctx, 50)
+				n := s.trackDue(ctx, trackBatch)
 				total += n
-				if n < 50 || ctx.Err() != nil {
+				if n < trackBatch || ctx.Err() != nil {
 					break
 				}
 			}
 			s.logTrackingStatus(context.Background(), total)
 			s.fillTokenNames(ctx)
+			s.refreshLatest(ctx, false) // one pass: up to SCOUT_LATEST_BATCH latest prices
 			fmt.Printf("processed %d call(s)\n", total)
 		case *trackOnly:
 			if !s.pc.Enabled {
@@ -1817,7 +1821,7 @@ func runPriceCheck(ctx context.Context, cfg *config, token, at string) error {
 	fmt.Printf("now:          %.12g %s (%+.1f%%), peak %+.1f%%, low %+.1f%% since the call; last trade block %d\n",
 		st.LastPriceQ, st.QuoteSym, (st.LastPriceQ/st.EntryPriceQ-1)*100, (st.RunMaxQ/st.EntryPriceQ-1)*100,
 		(st.RunMinQ/st.EntryPriceQ-1)*100, st.LastPriceBlock)
-	fmt.Printf("log chunk in use: %d blocks\n", o.rpc.chunk.Load())
+	fmt.Printf("log ranges:   up to %d blocks per eth_getLogs (SCOUT_RPC_LOG_CHUNK); %d range(s) split after the node refused them as too large or timed out\n", o.rpc.maxChunk, o.rpc.splits.Load())
 	if o.noState.Load() {
 		fmt.Println("node type:    full node (no historical state) — USD prices of the paired asset come from event logs")
 	} else {

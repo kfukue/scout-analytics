@@ -198,6 +198,12 @@ type webCallJSON struct {
 	PerceptorURL    *string  `json:"perceptor_url"`
 	CallCount       int      `json:"call_count"`
 	LastCallDate    string   `json:"last_call_date"`
+
+	LatestReturnPct  *float64 `json:"latest_return_pct"`
+	LatestPriceUSD   *float64 `json:"latest_price_usd"`
+	LatestAt         *string  `json:"latest_at"`
+	LatestTradeAt    *string  `json:"latest_trade_at"`
+	LatestAgeSeconds *int64   `json:"latest_age_seconds"`
 }
 
 type webCallsJSON struct {
