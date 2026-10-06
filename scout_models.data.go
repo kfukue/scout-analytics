@@ -1255,8 +1255,8 @@ const (
 
 // webRowsSQL loads the website's whole list in one statement: each token's
 // first call with its tracking row (and its latest price), the late-entry
-// results of the five windows, how often the token was called and its latest
-// Perceptor report. It reads the
+// results of the five windows, how often the token was called, its latest
+// Perceptor report and the market caps of the post. It reads the
 // tables directly (not scout_call_dataset_v, whose per-row lookups the website
 // does not need). Ordered by call id.
 var webRowsSQL = `SELECT c.id, c.message_id, c.message_date, c.channel_username, c.contract_address,
@@ -1265,7 +1265,8 @@ var webRowsSQL = `SELECT c.id, c.message_id, c.message_date, c.channel_username,
 	t.rugged, t.status,
 	` + webReturnsPivotSQL("r.") + `,
 	p.verdict, p.report_url, n.call_count, n.last_call_date,
-	t.latest_return_pct::float8, t.latest_price_usd::float8, t.latest_checked_at, t.latest_trade_at
+	t.latest_return_pct::float8, t.latest_price_usd::float8, t.latest_checked_at, t.latest_trade_at,
+	m.called_at_mcap_usd::float8, m.mcap_usd::float8, t.entry_price_usd::float8
 	FROM ` + webFirstCallsSQL + ` fc
 	JOIN scout_calls c ON c.id = fc.id
 	JOIN ` + webCallCountsSQL + ` n ON n.ca = fc.ca
@@ -1321,7 +1322,8 @@ func (st *ScoutStore) SelectWebRows(ctx context.Context) ([]ScoutWebRow, int, er
 			dest = append(dest, &perf[i])
 		}
 		dest = append(dest, &r.PerceptorVerd, &r.PerceptorURL, &r.CallCount, &r.LastCallDate,
-			&r.LatestReturn, &r.LatestPrice, &r.LatestAt, &r.LatestTradeAt)
+			&r.LatestReturn, &r.LatestPrice, &r.LatestAt, &r.LatestTradeAt,
+			&r.CalledAtMcap, &r.PostMcap, &r.PostPrice)
 		if err := rows.Scan(dest...); err != nil {
 			return nil, 0, err
 		}

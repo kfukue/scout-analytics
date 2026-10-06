@@ -311,7 +311,7 @@ func parseWebCallsQuery(v url.Values) (ScoutWebCallsFilter, error) {
 		*dst = n
 		return nil
 	}
-	if err := oneOf("sort", &f.Sort, "date", "return", "peak", "latest"); err != nil {
+	if err := oneOf("sort", &f.Sort, "date", "return", "peak", "latest", "call_mc", "latest_mc"); err != nil {
 		return f, err
 	}
 	if err := oneOf("dir", &f.Dir, "desc", "asc"); err != nil {
@@ -321,7 +321,7 @@ func parseWebCallsQuery(v url.Values) (ScoutWebCallsFilter, error) {
 		return f, err
 	}
 	usdOnly := "0"
-	if f.Sort == "return" || f.Sort == "peak" || f.Sort == "latest" {
+	if f.Sort != "date" { // return, peak, latest, call_mc, latest_mc: only USD-priced calls have them
 		usdOnly = "1"
 	}
 	if err := oneOf("usd_only", &usdOnly, "1", "0"); err != nil {

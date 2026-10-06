@@ -291,6 +291,7 @@ func TestWebETag(t *testing.T) {
 	// … and every other question another one
 	seen := map[string]string{calls: "/api/calls"}
 	for _, other := range []string{"q=a", "q=b", "sort=return", "sort=peak", "sort=return&usd_only=0", "dir=asc", "horizon=1h", "horizon=30d",
+		"sort=call_mc", "sort=latest_mc", "sort=call_mc&dir=asc", "sort=latest_mc&usd_only=0",
 		"usd_only=1", "verdict=clean", "verdict=not_scanned", "page=2", "per=10", "per=10&page=2", "q=a&verdict=clean"} {
 		e := etagOf("/api/calls?" + other)
 		if prev, dup := seen[e]; dup {

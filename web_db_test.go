@@ -33,6 +33,9 @@ type webSeed struct {
 	Entry   float64 // entry_price_usd (0 = NULL)
 	Late    float64 // entry_late_price_usd (0 = NULL)
 	Rugged  *bool
+	// market caps parsed from the post (scout_call_metrics; nil = NULL)
+	CalledMC *float64 // called_at_mcap_usd
+	MC       *float64 // mcap_usd
 	// horizon → late return, late peak, late drawdown
 	Returns map[string][3]float64
 }
@@ -56,8 +59,9 @@ func seedWebCall(t *testing.T, st *ScoutStore, base time.Time, w webSeed) int {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if w.PostSym != "" {
-		if _, err := st.Pool.Exec(ctx, `INSERT INTO scout_call_metrics (call_id, token_symbol, created_by, updated_by) VALUES ($1,$2,'t','t')`, *id, w.PostSym); err != nil {
+	if w.PostSym != "" || w.CalledMC != nil || w.MC != nil {
+		if _, err := st.Pool.Exec(ctx, `INSERT INTO scout_call_metrics (call_id, token_symbol, called_at_mcap_usd, mcap_usd, created_by, updated_by)
+			VALUES ($1,$2,$3,$4,'t','t')`, *id, strPtr(w.PostSym), w.CalledMC, w.MC); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -204,6 +208,9 @@ type webCallJSON struct {
 	LatestAt         *string  `json:"latest_at"`
 	LatestTradeAt    *string  `json:"latest_trade_at"`
 	LatestAgeSeconds *int64   `json:"latest_age_seconds"`
+
+	CallMcapUSD   *float64 `json:"call_mcap_usd"`
+	LatestMcapUSD *float64 `json:"latest_mcap_usd"`
 }
 
 type webCallsJSON struct {
@@ -363,6 +370,22 @@ func TestWebCallsOrderHorizonsAndFields(t *testing.T) {
 	fx.wantOrder(t, "sort=return&usd_only=0&dir=asc", "beta", "alpha", "gamma", "virt", "xss", "sol", "pct", "err", "gave")
 	if r := fx.wantOrder(t, "usd_only=1", "gamma", "beta", "alpha"); !r.USDOnly || r.Total != 3 {
 		t.Fatalf("usd_only=1 %+v", r)
+	}
+	// Market caps: no call here has one (TestWebMarketCaps has the values), so
+	// the USD rows all sort as "no value": by call id, in the direction asked for.
+	for _, s := range []string{"call_mc", "latest_mc"} {
+		if r := fx.wantOrder(t, "sort="+s, "gamma", "beta", "alpha"); !r.USDOnly || r.Total != 3 || r.Sort != s {
+			t.Fatalf("sort=%s %+v", s, r)
+		}
+		fx.wantOrder(t, "sort="+s+"&dir=asc", "alpha", "beta", "gamma")
+		if r := fx.wantOrder(t, "sort="+s+"&usd_only=0", "gave", "err", "pct", "sol", "xss", "virt", "gamma", "beta", "alpha"); r.USDOnly || r.Total != 9 {
+			t.Fatalf("sort=%s&usd_only=0 %+v", s, r)
+		}
+		for _, c := range fx.calls(t, "sort="+s+"&usd_only=0").Calls {
+			if c.CallMcapUSD != nil || c.LatestMcapUSD != nil {
+				t.Fatalf("a market cap without one in the post: %+v", c)
+			}
+		}
 	}
 
 	// Each horizon reads its own late-entry columns.
@@ -645,6 +668,7 @@ func TestWebBadRequestsAndMethods(t *testing.T) {
 	fx := newWebFixture(t, webConfig{GMGNTemplate: defaultGMGNTemplate})
 	for _, bad := range []string{
 		"sort=price", "sort=", "sort=DATE", "sort=return%20desc", "sort=date&sort=return",
+		"sort=mc", "sort=CALL_MC", "sort=call_mcap", "sort=call_mcap_usd", "sort=latest_mc%20desc", "sort=latest_mcap_usd", "sort=call_mc&sort=latest_mc",
 		"dir=up", "dir=", "dir=DESC", "dir=asc;--",
 		"horizon=2d", "horizon=", "horizon=1D", "horizon=1d%27", "horizon=30d%20OR%201=1",
 		"usd_only=yes", "usd_only=true", "usd_only=", "usd_only=2",

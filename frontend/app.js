@@ -101,6 +101,28 @@
     return '$' + v.toFixed(digits);
   }
 
+  // Market cap, compact: $850, $45.2k, $1.3M, $2.1B. A dash when there is none
+  // (or it is not a positive number). One decimal; a value that would round up
+  // to 1000 of a unit is written in the next one ($999,960 → $1.0M).
+  var MCAP_UNITS = [[1e3, 'k'], [1e6, 'M'], [1e9, 'B'], [1e12, 'T']];
+  function fmtMcap(v) {
+    if (!isNum(v) || v <= 0) { return DASH; }
+    if (v < 1) { return '<$1'; }
+    if (Math.round(v) < 1000) { return '$' + Math.round(v); }
+    for (var i = 0; i < MCAP_UNITS.length; i++) {
+      var body = (v / MCAP_UNITS[i][0]).toFixed(1);
+      if (Number(body) < 1000 || i === MCAP_UNITS.length - 1) { return '$' + body + MCAP_UNITS[i][1]; }
+    }
+    return DASH;
+  }
+
+  // A market cap cell; the exact amount (and what it is) on hover.
+  function mcapCell(v, what) {
+    var td = el('td', 'num mc', fmtMcap(v));
+    if (isNum(v) && v > 0) { td.title = what + ': $' + v.toLocaleString('en-US', { maximumFractionDigits: 0 }); }
+    return td;
+  }
+
   // Signed percentage: the sign is always written, so colour is never the only cue.
   function fmtPct(v) {
     if (!isNum(v)) { return DASH; }
@@ -195,16 +217,20 @@
     var unit = c.price_unit;
     if (typeof unit === 'string' && unit !== '' && unit !== 'usd') {
       // tracked, but in another asset: no number here would be in dollars
-      tr.appendChild(el('td', 'num', DASH));
+      tr.appendChild(el('td', 'num', DASH)); // entry
+      tr.appendChild(el('td', 'num', DASH)); // call market cap
       var td = el('td', 'center muted', 'no USD price');
       td.colSpan = 4; // return, peak, worst drop and latest
       tr.appendChild(td);
+      tr.appendChild(el('td', 'num', DASH)); // latest market cap
     } else {
       tr.appendChild(el('td', 'num', fmtPrice(c.entry_price_usd)));
+      tr.appendChild(mcapCell(c.call_mcap_usd, 'Market cap in the post'));
       tr.appendChild(pctCell(c.return_pct));
       tr.appendChild(pctCell(c.peak_pct));
       tr.appendChild(pctCell(c.drawdown_pct));
       tr.appendChild(latestCell(c));
+      tr.appendChild(mcapCell(c.latest_mcap_usd, 'Estimate (market cap in the post × latest price ÷ price at the post)'));
     }
 
     // Latest Perceptor report of the token; a dash when it was never scanned

@@ -30,6 +30,27 @@ func syntheticWebRows(n int, seed int64) []ScoutWebRow {
 	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 	rows := make([]ScoutWebRow, n)
 	lrng := rand.New(rand.NewSource(seed + 1000)) // the latest price has its own source, so the rest stays as it was
+	mrng := rand.New(rand.NewSource(seed + 2000)) // so do the market caps
+	// a market cap from the post: mostly one of few values (many ties), now and
+	// then missing, zero, negative or a number JSON cannot carry
+	mcap := func() *float64 {
+		var v float64
+		switch mrng.Intn(14) {
+		case 0, 1:
+			return nil
+		case 2:
+			v = 0
+		case 3:
+			v = -45000
+		case 4:
+			v = math.NaN()
+		case 5:
+			v = math.Inf(1)
+		default:
+			v = 5000 * float64(1+mrng.Intn(40))
+		}
+		return &v
+	}
 	for i := range rows {
 		r := &rows[i]
 		r.CallID = 10 + i*2
@@ -102,6 +123,23 @@ func syntheticWebRows(n int, seed int64) []ScoutWebRow {
 				r.LatestAt = nil
 			}
 		}
+		// market caps on every row (also the ones not tracked or not in USD,
+		// which must not show them) and the price at the post on tracked ones
+		r.CalledAtMcap, r.PostMcap = mcap(), mcap()
+		if r.Tracked {
+			p := 0.0001 * float64(1+mrng.Intn(20))
+			switch mrng.Intn(12) {
+			case 0:
+				r.PostPrice = nil
+			case 1:
+				r.PostPrice = new(float64) // zero
+			case 2:
+				nan := math.NaN()
+				r.PostPrice = &nan
+			default:
+				r.PostPrice = &p
+			}
+		}
 		if rng.Intn(4) == 0 {
 			r.PerceptorVerd = sp(verdicts[rng.Intn(len(verdicts))])
 			r.PerceptorURL = sp(fmt.Sprintf("https://www.perceptor.info/r/%032x", i))
@@ -111,6 +149,36 @@ func syntheticWebRows(n int, seed int64) []ScoutWebRow {
 		}
 	}
 	return rows
+}
+
+// refMcaps works out the two market caps of a raw row (as ScoutStore.SelectWebRows
+// returns it) the obvious way: call = called-at, else Mcap; latest = (Mcap, else
+// called-at) × latest price ÷ price at the post; nil unless every input is a
+// finite number above zero, the row is priced in USD and has a latest price
+// that is shown.
+func refMcaps(r *ScoutWebRow) (call, latest *float64) {
+	if r.PriceUnit == nil || *r.PriceUnit != "usd" {
+		return nil, nil
+	}
+	ok := func(p *float64) bool { return p != nil && *p > 0 && !math.IsInf(*p, 0) } // NaN > 0 is false
+	c := r.CalledAtMcap
+	if c == nil {
+		c = r.PostMcap
+	}
+	if ok(c) {
+		v := *c
+		call = &v
+	}
+	b := r.PostMcap
+	if b == nil {
+		b = r.CalledAtMcap
+	}
+	if r.LatestAt != nil && finite(r.LatestReturn) != nil && ok(r.LatestPrice) && ok(b) && ok(r.PostPrice) {
+		if v := *b * *r.LatestPrice / *r.PostPrice; ok(&v) {
+			latest = &v
+		}
+	}
+	return call, latest
 }
 
 // referencePage answers a request the slow, obvious way: filter every row, sort
@@ -150,6 +218,16 @@ func referencePage(rows []ScoutWebRow, f ScoutWebCallsFilter) (ids []int, total 
 				return 0, false
 			}
 			return *r.LatestReturn, true
+		}
+		if f.Sort == "call_mc" || f.Sort == "latest_mc" {
+			call, latest := refMcaps(r)
+			if f.Sort == "latest_mc" {
+				call = latest
+			}
+			if call == nil {
+				return 0, false
+			}
+			return *call, true
 		}
 		i := h * webPerfPerHorizon
 		if f.Sort == "peak" {
@@ -239,7 +317,7 @@ func TestWebSnapshotPageMatchesReference(t *testing.T) {
 		raw := syntheticWebRows(n, int64(n)+1)
 		snap := mustWebSnapshot(t, cloneWebRows(raw), 3, nil)
 		checked := 0
-		for _, sortBy := range []string{"date", "return", "peak", "latest"} {
+		for _, sortBy := range []string{"date", "return", "peak", "latest", "call_mc", "latest_mc"} {
 			for _, dir := range []string{"desc", "asc"} {
 				for _, hz := range ScoutWebHorizons {
 					for _, usdOnly := range []bool{false, true} {
@@ -260,13 +338,36 @@ func TestWebSnapshotPageMatchesReference(t *testing.T) {
 				}
 			}
 		}
-		if checked != 4*2*5*2*5*7*6 {
+		if checked != 6*2*5*2*5*7*6 {
 			t.Fatalf("checked %d combinations", checked)
+		}
+		// the market caps sent are the ones worked out the obvious way
+		withCall, withLatest := 0, 0
+		for i := range raw {
+			c := sentCall(t, snap, i, 1)
+			wantCall, wantLatest := refMcaps(&raw[i])
+			if fnum(c.CallMcapUSD) != fnum(wantCall) || fnum(c.LatestMcapUSD) != fnum(wantLatest) {
+				t.Fatalf("n=%d row %d: call_mcap_usd %s latest_mcap_usd %s, want %s %s", n, i,
+					fnum(c.CallMcapUSD), fnum(c.LatestMcapUSD), fnum(wantCall), fnum(wantLatest))
+			}
+			if wantCall != nil {
+				withCall++
+			}
+			if wantLatest != nil {
+				withLatest++
+			}
+		}
+		if n == 600 && (withCall < 100 || withLatest < 50) {
+			t.Fatalf("too few market caps to test: %d call, %d latest", withCall, withLatest)
 		}
 	}
 	snap := mustWebSnapshot(t, syntheticWebRows(20, 1), 0, nil)
 	for _, bad := range []ScoutWebCallsFilter{
 		{Sort: "price", Dir: "desc", Horizon: "1d", Page: 1, Per: 10},
+		{Sort: "call_mcap", Dir: "desc", Horizon: "1d", Page: 1, Per: 10},
+		{Sort: "CALL_MC", Dir: "desc", Horizon: "1d", Page: 1, Per: 10},
+		{Sort: "latest_mcap_usd", Dir: "desc", Horizon: "1d", Page: 1, Per: 10},
+		{Sort: "latest_mc", Dir: "up", Horizon: "1d", Page: 1, Per: 10},
 		{Sort: "date", Dir: "up", Horizon: "1d", Page: 1, Per: 10},
 		{Sort: "date", Dir: "desc", Horizon: "2d", Page: 1, Per: 10},
 		{Sort: "date", Dir: "desc", Horizon: "1d", Page: 0, Per: 10},
@@ -329,6 +430,77 @@ func TestWebSnapshotRowRules(t *testing.T) {
 	// NaN sorts as the highest value (as in the database) and is shown as no value
 	if ids, _ := pageIDs(t, snap, ScoutWebCallsFilter{Sort: "return", Dir: "desc", Horizon: "1d", Page: 1, Per: 10}); fmt.Sprint(ids) != "[1 3 2]" {
 		t.Fatalf("sort=return: %v", ids)
+	}
+
+	// The market caps: call = called-at, else Mcap; latest = (Mcap, else
+	// called-at) × latest price ÷ price at the post (not the late entry).
+	f := func(v float64) *float64 { return &v }
+	at := time.Date(2026, 9, 2, 0, 0, 0, 0, time.UTC)
+	usd := sp("usd")
+	cases := []struct {
+		name                       string
+		unit                       *string
+		calledAt, mcap, post, late *float64
+		ret, price                 *float64
+		readAt                     *time.Time
+		wantCall, wantLatest       string
+	}{
+		{"both (Mcap line first; at-post price, not the late entry)", usd, f(40000), f(50000), f(0.002), f(0.003), f(10), f(0.004), &at, "40000", "100000"},
+		{"no called-at", usd, nil, f(50000), f(0.002), nil, f(10), f(0.001), &at, "50000", "25000"},
+		{"no Mcap line", usd, f(40000), nil, f(0.002), nil, f(10), f(0.001), &at, "40000", "20000"},
+		{"called-at 0: no fallback", usd, f(0), f(50000), f(0.002), nil, f(10), f(0.004), &at, "null", "100000"},
+		{"called-at negative", usd, f(-1), f(50000), f(0.002), nil, f(10), f(0.004), &at, "null", "100000"},
+		{"called-at NaN", usd, f(nan), nil, f(0.002), nil, f(10), f(0.004), &at, "null", "null"},
+		{"called-at +Inf", usd, f(inf), nil, f(0.002), nil, f(10), f(0.004), &at, "null", "null"},
+		{"Mcap line 0", usd, f(40000), f(0), f(0.002), nil, f(10), f(0.004), &at, "40000", "null"},
+		{"Mcap line -Inf", usd, f(40000), f(math.Inf(-1)), f(0.002), nil, f(10), f(0.004), &at, "40000", "null"},
+		{"no price at the post (late entry only)", usd, f(40000), f(50000), nil, f(0.003), f(10), f(0.004), &at, "40000", "null"},
+		{"price at the post 0", usd, f(40000), f(50000), f(0), nil, f(10), f(0.004), &at, "40000", "null"},
+		{"price at the post NaN", usd, f(40000), f(50000), f(nan), nil, f(10), f(0.004), &at, "40000", "null"},
+		{"latest price 0", usd, f(40000), f(50000), f(0.002), nil, f(10), f(0), &at, "40000", "null"},
+		{"latest price negative", usd, f(40000), f(50000), f(0.002), nil, f(10), f(-0.004), &at, "40000", "null"},
+		{"latest price +Inf", usd, f(40000), f(50000), f(0.002), nil, f(10), f(inf), &at, "40000", "null"},
+		{"no latest price", usd, f(40000), f(50000), f(0.002), nil, nil, nil, nil, "40000", "null"},
+		{"latest price without the time it was read", usd, f(40000), f(50000), f(0.002), nil, f(10), f(0.004), nil, "40000", "null"},
+		{"latest return NaN", usd, f(40000), f(50000), f(0.002), nil, f(nan), f(0.004), &at, "40000", "null"},
+		{"too large", usd, f(1e300), nil, f(1e-300), nil, f(10), f(1e10), &at, "1e+300", "null"},
+		{"not in USD", sp("VIRT"), f(40000), f(50000), f(0.002), nil, f(10), f(0.004), &at, "null", "null"},
+		{"no price unit", nil, f(40000), f(50000), f(0.002), nil, f(10), f(0.004), &at, "null", "null"},
+		{"nothing from the post", usd, nil, nil, f(0.002), nil, f(10), f(0.004), &at, "null", "null"},
+	}
+	var mrows []ScoutWebRow
+	for i, c := range cases {
+		entry := c.late // the late entry, else the price at the post
+		if entry == nil {
+			entry = c.post
+		}
+		mrows = append(mrows, ScoutWebRow{CallID: 100 + i, MessageID: 1, MessageDate: at.Add(-time.Hour), ChannelUsername: "scoutrobinhood",
+			ContractAddress: caAlpha, PriceUnit: c.unit, EntryPrice: entry, Tracked: true, CallCount: 1,
+			CalledAtMcap: c.calledAt, PostMcap: c.mcap, PostPrice: c.post, LatestReturn: c.ret, LatestPrice: c.price, LatestAt: c.readAt})
+	}
+	msnap := mustWebSnapshot(t, mrows, 0, nil)
+	for i, c := range cases {
+		got := sentCall(t, msnap, i, 1)
+		if fnum(got.CallMcapUSD) != c.wantCall || fnum(got.LatestMcapUSD) != c.wantLatest {
+			t.Errorf("%s: call_mcap_usd %s latest_mcap_usd %s, want %s %s", c.name, fnum(got.CallMcapUSD), fnum(got.LatestMcapUSD), c.wantCall, c.wantLatest)
+		}
+		// the reference of TestWebSnapshotPageMatchesReference agrees
+		if a, b := refMcaps(&ScoutWebRow{PriceUnit: c.unit, CalledAtMcap: c.calledAt, PostMcap: c.mcap, PostPrice: c.post,
+			LatestReturn: c.ret, LatestPrice: c.price, LatestAt: c.readAt}); fnum(a) != c.wantCall || fnum(b) != c.wantLatest {
+			t.Errorf("%s: the reference gives %s %s", c.name, fnum(a), fnum(b))
+		}
+	}
+	// by value (ties: the higher call id first), the rows without one last in both directions
+	for q, want := range map[[2]string]string{
+		{"call_mc", "desc"}:   "[118 101 117 116 115 114 113 112 111 110 109 108 107 102 100 121 120 119 106 105 104 103]",
+		{"call_mc", "asc"}:    "[100 102 107 108 109 110 111 112 113 114 115 116 117 101 118 103 104 105 106 119 120 121]",
+		{"latest_mc", "desc"}: "[104 103 100 101 102 121 120 119 118 117 116 115 114 113 112 111 110 109 108 107 106 105]",
+		{"latest_mc", "asc"}:  "[102 101 100 103 104 105 106 107 108 109 110 111 112 113 114 115 116 117 118 119 120 121]",
+	} {
+		ids, total := pageIDs(t, msnap, ScoutWebCallsFilter{Sort: q[0], Dir: q[1], Horizon: "1d", Page: 1, Per: 50})
+		if fmt.Sprint(ids) != want || total != len(cases) {
+			t.Errorf("sort=%s dir=%s: %v (total %d), want %s", q[0], q[1], ids, total, want)
+		}
 	}
 }
 
@@ -467,6 +639,24 @@ func TestWebSnapshotVersion(t *testing.T) {
 	change("latest trade at", 5, func(rows []ScoutWebRow) { v := rows[4].LatestTradeAt.Add(-time.Hour); rows[4].LatestTradeAt = &v })
 	change("latest trade unknown", 5, func(rows []ScoutWebRow) { rows[4].LatestTradeAt = nil })
 	change("no latest price", 5, func(rows []ScoutWebRow) { rows[4].LatestAt = nil })
+	// the market caps: a USD row with both, from both figures of the post
+	m := -1
+	for i := range raw {
+		r := &raw[i]
+		if call, latest := refMcaps(r); call != nil && latest != nil && positive(r.CalledAtMcap) != nil && positive(r.PostMcap) != nil {
+			m = i
+			break
+		}
+	}
+	if m < 0 {
+		t.Fatal("no row with both market caps to change")
+	}
+	scaled := func(p *float64, k float64) *float64 { v := *p * k; return &v }
+	change("called-at market cap", 5, func(rows []ScoutWebRow) { rows[m].CalledAtMcap = scaled(rows[m].CalledAtMcap, 2) })
+	change("Mcap line", 5, func(rows []ScoutWebRow) { rows[m].PostMcap = scaled(rows[m].PostMcap, 3) })
+	change("price at the post", 5, func(rows []ScoutWebRow) { rows[m].PostPrice = scaled(rows[m].PostPrice, 4) })
+	change("no market caps", 5, func(rows []ScoutWebRow) { rows[m].CalledAtMcap, rows[m].PostMcap = nil, nil })
+	change("called-at only", 5, func(rows []ScoutWebRow) { rows[m].PostMcap = nil })
 	// … and one that the page does not show changes nothing: a latest price of a call not priced in USD
 	other := cloneWebRows(raw)
 	changed := false
@@ -478,6 +668,31 @@ func TestWebSnapshotVersion(t *testing.T) {
 	}
 	if c := mustWebSnapshot(t, other, 5, a); !changed || c.version != a.version {
 		t.Fatalf("a latest price outside USD (changed %v): version %q, want %q", changed, c.version, a.version)
+	}
+	// … nor do market caps of calls not priced in USD, nor a price at the post
+	// that no latest market cap uses
+	other = cloneWebRows(raw)
+	mcChanged, postChanged := 0, 0
+	for i := range other {
+		r := &other[i]
+		if r.PriceUnit == nil || *r.PriceUnit != "usd" {
+			v, w := 123456.0, 654321.0
+			r.CalledAtMcap, r.PostMcap = &v, &w
+			mcChanged++
+			continue
+		}
+		if _, latest := refMcaps(r); latest == nil && r.PostPrice != nil {
+			v := 0.5
+			r.PostPrice = &v
+			if _, latest := refMcaps(r); latest == nil {
+				postChanged++
+			} else {
+				r.PostPrice = raw[i].PostPrice
+			}
+		}
+	}
+	if c := mustWebSnapshot(t, other, 5, a); mcChanged == 0 || postChanged == 0 || c.version != a.version {
+		t.Fatalf("market caps outside USD (%d rows), unused prices at the post (%d rows): version %q, want %q", mcChanged, postChanged, c.version, a.version)
 	}
 }
 
@@ -673,6 +888,8 @@ var benchWebQueries = []struct{ name, query string }{
 	{"default", ""},
 	{"sort_return", "sort=return"},
 	{"sort_latest", "sort=latest"},
+	{"sort_call_mc", "sort=call_mc"},
+	{"sort_latest_mc", "sort=latest_mc"},
 	{"q", "q=pe"},
 	{"verdict", "verdict=clean"},
 	{"q_verdict_peak", "q=pe&verdict=clean&sort=peak"},

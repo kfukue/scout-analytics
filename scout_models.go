@@ -266,10 +266,23 @@ type ScoutWebRow struct {
 	LatestPrice   *float64
 	LatestAt      *time.Time
 	LatestTradeAt *time.Time
+	// Market caps from the post (scout_call_metrics, USD): the "called at" figure
+	// and the "Mcap" line; and the price at the post (scout_call_tracking.entry_price_usd,
+	// not the late entry), the divisor of the latest market cap estimate.
+	CalledAtMcap *float64
+	PostMcap     *float64
+	PostPrice    *float64
 
 	// worked out by the website when it builds its snapshot (websnapshot.go)
 	usd     bool  // priced in USD: only then are the numbers shown
 	verdict uint8 // webBucket…: where the Perceptor filter puts the token
+	// callMcap: CalledAtMcap, else PostMcap. latestMcap: an estimate,
+	// (PostMcap, else CalledAtMcap) × LatestPrice ÷ PostPrice. Both nil unless
+	// every input is there, positive and finite and the call is priced in USD.
+	// They point into mcapVals (set by setWebMcaps).
+	callMcap   *float64
+	latestMcap *float64
+	mcapVals   [2]float64
 }
 
 // ScoutWebCall is one row of the website's call list as sent to the page:
@@ -307,13 +320,21 @@ type ScoutWebCall struct {
 	LatestAt         *time.Time `json:"latest_at"`          // when the price was read (it is "as of" this time)
 	LatestTradeAt    *time.Time `json:"latest_trade_at"`    // the last trade the price comes from
 	LatestAgeSeconds *int64     `json:"latest_age_seconds"` // age of the call at LatestAt
+	// Market cap at the call, from the post ("called at", else the "Mcap"
+	// line), and an estimate of the market cap at the latest price: the post's
+	// market cap ("Mcap" line, else "called at") × latest price ÷ price at the
+	// post (assumes the token supply has not changed). nil when an input is
+	// missing, zero, negative or not finite, and for calls not priced in USD;
+	// LatestMcapUSD also when there is no latest price.
+	CallMcapUSD   *float64 `json:"call_mcap_usd"`
+	LatestMcapUSD *float64 `json:"latest_mcap_usd"`
 }
 
 // ScoutWebCallsFilter selects a page of the call list (first calls only). Sort, Dir, Horizon and Verdict
 // must be values of the fixed lists below (parseWebCallsQuery checks them; the snapshot rejects anything else).
 type ScoutWebCallsFilter struct {
 	Q       string // substring of token name, symbol or contract address ("" = all)
-	Sort    string // date | return | peak | latest
+	Sort    string // date | return | peak | latest | call_mc | latest_mc
 	Dir     string // desc | asc
 	Horizon string // 1h | 1d | 3d | 7d | 30d
 	USDOnly bool   // only calls priced in USD

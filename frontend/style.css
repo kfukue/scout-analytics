@@ -127,7 +127,7 @@ td.calls { color: var(--muted); }
 .pos { color: var(--pos); }
 .neg { color: var(--neg); }
 .age { color: var(--muted); font-size: 12px; }
-td.latest { cursor: default; }
+td.latest, td.mc { cursor: default; }
 .flag { color: var(--neg); font-weight: 600; }
 /* Perceptor verdicts: different words, and red flags is the heaviest (bold, boxed) */
 .pv-clean { color: var(--pos); }

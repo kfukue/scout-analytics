@@ -765,8 +765,9 @@ other sites):
   database.
 - **Calls** — Date (links to the post), Token and Symbol (link to GMGN), Calls (`×N` when the
   token was called N > 1 times, empty otherwise; hover for "Called N times, last on …"),
-  Entry $, Return %, Peak %, Worst drop %, Perceptor, Status. Search by token name, symbol or address; pick the window
-  (1h, 1d, 3d, 7d, 30d); click Date / Return / Peak to sort, click again to reverse. 50 per page.
+  Entry $, Call MC, Return %, Peak %, Worst drop %, Latest %, Latest MC, Perceptor, Status. Search by
+  token name, symbol or address; pick the window (1h, 1d, 3d, 7d, 30d); click Date / Call MC /
+  Return / Peak / Latest / Latest MC to sort, click again to reverse. 50 per page.
 - **Perceptor** — the column shows the verdict of the token's Perceptor report as words:
   "no red flags", "caution", "red flags" (linked to the report, in a new tab), or "–" when
   there is none. The "Perceptor" select next to the search box filters the list: All reports,
@@ -781,7 +782,8 @@ other sites):
   verdict could not be read counts as not scanned.
 - Every number is **in USD and measured from the entry 60 seconds after the post** (the
   `*_late_*` columns). A call tracked in another asset (no USD source for its pair) shows
-  "no USD price" instead of numbers. Sorting by Return, Peak or Latest lists the USD-priced calls only.
+  "no USD price" instead of numbers (and a dash in both market cap columns). Sorting by Return,
+  Peak, Latest, Call MC or Latest MC lists the USD-priced calls only.
 - **Latest %** (the column after "Worst drop %") is the return at the most recent price,
   from the same entry, followed by how old the call was when that price was read:
   `+35.2% · 60d` (`45m` under an hour, `30h` under two days, otherwise days). It comes from
@@ -789,6 +791,15 @@ other sites):
   a day for older ones) and does not change with the 1h … 30d buttons. `· quiet` is added
   when the last trade is more than 7 days older than the reading (the price is then that of
   an old trade); the tooltip gives both times. A dash means no latest price has been read yet.
+- **Call MC** (after "Entry $") is the market cap given in the call post: its "called at"
+  figure, or its "📈 Mcap" line when the post has no "called at" (`scout_call_metrics`).
+  **Latest MC** (after "Latest %") is an **estimate**, since the latest market cap is not
+  stored: the post's market cap (the Mcap line first, else "called at") × the latest price ÷
+  the price at the post. It assumes the token supply has not changed. Both are written
+  compactly (`$850`, `$45.2k`, `$1.3M`, `$2.1B`); hover for the exact amount. A dash when the
+  post gave no usable market cap, when there is no latest price (Latest MC), and for calls not
+  priced in USD. The legend under the table says that Latest MC is an estimate and how it is
+  worked out.
 
 **Token names.** The tracker reads each token's own `name()` and `symbol()` from its contract
 and stores them in `scout_call_tracking.token_name` / `token_symbol_onchain` (on-chain price
@@ -834,10 +845,10 @@ returned and cannot be found by its own name or symbol:
 | Parameter | Values | Default | |
 |---|---|---|---|
 | `q` | text, up to 100 characters | *(none)* | part of the token name, symbol or contract address; case-insensitive (letters of any script, by the Unicode lower-case rule); `%` and `_` are ordinary characters |
-| `sort` | `date`, `return`, `peak`, `latest` | `date` | empty values always come last; ties by call id. `latest` = by `latest_return_pct` (the same for every `horizon`) |
+| `sort` | `date`, `return`, `peak`, `latest`, `call_mc`, `latest_mc` | `date` | empty values always come last (in both directions); ties by call id, in the direction asked for. `latest` = by `latest_return_pct`, `call_mc` = by `call_mcap_usd`, `latest_mc` = by `latest_mcap_usd` (these three are the same for every `horizon`) |
 | `dir` | `desc`, `asc` | `desc` | |
 | `horizon` | `1h`, `1d`, `3d`, `7d`, `30d` | `1d` | which window `return_pct` / `peak_pct` / `drawdown_pct` are for |
-| `usd_only` | `1`, `0` | `1` when `sort` is `return`, `peak` or `latest`, else `0` | `1` = only tokens whose first call has `price_unit = usd` |
+| `usd_only` | `1`, `0` | `1` when `sort` is `return`, `peak`, `latest`, `call_mc` or `latest_mc`, else `0` | `1` = only tokens whose first call has `price_unit = usd` |
 | `verdict` | `clean`, `caution`, `red_flags`, `not_scanned` | *(none = all)* | the token's Perceptor verdict (see below). `clean` = no red flags found; `not_scanned` = no completed Perceptor report, or one whose verdict is `unknown` |
 | `page` | 1 … | `1` | |
 | `per` | 1 – 200 | `50` | |
@@ -857,7 +868,7 @@ Any other value or parameter → HTTP 400 with `{"error": "…"}`.
    "call_count": 3, "last_call_date": "2026-10-02T09:12:00Z",
    "latest_return_pct": 35.2, "latest_price_usd": 0.006084,
    "latest_at": "2026-11-30T14:31:10.52Z", "latest_trade_at": "2026-11-30T13:02:44Z",
-   "latest_age_seconds": 5184070}]}
+   "latest_age_seconds": 5184070, "call_mcap_usd": 45200, "latest_mcap_usd": 61110.4}]}
 ```
 `call_count` = how many real calls of that token exist in total (1 or more; update posts are
 not counted); `last_call_date` = the date of the most recent one (equal to `message_date` when there is only one). Everything else
@@ -875,6 +886,24 @@ the tracker has read a latest price for the call, and always for calls whose `pr
 not `usd`. A new reading changes the `ETag` of `/api/calls` (the age moves even when the
 price does not), so with the tracker running the list is "modified" about once per tracker
 cycle; `/api/summary` is not affected.
+
+`call_mcap_usd` and `latest_mcap_usd` are the last two fields of a call (in USD, from
+`scout_call_metrics` of the first call and its `scout_call_tracking` row):
+
+- `call_mcap_usd` = `COALESCE(called_at_mcap_usd, mcap_usd)`: the market cap at the call as
+  given in the post.
+- `latest_mcap_usd` = `COALESCE(mcap_usd, called_at_mcap_usd) × latest_price_usd ÷
+  entry_price_usd`, where `entry_price_usd` is the tracking row's price **at the post**
+  (not the late entry the `entry_price_usd` field of the response shows; the post's market cap
+  is a post-time figure). An **estimate** that assumes the token supply has not changed; the
+  latest market cap itself is not stored.
+
+Both are `null` when the call's `price_unit` is not `usd`, and when an input (the market cap
+`COALESCE` picked, the latest price or the price at the post) is missing, zero, negative or
+not finite, or the result is not finite. `COALESCE` only skips a missing value: a "called at"
+of 0 gives `call_mcap_usd = null`, not the Mcap line. `latest_mcap_usd` is also `null` whenever
+`latest_price_usd` is (no latest price yet). Like the latest price, they do not depend on
+`horizon`, and a change to either value changes the `ETag` of `/api/calls`.
 
 `snapshot_at` = when the website last read the database (the same moment as `updated_at` of
 `/api/summary`). `verdict` in the response repeats the filter that was applied (`""` when none).
