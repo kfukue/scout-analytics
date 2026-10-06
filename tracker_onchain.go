@@ -135,6 +135,9 @@ func (s *scanner) trackOneOnchain(ctx context.Context, t *ScoutCallTracking, pos
 			fail(TrackError, err, time.Hour)
 			return
 		}
+		if st.RugBlock > 0 {
+			log.Printf("%s: pool drained before the call (block %d) — rugged from the start (-100%%)", tag, st.RugBlock)
+		}
 	}
 	if t.EntryPriceUSD == nil {
 		q, ok, err := o.quoteUSD(ctx, st.Quote, st.EntryBlock)
@@ -154,6 +157,13 @@ func (s *scanner) trackOneOnchain(ctx context.Context, t *ScoutCallTracking, pos
 			log.Printf("%s: entry price $%.6g (%.6g %s × $%.6g, %s)", tag, p, st.EntryPriceQ, st.QuoteSym, q, o.quoteSource(st.Quote))
 		} else {
 			log.Printf("%s: entry price %.6g %s (no USD source for %s — tracked in %s)", tag, p, st.QuoteSym, st.QuoteSym, st.QuoteSym)
+		}
+		// The pool's quote side already under the rug threshold at entry:
+		// rugged from the start.
+		if st.RugBlock == 0 && st.EntryLiqQ > 0 && st.EntryQuoteUSD > 0 && st.EntryLiqQ*st.EntryQuoteUSD < o.cfg.RugLiqUSD {
+			liq := st.EntryLiqQ * st.EntryQuoteUSD
+			st.RugBlock, st.RugLiquidityUSD = st.EntryBlock, &liq
+			log.Printf("%s: pool quote side ~$%.4g at the call, under $%.0f — rugged from the start (-100%%)", tag, liq, o.cfg.RugLiqUSD)
 		}
 	}
 	inUSD := t.PriceUnit != nil && *t.PriceUnit == "usd"
@@ -183,7 +193,8 @@ func (s *scanner) trackOneOnchain(ctx context.Context, t *ScoutCallTracking, pos
 
 	// 3. Horizons, in order, each scanned once.
 	var next time.Time
-	var lastQ float64 = 1
+	var lastQ float64 = 1 // the quote's USD price at the last horizon computed in this run
+	var lastQKnown bool   // lastQ was read in this run
 	for _, h := range s.pc.Horizons {
 		due := t.EntryAt.Add(h.Dur)
 		if st.Done[h.Name] {
@@ -192,6 +203,14 @@ func (s *scanner) trackOneOnchain(ctx context.Context, t *ScoutCallTracking, pos
 		if now.Before(due) {
 			if next.IsZero() || due.Before(next) {
 				next = due
+			}
+			continue
+		}
+		if st.RugBlock > 0 && st.RugBlock <= st.ScanBlock {
+			// The pool was drained before this horizon's end (horizons are in
+			// order): -100%, nothing to read from the node.
+			if !s.saveHorizonOnchain(ctx, t, st, h, due, entryQ, 0, true, fail, tag) {
+				return
 			}
 			continue
 		}
@@ -249,8 +268,11 @@ func (s *scanner) trackOneOnchain(ctx context.Context, t *ScoutCallTracking, pos
 			fail(TrackError, fmt.Errorf("candles to +%s: %w", h.Name, err), backoff(t.Attempts))
 			return
 		}
+		// Drained at or before this horizon's end (found by this scan, or ahead
+		// of it by the latest pass): -100%, no USD rate needed.
+		rugged := st.RugBlock > 0 && st.RugBlock <= hBlock
 		q := 1.0
-		if inUSD {
+		if inUSD && !rugged {
 			var ok bool
 			if q, ok, err = o.quoteUSD(ctx, st.Quote, hBlock); err != nil || !ok {
 				if err == nil {
@@ -259,45 +281,16 @@ func (s *scanner) trackOneOnchain(ctx context.Context, t *ScoutCallTracking, pos
 				fail(TrackError, fmt.Errorf("USD price of %s at +%s: %w", st.QuoteSym, h.Name, err), backoff(t.Attempts))
 				return
 			}
+			lastQ, lastQKnown = q, true
 		}
-		lastQ = q
-		entry := *t.EntryPriceUSD
-		// Peak and low since the call, each trade valued at its own hour's rate.
-		hiU, loU := math.Max(st.RunMaxU, entry), entry
-		if st.RunMinU > 0 && st.RunMinU < loU {
-			loU = st.RunMinU
-		}
-		r := horizonResult{Horizon: h.Name, DueAt: due, Status: "done",
-			PriceUSD: st.LastPriceQ * q, MaxPriceUSD: hiU, MinPriceUSD: loU}
-		r.ReturnPct = (r.PriceUSD/entry - 1) * 100
-		r.MaxGainPct = (r.MaxPriceUSD/entry - 1) * 100
-		r.MaxDDPct = (r.MinPriceUSD/entry - 1) * 100
-		// The same, measured from the realistic entry: the pool price EntryDelay
-		// after the post, and only what happened after it.
-		if st.LatePriceQ > 0 {
-			late := st.LatePriceQ * entryQ
-			t.EntryLatePriceUSD = &late
-			hi, lo := math.Max(st.RunMaxLateU, late), late
-			if st.RunMinLateU > 0 && st.RunMinLateU < lo {
-				lo = st.RunMinLateU
-			}
-			rl, gl, dl := (r.PriceUSD/late-1)*100, (hi/late-1)*100, (lo/late-1)*100
-			r.ReturnLatePct, r.MaxGainLatePct, r.MaxDDLatePct = &rl, &gl, &dl
-		}
-		if st.LastPriceBlock > st.EntryBlock {
-			if ts, err := o.rpc.blockTime(ctx, st.LastPriceBlock); err == nil {
-				lt := time.Unix(ts, 0).UTC()
-				r.LastTradeAt = &lt
-			}
-		}
-		if err := s.db.UpsertReturn(ctx, t.CallID, h, r); err != nil {
-			fail(TrackError, fmt.Errorf("save %s: %w", h.Name, err), backoff(t.Attempts))
+		if !s.saveHorizonOnchain(ctx, t, st, h, due, entryQ, q, rugged, fail, tag) {
 			return
 		}
-		st.Done[h.Name] = true
-		cur := r.PriceUSD
-		t.CurrentPriceUSD = &cur
-		log.Printf("%s: +%s → %.6g (%+.1f%%), peak %+.1f%%, low %+.1f%%", tag, h.Name, r.PriceUSD, r.ReturnPct, r.MaxGainPct, r.MaxDDPct)
+	}
+
+	// A rugged call is flagged at once, without waiting for the last horizon.
+	if st.RugBlock > 0 {
+		s.flagRugged(t, st)
 	}
 
 	// 4. Schedule the next horizon, or finish.
@@ -306,18 +299,114 @@ func (s *scanner) trackOneOnchain(ctx context.Context, t *ScoutCallTracking, pos
 		t.NextCheckAt = next.Add(2 * time.Minute)
 		return
 	}
-	rug := t.CurrentPriceUSD != nil && *t.CurrentPriceUSD < *t.EntryPriceUSD*0.05
-	if inUSD {
-		if liq, ok := o.liquidityUSD(ctx, st, lastQ); ok {
-			t.CurrentLiquidityUSD = &liq
-			if liq < s.pc.RugLiqUSD {
+	rug := st.RugBlock > 0 || (t.CurrentPriceUSD != nil && *t.CurrentPriceUSD < *t.EntryPriceUSD*0.05)
+	if inUSD && st.RugBlock == 0 && !lastQKnown {
+		// Every horizon was computed by an earlier run (interrupted before
+		// the row was finished): lastQ is not the quote's USD price yet.
+		if q, ok, err := o.quoteUSD(ctx, st.Quote, latest); err == nil && ok {
+			lastQ, lastQKnown = q, true
+		}
+	}
+	if inUSD && st.RugBlock == 0 && lastQKnown {
+		// The quote side is compared with the threshold, like the price
+		// events; the column keeps the pool's depth (2 × the quote side).
+		if quoteSide, ok := o.liquidityUSD(ctx, st, lastQ); ok {
+			depth := poolDepthUSD(quoteSide)
+			t.CurrentLiquidityUSD = &depth
+			// An empty quote side always counts, even with the USD check
+			// off (SCOUT_RUG_LIQ_USD=0), like a drained price event.
+			if quoteSide == 0 || quoteSide < o.cfg.RugLiqUSD {
+				// Drained after the last horizon: the horizons stay, the latest
+				// return becomes -100% from now on.
 				rug = true
+				st.RugBlock, st.RugLiquidityUSD = latest, &quoteSide
 			}
 		}
 	}
 	t.Rugged = &rug
 	t.Status = TrackDone
 	t.NextCheckAt = now
+}
+
+// flagRugged marks a call whose pool was drained: rugged, and, when the quote
+// side at the rug is known, current_liquidity_usd = the pool's depth then
+// (poolDepthUSD: 2 × the quote side, the column's meaning).
+func (s *scanner) flagRugged(t *ScoutCallTracking, st *onchainState) {
+	yes := true
+	t.Rugged = &yes
+	if st.RugLiquidityUSD != nil {
+		depth := poolDepthUSD(*st.RugLiquidityUSD)
+		t.CurrentLiquidityUSD = &depth
+	}
+}
+
+// onchainHorizon computes one horizon's result from the running state. entry is
+// the entry price in the price unit, entryQ the quote → price-unit rate at the
+// call and q the rate at the horizon's end. rugged: the pool was drained at or
+// before the horizon's end; the price is then 0 (the token can no longer be
+// sold), the return and the low are -100% and the peak is the one reached
+// before the rug (the running extremes never include the rug or anything after
+// it). late is the realistic entry price (nil when there is none).
+func onchainHorizon(st *onchainState, name string, due time.Time, entry, entryQ, q float64, rugged bool) (r horizonResult, late *float64) {
+	price := st.LastPriceQ * q
+	// Peak and low since the call, each trade valued at its own hour's rate.
+	hiU, loU := math.Max(st.RunMaxU, entry), entry
+	if st.RunMinU > 0 && st.RunMinU < loU {
+		loU = st.RunMinU
+	}
+	if rugged {
+		price, loU = 0, 0
+	}
+	r = horizonResult{Horizon: name, DueAt: due, Status: "done", PriceUSD: price, MaxPriceUSD: hiU, MinPriceUSD: loU}
+	r.ReturnPct = (r.PriceUSD/entry - 1) * 100
+	r.MaxGainPct = (r.MaxPriceUSD/entry - 1) * 100
+	r.MaxDDPct = (r.MinPriceUSD/entry - 1) * 100
+	// The same, measured from the realistic entry: the pool price EntryDelay
+	// after the post, and only what happened after it.
+	if st.LatePriceQ > 0 {
+		lp := st.LatePriceQ * entryQ
+		late = &lp
+		hi, lo := math.Max(st.RunMaxLateU, lp), lp
+		if st.RunMinLateU > 0 && st.RunMinLateU < lo {
+			lo = st.RunMinLateU
+		}
+		if rugged {
+			lo = 0
+		}
+		rl, gl, dl := (r.PriceUSD/lp-1)*100, (hi/lp-1)*100, (lo/lp-1)*100
+		r.ReturnLatePct, r.MaxGainLatePct, r.MaxDDLatePct = &rl, &gl, &dl
+	}
+	return r, late
+}
+
+// saveHorizonOnchain stores one horizon's result (see onchainHorizon) and marks
+// it done. On a database error it calls fail and returns false.
+func (s *scanner) saveHorizonOnchain(ctx context.Context, t *ScoutCallTracking, st *onchainState, h horizon, due time.Time,
+	entryQ, q float64, rugged bool, fail func(string, error, time.Duration), tag string) bool {
+	r, late := onchainHorizon(st, h.Name, due, *t.EntryPriceUSD, entryQ, q, rugged)
+	if late != nil {
+		t.EntryLatePriceUSD = late
+	}
+	if st.LastPriceBlock > st.EntryBlock {
+		if ts, err := s.onchain.rpc.blockTime(ctx, st.LastPriceBlock); err == nil {
+			lt := time.Unix(ts, 0).UTC()
+			r.LastTradeAt = &lt
+		}
+	}
+	if err := s.db.UpsertReturn(ctx, t.CallID, h, r); err != nil {
+		fail(TrackError, fmt.Errorf("save %s: %w", h.Name, err), backoff(t.Attempts))
+		return false
+	}
+	st.Done[h.Name] = true
+	cur := r.PriceUSD
+	t.CurrentPriceUSD = &cur
+	if rugged {
+		log.Printf("%s: +%s → rugged at block %d (pool quote side under $%.0f): -100%%, peak before the rug %+.1f%%",
+			tag, h.Name, st.RugBlock, s.onchain.cfg.RugLiqUSD, r.MaxGainPct)
+	} else {
+		log.Printf("%s: +%s → %.6g (%+.1f%%), peak %+.1f%%, low %+.1f%%", tag, h.Name, r.PriceUSD, r.ReturnPct, r.MaxGainPct, r.MaxDDPct)
+	}
+	return true
 }
 
 // heartbeatEvery is how often a call that is still being worked on says so.

@@ -45,9 +45,10 @@ func TestWebMarketCaps(t *testing.T) {
 		return hdr.Get("ETag")
 	}
 
-	// before any market cap: the two fields are there, last in the row, and null
+	// before any market cap: the two fields are there, after the latest price and before the
+	// report fields, and null
 	if code, _, body := fx.get(t, "/api/calls?usd_only=0"); code != 200 ||
-		strings.Count(string(body), `"latest_age_seconds":null,"call_mcap_usd":null,"latest_mcap_usd":null}`) != 9 {
+		strings.Count(string(body), `"latest_age_seconds":null,"call_mcap_usd":null,"latest_mcap_usd":null,"has_salpha_report":`) != 9 {
 		t.Fatalf("the market cap fields of rows without one: %d %s", code, body)
 	}
 	tagBefore, sumBefore := etagOf("/api/calls?sort=call_mc"), etagOf("/api/summary")

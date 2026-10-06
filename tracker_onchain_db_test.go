@@ -64,7 +64,15 @@ func runTrackerOnchain(t *testing.T, mode string) {
 	setup(young, poolY, tWETH, eYoung, map[uint64]float64{500: 1e-6, 1000 + 20000: 5e-6, 1000 + 30000: 2e-6, 1000 + 2*day: 3e-6})
 	setup(old, poolO, tWETH, eOld, map[uint64]float64{500: 1e-6, 1000 + 20000: 4e-6, 1000 + 5*day: 2e-6, 1000 + 11*day: 1e-8})
 	setup(nostock, poolN, stock, eNo, map[uint64]float64{500: 2e-5, 1000 + 20000: 3e-5, 1000 + day/2: 6e-5})
-	f.constCall(tWETH, selBalanceOf, ret(w32(wei(0.05)))) // 0.05 WETH left in the pool → ~$300 liquidity
+	// 0.05 WETH left in the pool: $150 of quote side (stored as $300, 2 × it).
+	// "archive" keeps the $500 default (under it: rugged by the end check too);
+	// "full" and "mainnet" set SCOUT_RUG_LIQ_USD=100 (above it: price rule only).
+	f.constCall(tWETH, selBalanceOf, ret(w32(wei(0.05))))
+	rugLiqEnv := "100"
+	if mode == "archive" {
+		rugLiqEnv = ""
+	}
+	t.Setenv("SCOUT_RUG_LIQ_USD", rugLiqEnv)
 
 	t.Setenv("SCOUT_PRICE_SOURCE", "onchain")
 	t.Setenv("SCOUT_RPC_URL", f.srv.URL)
@@ -123,11 +131,23 @@ func runTrackerOnchain(t *testing.T, mode string) {
 		t.Fatalf("young state: %+v", os)
 	}
 
-	// old: all horizons done; -99% at 30d, liquidity ~$300 < $500 → rugged
+	// old: all horizons done; -99% at 30d → rugged by the price rule (< 5% of
+	// entry). The end check reads $150 of quote side: under the $500 default
+	// it is a rug too (rug block set, latest -100% from now on); above a $100
+	// threshold it is not. Either way the column stores the depth, $300.
 	to, _ := st.GetTracking(ctx, ids[1])
 	ro, _ := st.ReturnsForCall(ctx, ids[1])
 	if to.Status != TrackDone || to.Rugged == nil || !*to.Rugged || len(ro) != 5 || to.CurrentLiquidityUSD == nil || math.Abs(*to.CurrentLiquidityUSD-300) > 1e-6 {
 		t.Fatalf("old: %+v returns %v", to, sortedKeys(ro))
+	}
+	var oos onchainState
+	if err := json.Unmarshal(to.Onchain, &oos); err != nil {
+		t.Fatal(err)
+	}
+	if endRug := oos.RugBlock > 0; endRug != (rugLiqEnv == "") ||
+		(endRug && (oos.RugLiquidityUSD == nil || math.Abs(*oos.RugLiquidityUSD-150) > 1e-6)) {
+		t.Fatalf("old, SCOUT_RUG_LIQ_USD=%q: got rug block %d quote side %v, want a rug at $150 only under the $500 default",
+			rugLiqEnv, oos.RugBlock, rugF(oos.RugLiquidityUSD))
 	}
 	if r := ro["30d"]; !near(r.ReturnPct, -99) || !near(r.MaxGainPct, 300) || !near(r.MaxDDPct, -99) {
 		t.Fatalf("old 30d: %+v", r)

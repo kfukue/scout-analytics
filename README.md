@@ -138,7 +138,36 @@ is enough**, as long as it serves old event logs (`eth_getLogs`); an archive nod
 4. **Each horizon** (`1h, 1d, 3d, 7d, 30d`): price, **return %**, **max gain %**, **max drawdown %**
    → `scout_call_returns`. Swaps are scanned once: progress is kept per call, each check
    only reads the new block range.
-5. After the last horizon: **rugged** = price < 5% of entry, or pool liquidity < $500 (v2/v3).
+5. **Rugged** (see below): the pool's quote side under `SCOUT_RUG_LIQ_USD` ($500) at any
+   price event, or an empty pool; and after the last horizon also price < 5% of entry.
+
+**Rugged.** The rule watches the pool's **quote side**: the ETH/WETH, USDG, stock token …
+the pool holds, valued in USD. A pool is rugged when its quote side is under
+`SCOUT_RUG_LIQ_USD` (default `$500`, settable in `.env`).
+- **No extra node requests:** the liquidity comes from each price event the tracker reads
+  anyway: v2 the quote reserve in `Sync`; v3/v4 the quote side of the in-range reserves, from
+  the `Swap`'s liquidity and `sqrtPriceX96`. The v3/v4 figure is an **in-range approximation**
+  (it ignores liquidity outside the current price range). It is valued at the quote's USD
+  price at entry (the latest pass: at its current price); a quote with no USD price is only
+  caught by an empty pool, never by a guess.
+- **An empty pool always counts**, also with `SCOUT_RUG_LIQ_USD=0` (USD check off): zero
+  liquidity or a swap at the price bound (v3/v4), a zero reserve (v2).
+- **From the first such trade on:** the price is 0, every horizon ending at or after it is
+  −100% with drawdown −100%, and its peak is the one reached before the rug; nothing after
+  it counts (not even trades in a re-funded pool). The call is flagged `rugged` at once,
+  without waiting for the last horizon.
+- **Latest return:** −100% (price 0), refreshed at most once a day, with no chain reads.
+- **Under the threshold already at the call:** every horizon is −100% with no peak.
+- **After the last horizon** the pool's quote-asset balance (`balanceOf`, v2/v3; v4 pools
+  share one contract) is compared the same way; the price rule (< 5% of entry) still applies
+  too.
+- **Once rugged, always rugged.**
+- **Backstop:** a price more than 1,000,000× the entry price is skipped as invalid.
+
+`scout_call_tracking.current_liquidity_usd` keeps its meaning: the pool's depth, **2 × the
+quote side** in USD (so a call rugged at $400 of quote side shows $800); v4 pools have none
+unless they rugged. The rule above describes the on-chain source; `SCOUT_PRICE_SOURCE=gecko`
+compares GeckoTerminal's `reserve_usd` (both sides) with the same number.
 
 **Only the first call of each token is tracked.** The channel often calls the same token
 again; following every repeat would cost days of node time for the same price history. The
@@ -244,7 +273,7 @@ Only use the feature columns as model inputs; everything about the future is an 
 | `SCOUT_STABLES` | USDG | tokens worth $1 |
 | `SCOUT_WETH`, `SCOUT_V4_POOL_MANAGER`, `SCOUT_ETH_USD_POOL` | Robinhood Chain addresses | override if needed |
 | `SCOUT_DISCOVERY_BLOCKS` | `18000` | ± blocks around the call searched for the token's transfers (widened automatically) |
-| `SCOUT_RUG_LIQ_USD` | `500` | liquidity below this = rugged |
+| `SCOUT_RUG_LIQ_USD` | `500` | rugged when the USD value of the pool's **quote side** (ETH/WETH, USDG, stock token …) is below this; settable in `.env`. `0` = USD check off, but an empty pool still counts. Negative values are rejected |
 | `SCOUT_TRACK_INTERVAL` | `1m` | how often due checks are processed |
 | `SCOUT_TRACK_WORKERS` | `8` | calls tracked at the same time (on-chain source) |
 | `SCOUT_RPC_PARALLEL` | `8` | block ranges of one scan fetched from the node at the same time |
@@ -769,10 +798,18 @@ read on demand (see below).
   `scout_call_metrics`, `scout_call_returns` and `scout_investigations` (not through
   `scout_call_dataset_v`, whose per-row lookups the page does not need). On the test machine
   (2 cores) it takes about 0.3 seconds for 12,000 tokens (22,600 posts). No new table or index.
+  It names, per token, the Perceptor and sAlpha reports the row detail shows (their ids). The
+  texts of those reports are read by a second, small query **only for report ids the website
+  does not hold yet** (none when no report arrived since the last read); see the row detail
+  below.
 - **Memory**: about 1 KB per token for the snapshot (about 10 MB for 12,000 tokens, about
   90 MB for 100,000; the five window returns in every row added about 110 bytes a token), on top of the program itself; while a refresh runs, the rows just read
   are in memory next to it for a moment. The whole process measured 40–55 MB with 12,000
-  tokens (peak 78 MB under a load test).
+  tokens (peak 78 MB under a load test). The row detail adds about 85 bytes a token to the
+  snapshot (two report ids and three fields in every row: about 1 MB for 12,000 tokens) plus
+  the report texts, about 300 bytes per report held: with the current data (about 340 sAlpha
+  replies, half of them empty, of 33 characters on average and 1,035 at most, and a few
+  hundred Perceptor summaries of a line each) well under 1 MB. Each text is kept up to 32 KB.
 
 **Caching and compression** (nothing to set up):
 
@@ -842,6 +879,33 @@ other sites):
     sortable.
   - Search by token name, symbol or address. 50 per page. On a narrow screen the table scrolls
     sideways inside its box; the page itself does not.
+- **Row detail (the token's reports)** — the **▸** button before the date of every row opens a
+  panel under the row with the token's reports; a click anywhere else on the row does the same,
+  except on a link (the post, GMGN, the Perceptor report) or while selecting text. The button
+  is a real button: Tab to it and press Enter or Space; it says whether the row is open
+  (`aria-expanded`). The panel shows:
+  - **Perceptor**: the verdict ("no red flags", "caution", "red flags"), the verdict line of
+    the report and its time, the summary, and "Open the Perceptor report" (https links only);
+    "No Perceptor report" when the token was never scanned. It is the same report the
+    Perceptor column shows.
+  - **sAlpha**: the text of the token's latest completed sAlpha report, as plain text with its
+    line breaks, its time and "Open the sAlpha report" (https links only). **About half of
+    sAlpha's replies are empty; an empty reply (or one of white space only) counts as no
+    report**: the latest reply that has text is shown, whichever post of the token it was made
+    for, and "No sAlpha report" when there is none. A reply that failed, timed out or was
+    rate-limited never counts.
+  - A text longer than 32 KB is cut there and marked "Cut at 32 KB."; a long one scrolls
+    inside the panel. The panel is never wider than the visible part of the table box, also on
+    a phone while the table is scrolled sideways.
+  The panel is loaded when it is opened ("Loading…" until then; an error notice if it cannot
+  be loaded, tried again with the next refresh). Open rows **stay open**, with their content,
+  through the 30-second refresh, **Refresh now**, sorting, the window selector, searching and
+  paging (a row that is on another page is open again when you come back to it). When a newer
+  report arrives the panel is updated with the next refresh. If the row's call is no longer in
+  the list (after a reset), the panel says "Not available in the data now shown; refresh the
+  page."
+- **sA** — a small "sA" badge next to the Perceptor verdict (or its dash) marks a token that
+  has an sAlpha report with text (hover for a hint). An empty reply gives no badge.
 - **Perceptor** — the column shows the verdict of the token's Perceptor report as words:
   "no red flags", "caution", "red flags" (linked to the report, in a new tab), or "–" when
   there is none. The "Perceptor" select next to the search box filters the list: All reports,
@@ -889,7 +953,7 @@ Names come from arbitrary contracts: control characters are removed, the length 
 
 ### API
 
-The two `GET` endpoints answer from the snapshot (see above) and send `ETag`, `Cache-Control: no-cache`,
+The three `GET` endpoints answer from the snapshot (see above) and send `ETag`, `Cache-Control: no-cache`,
 `Vary: Accept-Encoding` and `X-Snapshot-At` (when the database was last read, RFC 3339). Send
 the `ETag` back as `If-None-Match` to get `304 Not Modified` while the data is unchanged. The
 `ETag` is a weak one (`W/"…"`): the same `ETag` means the same data; only the time stamps in
@@ -944,7 +1008,8 @@ Any other value or parameter → HTTP 400 with `{"error": "…"}`.
    "call_count": 3, "last_call_date": "2026-10-02T09:12:00Z",
    "latest_return_pct": 35.2, "latest_price_usd": 0.006084,
    "latest_at": "2026-11-30T14:31:10.52Z", "latest_trade_at": "2026-11-30T13:02:44Z",
-   "latest_age_seconds": 5184070, "call_mcap_usd": 45200, "latest_mcap_usd": 61110.4}]}
+   "latest_age_seconds": 5184070, "call_mcap_usd": 45200, "latest_mcap_usd": 61110.4,
+   "has_salpha_report": true, "perceptor_report_id": 5120, "salpha_report_id": 5121}]}
 ```
 `call_count` = how many real calls of that token exist in total (1 or more; update posts are
 not counted); `last_call_date` = the date of the most recent one (equal to `message_date` when there is only one). Everything else
@@ -996,6 +1061,49 @@ that contract address, upper/lower case ignored — not only the listed call's o
 history (only live calls are scanned). `perceptor_url` is also `null` when the stored link
 does not start with `https://`. This is a rule of the website only:
 `scout_call_dataset_v.perceptor_verdict` is unchanged and still belongs to the single call.
+
+`has_salpha_report`, `perceptor_report_id` and `salpha_report_id` are the last three fields of
+a call and say which reports `GET /api/call` returns for it (per token, like the verdict):
+`perceptor_report_id` = the id (`scout_investigations.id`) of the Perceptor investigation the
+verdict comes from; `salpha_report_id` = the id of the token's latest completed sAlpha
+investigation (tool `salpha`, `status = completed`, newest `requested_at`, contract address
+with upper/lower case ignored) **whose `report_text` is not empty and not only white space**;
+`has_salpha_report` = `salpha_report_id` is not `null`. A new report of either tool changes
+them, and so the `ETag` of `/api/calls`; an empty sAlpha reply changes nothing.
+
+`GET /api/call?id=<call_id>` — the row detail: the Perceptor and sAlpha reports of the token of
+one listed call (`call_id` of a row of `/api/calls`), from memory:
+
+```json
+{"call_id": 812,
+ "perceptor": {"id": 5120, "verdict": "caution", "label": "Caution", "summary": "Top 10 hold 40%",
+   "url": "https://www.perceptor.info/r/deb9d3118ec1480e985032f9472c87c0",
+   "at": "2026-10-01T14:31:02Z", "truncated": false},
+ "salpha": {"id": 5121, "text": "Smart money: 3 wallets bought…", "url": null,
+   "at": "2026-10-01T14:31:40Z", "truncated": false}}
+```
+- `perceptor` = the report of `perceptor_report_id` (`null` when there is none): `verdict` is
+  `clean`, `caution`, `red_flags` or `unknown`; `label` and `summary` are the report's
+  `verdict_label` and `verdict_summary` (either may be `null`).
+- `salpha` = the report of `salpha_report_id` (`null` when the token has no sAlpha report with
+  text): `text` is its `report_text`, plain text from a bot (show it as text, never as HTML).
+- `url` = the report's link, `null` unless it starts with `https://` (and is at most 2,048
+  characters). `at` = `completed_at`, else `requested_at`. `truncated` = a text was longer
+  than 32 KB and is cut there (at a character boundary).
+- **Codes:** `400` for a missing or bad `id` (a whole number from 1 to 2147483647, written
+  plainly) or any other parameter; `404` when `id` is not the call of a row of the list — also
+  a call the page got from an older snapshot that is no longer listed; `503` before the first
+  snapshot. The body of an error is `{"error": "…"}`.
+- **Caching:** `ETag` (weak) follows the call's two reports only, so it stays the same while
+  anything else changes; `If-None-Match` → `304`. `Cache-Control: no-cache`, `X-Snapshot-At`,
+  and gzip like the other JSON (for answers of 1 KB or more).
+- **Memory, and what is read:** the texts are held in memory next to the snapshot, keyed by
+  investigation id, and only for the reports some row names. A refresh keeps the texts it has
+  and reads, with one extra query, only those of report ids it does not hold yet (an
+  investigation is written once, so a text it holds never changes); texts no row names any more
+  are let go. A request never reads the database. If that query fails, the whole refresh counts
+  as failed and the snapshot before stays. A report that cannot be read at that moment is left
+  out of the row until the next refresh.
 
 `POST /api/refresh` — "Refresh now": the website reads the database at once (the same read
 as the background refresh), puts the new snapshot in place and then answers. No parameters

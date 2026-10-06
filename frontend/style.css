@@ -121,8 +121,9 @@ button { font: inherit; color: inherit; }
 .segmented.compact button { height: 28px; min-width: 36px; padding: 0 8px; font-size: 13px; }
 #explain { margin-bottom: 8px; }
 
-/* The table scrolls sideways inside this box; the page itself never does. */
-.table-wrap { overflow-x: auto; max-width: 100%; border: 1px solid var(--border); border-radius: 8px; }
+/* The table scrolls sideways inside this box; the page itself never does.
+   It is also the size container of the row detail (100cqw = its visible width). */
+.table-wrap { overflow-x: auto; max-width: 100%; border: 1px solid var(--border); border-radius: 8px; container-type: inline-size; }
 th.win.first, td.win.first { border-left: 1px solid var(--border); }
 table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
 th, td { padding: 7px 8px; text-align: left; white-space: nowrap; border-bottom: 1px solid var(--border); }
@@ -150,6 +151,79 @@ td.latest, td.mc { cursor: default; }
 .pv-caution { color: var(--warn); font-weight: 600; }
 .pv-red { color: var(--neg); font-weight: 700; border: 1px solid currentColor; border-radius: 4px; padding: 0 5px; }
 a.pv { text-decoration: underline; text-underline-offset: 2px; }
+/* "sA": the token has an sAlpha report (open the row to read it) */
+.sa-badge {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 0 4px;
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 16px;
+  color: var(--muted);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  vertical-align: 1px;
+  cursor: help;
+}
+
+/* Row detail: the toggle in the first cell, and the detail row under it */
+tbody tr.call-row { cursor: pointer; }
+tbody tr.call-row.open { background: var(--row-hover); }
+tbody tr.call-row.open td { border-bottom-color: transparent; }
+.row-toggle {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  margin: -3px 4px -3px -3px;
+  padding: 0;
+  vertical-align: middle;
+  color: var(--muted);
+  background: none;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  cursor: pointer;
+}
+.row-toggle:hover { color: var(--text); border-color: var(--border); }
+.row-toggle .chev { display: inline-block; transition: transform .15s ease; }
+.row-toggle[aria-expanded="true"] .chev { transform: rotate(90deg); }
+tbody tr.detail-row, tbody tr.detail-row:hover { background: var(--panel); }
+td.detail-cell { padding: 0; white-space: normal; }
+/* The text box stays within the visible part of the table box, whatever the
+   table's width: it sticks to the left edge and is as wide as the box. */
+.detail-box {
+  position: sticky;
+  left: 0;
+  box-sizing: border-box;
+  width: calc(100vw - 40px);
+  max-width: 1366px;
+  padding: 10px 14px 12px;
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px 24px;
+  cursor: auto;
+}
+@supports (container-type: inline-size) {
+  .detail-box { width: 100cqw; max-width: none; }
+}
+@container (max-width: 640px) {
+  .detail-box { grid-template-columns: minmax(0, 1fr); }
+}
+.detail-box > * { min-width: 0; }
+.detail-note { grid-column: 1 / -1; }
+.report-title { font-size: 13px; margin: 0 0 4px; }
+.report-meta { color: var(--muted); font-size: 12px; margin: 0 0 4px; }
+.report-text {
+  margin: 0 0 6px;
+  max-height: 24em;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+.report-link { font-size: 13px; }
+.error { color: var(--neg); }
 
 .notice { padding: 10px 2px; color: var(--muted); }
 .notice.error { color: var(--neg); }
@@ -171,7 +245,7 @@ a.pv { text-decoration: underline; text-underline-offset: 2px; }
   #search { max-width: none; flex-basis: 100%; }
   th, td { padding: 6px 7px; }
 }
-@media (prefers-reduced-motion: reduce) { .bar-fill { transition: none; } }
+@media (prefers-reduced-motion: reduce) { .bar-fill, .row-toggle .chev { transition: none; } }
 
 /* Status legend under the table */
 .legend { margin-top: 14px; border: 1px solid var(--border); border-radius: 8px; background: var(--panel); padding: 8px 12px; font-size: 13px; }

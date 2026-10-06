@@ -13,12 +13,14 @@ import (
 	"io"
 	"io/fs"
 	"log"
+	"math"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"path"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -621,6 +623,11 @@ type webServer struct {
 	// readRows reads the list from the database (ScoutStore.SelectWebRows;
 	// tests put a fake in its place). nil = no database.
 	readRows func(context.Context) ([]ScoutWebRow, int, error)
+	// readReports reads the texts of the reports with the given ids
+	// (ScoutStore.SelectWebReports; tests put a fake in its place). Only ids
+	// the snapshot does not hold yet are asked for, as part of the same read
+	// as readRows. nil = no texts: the rows then show no report detail.
+	readReports func(context.Context, []int) (map[int]*ScoutWebReport, error)
 	// life is the context the reads run under: cancelled when the website
 	// stops, never by a single request (runWeb sets it; Background otherwise).
 	life context.Context
@@ -658,6 +665,7 @@ func newWebServer(st *ScoutStore, cfg webConfig, static fs.FS) (*webServer, erro
 		errLog: logLimiter{every: webErrorLogEvery}, life: context.Background(), manualWait: webManualRefreshWait}
 	if st != nil {
 		s.readRows = st.SelectWebRows
+		s.readReports = st.SelectWebReports
 	}
 	if cfg.Dir == "" {
 		files, err := loadWebStatic(static)
@@ -668,6 +676,7 @@ func newWebServer(st *ScoutStore, cfg webConfig, static fs.FS) (*webServer, erro
 	}
 	s.mux.HandleFunc("/api/summary", s.handleSummary)
 	s.mux.HandleFunc("/api/calls", s.handleCalls)
+	s.mux.HandleFunc("/api/call", s.handleCall)
 	s.mux.HandleFunc(webRefreshPath, s.handleRefresh)
 	s.mux.HandleFunc("/api/", func(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusNotFound, "no such endpoint")
@@ -750,6 +759,10 @@ func (s *webServer) readSnapshot(ctx context.Context) error {
 	defer cancel()
 	start := time.Now()
 	rows, updatePosts, err := s.readRows(ctx)
+	var reports map[int]*webReport
+	if err == nil {
+		reports, err = s.readReportTexts(ctx, rows)
+	}
 	if err != nil {
 		s.failing = true
 		// one line a minute at most; none when the program is stopping, and none
@@ -770,6 +783,7 @@ func (s *webServer) readSnapshot(ctx context.Context) error {
 	snap.took = time.Since(start)
 	snap.loadedAt = time.Now().UTC().Truncate(time.Millisecond)
 	snap.answers = &webAnswers{} // answers carry loadedAt: none is taken over from the snapshot before
+	snap.reports = reports
 	s.snap.Store(snap)
 	if s.failing {
 		s.failing, s.errLog.last = false, time.Time{}
@@ -782,6 +796,26 @@ func (s *webServer) readSnapshot(ctx context.Context) error {
 		log.Printf("web: snapshot %s tokens in %s", commas(n), snap.took.Round(time.Millisecond))
 	}
 	return nil
+}
+
+// readReportTexts makes the text map for the rows just read: the texts of the
+// snapshot in place are kept, and only the report ids it does not hold are read
+// from the database, with one query (none when there is nothing new). It may
+// take an id off a row whose report could not be read (see webReportsFor).
+// Only readSnapshot calls it.
+func (s *webServer) readReportTexts(ctx context.Context, rows []ScoutWebRow) (map[int]*webReport, error) {
+	var old map[int]*webReport
+	if prev := s.snap.Load(); prev != nil {
+		old = prev.reports
+	}
+	var got map[int]*ScoutWebReport
+	if missing := webMissingReports(rows, old); len(missing) > 0 && s.readReports != nil {
+		var err error
+		if got, err = s.readReports(ctx, missing); err != nil {
+			return nil, fmt.Errorf("report texts: %w", err)
+		}
+	}
+	return webReportsFor(rows, old, got), nil
 }
 
 // refreshLoop refreshes the snapshot every cfg.Refresh until ctx is cancelled.
@@ -1004,6 +1038,98 @@ func (s *webServer) handleCalls(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSONBytes(w, r, http.StatusOK, buf.Bytes())
+}
+
+// webCallDetail is the body of GET /api/call: the reports of the token of one
+// listed call (the call's own row in /api/calls says which ones).
+type webCallDetail struct {
+	CallID    int                 `json:"call_id"`
+	Perceptor *webPerceptorDetail `json:"perceptor"` // null = no completed Perceptor report
+	SAlpha    *webSAlphaDetail    `json:"salpha"`    // null = no completed sAlpha report with text
+}
+
+// webPerceptorDetail: the token's latest completed Perceptor report.
+type webPerceptorDetail struct {
+	ID        int       `json:"id"`
+	Verdict   string    `json:"verdict"` // clean | caution | red_flags | unknown
+	Label     *string   `json:"label"`   // verdict_label, e.g. "No red flags found"
+	Summary   *string   `json:"summary"` // verdict_summary
+	URL       *string   `json:"url"`     // https only
+	At        time.Time `json:"at"`      // completed_at, else requested_at
+	Truncated bool      `json:"truncated"`
+}
+
+// webSAlphaDetail: the token's latest completed sAlpha report with text.
+type webSAlphaDetail struct {
+	ID        int       `json:"id"`
+	Text      string    `json:"text"` // report_text, plain text
+	URL       *string   `json:"url"`  // https only
+	At        time.Time `json:"at"`   // completed_at, else requested_at
+	Truncated bool      `json:"truncated"`
+}
+
+// webCallDetailVersion: part of the ETag of /api/call; raise it when the body
+// of a report changes form, so pages kept open ask again.
+const webCallDetailVersion = "1"
+
+// parseWebCallID reads the query of /api/call: exactly one id, a whole number
+// from 1 to 2^31−1, written plainly.
+func parseWebCallID(raw string) (int32, error) {
+	v, err := url.ParseQuery(raw)
+	if err != nil {
+		return 0, errors.New("malformed query string")
+	}
+	for k, vals := range v {
+		if k != "id" {
+			return 0, errors.New("unknown parameter (use id)")
+		}
+		if len(vals) != 1 {
+			return 0, errors.New("id: given more than once")
+		}
+	}
+	idText := v.Get("id")
+	n, err := strconv.Atoi(idText)
+	if !v.Has("id") || err != nil || len(idText) > 10 || n < 1 || n > math.MaxInt32 || strconv.Itoa(n) != idText {
+		return 0, fmt.Errorf("id: use the call_id of a row, a whole number from 1 to %d", math.MaxInt32)
+	}
+	return int32(n), nil
+}
+
+// handleCall is GET /api/call?id=<call_id>: the Perceptor and sAlpha reports
+// of the token of a listed call (one that is a row of the list), from memory.
+// 400 for a bad id, 404 for an id that is not a row of the snapshot (also one
+// of an older snapshot that has gone), 503 before the first snapshot. The ETag
+// follows the two reports only, so it stays "not modified" while other data
+// changes.
+func (s *webServer) handleCall(w http.ResponseWriter, r *http.Request) {
+	id, err := parseWebCallID(r.URL.RawQuery)
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	snap := s.snapshot(w)
+	if snap == nil {
+		return
+	}
+	pos, found := slices.BinarySearch(snap.ids, id)
+	if !found {
+		writeJSONError(w, http.StatusNotFound, "this call is not a row of the list (any more); refresh the page")
+		return
+	}
+	pid, sid := snap.percID[pos], snap.salphaID[pos]
+	etag := `W/"call-` + strconv.Itoa(int(id)) + "-" + strconv.Itoa(int(pid)) + "-" + strconv.Itoa(int(sid)) + "-" + webCallDetailVersion + `"`
+	s.snapshotHeaders(w, snap, etag)
+	if s.notModified(w, r, etag) {
+		return
+	}
+	d := webCallDetail{CallID: int(id)}
+	if e := snap.reports[int(pid)]; pid != 0 && e != nil {
+		d.Perceptor = &webPerceptorDetail{ID: e.id, Verdict: e.verdict, Label: e.label, Summary: e.summary, URL: e.url, At: e.at, Truncated: e.truncated}
+	}
+	if e := snap.reports[int(sid)]; sid != 0 && e != nil {
+		d.SAlpha = &webSAlphaDetail{ID: e.id, Text: e.text, URL: e.url, At: e.at, Truncated: e.truncated}
+	}
+	writeJSON(w, r, http.StatusOK, &d)
 }
 
 const (

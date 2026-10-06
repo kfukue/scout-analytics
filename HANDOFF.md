@@ -22,9 +22,11 @@ Branch `scout-call-model`. Production runs `main`.
   calls get status `repeat`. A latest-price pass keeps a current return per
   token (every 15 minutes under 30 days old, daily after).
 - Website (`-web`, port 8090, no login, read-only): one row per token, served
-  from an in-memory snapshot refreshed every 15 seconds. Sort by date, return,
-  peak, latest; search; horizon buttons; Perceptor filter and column; legend.
-  Front end is plain JavaScript in `frontend/` (no framework, no build step).
+  from an in-memory snapshot refreshed every 15 seconds, plus a "Refresh now"
+  button. Columns: Date | Token | Symbol | Calls | Perceptor | Status | Entry $ |
+  Call MC | Latest MC | Latest % | Peak % | Worst drop % | 1h | 1d | 3d | 7d |
+  30d. Search, sorts, Perceptor filter, legend. Front end is plain JavaScript in
+  `frontend/` (no framework, no build step).
 - Model (`ml/`): labels for four holding periods, logistic baseline and
   LightGBM, time-split validation with pass/fail gates, scoring service. Not
   trained on real data yet: the tracker has to finish the history first.
@@ -36,18 +38,37 @@ Branch `scout-call-model`. Production runs `main`.
    range is split only on a "too large" refusal or a node "request timed out"
    (after one retry); it grows back after 3 full-size answers; the floor is 200
    blocks; progress lines show the range size.
-
-### Built, not yet committed: market cap columns
-
-In the working tree at the time of writing; the owner commits it. He has been
-given the commit commands. HANDOFF.md is committed separately.
-
-- Call MC = `COALESCE(called_at_mcap_usd, mcap_usd)`.
-- Latest MC = `COALESCE(mcap_usd, called_at_mcap_usd)` × `latest_price_usd` ÷
-  at-post `entry_price_usd` (an estimate; assumes supply has not changed).
-- Both sortable (`call_mc`, `latest_mc`); a dash for non-USD or invalid inputs.
-- 118 tests passed against a throwaway local Postgres. The owner still has to
-  check it in a browser at 1280px and 390px, light and dark.
+3. Market cap columns (commit 9894e0f): Call MC and Latest MC.
+   - Call MC = the first valid figure of `called_at_mcap_usd`, `mcap_usd` (a 0
+     or NaN called-at value falls back to `mcap_usd`; the fallback shipped in
+     1f4e206).
+   - Latest MC = `COALESCE(mcap_usd, called_at_mcap_usd)` ×
+     `latest_price_usd` ÷ at-post `entry_price_usd` (an estimate; assumes
+     supply has not changed).
+   - Both sortable (`call_mc`, `latest_mc`); a dash for non-USD or invalid
+     inputs.
+4. "Refresh now" button, new column order and per-window returns (commit
+   1f4e206).
+   - Order: Date | Token | Symbol | Calls | Perceptor | Status | Entry $ |
+     Call MC | Latest MC | Latest % | Peak % | Worst drop % | 1h | 1d | 3d |
+     7d | 30d.
+   - The 1h/1d/3d/7d/30d selector switches only Peak % and Worst drop %. The
+     five window columns sort with `return_1h` … `return_30d`.
+   - `POST /api/refresh`: coalesced with the background loop, 5 s global rate
+     limit, same-origin check, waits at most 15 s (then 504), 503 on a database
+     failure. Every other request is still answered from the snapshot.
+   - Same commit: the Call MC first-valid-figure fallback, and the
+     `TestWebGzip` fix (the test now expects SVG to be compressed).
+5. `-retry-no-pool` (commit 8ed80f9): one-shot, database-only command that sets
+   `no_pool` first calls back to `pending`, due now.
+   - `-retry-gave-up` also includes `gave_up` calls; those without an entry
+     price get their on-chain state cleared so the pool is discovered again.
+   - `-retry-launchpad a,b` limits it to launchpads or dexes (match ignores
+     case, spaces and punctuation). `-retry-dry-run` only shows what would be
+     reset.
+   - **Not run yet.** The owner plans to run it only after Pons V2 support and
+     the Longxyz/USD work are deployed: first a dry run without a filter, then
+     e.g. `-retry-no-pool -retry-launchpad pons_v2,pons -retry-gave-up`.
 
 ### Tracker speed: root cause and fix
 
@@ -100,7 +121,8 @@ tokens: GME, MSFT, TSLA, SPCX, CRCL, GOOGL, MU, NVDA, AMZN, SNDK. A full
   in `scoutanalytics.sql` must be safe to repeat (it runs at every start).
   Views are dropped and recreated at startup, dependents first.
 - Website speed is the priority: requests are answered from the snapshot and
-  must not query the database. Keep p95 under 10 ms; rerun the benchmark
+  must not query the database (the only exception is the rate-limited
+  `POST /api/refresh`). Keep p95 under 10 ms; rerun the benchmark
   (`go test -run xxx -bench BenchmarkWebSnapshot`) after touching it.
 - Only real calls are scanned, delivered and tracked; one row per token.
 - The owner commits and pushes; agents' git commit and push are blocked by
@@ -110,19 +132,23 @@ tokens: GME, MSFT, TSLA, SPCX, CRCL, GOOGL, MU, NVDA, AMZN, SNDK. A full
 - Ask the owner before resetting calls, and give him the exact SQL.
 - One line of work at a time on this database: two branches migrating the same
   schema caused both production startup failures so far.
+- One coder at a time on overlapping files: parallel coders in the same tree
+  mixed their README edits.
+- A coder that runs a throwaway Postgres uses its own scratchpad directory and
+  its own port, then stops it and deletes the directory when done.
 - The owner prefers not to set up a local test database. For prod data he runs
   read-only queries and pastes the results.
 
 ## How to test
 
 - `go vet ./telegrambot/scoutanalytics` and
-  `go test -race ./telegrambot/scoutanalytics` (118 tests with the market cap
-  work). Database tests need `SCOUT_TEST_DATABASE_URL` pointing at a throwaway
-  Postgres; without it they are skipped. `TestOpenScoutStoreSelection` needs
-  that database to be named `scout_test`. A coder briefly ran a throwaway
-  Postgres in the session scratchpad for this and then deleted it.
-- `TestWebGzip` fails, on HEAD as well: it expects `.svg` uncompressed while
-  `webTextTypes` compresses it (fix in item 1 below).
+  `go test -race ./telegrambot/scoutanalytics`. Database tests need
+  `SCOUT_TEST_DATABASE_URL` pointing at a throwaway Postgres; without it they
+  are skipped. `TestOpenScoutStoreSelection` needs that database to be named
+  `scout_test` (the README's example URL uses that name but does not say it is
+  required). See the rule above on running a throwaway Postgres.
+- `TestLatestPriceInterruptedLeavesRowUntouched` is flaky (see Next work
+  item 7).
 - On-chain code uses the fake chain in `onchain_test.go`; never call real nodes.
 - `python -m pytest tests -q` in `ml/` (27 tests).
 - Page changes: check in a real browser at 1280px and 390px, light and dark.
@@ -131,42 +157,8 @@ tokens: GME, MSFT, TSLA, SPCX, CRCL, GOOGL, MU, NVDA, AMZN, SNDK. A full
 
 ## Next work (in order; one line of work at a time)
 
-1. **Commit the market cap work** (owner). Then two small follow-ups:
-   - Call MC should fall back to the first *valid* figure: a called-at value of
-     0 or NaN shows a dash today instead of using `mcap_usd`.
-   - Fix `TestWebGzip` (see "How to test").
-   - Document in the README that `TestOpenScoutStoreSelection` needs the test
-     database to be named `scout_test`.
-2. **"Refresh now" button and new column layout** (same website files, so one
-   piece of work).
-   - **Refresh now** on the website's Import progress panel. It triggers an
-     immediate snapshot refresh, coalesced and rate-limited globally (at most
-     one database read every few seconds, shared by all clients; the site has
-     no login), then the page re-fetches. Every other request is still answered
-     from the snapshot. Rerun the benchmark.
-   - **New column order (owner decided, 5 Oct):**
-     Date | Token | Symbol | Calls | Perceptor | Status | Entry $ | Call MC |
-     Latest MC | Latest % | Peak % | Worst drop % | 1h | 1d | 3d | 7d | 30d
-     - Perceptor and Status move up, next to the token.
-     - Latest MC and Latest % sit right after Call MC.
-     - Peak % and Worst drop % come right after the latest columns. A small
-       1h/1d/3d/7d/30d selector switches only these two (option B; the owner
-       chose it over hover-only and over dropping them). Both stay sortable by
-       the selected window.
-     - 1h … 30d are five new columns, each showing that window's return %
-       (late-entry USD, as today), each sortable. The existing horizon buttons
-       become the peak/drop selector.
-   - Implementation notes:
-     - The API needs per-horizon returns for all five windows in each row
-       (they're already in the snapshot). New sort values per window, e.g.
-       `return_1h` … `return_30d`, or keep `sort=return&horizon=…`; choose and
-       document.
-     - Keep the per-request JSON splice for the selected window's peak/drop.
-     - Non-USD rows: line the cells up with dashes / "no USD price".
-     - Mobile: the table scrolls sideways.
-     - Rerun the benchmark; browser check at 1280/390px, light and dark.
-     - Update the README (Website and API sections).
-3. **sAlpha report on the page** (owner asked again, 6 Oct).
+1. **sAlpha report on the page** (owner asked again, 6 Oct; he wants it before
+   Pons V2).
    - The @salpha_research_bot reply is already stored in `scout_investigations`
      (tool code `salpha`, `report_text`, `report_url`). It arrives later than
      Perceptor's, and sometimes not at all.
@@ -177,16 +169,44 @@ tokens: GME, MSFT, TSLA, SPCX, CRCL, GOOGL, MU, NVDA, AMZN, SNDK. A full
      list stays small. Use the latest completed report per token (contract
      address, case-insensitive), as the Perceptor column does.
    - Add a small marker in the row when an sAlpha report exists.
-   - Website rules apply:
-     - Answer from the in-memory snapshot. Either keep report texts in a
-       separate per-token map in the snapshot, or keep only a presence flag and
-       the latest investigation ids in the snapshot and load the text into a
-       bounded cache. The text must never be queried per request. Decide which
-       is acceptable for memory, and note the size.
-     - Rerun the benchmark.
-     - Browser check at 1280/390px, light and dark.
    - Most imported history has no report; only live calls are scanned.
-4. **Pons V2 support** (owner approved). 60% of first calls are Pons V2 and
+   - Design notes:
+     - Before building, ask the owner to run this on prod to see what the
+       sAlpha data looks like (empty `report_text` against attachments, text
+       lengths, counts):
+
+       ```sql
+       SELECT i.status, count(*) n,
+              count(*) FILTER (WHERE coalesce(i.report_text,'') = '') empty_text,
+              avg(length(i.report_text))::int avg_len, max(length(i.report_text)) max_len,
+              count(*) FILTER (WHERE i.details ? 'files' OR i.details ? 'photos') with_attachments,
+              count(DISTINCT lower(c.contract_address)) tokens
+       FROM scout_investigations i
+       JOIN scout_investigation_tools t ON t.id = i.tool_id
+       LEFT JOIN scout_calls c ON c.id = i.call_id
+       WHERE t.code = 'salpha' GROUP BY 1;
+       ```
+     - Decide whether Perceptor's "summary" means `verdict_summary` or
+       `report_text`.
+     - Snapshot: keep a presence flag plus the latest investigation id per
+       token in the row snapshot (so in the pre-encoded row and in
+       `hashWebRows`). Load the text into a separate in-memory map keyed by
+       investigation id, reading only ids not already loaded, with a capped
+       length per report; note the resulting memory size. The text is never
+       queried per request.
+     - `GET /api/call?id=` has its own ETag; 400 for a bad id, 404 for an
+       unknown one, 503 before the first snapshot.
+     - Show the report link only if it starts with `https://`.
+     - Expanded rows stay open across the 30 s refresh, Refresh now and a
+       re-sort (track them by `call_id`). A 304 leaves them alone.
+     - Use a real toggle button with `aria-expanded`. Clicks on the links in a
+       row must not toggle it.
+     - Limit the pane text to the visible width of the scroll box (the table
+       is about 1,411 px wide). Use `pre-wrap` through a CSS class (CSP: no
+       inline style).
+     - Rerun the benchmark; browser check at 1280/390px, light and dark.
+     - Run it alone, on a clean tree.
+2. **Pons V2 support** (owner approved). 60% of first calls are Pons V2 and
    almost none are priced.
    - Pons V2 deploys one bonding curve per token. Factory
      0x7eD598BcEf8bd9Edd8C97A195C6d13f40801EC7e emits
@@ -212,11 +232,11 @@ tokens: GME, MSFT, TSLA, SPCX, CRCL, GOOGL, MU, NVDA, AMZN, SNDK. A full
    - Estimate: about 150-250 lines plus tests. No schema change, no state
      version bump. `no_pool` calls retry every 6 hours on their own. The 2
      `gave_up` Pons calls need a reset (cheap with the full index; ask the owner
-     first).
+     first): `-retry-no-pool` covers this after deploy (see "Shipped", item 5).
    - Example token 0x59e8ae5c2e1edf77d2169e0ae67524c43aaca393 (call 10214). The
      owner was asked to run a factory eth_getLogs (topic1 = token) to confirm
      the layout on chain.
-5. **USD source fix and data-loss bug**, in `quoteUSD`/`quoteViaPool`
+3. **USD source fix and data-loss bug**, in `quoteUSD`/`quoteViaPool`
    (`onchain.go`, `onchain_extra.go`, `tracker_onchain.go`).
    - (a) The `quotePools[quote]=nil` cache lives for the whole process and
      ignores the block, and JSON-RPC errors are cached as "no pool". Separate
@@ -314,9 +334,9 @@ tokens: GME, MSFT, TSLA, SPCX, CRCL, GOOGL, MU, NVDA, AMZN, SNDK. A full
    - (f) After it ships: reset the stuck non-USD calls and the calls that hit
      the data-loss bug so they re-track in USD. Ask the owner first and give him
      the exact SQL.
-6. **Longxyz.** It trades against stock tokens, so it is probably covered by the
-   feeds plus item 5. Verify after item 5.
-7. **Push updates for new tokens.** The owner confirmed nothing needs to go from
+4. **Longxyz.** It trades against stock tokens, so it is probably covered by the
+   feeds plus item 3. Verify after item 3.
+5. **Push updates for new tokens.** The owner confirmed nothing needs to go from
    the page to the server, so use Server-Sent Events, not a WebSocket. When the
    listener records a new token and when its Perceptor or sAlpha report
    arrives, the open page should update without waiting for the next refresh
@@ -333,9 +353,9 @@ tokens: GME, MSFT, TSLA, SPCX, CRCL, GOOGL, MU, NVDA, AMZN, SNDK. A full
      so in the README.
    - Keep the events endpoint cheap: one goroutine per client, heartbeat
      comment every 25 seconds, cap the number of clients.
-8. **Scatter plot** of call properties against return. Parked until the tracker
+6. **Scatter plot** of call properties against return. Parked until the tracker
    has finished and the model report shows which properties matter.
-9. **Smaller tracker improvements** (not started):
+7. **Smaller tracker improvements** (not started):
    - A rolling worker queue: today each 50-call cycle waits for its slowest
      call, about 70 s of idle time per new v4 call.
    - `resolveV4` walks back up to 400 × 200k blocks to find `Initialize` (call
@@ -343,17 +363,19 @@ tokens: GME, MSFT, TSLA, SPCX, CRCL, GOOGL, MU, NVDA, AMZN, SNDK. A full
    - `blockAt` makes uncached head requests.
    - Checkpoint within a horizon segment.
    - The latest pass re-reads blocks that the horizon scan reads later.
-10. **Other call sources** (parked).
-    - Best candidates: the Call Analyser channels (@CallAnalyserRobinhood,
-      @CallAnalyserETH, @CallAnalyserBase), an aggregator with named callers in a
-      parseable format, so the tracker can rank callers by measured ROI. No
-      independent win-rate data exists anywhere.
-    - Other public call channels were reviewed and not selected.
-    - Adding a source needs multi-channel support, a parser per source, a
-      caller-name field and a network field. ETH/Base pricing needs a node per
-      chain.
-    - Suggested first step after the model report: @CallAnalyserRobinhood (same
-      chain).
+   - Flaky test `TestLatestPriceInterruptedLeavesRowUntouched`: fails about 1
+     run in 10, on old code as well.
+8. **Other call sources** (parked).
+   - Best candidates: the Call Analyser channels (@CallAnalyserRobinhood,
+     @CallAnalyserETH, @CallAnalyserBase), an aggregator with named callers in a
+     parseable format, so the tracker can rank callers by measured ROI. No
+     independent win-rate data exists anywhere.
+   - Other public call channels were reviewed and not selected.
+   - Adding a source needs multi-channel support, a parser per source, a
+     caller-name field and a network field. ETH/Base pricing needs a node per
+     chain.
+   - Suggested first step after the model report: @CallAnalyserRobinhood (same
+     chain).
 
 ## Already done (asked again recently)
 
@@ -365,12 +387,14 @@ tokens: GME, MSFT, TSLA, SPCX, CRCL, GOOGL, MU, NVDA, AMZN, SNDK. A full
 
 - Should `prior_calls`, `calls_prev_1h` and `calls_prev_24h` (model inputs)
   count real calls only? They still count update posts.
-- "Show the expanded pane with the questions": unclear what this refers to.
+- "Show the expanded pane with the questions": probably the sAlpha row detail
+  pane (Next work item 1). Ask the owner to confirm, and whether "the
+  questions" means something the pane should show.
 - Add a `reviewer` agent and a deploy checklist?
 - A staging copy of `assetdb` would let changes be run against real data
   before production.
 - Did he add the full 33-feed `SCOUT_CHAINLINK_FEEDS` line?
-- Result of the Pons factory eth_getLogs (item 4).
+- Result of the Pons factory eth_getLogs (item 2).
 - Result of the error query under "Prod data findings".
 
 ## Deploying
@@ -383,7 +407,9 @@ restart the three processes:
 - `SCOUT_RPC_RPS=300 SCOUT_TRACK_WORKERS=12 SCOUT_RPC_PARALLEL=4 SCOUT_RPC_MAX_INFLIGHT=48 go run ./telegrambot/scoutanalytics -track`
   with the latest-price pass on (the owner wants latest prices).
   `SCOUT_RPC_LOG_CHUNK` is unset (default 200000).
-- `go run ./telegrambot/scoutanalytics -web`
+- `go run ./telegrambot/scoutanalytics -web`. If a reverse proxy is put in
+  front of it, it must pass the `Host` header unchanged, or the same-origin
+  check makes `POST /api/refresh` (Refresh now) return 403.
 
 The Nitro node runs with `--execution.rpc.log-history=0`; keep it, or the
 tracker slows down again on old ranges.

@@ -3,7 +3,9 @@ package main
 import (
 	"bytes"
 	"compress/gzip"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -11,10 +13,12 @@ import (
 	"math/rand"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"sort"
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 // syntheticWebRows makes n rows the way ScoutStore.SelectWebRows returns them
@@ -31,6 +35,7 @@ func syntheticWebRows(n int, seed int64) []ScoutWebRow {
 	rows := make([]ScoutWebRow, n)
 	lrng := rand.New(rand.NewSource(seed + 1000)) // the latest price has its own source, so the rest stays as it was
 	mrng := rand.New(rand.NewSource(seed + 2000)) // so do the market caps
+	srng := rand.New(rand.NewSource(seed + 3000)) // and the sAlpha reports
 	// a market cap from the post: mostly one of few values (many ties), now and
 	// then missing, zero, negative or a number JSON cannot carry
 	mcap := func() *float64 {
@@ -146,9 +151,38 @@ func syntheticWebRows(n int, seed int64) []ScoutWebRow {
 			if i%13 == 0 {
 				r.PerceptorURL = sp("http://www.perceptor.info/r/plain")
 			}
+			id := 1000000 + i
+			r.PerceptorID = &id
+		}
+		if srng.Intn(6) == 0 {
+			id := 2000000 + i
+			r.SAlphaID = &id
 		}
 	}
 	return rows
+}
+
+// syntheticWebReports makes the report of every id rows refer to, the way
+// ScoutStore.SelectWebReports returns them.
+func syntheticWebReports(rows []ScoutWebRow) map[int]*ScoutWebReport {
+	out := map[int]*ScoutWebReport{}
+	at := time.Date(2026, 3, 1, 12, 0, 0, 0, time.UTC)
+	for i := range rows {
+		r := &rows[i]
+		if p := r.PerceptorID; p != nil {
+			verdict := levelUnknown
+			if r.PerceptorVerd != nil {
+				verdict = *r.PerceptorVerd
+			}
+			out[*p] = &ScoutWebReport{ID: *p, Tool: webToolPerceptor, At: at.Add(time.Duration(i) * time.Minute), Verdict: verdict,
+				Label: sp("No red flags found"), Summary: sp(fmt.Sprintf("Top 10 hold %d%%; LP locked", i%90)), URL: r.PerceptorURL}
+		}
+		if p := r.SAlphaID; p != nil {
+			out[*p] = &ScoutWebReport{ID: *p, Tool: webToolSAlpha, At: at.Add(time.Duration(i) * time.Minute),
+				Text: fmt.Sprintf("Smart money: %d wallets bought\nDev holds %d%%", i%17, i%9), URL: sp(fmt.Sprintf("https://salpha.example/r/%d", i))}
+		}
+	}
+	return out
 }
 
 // refMcaps works out the two market caps of a raw row (as ScoutStore.SelectWebRows
@@ -672,6 +706,8 @@ func TestWebSnapshotVersion(t *testing.T) {
 	change("unit", 5, func(rows []ScoutWebRow) { rows[4].PriceUnit = sp("eth") })
 	change("verdict", 5, func(rows []ScoutWebRow) { rows[5].PerceptorVerd = sp("clean!") })
 	change("report", 5, func(rows []ScoutWebRow) { rows[5].PerceptorURL = sp("https://example.org/r") })
+	change("sAlpha report", 5, func(rows []ScoutWebRow) { id := 7777777; rows[6].SAlphaID = &id })
+	change("Perceptor report id", 5, func(rows []ScoutWebRow) { id := 7777778; rows[6].PerceptorID = &id })
 	change("rugged", 5, func(rows []ScoutWebRow) { no := false; rows[0].Rugged = &no })
 	change("tracked", 5, func(rows []ScoutWebRow) { rows[0].Tracked = !rows[0].Tracked })
 	// the latest price: row 4 is priced in USD and has one
@@ -831,8 +867,10 @@ func benchWebServer(tb testing.TB, n int) *webServer {
 	if err != nil {
 		tb.Fatal(err)
 	}
-	snap := mustWebSnapshot(tb, syntheticWebRows(n, 42), 600, nil)
+	rows := syntheticWebRows(n, 42)
+	snap := mustWebSnapshot(tb, rows, 600, nil)
 	snap.loadedAt = time.Now().UTC()
+	snap.reports = webReportsFor(rows, nil, syntheticWebReports(rows))
 	ws.snap.Store(snap)
 	return ws
 }
@@ -1013,6 +1051,25 @@ func BenchmarkWebSnapshot(b *testing.B) {
 		req.Header.Set("If-None-Match", rec.Header().Get("ETag"))
 		serve(b, req, 304)
 	})
+	// the row detail (GET /api/call) of a token with both reports
+	detail := 0
+	for i := 0; i < snap.n && detail == 0; i++ {
+		if snap.percID[i] != 0 && snap.salphaID[i] != 0 {
+			detail = int(snap.ids[i])
+		}
+	}
+	if detail == 0 {
+		b.Fatal("no row with both reports")
+	}
+	detailPath := fmt.Sprintf("/api/call?id=%d", detail)
+	b.Run("http/call", func(b *testing.B) { serve(b, httptest.NewRequest("GET", detailPath, nil), 200) })
+	b.Run("http/call_not_modified", func(b *testing.B) {
+		rec := httptest.NewRecorder()
+		ws.ServeHTTP(rec, httptest.NewRequest("GET", detailPath, nil))
+		req := httptest.NewRequest("GET", detailPath, nil)
+		req.Header.Set("If-None-Match", rec.Header().Get("ETag"))
+		serve(b, req, 304)
+	})
 	raw := syntheticWebRows(n, 42)
 	b.Run("build", func(b *testing.B) {
 		b.ReportAllocs()
@@ -1036,4 +1093,407 @@ func BenchmarkWebSnapshot(b *testing.B) {
 			}
 		}
 	})
+}
+
+// getWeb asks ws for path with header pairs.
+func getWeb(ws *webServer, path string, hdr ...string) *httptest.ResponseRecorder {
+	req := httptest.NewRequest("GET", path, nil)
+	for i := 0; i+1 < len(hdr); i += 2 {
+		req.Header.Set(hdr[i], hdr[i+1])
+	}
+	rec := httptest.NewRecorder()
+	ws.ServeHTTP(rec, req)
+	return rec
+}
+
+// webCallDetailJSON is the body of GET /api/call as the page reads it.
+type webCallDetailJSON struct {
+	CallID    int `json:"call_id"`
+	Perceptor *struct {
+		ID        int     `json:"id"`
+		Verdict   string  `json:"verdict"`
+		Label     *string `json:"label"`
+		Summary   *string `json:"summary"`
+		URL       *string `json:"url"`
+		At        string  `json:"at"`
+		Truncated bool    `json:"truncated"`
+	} `json:"perceptor"`
+	SAlpha *struct {
+		ID        int     `json:"id"`
+		Text      string  `json:"text"`
+		URL       *string `json:"url"`
+		At        string  `json:"at"`
+		Truncated bool    `json:"truncated"`
+	} `json:"salpha"`
+}
+
+func decodeCallDetail(tb testing.TB, body []byte) webCallDetailJSON {
+	tb.Helper()
+	var d webCallDetailJSON
+	dec := json.NewDecoder(bytes.NewReader(body))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&d); err != nil {
+		tb.Fatalf("decode %s: %v", body, err)
+	}
+	return d
+}
+
+// TestWebReportFlagAndVersion: the row carries whether the token has an sAlpha
+// report with text, and the ids of the two reports; a new sAlpha report
+// changes the version (and so the ETag of /api/calls), while a reply without
+// text, which the read never picks (see TestWebDetailSelection), changes
+// nothing and costs no read of the texts.
+func TestWebReportFlagAndVersion(t *testing.T) {
+	ws, db := fakeWebServer(t, 200)
+	snap := ws.snap.Load()
+	// a row without an sAlpha report, and one with
+	without, with := -1, -1
+	for i := range db.rows {
+		if db.rows[i].SAlphaID == nil && without < 0 {
+			without = i
+		}
+		if db.rows[i].SAlphaID != nil && with < 0 {
+			with = i
+		}
+	}
+	if without < 0 || with < 0 {
+		t.Fatal("the synthetic rows need tokens with and without an sAlpha report")
+	}
+	if c := sentCall(t, snap, with, 1); !c.HasSAlpha || c.SAlphaReportID == nil || *c.SAlphaReportID != *db.rows[with].SAlphaID {
+		t.Fatalf("row with a report: %+v", c)
+	}
+	if c := sentCall(t, snap, without, 1); c.HasSAlpha || c.SAlphaReportID != nil {
+		t.Fatalf("row without a report: %+v", c)
+	}
+	tag := getWeb(ws, "/api/calls?per=200").Header().Get("ETag")
+
+	// an empty reply arrives: the read picks the same report as before (none)
+	if err := ws.refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if s2 := ws.snap.Load(); s2.version != snap.version || getWeb(ws, "/api/calls?per=200").Header().Get("ETag") != tag {
+		t.Fatal("no new report with text: the version must stay")
+	}
+	if a := db.takeAsked(); len(a) != 0 {
+		t.Fatalf("nothing new, yet the texts were read: %v", a)
+	}
+
+	// a report with text arrives for the token that had none
+	rows := cloneWebRows(db.rows)
+	id := 3000000
+	rows[without].SAlphaID = &id
+	db.reports[id] = &ScoutWebReport{ID: id, Tool: webToolSAlpha, At: time.Now(), Text: "fresh"}
+	db.set(rows, nil)
+	if err := ws.refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	s3 := ws.snap.Load()
+	if s3.version == snap.version || getWeb(ws, "/api/calls?per=200").Header().Get("ETag") == tag {
+		t.Fatal("a new sAlpha report must change the version and the ETag")
+	}
+	if c := sentCall(t, s3, without, 1); !c.HasSAlpha || c.SAlphaReportID == nil || *c.SAlphaReportID != id {
+		t.Fatalf("row after the new report: %+v", c)
+	}
+	if a := db.takeAsked(); len(a) != 1 || !slices.Equal(a[0], []int{id}) {
+		t.Fatalf("texts read: %v, want only [%d]", a, id)
+	}
+	// a newer Perceptor report too
+	rows = cloneWebRows(rows)
+	pid := 3000001
+	rows[without].PerceptorID = &pid
+	db.reports[pid] = &ScoutWebReport{ID: pid, Tool: webToolPerceptor, At: time.Now(), Verdict: levelCaution}
+	db.set(rows, nil)
+	if err := ws.refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if ws.snap.Load().version == s3.version {
+		t.Fatal("a new Perceptor report must change the version")
+	}
+}
+
+// TestWebReportTexts: the text map holds exactly the reports the rows refer
+// to; a refresh reads only the ids it does not hold yet (none when nothing is
+// new), drops the ones no row refers to any more, and leaves the map of the
+// snapshot before as it was.
+func TestWebReportTexts(t *testing.T) {
+	ws, db := fakeWebServer(t, 300)
+	referenced := func(rows []ScoutWebRow) map[int]bool {
+		m := map[int]bool{}
+		for i := range rows {
+			for _, p := range [2]*int{rows[i].PerceptorID, rows[i].SAlphaID} {
+				if p != nil {
+					m[*p] = true
+				}
+			}
+		}
+		return m
+	}
+	first := ws.snap.Load()
+	want := referenced(db.rows)
+	if len(want) < 50 || len(first.reports) != len(want) {
+		t.Fatalf("%d texts kept, %d referenced", len(first.reports), len(want))
+	}
+	for id := range want {
+		if first.reports[id] == nil {
+			t.Fatalf("report %d missing", id)
+		}
+	}
+
+	// the first read asks for every id, once
+	ws2, db2 := benchWebServer(t, 1), &fakeWebDB{rows: syntheticWebRows(300, 5)}
+	db2.reports = syntheticWebReports(db2.rows)
+	ws2.readRows, ws2.readReports = db2.read, db2.readReports
+	ws2.snap.Store(nil)
+	if err := ws2.refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if a := db2.takeAsked(); len(a) != 1 || len(a[0]) != len(want) {
+		t.Fatalf("first read asked %d times, want once for %d ids", len(a), len(want))
+	}
+
+	// unchanged: no read of the texts, the same entries
+	if err := ws.refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if a := db.takeAsked(); len(a) != 0 {
+		t.Fatalf("unchanged rows, yet texts read: %v", a)
+	}
+	second := ws.snap.Load()
+	for id, e := range first.reports {
+		if second.reports[id] != e {
+			t.Fatalf("report %d was made again", id)
+		}
+	}
+	// a text changed in the database is not read again (an investigation is
+	// written once, so this cannot happen; it shows that nothing is re-read)
+	for id := range want {
+		db.reports[id] = &ScoutWebReport{ID: id, Tool: db.reports[id].Tool, Text: "changed", Label: sp("changed")}
+	}
+	if err := ws.refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if a := db.takeAsked(); len(a) != 0 {
+		t.Fatalf("texts read again: %v", a)
+	}
+
+	// one report gone, one new: only the new id is read, the old one is dropped
+	rows := cloneWebRows(db.rows)
+	gone, added := -1, -1
+	for i := range rows {
+		if rows[i].SAlphaID != nil && gone < 0 {
+			gone = i
+		} else if rows[i].SAlphaID == nil && rows[i].PerceptorID == nil && added < 0 {
+			added = i
+		}
+	}
+	goneID := *rows[gone].SAlphaID
+	rows[gone].SAlphaID = nil
+	newID := 4000000
+	rows[added].SAlphaID = &newID
+	db.reports[newID] = &ScoutWebReport{ID: newID, Tool: webToolSAlpha, Text: "new one"}
+	// and an id the database does not return (deleted in between): the row
+	// loses it for now, and it is asked for again next time
+	lostID := 4000001
+	rows[added].PerceptorID = &lostID
+	db.set(rows, nil)
+	before := ws.snap.Load()
+	beforeLen := len(before.reports)
+	if err := ws.refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	a := db.takeAsked()
+	if len(a) == 1 {
+		slices.Sort(a[0])
+	}
+	if len(a) != 1 || !slices.Equal(a[0], []int{newID, lostID}) {
+		t.Fatalf("texts read: %v, want [%d %d]", a, newID, lostID)
+	}
+	now := ws.snap.Load()
+	if now.reports[goneID] != nil || now.reports[newID] == nil || now.reports[newID].text != "new one" || now.reports[lostID] != nil {
+		t.Fatal("text map after one report gone and one new")
+	}
+	want = referenced(rows)
+	delete(want, lostID)
+	if len(now.reports) != len(want) {
+		t.Fatalf("%d texts kept, want %d", len(now.reports), len(want))
+	}
+	if len(before.reports) != beforeLen || before.reports[goneID] == nil || before.reports[newID] != nil {
+		t.Fatal("the map of the snapshot before was changed")
+	}
+	if c := sentCall(t, now, added, 1); c.PerceptorReportID != nil || !c.HasSAlpha {
+		t.Fatalf("row with a report that could not be read: %+v", c)
+	}
+	if err := ws.refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if a := db.takeAsked(); len(a) != 1 || !slices.Equal(a[0], []int{lostID}) {
+		t.Fatalf("the missing report must be asked for again: %v", a)
+	}
+
+	// the texts cannot be read: the refresh fails and the snapshot stays
+	rows = cloneWebRows(rows)
+	newer := 4000002
+	rows[gone].SAlphaID = &newer
+	db.set(rows, nil)
+	db.mu.Lock()
+	db.reportsErr = errors.New("down")
+	db.mu.Unlock()
+	kept := ws.snap.Load()
+	if err := ws.refresh(context.Background()); err == nil || ws.snap.Load() != kept {
+		t.Fatalf("a failed read of the texts: %v", err)
+	}
+}
+
+// TestWebReportCut: texts are kept up to 32 KB, cut at a character boundary
+// and marked; links only when they are https and not absurdly long.
+func TestWebReportCut(t *testing.T) {
+	exact := strings.Repeat("a", webReportMaxBytes)
+	if r := newWebReport(&ScoutWebReport{Tool: webToolSAlpha, Text: exact}); r.truncated || r.text != exact {
+		t.Fatal("a text of exactly the limit must be kept whole")
+	}
+	// a 3-byte character across the limit
+	long := strings.Repeat("a", webReportMaxBytes-1) + "€" + strings.Repeat("b", 100)
+	r := newWebReport(&ScoutWebReport{Tool: webToolSAlpha, Text: long, URL: sp("http://salpha.example/x")})
+	if !r.truncated || len(r.text) != webReportMaxBytes-1 || !utf8.ValidString(r.text) || r.url != nil {
+		t.Fatalf("cut: truncated %v, %d bytes, valid %v, url %v", r.truncated, len(r.text), utf8.ValidString(r.text), r.url)
+	}
+	p := newWebReport(&ScoutWebReport{Tool: webToolPerceptor, Verdict: levelRedFlags, Summary: sp(strings.Repeat("é", webReportMaxBytes)),
+		Label: sp("Red flags"), Text: "not shown", URL: sp("https://www.perceptor.info/r/" + strings.Repeat("x", webReportMaxURL))})
+	if !p.truncated || len(*p.summary) != webReportMaxBytes || p.text != "" || p.url != nil || p.verdict != levelRedFlags {
+		t.Fatalf("perceptor cut: %v %d %q %v %q", p.truncated, len(*p.summary), p.text, p.url, p.verdict)
+	}
+	if p := newWebReport(&ScoutWebReport{Tool: webToolPerceptor, Verdict: "not_scanned", URL: sp("https://www.perceptor.info/r/1")}); p.verdict != levelUnknown ||
+		p.url == nil || p.truncated {
+		t.Fatalf("perceptor: %+v", p)
+	}
+}
+
+// TestWebCallEndpoint: GET /api/call answers from memory with the reports of
+// a listed call's token: 400 for a bad id, 404 for one that is not a row, 503
+// before the first snapshot; its own ETag (which follows the reports only),
+// 304, Cache-Control: no-cache and gzip for large answers.
+func TestWebCallEndpoint(t *testing.T) {
+	cold := benchWebServer(t, 1)
+	cold.snap.Store(nil)
+	if rec := getWeb(cold, "/api/call?id=10"); rec.Code != 503 || rec.Header().Get("Retry-After") == "" {
+		t.Fatalf("before the first snapshot: %d", rec.Code)
+	}
+	if rec := getWeb(cold, "/api/call?id=x"); rec.Code != 400 {
+		t.Fatalf("bad id before the first snapshot: %d", rec.Code)
+	}
+
+	ws, db := fakeWebServer(t, 120)
+	for _, q := range []string{"", "?", "?id=", "?id=abc", "?id=0", "?id=-4", "?id=010", "?id=+10", "?id=10.0", "?id=1e3", "?id=%2010",
+		"?id=2147483648", "?id=99999999999999999999", "?id=10&id=10", "?id=10&x=1", "?ID=10", "?id=10;", "?%zz"} {
+		rec := getWeb(ws, "/api/call"+q)
+		var e map[string]string
+		if rec.Code != 400 || json.Unmarshal(rec.Body.Bytes(), &e) != nil || e["error"] == "" || rec.Header().Get("ETag") != "" {
+			t.Errorf("%q: %d %s", q, rec.Code, rec.Body)
+		}
+	}
+	// ids of the synthetic rows are 10, 12, 14, …: 11 is no row
+	for _, q := range []string{"?id=11", "?id=1", "?id=2147483647"} {
+		if rec := getWeb(ws, "/api/call"+q); rec.Code != 404 || !strings.Contains(rec.Body.String(), "refresh") || rec.Header().Get("ETag") != "" {
+			t.Errorf("%s: %d %s", q, rec.Code, rec.Body)
+		}
+	}
+	rec := httptest.NewRecorder()
+	ws.ServeHTTP(rec, httptest.NewRequest("POST", "/api/call?id=10", nil))
+	if rec.Code != 405 {
+		t.Fatalf("POST: %d", rec.Code)
+	}
+
+	// a row with both reports and one with none
+	both, none := -1, -1
+	for i := range db.rows {
+		r := &db.rows[i]
+		if r.PerceptorID != nil && r.SAlphaID != nil && r.PerceptorURL != nil && both < 0 {
+			both = i
+		}
+		if r.PerceptorID == nil && r.SAlphaID == nil && none < 0 {
+			none = i
+		}
+	}
+	if both < 0 || none < 0 {
+		t.Fatal("the synthetic rows need tokens with both reports and with none")
+	}
+	r := db.rows[both]
+	rec = getWeb(ws, fmt.Sprintf("/api/call?id=%d", r.CallID))
+	h := rec.Header()
+	if rec.Code != 200 || h.Get("Cache-Control") != "no-cache" || !strings.HasPrefix(h.Get("ETag"), `W/"`) || h.Get("X-Snapshot-At") == "" ||
+		!strings.HasPrefix(h.Get("Content-Type"), "application/json") || h.Get("Content-Security-Policy") == "" || h.Get("Content-Encoding") != "" {
+		t.Fatalf("detail: %d %v", rec.Code, h)
+	}
+	d := decodeCallDetail(t, rec.Body.Bytes())
+	src := db.reports[*r.SAlphaID]
+	if d.CallID != r.CallID || d.Perceptor == nil || d.Perceptor.ID != *r.PerceptorID || d.Perceptor.Verdict != *r.PerceptorVerd ||
+		d.Perceptor.Summary == nil || *d.Perceptor.Summary != *db.reports[*r.PerceptorID].Summary ||
+		d.SAlpha == nil || d.SAlpha.ID != *r.SAlphaID || d.SAlpha.Text != src.Text || d.SAlpha.URL == nil || *d.SAlpha.URL != *src.URL ||
+		d.SAlpha.At != src.At.UTC().Format(time.RFC3339) || d.SAlpha.Truncated {
+		t.Fatalf("detail of %d: %s", r.CallID, rec.Body)
+	}
+	if (d.Perceptor.URL == nil) != !strings.HasPrefix(*r.PerceptorURL, "https://") {
+		t.Fatalf("perceptor link %v for %q", d.Perceptor.URL, *r.PerceptorURL)
+	}
+	etag := h.Get("ETag")
+	if rec := getWeb(ws, fmt.Sprintf("/api/call?id=%d", r.CallID), "If-None-Match", etag); rec.Code != 304 || rec.Body.Len() != 0 ||
+		rec.Header().Get("ETag") != etag || rec.Header().Get("Cache-Control") != "no-cache" {
+		t.Fatalf("If-None-Match: %d", rec.Code)
+	}
+	rec = getWeb(ws, fmt.Sprintf("/api/call?id=%d", db.rows[none].CallID))
+	if d := decodeCallDetail(t, rec.Body.Bytes()); rec.Code != 200 || d.Perceptor != nil || d.SAlpha != nil ||
+		!strings.Contains(rec.Body.String(), `"perceptor":null`) || !strings.Contains(rec.Body.String(), `"salpha":null`) {
+		t.Fatalf("token without reports: %d %s", rec.Code, rec.Body)
+	}
+
+	// another row changes: the detail stays "not modified"
+	rows := cloneWebRows(db.rows)
+	rows[none].TokenName = sp("renamed")
+	db.set(rows, nil)
+	if err := ws.refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if rec := getWeb(ws, fmt.Sprintf("/api/call?id=%d", r.CallID), "If-None-Match", etag); rec.Code != 304 {
+		t.Fatalf("an unrelated change: %d", rec.Code)
+	}
+	// a new, long sAlpha report: another ETag, and gzip for clients that take it
+	rows = cloneWebRows(rows)
+	big := 5000000
+	rows[both].SAlphaID = &big
+	text := strings.Repeat("<b>wallet</b> 0xabc bought \"a lot\"\n", 200)
+	db.reports[big] = &ScoutWebReport{ID: big, Tool: webToolSAlpha, At: time.Now(), Text: text}
+	db.set(rows, nil)
+	if err := ws.refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	rec = getWeb(ws, fmt.Sprintf("/api/call?id=%d", r.CallID), "If-None-Match", etag)
+	if rec.Code != 200 || rec.Header().Get("ETag") == etag {
+		t.Fatalf("new report: %d, ETag %s", rec.Code, rec.Header().Get("ETag"))
+	}
+	if d := decodeCallDetail(t, rec.Body.Bytes()); d.SAlpha == nil || d.SAlpha.Text != text || d.SAlpha.URL != nil {
+		t.Fatalf("long report: %+v", d.SAlpha)
+	}
+	plain := rec.Body.Bytes()
+	zipped := getWeb(ws, fmt.Sprintf("/api/call?id=%d", r.CallID), "Accept-Encoding", "gzip")
+	if zipped.Header().Get("Content-Encoding") != "gzip" || !strings.Contains(zipped.Header().Get("Vary"), "Accept-Encoding") || zipped.Body.Len() >= len(plain) {
+		t.Fatalf("gzip: %v", zipped.Header())
+	}
+	zr, err := gzip.NewReader(zipped.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out, _ := io.ReadAll(zr); !bytes.Equal(out, plain) {
+		t.Fatal("gzip body differs")
+	}
+	if small := getWeb(ws, fmt.Sprintf("/api/call?id=%d", db.rows[none].CallID), "Accept-Encoding", "gzip"); small.Code != 200 || small.Header().Get("Content-Encoding") != "" {
+		t.Fatal("a small answer was compressed")
+	}
+	// a call that is no row any more (asked by a page of an older snapshot): 404
+	db.set(rows[1:], nil)
+	if err := ws.refresh(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if rec := getWeb(ws, fmt.Sprintf("/api/call?id=%d", rows[0].CallID)); rec.Code != 404 {
+		t.Fatalf("a row that has gone: %d", rec.Code)
+	}
 }

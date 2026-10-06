@@ -239,7 +239,11 @@ var ScoutWebHorizons = [5]string{"1h", "1d", "3d", "7d", "30d"}
 // CallCount and LastCallDate describe all real calls of the token (update posts
 // left out; contract address compared without regard to letter case).
 // PerceptorVerd and PerceptorURL are the token's latest completed Perceptor
-// report (any post of the token), nil when it was never scanned.
+// report (any post of the token), nil when it was never scanned; PerceptorID is
+// that investigation's id. SAlphaID is the token's latest completed sAlpha
+// investigation whose report_text is not empty (nor only white space), nil
+// when there is none. The texts of both are read separately, by id
+// (ScoutStore.SelectWebReports).
 type ScoutWebRow struct {
 	CallID          int
 	MessageID       int
@@ -257,6 +261,8 @@ type ScoutWebRow struct {
 	HasPerf         uint16
 	PerceptorVerd   *string // clean | caution | red_flags | unknown
 	PerceptorURL    *string
+	PerceptorID     *int
+	SAlphaID        *int
 	CallCount       int
 	LastCallDate    time.Time
 	// The tracker's latest-price pass (in PriceUnit; nil until the first refresh):
@@ -339,6 +345,30 @@ type ScoutWebCall struct {
 	// there is no latest price.
 	CallMcapUSD   *float64 `json:"call_mcap_usd"`
 	LatestMcapUSD *float64 `json:"latest_mcap_usd"`
+	// The token's reports, whose texts GET /api/call returns: HasSAlpha says
+	// the token has an sAlpha report with text (an empty one counts as none);
+	// the two ids are the investigations the detail shows (nil = none). A new
+	// report changes them, so the page knows to ask for the detail again.
+	HasSAlpha         bool `json:"has_salpha_report"`
+	PerceptorReportID *int `json:"perceptor_report_id"`
+	SAlphaReportID    *int `json:"salpha_report_id"`
+}
+
+// ScoutWebReport is one investigation as the website's row detail shows it
+// (ScoutStore.SelectWebReports). Tool is perceptor or salpha. At is
+// completed_at, else requested_at. Verdict is clean | caution | red_flags |
+// unknown. Label and Summary are verdict_label and verdict_summary; Text is
+// report_text (read for sAlpha only, at most webReportMaxBytes and a little);
+// URL is report_url as stored (the website keeps https:// links only).
+type ScoutWebReport struct {
+	ID      int
+	Tool    string
+	At      time.Time
+	Verdict string
+	Label   *string
+	Summary *string
+	Text    string
+	URL     *string
 }
 
 // ScoutWebCallsFilter selects a page of the call list (first calls only). Sort, Dir, Horizon and Verdict
