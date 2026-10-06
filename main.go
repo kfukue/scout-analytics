@@ -1427,7 +1427,14 @@ func main() {
 	listenOnly := flag.Bool("listen-only", false, "listener without the performance tracker: new calls are still scanned, delivered and queued for tracking; run -track in another terminal to compute performance")
 	webOnly := flag.Bool("web", false, "run only the read-only website and its JSON API (no Telegram), forever; address from SCOUT_WEB_ADDR (default :8090)")
 	listChats := flag.Bool("list-chats", false, "print your groups/channels with their ids (for SCOUT_NOTIFY_PEER), then exit")
+	retryNoPool := flag.Bool("retry-no-pool", false, "put first calls with tracking status no_pool back to pending, due now (a running tracker picks them up), then exit (DB only)")
+	retryGaveUp := flag.Bool("retry-gave-up", false, "with -retry-no-pool: also gave_up calls")
+	retryLaunchpad := flag.String("retry-launchpad", "", "with -retry-no-pool: only calls whose launchpad or dex is one of these, comma-separated, e.g. pons_v2 (case, spaces and _ ignored)")
+	retryDryRun := flag.Bool("retry-dry-run", false, "with -retry-no-pool: only print what would be reset")
 	flag.Parse()
+	if !*retryNoPool && (*retryGaveUp || *retryLaunchpad != "" || *retryDryRun) {
+		log.Fatal("-retry-gave-up, -retry-launchpad and -retry-dry-run are used with -retry-no-pool")
+	}
 
 	cfg, err := loadConfig(*envFile)
 	if err != nil {
@@ -1468,11 +1475,19 @@ func main() {
 	}
 
 	// Modes that need only the database (no Telegram login).
-	if *exportPath != "" || *trackOnly || *trackOnce || *webOnly {
+	if *exportPath != "" || *trackOnly || *trackOnce || *webOnly || *retryNoPool {
 		if s.db == nil {
 			log.Fatal("these modes need the database (SCOUT_DB=off is set)")
 		}
 		switch {
+		case *retryNoPool:
+			f := RetryFilter{GaveUp: *retryGaveUp, Launchpads: parseLaunchpads(*retryLaunchpad)}
+			if *retryLaunchpad != "" && len(f.Launchpads) == 0 {
+				log.Fatalf("-retry-launchpad %q has no usable value", *retryLaunchpad)
+			}
+			if err := runRetryNoPool(ctx, s.db, os.Stdout, f, *retryDryRun); err != nil {
+				log.Fatalf("retry: %v", err)
+			}
 		case *exportPath != "":
 			f, err := os.Create(*exportPath)
 			if err != nil {
