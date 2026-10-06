@@ -137,11 +137,35 @@ tokens: GME, MSFT, TSLA, SPCX, CRCL, GOOGL, MU, NVDA, AMZN, SNDK. A full
    - Fix `TestWebGzip` (see "How to test").
    - Document in the README that `TestOpenScoutStoreSelection` needs the test
      database to be named `scout_test`.
-2. **"Refresh now" button** on the website's Import progress panel. It triggers
-   an immediate snapshot refresh, coalesced and rate-limited globally (at most
-   one database read every few seconds, shared by all clients; the site has no
-   login), then the page re-fetches. Every other request is still answered from
-   the snapshot. Rerun the benchmark.
+2. **"Refresh now" button and new column layout** (same website files, so one
+   piece of work).
+   - **Refresh now** on the website's Import progress panel. It triggers an
+     immediate snapshot refresh, coalesced and rate-limited globally (at most
+     one database read every few seconds, shared by all clients; the site has
+     no login), then the page re-fetches. Every other request is still answered
+     from the snapshot. Rerun the benchmark.
+   - **New column order (owner decided, 5 Oct):**
+     Date | Token | Symbol | Calls | Perceptor | Status | Entry $ | Call MC |
+     Latest MC | Latest % | Peak % | Worst drop % | 1h | 1d | 3d | 7d | 30d
+     - Perceptor and Status move up, next to the token.
+     - Latest MC and Latest % sit right after Call MC.
+     - Peak % and Worst drop % come right after the latest columns. A small
+       1h/1d/3d/7d/30d selector switches only these two (option B; the owner
+       chose it over hover-only and over dropping them). Both stay sortable by
+       the selected window.
+     - 1h … 30d are five new columns, each showing that window's return %
+       (late-entry USD, as today), each sortable. The existing horizon buttons
+       become the peak/drop selector.
+   - Implementation notes:
+     - The API needs per-horizon returns for all five windows in each row
+       (they're already in the snapshot). New sort values per window, e.g.
+       `return_1h` … `return_30d`, or keep `sort=return&horizon=…`; choose and
+       document.
+     - Keep the per-request JSON splice for the selected window's peak/drop.
+     - Non-USD rows: line the cells up with dashes / "no USD price".
+     - Mobile: the table scrolls sideways.
+     - Rerun the benchmark; browser check at 1280/390px, light and dark.
+     - Update the README (Website and API sections).
 3. **sAlpha report on the page** (owner asked again, 6 Oct).
    - The @salpha_research_bot reply is already stored in `scout_investigations`
      (tool code `salpha`, `report_text`, `report_url`). It arrives later than
