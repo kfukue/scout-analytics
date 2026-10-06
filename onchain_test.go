@@ -214,16 +214,31 @@ func sqrtX96(raw float64) *big.Int {
 func (f *fakeChain) transfer(token, from, to string, block uint64, tx string) {
 	f.logs = append(f.logs, fakeLog{addr: token, topics: []string{topicTransfer, addrTopic(from), addrTopic(to)}, data: ret(wInt(1)), block: block, tx: tx})
 }
+
+// fakeLiq is the in-range liquidity L of the fake v3/v4 swaps: deep enough that
+// every test price leaves the pool far above the rug threshold.
+var fakeLiq = new(big.Int).Exp(big.NewInt(10), big.NewInt(24), nil)
+
 func (f *fakeChain) swapV3(pool string, block uint64, tx string, sqrtP *big.Int) {
+	f.swapV3L(pool, block, tx, sqrtP, fakeLiq, 0)
+}
+
+// swapV3L is swapV3 with the pool's liquidity and tick after the swap.
+func (f *fakeChain) swapV3L(pool string, block uint64, tx string, sqrtP, liq *big.Int, tick int64) {
 	f.logs = append(f.logs, fakeLog{addr: pool, topics: []string{topicSwapV3, addrTopic("0xaa"), addrTopic("0xbb")},
-		data: ret(wInt(-5), wInt(7), w32(sqrtP), wInt(1), wInt(0)), block: block, tx: tx})
+		data: ret(wInt(-5), wInt(7), w32(sqrtP), w32(liq), wInt(tick)), block: block, tx: tx})
 }
 func (f *fakeChain) syncV2(pool string, block uint64, tx string, r0, r1 *big.Int) {
 	f.logs = append(f.logs, fakeLog{addr: pool, topics: []string{topicSyncV2}, data: ret(w32(r0), w32(r1)), block: block, tx: tx})
 }
 func (f *fakeChain) swapV4(pm, id string, block uint64, tx string, sqrtP *big.Int) {
+	f.swapV4L(pm, id, block, tx, sqrtP, fakeLiq, 0)
+}
+
+// swapV4L is swapV4 with the pool's liquidity and tick after the swap.
+func (f *fakeChain) swapV4L(pm, id string, block uint64, tx string, sqrtP, liq *big.Int, tick int64) {
 	f.logs = append(f.logs, fakeLog{addr: pm, topics: []string{topicSwapV4, id, addrTopic("0xaa")},
-		data: ret(wInt(5), wInt(-7), w32(sqrtP), wInt(1), wInt(0), wInt(3000)), block: block, tx: tx})
+		data: ret(wInt(5), wInt(-7), w32(sqrtP), w32(liq), wInt(tick), wInt(3000)), block: block, tx: tx})
 }
 
 func testOnchain(t *testing.T, f *fakeChain, extraEnv map[string]string) *onchainSource {
@@ -745,8 +760,9 @@ func TestDiscoverAndPriceV2Stable(t *testing.T) {
 	if q, ok, _ := o.quoteUSD(ctx, st.Quote, eb); !ok || q != 1 {
 		t.Fatalf("stable quote %v %v", q, ok)
 	}
-	if liq, ok := o.liquidityUSD(ctx, st, 1); !ok || liq != 24_000 {
-		t.Fatalf("liquidity %v %v", liq, ok)
+	// the quote side only: the 12k USDG the pool holds (the column stores 2×)
+	if liq, ok := o.liquidityUSD(ctx, st, 1); !ok || liq != 12_000 || poolDepthUSD(liq) != 24_000 {
+		t.Fatalf("liquidity: got %v %v, want quote side 12000 (depth 24000)", liq, ok)
 	}
 }
 

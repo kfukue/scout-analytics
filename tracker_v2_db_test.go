@@ -11,7 +11,7 @@ import (
 
 func (f *fakeChain) swapV3Amt(pool string, block uint64, sqrtP, a0, a1 *big.Int) {
 	f.logs = append(f.logs, fakeLog{addr: pool, topics: []string{topicSwapV3, addrTopic("0xaa"), addrTopic("0xbb")},
-		data: ret(w32(a0), w32(a1), w32(sqrtP), wInt(1), wInt(0)), block: block, tx: hexU64(block)})
+		data: ret(w32(a0), w32(a1), w32(sqrtP), w32(fakeLiq), wInt(0)), block: block, tx: hexU64(block)})
 }
 
 // State v2 end to end: a token paired with an asset that has no price feed

@@ -77,7 +77,7 @@ func TestTrackerEndToEnd(t *testing.T) {
 	fresh := "0x7777777777777777777777777777777777777777" // 10 min old: nothing due yet
 	eYoung, eOld := now.Add(-8*24*time.Hour), now.Add(-35*24*time.Hour)
 	addToken(f, young, "0xpoolyoung", eYoung, 25000)
-	addToken(f, old, "0xpoolold", eOld, 120) // liquidity pulled → rug
+	addToken(f, old, "0xpoolold", eOld, 120) // liquidity pulled: a $120 reserve, under the $500 threshold
 
 	s.onChannelPost(postAt(1, eYoung, young))
 	s.onChannelPost(postAt(2, eOld, old))
@@ -109,7 +109,8 @@ func TestTrackerEndToEnd(t *testing.T) {
 		t.Fatalf("young 1d: %+v", r)
 	}
 
-	// old: everything done; collapse after day 10 + tiny liquidity → rugged
+	// old: everything done; collapse after day 10 (< 5% of entry) and a $120
+	// reserve (GeckoTerminal's reserve_usd, both sides, < $500) → rugged
 	to, _ := st.GetTracking(ctx, ids[1])
 	if to.Status != TrackDone || to.Rugged == nil || !*to.Rugged {
 		t.Fatalf("old tracking: %+v", to)

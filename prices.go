@@ -38,7 +38,7 @@ type priceConfig struct {
 	KeyHeader string
 	RPM       int
 	Horizons  []horizon
-	RugLiqUSD float64 // pool liquidity below this (now) → rugged
+	RugLiqUSD float64 // = Onchain.RugLiqUSD (SCOUT_RUG_LIQ_USD); the gecko source compares its pool reserve (both sides) with it
 	Enabled   bool
 	Interval  time.Duration // tracker loop interval
 	Workers   int           // calls tracked at the same time (on-chain source)
@@ -78,7 +78,7 @@ func loadPriceConfig() (priceConfig, error) {
 		APIKey:    env("SCOUT_PRICE_API_KEY", ""),
 		KeyHeader: env("SCOUT_PRICE_API_KEY_HEADER", "x-cg-pro-api-key"),
 		RPM:       10,
-		RugLiqUSD: 500,
+		RugLiqUSD: defaultRugLiqUSD,
 		Enabled:   envBool("SCOUT_TRACK_PERFORMANCE", true),
 		Interval:  envDur("SCOUT_TRACK_INTERVAL", time.Minute),
 		Workers:   8,
@@ -99,13 +99,6 @@ func loadPriceConfig() (priceConfig, error) {
 	}
 	if err := pc.loadLatestConfig(); err != nil {
 		return pc, err
-	}
-	if v := env("SCOUT_RUG_LIQ_USD", ""); v != "" {
-		f, err := strconv.ParseFloat(v, 64)
-		if err != nil {
-			return pc, fmt.Errorf("SCOUT_RUG_LIQ_USD=%q: %v", v, err)
-		}
-		pc.RugLiqUSD = f
 	}
 	for _, h := range strings.Split(env("SCOUT_PERF_HORIZONS", "1h,1d,3d,7d,30d"), ",") {
 		h = strings.TrimSpace(h)
@@ -129,6 +122,8 @@ func loadPriceConfig() (priceConfig, error) {
 	if pc.Onchain, err = loadOnchainConfig(); err != nil {
 		return pc, err
 	}
+	// SCOUT_RUG_LIQ_USD is read and checked once, by loadOnchainConfig.
+	pc.RugLiqUSD = pc.Onchain.RugLiqUSD
 	if len(pc.Horizons) == 0 {
 		return pc, errors.New("SCOUT_PERF_HORIZONS is empty")
 	}

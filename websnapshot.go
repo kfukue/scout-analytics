@@ -15,6 +15,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 )
 
 // ---------------------------------------------------------------------------
@@ -135,6 +136,135 @@ type webSnapshot struct {
 	// answers already encoded for this snapshot (nil = none are kept); the one
 	// part of a snapshot that still changes after it is put in place
 	answers *webAnswers
+	// percID[i] and salphaID[i]: the investigations the detail of row i shows
+	// (0 = none); reports holds their texts by investigation id, exactly the
+	// ids some row refers to (set by webServer.readSnapshot, never changed
+	// after the snapshot is in place; the entries are shared with the snapshot
+	// before, which is how a refresh reads only the texts it does not have).
+	percID   []int32
+	salphaID []int32
+	reports  map[int]*webReport
+}
+
+// webReportMaxBytes: the most of one text (report, summary, label) the
+// website keeps; a longer one is cut there (at a character boundary) and
+// marked as cut. sAlpha's reports are about 33 characters on average (1,035 at
+// most) and Perceptor's summaries are a line, so in practice nothing is cut.
+const webReportMaxBytes = 32 << 10
+
+// webReportMaxURL: a longer report link is not kept.
+const webReportMaxURL = 2048
+
+// webReport is one report as the row detail (GET /api/call) shows it: an
+// investigation, its texts already cut to size and its link kept only when it
+// is https. It never changes once made: an investigation is written once.
+type webReport struct {
+	id        int
+	tool      string
+	at        time.Time
+	verdict   string  // Perceptor: clean | caution | red_flags | unknown
+	label     *string // Perceptor: verdict_label
+	summary   *string // Perceptor: verdict_summary
+	text      string  // sAlpha: report_text
+	url       *string
+	truncated bool // a text was longer than webReportMaxBytes and was cut
+}
+
+// cutText returns s cut to at most max bytes, at a character boundary, and
+// whether it was cut.
+func cutText(s string, max int) (string, bool) {
+	if len(s) <= max {
+		return s, false
+	}
+	i := max
+	for i > 0 && !utf8.RuneStart(s[i]) {
+		i--
+	}
+	return s[:i], true
+}
+
+// newWebReport keeps what the detail shows of an investigation read from the
+// database: the texts of its tool, cut to webReportMaxBytes, and an https link.
+func newWebReport(r *ScoutWebReport) *webReport {
+	w := &webReport{id: r.ID, tool: r.Tool, at: r.At.UTC()}
+	cut := func(p *string) *string {
+		if p == nil {
+			return nil
+		}
+		v, c := cutText(*p, webReportMaxBytes)
+		w.truncated = w.truncated || c
+		return &v
+	}
+	switch r.Tool {
+	case webToolPerceptor:
+		w.verdict = r.Verdict
+		if _, ok := webVerdictBuckets[w.verdict]; !ok || w.verdict == "not_scanned" {
+			w.verdict = levelUnknown
+		}
+		w.label, w.summary = cut(r.Label), cut(r.Summary)
+	case webToolSAlpha:
+		w.text, w.truncated = cutText(r.Text, webReportMaxBytes)
+	}
+	if r.URL != nil && strings.HasPrefix(*r.URL, "https://") && len(*r.URL) <= webReportMaxURL {
+		u := *r.URL
+		w.url = &u
+	}
+	return w
+}
+
+// The tool codes whose reports the row detail shows.
+const (
+	webToolPerceptor = "perceptor"
+	webToolSAlpha    = "salpha"
+)
+
+// webMissingReports returns the report ids rows refer to that have is
+// missing, each once, in the order met.
+func webMissingReports(rows []ScoutWebRow, have map[int]*webReport) []int {
+	var out []int
+	seen := map[int]bool{}
+	for i := range rows {
+		for _, p := range [2]*int{rows[i].PerceptorID, rows[i].SAlphaID} {
+			if p != nil && have[*p] == nil && !seen[*p] {
+				seen[*p] = true
+				out = append(out, *p)
+			}
+		}
+	}
+	return out
+}
+
+// webReportsFor makes the text map of a new snapshot: for every report id
+// rows refer to, the entry of old (the snapshot before) or, for an id not in
+// old, the one just read (got). Entries no row refers to any more are not
+// taken over. A row whose report could not be read (not in old nor in got, or
+// of another tool) loses that id: the next refresh asks for it again. old is
+// never changed: requests may still read it.
+func webReportsFor(rows []ScoutWebRow, old map[int]*webReport, got map[int]*ScoutWebReport) map[int]*webReport {
+	m := make(map[int]*webReport)
+	keep := func(p *int, tool string) *int {
+		if p == nil {
+			return nil
+		}
+		if e := m[*p]; e != nil {
+			return p
+		}
+		if e := old[*p]; e != nil && e.tool == tool {
+			m[*p] = e
+			return p
+		}
+		if g := got[*p]; g != nil && g.ID == *p && g.Tool == tool {
+			m[*p] = newWebReport(g)
+			return p
+		}
+		return nil
+	}
+	for i := range rows {
+		r := &rows[i]
+		r.PerceptorID = keep(r.PerceptorID, webToolPerceptor)
+		r.SAlphaID = keep(r.SAlphaID, webToolSAlpha)
+	}
+	return m
 }
 
 const webFlagUSD = 0x80 // in webSnapshot.flags, next to the bucket
@@ -224,6 +354,7 @@ func (c webConfig) webCall(r *ScoutWebRow) ScoutWebCall {
 		PerceptorVerd: r.PerceptorVerd, PerceptorURL: r.PerceptorURL,
 		CallCount: r.CallCount, LastCallDate: r.LastCallDate,
 		CallMcapUSD: r.callMcap, LatestMcapUSD: r.latestMcap,
+		HasSAlpha: r.SAlphaID != nil, PerceptorReportID: r.PerceptorID, SAlphaReportID: r.SAlphaID,
 	}
 }
 
@@ -301,6 +432,11 @@ func newWebSnapshot(rows []ScoutWebRow, updatePosts int, prev *webSnapshot, cfg 
 		if r.PerceptorURL != nil && !strings.HasPrefix(*r.PerceptorURL, "https://") {
 			r.PerceptorURL = nil // the page only links to https addresses
 		}
+		for _, p := range [2]**int{&r.PerceptorID, &r.SAlphaID} {
+			if *p != nil && (**p <= 0 || **p > math.MaxInt32) {
+				*p = nil // not an id the snapshot can hold
+			}
+		}
 		r.verdict = webBucketNotScanned
 		if r.PerceptorVerd != nil {
 			if b, ok := webVerdictBuckets[*r.PerceptorVerd]; ok {
@@ -328,7 +464,9 @@ func newWebSnapshot(rows []ScoutWebRow, updatePosts int, prev *webSnapshot, cfg 
 	s.rowAt = make([]uint32, n+1)
 	s.rowCut = make([]uint32, n)
 	s.searchAt = make([]uint32, n+1)
-	s.rowJSON = make([]byte, 0, n*880) // about 810 bytes a row
+	s.percID = make([]int32, n)
+	s.salphaID = make([]int32, n)
+	s.rowJSON = make([]byte, 0, n*940) // about 870 bytes a row
 	s.search = make([]byte, 0, n*72)
 	var one bytes.Buffer // one encoded row
 	enc := json.NewEncoder(&one)
@@ -349,6 +487,12 @@ func newWebSnapshot(rows []ScoutWebRow, updatePosts int, prev *webSnapshot, cfg 
 		}
 		s.hasPerf[i] = r.HasPerf
 		copy(s.perf[i*webPerfPerRow:], r.Perf[:])
+		if r.PerceptorID != nil {
+			s.percID[i] = int32(*r.PerceptorID)
+		}
+		if r.SAlphaID != nil {
+			s.salphaID[i] = int32(*r.SAlphaID)
+		}
 
 		one.Reset()
 		call := cfg.webCall(r)
@@ -413,6 +557,14 @@ func hashWebRows(rows []ScoutWebRow, updatePosts int, gmgn string) string {
 		buf = append(buf, 1)
 		str(*p)
 	}
+	optInt := func(p *int) {
+		if p == nil {
+			buf = append(buf, 0)
+			return
+		}
+		buf = append(buf, 1)
+		num(int64(*p))
+	}
 	flt := func(v float64) { buf = binary.LittleEndian.AppendUint64(buf, math.Float64bits(v)) }
 	optFlt := func(p *float64) {
 		if p == nil {
@@ -473,6 +625,10 @@ func hashWebRows(rows []ScoutWebRow, updatePosts int, gmgn string) string {
 		// the market caps as shown (worked out by newWebSnapshot), not their inputs
 		optFlt(r.callMcap)
 		optFlt(r.latestMcap)
+		// the reports the detail shows (a new one changes the version, an
+		// empty sAlpha reply is never chosen, so it does not)
+		optInt(r.PerceptorID)
+		optInt(r.SAlphaID)
 		h.Write(buf)
 	}
 	return hex.EncodeToString(h.Sum(nil)[:12])

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -21,6 +22,37 @@ type fakeWebDB struct {
 	rows  []ScoutWebRow
 	err   error
 	gate  chan struct{} // nil = answer at once
+	// the report texts by investigation id, the ids each read of them asked
+	// for, and the error it gives
+	reports    map[int]*ScoutWebReport
+	asked      [][]int
+	reportsErr error
+}
+
+func (f *fakeWebDB) readReports(ctx context.Context, ids []int) (map[int]*ScoutWebReport, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.asked = append(f.asked, slices.Clone(ids))
+	if f.reportsErr != nil {
+		return nil, f.reportsErr
+	}
+	out := map[int]*ScoutWebReport{}
+	for _, id := range ids {
+		if r := f.reports[id]; r != nil {
+			c := *r
+			out[id] = &c
+		}
+	}
+	return out, nil
+}
+
+// takeAsked returns the ids each read of the texts asked for since the last call.
+func (f *fakeWebDB) takeAsked() [][]int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	a := f.asked
+	f.asked = nil
+	return a
 }
 
 func (f *fakeWebDB) read(ctx context.Context) ([]ScoutWebRow, int, error) {
@@ -70,12 +102,15 @@ func fakeWebServer(t *testing.T, n int) (*webServer, *fakeWebDB) {
 	t.Helper()
 	ws := benchWebServer(t, 1)
 	db := &fakeWebDB{rows: syntheticWebRows(n, 5)}
+	db.reports = syntheticWebReports(db.rows)
 	ws.readRows = db.read
+	ws.readReports = db.readReports
 	ws.snap.Store(nil)
 	if err := ws.refresh(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	db.reads.Store(0)
+	db.takeAsked()
 	return ws, db
 }
 

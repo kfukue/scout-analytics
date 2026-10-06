@@ -49,6 +49,18 @@
   var lastRefresh = 0;
   var refreshing = false; // "Refresh now" is waiting for the server
 
+  // Row detail (the token's Perceptor and sAlpha reports). Open rows are kept
+  // by call_id, so they stay open across the 30-second refresh, "Refresh now",
+  // sorting, the window selector and paging. Each open row has one detail row
+  // node, made once and moved back under its row whenever the table is drawn
+  // again, so what it shows stays as it is. details[id] is what the server
+  // answered for that call (with its ETag), and which reports it was for.
+  var openRows = {};   // call_id → true
+  var detailRows = {}; // call_id → the detail <tr>
+  var details = {};    // call_id → { etag, data, ids, status: 'loading' | 'ok' | 'error' | 'gone', why, seq }
+  var rowReports = {}; // call_id → the report ids the row named when it was last drawn
+  var detailSeq = 0;
+
   function $(id) { return document.getElementById(id); }
 
   function el(tag, className, text) {
@@ -187,15 +199,42 @@
     return ca.slice(0, 6) + '…' + ca.slice(-4);
   }
 
-  function buildRow(c) {
-    var tr = el('tr');
+  // The call id of a row as a plain whole number ('' when it is not one).
+  function callKey(c) {
+    var id = c && c.call_id;
+    return (typeof id === 'number' && isFinite(id) && id > 0 && Math.floor(id) === id) ? String(id) : '';
+  }
 
-    var tdDate = el('td');
+  // Which reports a row names: when this changes, an open detail is asked for again.
+  function reportIds(c) {
+    return (isNum(c.perceptor_report_id) ? c.perceptor_report_id : 0) + ':' +
+      (isNum(c.salpha_report_id) ? c.salpha_report_id : 0);
+  }
+
+  function buildRow(c) {
+    var tr = el('tr', 'call-row');
+    var key = callKey(c);
+    var name = (typeof c.token_name === 'string' && c.token_name.trim() !== '') ? c.token_name : shortAddress(c.contract_address);
+
+    var tdDate = el('td', 'date');
+    if (key) {
+      tr.dataset.callId = key;
+      // opens the row detail (the token's reports); a real button, so it
+      // works with the keyboard
+      var tog = el('button', 'row-toggle');
+      tog.type = 'button';
+      tog.setAttribute('aria-expanded', 'false');
+      tog.setAttribute('aria-label', 'Reports of ' + name);
+      tog.title = 'Show the Perceptor and sAlpha reports';
+      var chev = el('span', 'chev', '▸');
+      chev.setAttribute('aria-hidden', 'true');
+      tog.appendChild(chev);
+      tdDate.appendChild(tog);
+    }
     var dateNode = linkOrText(c.post_url, fmtDate(c.message_date));
     tdDate.appendChild(dateNode);
     tr.appendChild(tdDate);
 
-    var name = (typeof c.token_name === 'string' && c.token_name.trim() !== '') ? c.token_name : shortAddress(c.contract_address);
     var tdToken = el('td');
     var tokenNode = linkOrText(c.gmgn_url, name, 'token');
     tokenNode.title = name + '\n' + String(c.contract_address || '');
@@ -231,6 +270,12 @@
       tdPerc.appendChild(pvNode);
     } else {
       tdPerc.textContent = DASH;
+    }
+    // the token has an sAlpha report with text (an empty reply counts as none)
+    if (c.has_salpha_report === true) {
+      var sa = el('span', 'sa-badge', 'sA');
+      sa.title = 'sAlpha report available: open the row (▸) to read it';
+      tdPerc.appendChild(sa);
     }
     tr.appendChild(tdPerc);
 
@@ -277,6 +322,179 @@
     m.classList.toggle('error', !!isError);
   }
 
+  // ---- Row detail ---------------------------------------------------------
+
+  function colCount() {
+    var n = document.querySelectorAll('thead th').length;
+    return n > 0 ? n : 17;
+  }
+
+  function setExpanded(tr, key, open) {
+    var btn = tr.querySelector('.row-toggle');
+    tr.classList.toggle('open', open);
+    if (!btn) { return; }
+    btn.setAttribute('aria-expanded', open ? 'true' : 'false');
+    if (open) {
+      btn.setAttribute('aria-controls', 'detail-' + key);
+    } else {
+      btn.removeAttribute('aria-controls');
+    }
+  }
+
+  // The detail row of a call: made once, kept while the page is open.
+  function detailRowFor(key) {
+    var tr = detailRows[key];
+    if (tr) { return tr; }
+    tr = el('tr', 'detail-row');
+    tr.id = 'detail-' + key;
+    var td = el('td', 'detail-cell');
+    td.colSpan = colCount();
+    var box = el('div', 'detail-box');
+    td.appendChild(box);
+    tr.appendChild(td);
+    detailRows[key] = tr;
+    drawDetail(key);
+    return tr;
+  }
+
+  function reportMeta(parts) {
+    var p = el('p', 'report-meta');
+    for (var i = 0; i < parts.length; i++) {
+      if (i > 0) { p.appendChild(document.createTextNode(' · ')); }
+      p.appendChild(typeof parts[i] === 'string' ? document.createTextNode(parts[i]) : parts[i]);
+    }
+    return p;
+  }
+
+  function perceptorSection(p) {
+    var sec = el('section', 'report');
+    sec.appendChild(el('h3', 'report-title', 'Perceptor'));
+    if (!p || typeof p !== 'object') {
+      sec.appendChild(el('p', 'muted', 'No Perceptor report'));
+      return sec;
+    }
+    var pv = Object.prototype.hasOwnProperty.call(VERDICT_TEXT, p.verdict) ? VERDICT_TEXT[p.verdict] : null;
+    var parts = [pv ? el('span', pv.cls, pv.text) : el('span', 'muted', 'verdict not readable')];
+    if (typeof p.label === 'string' && p.label.trim() !== '' && (!pv || p.label.toLowerCase() !== pv.text)) { parts.push(p.label); }
+    if (typeof p.at === 'string') { parts.push(fmtDate(p.at)); }
+    sec.appendChild(reportMeta(parts));
+    if (typeof p.summary === 'string' && p.summary.trim() !== '') {
+      sec.appendChild(el('p', 'report-text', p.summary));
+    }
+    if (p.truncated === true) { sec.appendChild(el('p', 'muted small', 'Cut at 32 KB.')); }
+    if (isHttps(p.url)) { sec.appendChild(linkOrText(p.url, 'Open the Perceptor report', 'report-link')); }
+    return sec;
+  }
+
+  function salphaSection(s) {
+    var sec = el('section', 'report');
+    sec.appendChild(el('h3', 'report-title', 'sAlpha'));
+    if (!s || typeof s !== 'object' || typeof s.text !== 'string' || s.text.trim() === '') {
+      sec.appendChild(el('p', 'muted', 'No sAlpha report'));
+      return sec;
+    }
+    if (typeof s.at === 'string') { sec.appendChild(reportMeta([fmtDate(s.at)])); }
+    sec.appendChild(el('p', 'report-text', s.text));
+    if (s.truncated === true) { sec.appendChild(el('p', 'muted small', 'Cut at 32 KB.')); }
+    if (isHttps(s.url)) { sec.appendChild(linkOrText(s.url, 'Open the sAlpha report', 'report-link')); }
+    return sec;
+  }
+
+  // Draws what is known of a call's detail into its detail row.
+  function drawDetail(key) {
+    var tr = detailRows[key];
+    if (!tr) { return; }
+    var box = tr.querySelector('.detail-box');
+    var d = details[key];
+    box.textContent = '';
+    if (!d || (d.status === 'loading' && !d.data)) {
+      box.appendChild(el('p', 'muted detail-note', 'Loading…'));
+      return;
+    }
+    if (d.status === 'gone') {
+      box.appendChild(el('p', 'error detail-note', 'Not available in the data now shown; refresh the page.'));
+      return;
+    }
+    if (!d.data) {
+      box.appendChild(el('p', 'error detail-note', 'Could not load the reports' + (d.why ? ' (' + d.why + ')' : '') +
+        '. They are asked for again with the next refresh.'));
+      return;
+    }
+    box.appendChild(perceptorSection(d.data.perceptor));
+    box.appendChild(salphaSection(d.data.salpha));
+    if (d.status === 'error') {
+      box.appendChild(el('p', 'error small detail-note', 'Could not check for newer reports' + (d.why ? ' (' + d.why + ')' : '') + '.'));
+    }
+  }
+
+  // Asks for a call's detail again when the row names other reports than the
+  // ones shown, or the last try failed. The server answers 304 when nothing
+  // changed, and then nothing is drawn again.
+  function refreshDetail(key) {
+    var d = details[key];
+    if (d && d.status === 'ok' && d.ids === rowReports[key]) { return; }
+    if (d && d.status === 'loading' && d.want === rowReports[key]) { return; } // already on its way
+    loadDetail(key);
+  }
+
+  function loadDetail(key) {
+    var d = details[key];
+    if (!d) { d = details[key] = { etag: '', data: null, ids: '', status: '', why: '', seq: 0, want: '' }; }
+    var seq = ++detailSeq;
+    var want = rowReports[key] || '';
+    var hadError = d.status === 'error';
+    d.seq = seq;
+    d.want = want;
+    if (!d.data) { d.status = 'loading'; drawDetail(key); } else { d.status = 'loading'; }
+    fetchJSON('api/call?id=' + encodeURIComponent(key), d.data ? d.etag : '').then(function (res) {
+      if (d.seq !== seq) { return; } // a newer request has taken over
+      d.ids = want;
+      d.why = '';
+      d.status = 'ok';
+      if (res.data === null) { // not modified: what is shown is current
+        if (hadError) { drawDetail(key); } // only the notice of the failed try goes
+        return;
+      }
+      if (!res.data || typeof res.data !== 'object') { throw new Error('unexpected answer'); }
+      d.data = res.data;
+      d.etag = res.etag;
+      drawDetail(key);
+    }).catch(function (err) {
+      if (d.seq !== seq) { return; }
+      d.status = err && err.status === 404 ? 'gone' : 'error';
+      d.why = err && err.message ? err.message : '';
+      if (d.status === 'gone') { d.data = null; d.etag = ''; }
+      drawDetail(key);
+    });
+  }
+
+  // Open details whose last try failed are tried again with every refresh
+  // (also when the list itself has not changed).
+  function retryFailedDetails() {
+    for (var key in openRows) {
+      if (Object.prototype.hasOwnProperty.call(openRows, key) && details[key] && details[key].status === 'error' &&
+          detailRows[key] && detailRows[key].parentNode) {
+        loadDetail(key);
+      }
+    }
+  }
+
+  function toggleRow(tr) {
+    var key = tr.dataset.callId;
+    if (!key) { return; }
+    if (openRows[key]) {
+      delete openRows[key];
+      var dr = detailRows[key];
+      if (dr && dr.parentNode) { dr.parentNode.removeChild(dr); }
+      setExpanded(tr, key, false);
+      return;
+    }
+    openRows[key] = true;
+    tr.parentNode.insertBefore(detailRowFor(key), tr.nextSibling);
+    setExpanded(tr, key, true);
+    refreshDetail(key);
+  }
+
   // The label of a header: Peak % and Worst drop % name the window chosen.
   function headerLabel(base, th) {
     return th.dataset.window ? base + ' (' + state.horizon + ')' : base;
@@ -314,9 +532,23 @@
     var rows = $('rows');
     var frag = document.createDocumentFragment();
     var calls = Array.isArray(data.calls) ? data.calls : [];
-    for (var i = 0; i < calls.length; i++) { frag.appendChild(buildRow(calls[i])); }
+    var reopen = [];
+    for (var i = 0; i < calls.length; i++) {
+      var tr = buildRow(calls[i]);
+      frag.appendChild(tr);
+      var key = callKey(calls[i]);
+      if (!key) { continue; }
+      rowReports[key] = reportIds(calls[i]);
+      if (openRows[key]) {
+        // still open: the same detail node goes back under the row
+        setExpanded(tr, key, true);
+        frag.appendChild(detailRowFor(key));
+        reopen.push(key);
+      }
+    }
     rows.textContent = '';
     rows.appendChild(frag);
+    for (var j = 0; j < reopen.length; j++) { refreshDetail(reopen[j]); }
 
     var total = isNum(data.total) ? data.total : 0;
     var per = isNum(data.per) && data.per > 0 ? data.per : PER_PAGE;
@@ -347,7 +579,11 @@
         // read the (empty) body so the browser counts the request as finished
         return r.text().then(function () { return { data: null, etag: etag, at: meta.at }; });
       }
-      if (!r.ok) { throw new Error('HTTP ' + r.status); }
+      if (!r.ok) {
+        var err = new Error('HTTP ' + r.status);
+        err.status = r.status;
+        throw err;
+      }
       return r.json().then(function (data) { return { data: data, etag: meta.etag, at: meta.at }; });
     });
   }
@@ -525,6 +761,20 @@
   function bind() {
     $('refresh-now').addEventListener('click', refreshNow);
 
+    // Opening a row: its toggle button, or a click elsewhere on the row that
+    // is not on a link or another control, nor the end of selecting text.
+    $('rows').addEventListener('click', function (ev) {
+      var t = ev.target;
+      if (!t || typeof t.closest !== 'function') { return; }
+      var tr = t.closest('tr');
+      if (!tr || !tr.classList.contains('call-row')) { return; }
+      if (t.closest('.row-toggle')) { toggleRow(tr); return; }
+      if (t.closest('a, button, input, select, textarea, summary, label')) { return; }
+      var sel = window.getSelection ? window.getSelection() : null;
+      if (sel && !sel.isCollapsed && String(sel).trim() !== '') { return; }
+      toggleRow(tr);
+    });
+
     var ths = document.querySelectorAll('th[data-sort]');
     Array.prototype.forEach.call(ths, function (th) {
       th.querySelector('button').addEventListener('click', function () {
@@ -593,6 +843,7 @@
     lastRefresh = Date.now();
     loadSummary();
     loadCalls(true);
+    retryFailedDetails();
     scheduleRefresh(REFRESH_MS);
   }
 

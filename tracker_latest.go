@@ -47,6 +47,8 @@ const (
 	latestStateKeyBlock  = "latest_block"
 	latestStateKeyPrice  = "latest_price_q"
 	latestStateKeyTrades = "latest_trade_block"
+	latestStateKeyRug    = "rug_block"   // onchainState.RugBlock, when the pass finds the rug
+	latestStateKeyRugLiq = "rug_liq_usd" // onchainState.RugLiquidityUSD
 )
 
 // latestRetryAfter: a row whose refresh failed is left alone for this long
@@ -298,8 +300,29 @@ func (s *scanner) latestOne(ctx context.Context, t *ScoutCallTracking, head uint
 	o := s.onchain
 	var st onchainState
 	if len(t.Onchain) == 0 || json.Unmarshal(t.Onchain, &st) != nil || st.V < onchainStateVersion ||
-		st.Pool == "" || st.EntryPriceQ <= 0 || st.LastPriceQ <= 0 || t.EntryPriceUSD == nil {
+		st.Pool == "" || st.EntryPriceQ <= 0 || t.EntryPriceUSD == nil {
 		return false, errors.New("no usable on-chain state (pool and entry price)")
+	}
+	if st.RugBlock > 0 {
+		// Rugged: -100% for good, nothing to read from the node. The row is
+		// still saved (latest_checked_at moves on), so it is due again only
+		// after a day (see latestDueSQL), not on every pass.
+		return false, s.saveLatestRugged(ctx, t, readAt, nil, nil)
+	}
+	if st.LastPriceQ <= 0 {
+		return false, errors.New("no usable on-chain state (pool and entry price)")
+	}
+	usd := t.PriceUnit != nil && *t.PriceUnit == "usd"
+	// The quote's USD price of the current hour (one lookup per hour for all
+	// rows): converts the price, and values the pool's quote side for the rug
+	// check. Without one, only the certain signals count.
+	qUSD := 0.0
+	if usd {
+		q, err := quotes.usd(ctx, st.Quote)
+		if err != nil {
+			return false, fmt.Errorf("USD price of %s: %w", st.QuoteSym, err)
+		}
+		qUSD = q
 	}
 	// Where to start: after the last block either scan has covered. The price
 	// known there is the pass's own, unless the horizon scan has moved past it
@@ -310,10 +333,20 @@ func (s *scanner) latestOne(ctx context.Context, t *ScoutCallTracking, head uint
 	}
 	to := from
 	events := false
+	var rugBlock uint64
+	var rugLiq *float64
 	if head > from {
 		addr, topics := st.logFilter()
 		if err := o.rpc.getLogsChunked(ctx, addr, topics, from+1, head, func(l rpcLog) {
-			if p := st.priceOfLog(l); p > 0 {
+			if rugBlock > 0 {
+				return // drained: nothing after the rug counts
+			}
+			ev := st.eventOfLog(l)
+			if rug, liq := ev.rug(qUSD, o.cfg.RugLiqUSD); rug {
+				rugBlock, rugLiq = l.block(), liq
+				return
+			}
+			if p := ev.price; p > 0 && !st.implausible(p, l.block()) {
 				priceQ, tradeBlock, events = p, l.block(), true
 			}
 		}); err != nil {
@@ -324,15 +357,22 @@ func (s *scanner) latestOne(ctx context.Context, t *ScoutCallTracking, head uint
 	if ctx.Err() != nil {
 		return false, ctx.Err()
 	}
-	// Quote units → the call's price unit, at the quote asset's USD price of the
-	// current hour (one lookup per hour for all rows).
-	price := priceQ
-	if t.PriceUnit != nil && *t.PriceUnit == "usd" {
-		q, err := quotes.usd(ctx, st.Quote)
-		if err != nil {
-			return false, fmt.Errorf("USD price of %s: %w", st.QuoteSym, err)
+	if rugBlock > 0 {
+		log.Printf("call %d: pool quote side under $%.0f at block %d — rugged, latest return -100%%", t.CallID, o.cfg.RugLiqUSD, rugBlock)
+		patch := map[string]any{latestStateKeyBlock: to, latestStateKeyPrice: priceQ, latestStateKeyTrades: tradeBlock,
+			latestStateKeyRug: rugBlock}
+		var depth *float64 // current_liquidity_usd: the pool's depth, 2 × the quote side
+		if rugLiq != nil {
+			patch[latestStateKeyRugLiq] = *rugLiq // the state keeps the quote side
+			d := poolDepthUSD(*rugLiq)
+			depth = &d
 		}
-		price = priceQ * q
+		return true, s.saveLatestRugged(ctx, t, readAt, patch, depth)
+	}
+	// Quote units → the call's price unit.
+	price := priceQ
+	if usd {
+		price = priceQ * qUSD
 	}
 	entry := t.EntryLatePriceUSD
 	if entry == nil {
@@ -371,4 +411,30 @@ func (s *scanner) latestOne(ctx context.Context, t *ScoutCallTracking, head uint
 		return false, fmt.Errorf("save: %w", err)
 	}
 	return changed, nil
+}
+
+// saveLatestRugged stores the latest price of a rugged call: price 0 (the
+// token can no longer be sold), return -100%, and the rugged flag. patch
+// (optional) is merged into the on-chain state; liq, when known, becomes
+// current_liquidity_usd (the pool's depth, poolDepthUSD of the quote side).
+// Like latestOne, nothing is written once ctx is cancelled.
+func (s *scanner) saveLatestRugged(ctx context.Context, t *ScoutCallTracking, readAt time.Time, patch map[string]any, liq *float64) error {
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	if patch == nil {
+		patch = map[string]any{}
+	}
+	state, err := json.Marshal(patch)
+	if err != nil {
+		return err
+	}
+	ret := -100.0
+	sctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), latestSaveTimeout)
+	defer cancel()
+	if err := s.db.SaveLatestPrice(sctx, ScoutLatestPrice{CallID: t.CallID, Price: 0, ReturnPct: &ret,
+		CheckedAt: readAt, State: state, Rugged: true, LiquidityUSD: liq}); err != nil {
+		return fmt.Errorf("save: %w", err)
+	}
+	return nil
 }

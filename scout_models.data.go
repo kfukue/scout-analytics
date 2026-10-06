@@ -870,13 +870,15 @@ func (st *ScoutStore) SaveTracking(ctx context.Context, t *ScoutCallTracking) er
 // status tracking or done, an entry price and a current on-chain state with a
 // pool. It is due when it has no latest price yet, or the last one was read at
 // or before its cut-off: $2 for calls posted after $1 (younger than 30 days),
-// $3 for older ones.
+// $3 for older ones and for rugged calls (rug_block in the state: their latest
+// return is -100% for good, so they are re-stamped at most at the old pace).
 var latestDueSQL = ` FROM scout_call_tracking t JOIN ` + webFirstCallsSQL + ` fc ON fc.id = t.call_id
 	WHERE t.status IN ('tracking','done') AND t.entry_price_usd IS NOT NULL AND t.onchain IS NOT NULL
 	  AND COALESCE(t.onchain->>'pool', '') <> '' AND COALESCE((t.onchain->>'entry_price_q')::float8, 0) > 0
 	  AND COALESCE((t.onchain->>'v')::int, 0) >= ` + strconv.Itoa(onchainStateVersion) + `
 	  AND (t.latest_checked_at IS NULL OR t.latest_checked_at <=
-	       CASE WHEN t.entry_at > $1::timestamptz THEN $2::timestamptz ELSE $3::timestamptz END)`
+	       CASE WHEN t.entry_at > $1::timestamptz AND COALESCE((t.onchain->>'rug_block')::numeric, 0) = 0
+	            THEN $2::timestamptz ELSE $3::timestamptz END)`
 
 // DueLatest returns up to limit rows whose latest price is due: calls younger
 // than recentAge first, then the ones not refreshed for the longest (never
@@ -926,17 +928,25 @@ type ScoutLatestPrice struct {
 	// latest_price_q, latest_trade_block) as a JSON object. They are merged into
 	// the stored state: every other key stays as it is.
 	State []byte
+	// Rugged: the pool was drained (pass-found rugs add rug_block to State):
+	// rugged is set to true, and current_liquidity_usd to LiquidityUSD when
+	// that is known. false = both columns stay as they are.
+	Rugged       bool
+	LiquidityUSD *float64
 }
 
 // SaveLatestPrice writes the four latest_* columns and merges the pass's cursor
-// into the on-chain state. Nothing else of the row changes: status, schedule,
-// attempts, horizon scan progress and updated_at stay as they are.
+// into the on-chain state. Nothing else of the row changes (status, schedule,
+// attempts, horizon scan progress and updated_at stay as they are), except
+// rugged / current_liquidity_usd for a rugged call (p.Rugged).
 func (st *ScoutStore) SaveLatestPrice(ctx context.Context, p ScoutLatestPrice) error {
 	_, err := st.Pool.Exec(ctx, `UPDATE scout_call_tracking SET
 		latest_price_usd = $2, latest_return_pct = $3, latest_checked_at = $4,
-		latest_trade_at = COALESCE($5, latest_trade_at), onchain = onchain || $6::jsonb
+		latest_trade_at = COALESCE($5, latest_trade_at), onchain = onchain || $6::jsonb,
+		rugged = CASE WHEN $7::boolean THEN true ELSE rugged END,
+		current_liquidity_usd = CASE WHEN $7::boolean AND $8::float8 IS NOT NULL THEN $8::float8 ELSE current_liquidity_usd END
 		WHERE call_id = $1 AND onchain IS NOT NULL`,
-		p.CallID, p.Price, p.ReturnPct, p.CheckedAt.UTC(), p.TradeAt, string(p.State))
+		p.CallID, p.Price, p.ReturnPct, p.CheckedAt.UTC(), p.TradeAt, string(p.State), p.Rugged, p.LiquidityUSD)
 	return err
 }
 
@@ -1246,17 +1256,27 @@ const (
 	// token it was run for). verdict is one of clean | caution | red_flags | unknown.
 	webPerceptorSQL = `(SELECT DISTINCT ON (lower(i.contract_address)) lower(i.contract_address) AS ca,
 		CASE WHEN i.verdict_level IN ('clean', 'caution', 'red_flags') THEN i.verdict_level ELSE 'unknown' END AS verdict,
-		i.report_url
+		i.report_url, i.id
 		FROM scout_investigations i JOIN scout_investigation_tools pt ON pt.id = i.tool_id AND pt.code = 'perceptor'
 		WHERE i.status = 'completed'
 		ORDER BY lower(i.contract_address), i.requested_at DESC, i.id DESC)`
 	webPerceptorJoinSQL = ` LEFT JOIN ` + webPerceptorSQL + ` p ON p.ca = fc.ca`
+	// webSAlphaSQL: each token's latest completed sAlpha investigation by the
+	// same rule, among those whose report_text has something other than white
+	// space (about half of sAlpha's replies are empty: they count as no report,
+	// so an older one with text is taken instead).
+	webSAlphaSQL = `(SELECT DISTINCT ON (lower(i.contract_address)) lower(i.contract_address) AS ca, i.id
+		FROM scout_investigations i JOIN scout_investigation_tools sat ON sat.id = i.tool_id AND sat.code = 'salpha'
+		WHERE i.status = 'completed' AND i.report_text ~ '[^[:space:]]'
+		ORDER BY lower(i.contract_address), i.requested_at DESC, i.id DESC)`
+	webSAlphaJoinSQL = ` LEFT JOIN ` + webSAlphaSQL + ` sa ON sa.ca = fc.ca`
 )
 
 // webRowsSQL loads the website's whole list in one statement: each token's
 // first call with its tracking row (and its latest price), the late-entry
 // results of the five windows, how often the token was called, its latest
-// Perceptor report and the market caps of the post. It reads the
+// Perceptor report, the id of its latest sAlpha report with text and the
+// market caps of the post. It reads the
 // tables directly (not scout_call_dataset_v, whose per-row lookups the website
 // does not need). Ordered by call id.
 var webRowsSQL = `SELECT c.id, c.message_id, c.message_date, c.channel_username, c.contract_address,
@@ -1264,7 +1284,7 @@ var webRowsSQL = `SELECT c.id, c.message_id, c.message_date, c.channel_username,
 	t.price_unit, COALESCE(t.entry_late_price_usd, t.entry_price_usd)::float8, t.entry_price_usd IS NOT NULL,
 	t.rugged, t.status,
 	` + webReturnsPivotSQL("r.") + `,
-	p.verdict, p.report_url, n.call_count, n.last_call_date,
+	p.verdict, p.report_url, p.id, sa.id, n.call_count, n.last_call_date,
 	t.latest_return_pct::float8, t.latest_price_usd::float8, t.latest_checked_at, t.latest_trade_at,
 	m.called_at_mcap_usd::float8, m.mcap_usd::float8, t.entry_price_usd::float8
 	FROM ` + webFirstCallsSQL + ` fc
@@ -1273,7 +1293,7 @@ var webRowsSQL = `SELECT c.id, c.message_id, c.message_date, c.channel_username,
 	LEFT JOIN scout_call_metrics m ON m.call_id = fc.id
 	LEFT JOIN scout_call_tracking t ON t.call_id = fc.id
 	LEFT JOIN (SELECT call_id, ` + webReturnsPivotSQL("") + `
-		FROM scout_call_returns WHERE status = 'done' GROUP BY call_id) r ON r.call_id = fc.id` + webPerceptorJoinSQL + `
+		FROM scout_call_returns WHERE status = 'done' GROUP BY call_id) r ON r.call_id = fc.id` + webPerceptorJoinSQL + webSAlphaJoinSQL + `
 	ORDER BY c.id`
 
 // webReturnsPivotSQL lists the 15 result columns (window × return, peak,
@@ -1321,7 +1341,7 @@ func (st *ScoutStore) SelectWebRows(ctx context.Context) ([]ScoutWebRow, int, er
 		for i := range perf {
 			dest = append(dest, &perf[i])
 		}
-		dest = append(dest, &r.PerceptorVerd, &r.PerceptorURL, &r.CallCount, &r.LastCallDate,
+		dest = append(dest, &r.PerceptorVerd, &r.PerceptorURL, &r.PerceptorID, &r.SAlphaID, &r.CallCount, &r.LastCallDate,
 			&r.LatestReturn, &r.LatestPrice, &r.LatestAt, &r.LatestTradeAt,
 			&r.CalledAtMcap, &r.PostMcap, &r.PostPrice)
 		if err := rows.Scan(dest...); err != nil {
@@ -1339,4 +1359,40 @@ func (st *ScoutStore) SelectWebRows(ctx context.Context) ([]ScoutWebRow, int, er
 		return nil, 0, err
 	}
 	return out, updatePosts, nil
+}
+
+// webReportReadChars: how much of a text SelectWebReports reads, in characters:
+// one more than the website keeps in bytes, so it can tell that a text was cut
+// (a character is at least one byte).
+const webReportReadChars = webReportMaxBytes + 1
+
+// SelectWebReports returns the investigations with the given ids, for the
+// website's row detail: the verdict, label, summary and link of each, and the
+// report text of sAlpha investigations (Perceptor's own text is not shown).
+// Every text is read up to webReportReadChars characters. Ids that do not
+// exist are left out.
+func (st *ScoutStore) SelectWebReports(ctx context.Context, ids []int) (map[int]*ScoutWebReport, error) {
+	out := make(map[int]*ScoutWebReport, len(ids))
+	if len(ids) == 0 {
+		return out, nil
+	}
+	rows, err := st.Pool.Query(ctx, `SELECT i.id, t.code, COALESCE(i.completed_at, i.requested_at),
+		CASE WHEN i.verdict_level IN ('clean', 'caution', 'red_flags') THEN i.verdict_level ELSE 'unknown' END,
+		left(i.verdict_label, $2), left(i.verdict_summary, $2),
+		CASE WHEN t.code = 'salpha' THEN left(i.report_text, $2) ELSE '' END,
+		i.report_url
+		FROM scout_investigations i JOIN scout_investigation_tools t ON t.id = i.tool_id
+		WHERE i.id = ANY($1)`, ids, webReportReadChars)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var r ScoutWebReport
+		if err := rows.Scan(&r.ID, &r.Tool, &r.At, &r.Verdict, &r.Label, &r.Summary, &r.Text, &r.URL); err != nil {
+			return nil, err
+		}
+		out[r.ID] = &r
+	}
+	return out, rows.Err()
 }

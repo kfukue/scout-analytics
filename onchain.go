@@ -63,7 +63,22 @@ type onchainConfig struct {
 	MainnetFeeds  map[string]string // quote token (lower) or "eth" → Chainlink feed on Ethereum mainnet
 
 	EntryDelay time.Duration // realistic entry: the pool price this long after the post (default 60s)
+
+	// RugLiqUSD: a pool whose quote side (the ETH/WETH, USDG, stock token …
+	// it holds, valued in USD) is below this many USD is rugged
+	// (SCOUT_RUG_LIQ_USD, default 500; 0 = the USD check is off, an empty pool
+	// still counts).
+	RugLiqUSD float64
 }
+
+// defaultRugLiqUSD: a pool's quote side below this (USD) = rugged (SCOUT_RUG_LIQ_USD).
+const defaultRugLiqUSD = 500
+
+// poolDepthUSD turns a quote-side USD value into what current_liquidity_usd
+// stores: the pool's depth counted on both sides, 2 × the quote side (the
+// column's meaning since before the rug guard). The rug threshold is compared
+// with the quote side itself.
+func poolDepthUSD(quoteSideUSD float64) float64 { return 2 * quoteSideUSD }
 
 // Chainlink ETH/USD on Ethereum mainnet (8 decimals).
 const mainnetEthUsdFeed = "0x5f4ec3df9cbd43714fe2740f5e3616155c5b8419"
@@ -93,6 +108,14 @@ func loadOnchainConfig() (onchainConfig, error) {
 	}
 	if oc.EntryDelay < 0 {
 		return oc, fmt.Errorf("SCOUT_ENTRY_DELAY: want a duration >= 0")
+	}
+	oc.RugLiqUSD = defaultRugLiqUSD
+	if v := env("SCOUT_RUG_LIQ_USD", ""); v != "" {
+		f, err := strconv.ParseFloat(v, 64)
+		if err != nil || f < 0 || math.IsNaN(f) || math.IsInf(f, 0) {
+			return oc, fmt.Errorf("SCOUT_RUG_LIQ_USD=%q: want a number >= 0", v)
+		}
+		oc.RugLiqUSD = f
 	}
 	if v := env("SCOUT_MAINNET_RPC_RPS", ""); v != "" {
 		n, err := strconv.Atoi(v)
@@ -1308,6 +1331,19 @@ type onchainState struct {
 	LatestBlock      uint64  `json:"latest_block,omitempty"`       // price events read through this block
 	LatestPriceQ     float64 `json:"latest_price_q,omitempty"`     // pool price at LatestBlock, in quote units
 	LatestTradeBlock uint64  `json:"latest_trade_block,omitempty"` // block of the trade that price comes from
+
+	// Rug: the first block whose price event showed the pool's quote side below
+	// SCOUT_RUG_LIQ_USD (or certainly empty). From that block on no price counts,
+	// every horizon ending at or after it is -100%, and so is the latest return.
+	// Once rugged, a call stays rugged. Optional additions; no version change.
+	RugBlock        uint64   `json:"rug_block,omitempty"`
+	RugLiquidityUSD *float64 `json:"rug_liq_usd,omitempty"` // the pool's quote side in USD at the rug (nil = unknown)
+	// EntryLiqQ: the liquidity shown by the entry price's event, in quote units
+	// (0 = not measured); checked against the threshold once the quote's USD
+	// price at entry is known.
+	EntryLiqQ float64 `json:"entry_liq_q,omitempty"`
+
+	warnedJump bool // the 1e6× backstop was logged for this call in this run (not stored)
 }
 
 // onchainStateVersion: calls tracked with an older state are tracked again from
@@ -1563,9 +1599,40 @@ func (o *onchainSource) resolveV4(ctx context.Context, st *onchainState, token s
 	return false, nil
 }
 
-// priceOfLog returns the token's price in quote units after this event (0 = n/a).
-func (st *onchainState) priceOfLog(l rpcLog) float64 {
+// Uniswap v3/v4 ticks run from -maxTick to +maxTick. A swap that ends within
+// tickBoundSlack ticks of either end ran out of in-range liquidity: its
+// sqrtPriceX96 is the bound (about 2^±128 quote per token), not a price.
+const (
+	maxTick        = 887272
+	tickBoundSlack = 100
+)
+
+// maxPriceJump: in the horizon scan and the latest pass, a price more than
+// this many times the entry price is taken as invalid and skipped (backstop).
+const maxPriceJump = 1e6
+
+// poolEvent is what one price event (v2 Sync, v3/v4 Swap) says about the pool.
+type poolEvent struct {
+	price    float64 // the token's price in quote units after the event (0 = n/a or not usable)
+	liqQ     float64 // the pool's quote side after the event, in quote units
+	liqKnown bool    // liqQ was measured
+	drained  bool    // the pool is certainly empty (no in-range liquidity, tick at the bound, zero v2 reserve)
+}
+
+// eventOfLog decodes a price event. Liquidity is ONE side of the pool, the
+// quote side, in quote units (like liquidityUSD):
+//   - v2: the quote reserve in the Sync event.
+//   - v3/v4: the quote side of the in-range virtual reserves, from the
+//     Swap's liquidity L and sqrtPriceX96 (raw sqrtP = sqrtPriceX96 / 2^96):
+//     L·sqrtP when the quote is token1, L / sqrtP when it is token0, divided by
+//     10^quote decimals. An approximation of the in-range liquidity only: it
+//     ignores liquidity outside the current tick range and overstates what a
+//     narrow range can actually pay out.
+//
+// A drained event has no usable price (price 0).
+func (st *onchainState) eventOfLog(l rpcLog) poolEvent {
 	data := unhex(l.Data)
+	var ev poolEvent
 	var p0in1 float64
 	d0, d1 := st.TokenDec, st.QuoteDec
 	if !st.TokenIs0 {
@@ -1573,17 +1640,93 @@ func (st *onchainState) priceOfLog(l rpcLog) float64 {
 	}
 	switch st.Kind {
 	case "v2":
-		p0in1 = priceFromReserves(word(data, 0), word(data, 1), d0, d1)
-	default: // v3 and v4 carry sqrtPriceX96 as the third data word
-		p0in1 = priceFromSqrtX96(word(data, 2), d0, d1)
+		r0, r1 := word(data, 0), word(data, 1)
+		tok, quo := r0, r1
+		if !st.TokenIs0 {
+			tok, quo = r1, r0
+		}
+		ev.drained = tok.Sign() == 0 || quo.Sign() == 0
+		ev.liqQ, ev.liqKnown = bigToFloat(quo)/pow10(st.QuoteDec), true
+		p0in1 = priceFromReserves(r0, r1, d0, d1)
+	default: // v3 and v4: sqrtPriceX96, liquidity and tick are data words 2, 3 and 4
+		sqrtP := word(data, 2)
+		p0in1 = priceFromSqrtX96(sqrtP, d0, d1)
+		if len(data) >= 5*32 {
+			liq, tick := word(data, 3), signedWord(data, 4)
+			ev.drained = liq.Sign() == 0 || sqrtP.Sign() == 0 ||
+				new(big.Int).Abs(tick).Cmp(big.NewInt(maxTick-tickBoundSlack)) >= 0
+			ev.liqKnown = true
+			if liq.Sign() > 0 && sqrtP.Sign() > 0 {
+				sp := new(big.Float).SetPrec(256).SetInt(sqrtP)
+				sp.Quo(sp, new(big.Float).SetPrec(256).SetInt(new(big.Int).Lsh(big.NewInt(1), 96))) // raw sqrt(token1 per token0)
+				amt := new(big.Float).SetPrec(256).SetInt(liq)
+				if st.TokenIs0 {
+					amt.Mul(amt, sp) // quote = token1: L·sqrtP
+				} else {
+					amt.Quo(amt, sp) // quote = token0: L / sqrtP
+				}
+				// The accuracy flag is not needed: a rounded figure is fine for
+				// a threshold check, and overflow gives +Inf (not a rug).
+				f, _ := amt.Float64()
+				ev.liqQ = f / pow10(st.QuoteDec)
+			}
+		}
 	}
-	if p0in1 <= 0 || math.IsInf(p0in1, 0) || math.IsNaN(p0in1) {
-		return 0
+	if ev.drained || p0in1 <= 0 || math.IsInf(p0in1, 0) || math.IsNaN(p0in1) {
+		return ev
 	}
-	if st.TokenIs0 {
-		return p0in1
+	ev.price = p0in1
+	if !st.TokenIs0 {
+		ev.price = 1 / p0in1
 	}
-	return 1 / p0in1
+	return ev
+}
+
+// rug tells whether the event shows the pool's quote side under minUSD, and
+// the quote side in USD when it is known. qUSD is the quote asset's USD price;
+// 0 = unknown, and then only the certain signals count (never a guess).
+func (ev poolEvent) rug(qUSD, minUSD float64) (bool, *float64) {
+	var liq *float64
+	switch {
+	case ev.liqKnown && ev.liqQ == 0:
+		zero := 0.0
+		liq = &zero
+	case ev.liqKnown && qUSD > 0:
+		v := ev.liqQ * qUSD
+		liq = &v
+	}
+	if ev.drained {
+		return true, liq
+	}
+	return liq != nil && minUSD > 0 && *liq < minUSD, liq
+}
+
+// priceOfLog returns the token's price in quote units after this event
+// (0 = n/a, including the bound price of a drained pool).
+func (st *onchainState) priceOfLog(l rpcLog) float64 {
+	return st.eventOfLog(l).price
+}
+
+// implausible: a price more than maxPriceJump times the entry price (the
+// backstop of the scan and the latest pass; logged once per call and run).
+func (st *onchainState) implausible(p float64, block uint64) bool {
+	if st.EntryPriceQ <= 0 || p <= st.EntryPriceQ*maxPriceJump {
+		return false
+	}
+	if !st.warnedJump {
+		st.warnedJump = true
+		log.Printf("uniswap-%s pool %s: price %.6g %s at block %d is more than %.0e× the entry price %.6g — skipped as invalid",
+			st.Kind, st.poolRef(), p, st.QuoteSym, block, maxPriceJump, st.EntryPriceQ)
+	}
+	return true
+}
+
+// poolRef names the pool: the v4 pool id, or the pool address.
+func (st *onchainState) poolRef() string {
+	if st.Kind == "v4" {
+		return st.PoolID
+	}
+	return st.Pool
 }
 
 func (st *onchainState) logFilter() (string, []any) {
@@ -1597,15 +1740,27 @@ func (st *onchainState) logFilter() (string, []any) {
 }
 
 // scan folds price events in (from, to] into the running state.
-// obs (optional) sees every price event, in order.
+// obs (optional) sees every price event, in order. The first event that shows
+// the pool under the rug threshold sets RugBlock; neither it nor anything after
+// it is folded in or shown to obs. Prices above maxPriceJump × entry are skipped.
 func (o *onchainSource) scan(ctx context.Context, st *onchainState, to uint64, obs func(block uint64, p float64)) error {
 	if to <= st.ScanBlock {
 		return nil
 	}
 	addr, topics := st.logFilter()
 	err := o.rpc.getLogsChunked(ctx, addr, topics, st.ScanBlock+1, to, func(l rpcLog) {
-		p := st.priceOfLog(l)
-		if p <= 0 {
+		if st.RugBlock > 0 && l.block() >= st.RugBlock {
+			return // the pool was drained: nothing from the rug on counts
+		}
+		ev := st.eventOfLog(l)
+		// Liquidity is valued at the quote's USD price at entry (no node
+		// request); without one, only the certain signals count.
+		if rug, liq := ev.rug(st.EntryQuoteUSD, o.cfg.RugLiqUSD); rug {
+			st.RugBlock, st.RugLiquidityUSD = l.block(), liq
+			return
+		}
+		p := ev.price
+		if p <= 0 || st.implausible(p, l.block()) {
 			return
 		}
 		st.LastPriceQ, st.LastPriceBlock = p, l.block()
@@ -1637,9 +1792,28 @@ func (o *onchainSource) scan(ctx context.Context, st *onchainState, to uint64, o
 }
 
 // entryPrice: the last trade price at or before the call; if the token had not
-// traded yet, the first trade after it.
+// traded yet, the first trade after it. Events of a drained pool give no price.
+// When the pool traded before the call and the last event at or before the
+// call shows it drained, the call is rugged from the start: RugBlock is that
+// event's block, and the entry is the last usable price before it. The entry
+// event's liquidity is kept in EntryLiqQ for the USD check once the quote's
+// USD price at entry is known.
 func (o *onchainSource) entryPrice(ctx context.Context, st *onchainState, latest uint64) error {
 	addr, topics := st.logFilter()
+	setEntry := func(p float64, block uint64, ev poolEvent, scanTo uint64) {
+		st.EntryPriceQ, st.LastPriceQ, st.LastPriceBlock = p, p, block
+		st.RunMaxQ, st.RunMinQ, st.ScanBlock = p, p, scanTo
+		st.LatePriceQ, st.RunMaxLateQ, st.RunMinLateQ = p, 0, 0
+		st.EntryLiqQ = 0
+		if ev.liqKnown {
+			st.EntryLiqQ = ev.liqQ
+		}
+	}
+	rugAt := func(block uint64) {
+		zero := 0.0
+		st.RugBlock, st.RugLiquidityUSD = block, &zero
+	}
+	var drainedAt uint64                      // the last event so far showed a drained pool (0 = no)
 	for _, mult := range []uint64{1, 8, 64} { // look back further for quiet pools
 		span := o.cfg.DiscoveryBlocks * mult
 		from := uint64(1)
@@ -1648,17 +1822,23 @@ func (o *onchainSource) entryPrice(ctx context.Context, st *onchainState, latest
 		}
 		var last float64
 		var lastBlock uint64
+		var lastEv poolEvent
+		drainedAt = 0
 		if err := o.rpc.getLogsChunked(ctx, addr, topics, from, st.EntryBlock, func(l rpcLog) {
-			if p := st.priceOfLog(l); p > 0 {
-				last, lastBlock = p, l.block()
+			ev := st.eventOfLog(l)
+			if ev.drained {
+				drainedAt = l.block()
+			} else if ev.price > 0 {
+				last, lastBlock, lastEv, drainedAt = ev.price, l.block(), ev, 0
 			}
 		}); err != nil {
 			return err
 		}
 		if last > 0 {
-			st.EntryPriceQ, st.LastPriceQ, st.LastPriceBlock = last, last, lastBlock
-			st.RunMaxQ, st.RunMinQ, st.ScanBlock = last, last, st.EntryBlock
-			st.LatePriceQ, st.RunMaxLateQ, st.RunMinLateQ = last, 0, 0
+			setEntry(last, lastBlock, lastEv, st.EntryBlock)
+			if drainedAt > 0 {
+				rugAt(drainedAt)
+			}
 			return nil
 		}
 		if from == 1 {
@@ -1670,12 +1850,15 @@ func (o *onchainSource) entryPrice(ctx context.Context, st *onchainState, latest
 	if to > latest {
 		to = latest
 	}
+	// Drained events before the pool's first real trade are a pool not funded
+	// yet (a swap into an empty pool), not a rug: they are only skipped.
 	var first float64
 	var firstBlock uint64
+	var firstEv poolEvent
 	if err := o.rpc.getLogsChunked(ctx, addr, topics, st.EntryBlock+1, to, func(l rpcLog) {
 		if first == 0 {
-			if p := st.priceOfLog(l); p > 0 {
-				first, firstBlock = p, l.block()
+			if ev := st.eventOfLog(l); ev.price > 0 {
+				first, firstBlock, firstEv = ev.price, l.block(), ev
 			}
 		}
 	}); err != nil {
@@ -1684,9 +1867,7 @@ func (o *onchainSource) entryPrice(ctx context.Context, st *onchainState, latest
 	if first == 0 {
 		return errNoTrades
 	}
-	st.EntryPriceQ, st.LastPriceQ, st.LastPriceBlock = first, first, firstBlock
-	st.RunMaxQ, st.RunMinQ, st.ScanBlock = first, first, firstBlock
-	st.LatePriceQ, st.RunMaxLateQ, st.RunMinLateQ = first, 0, 0
+	setEntry(first, firstBlock, firstEv, firstBlock)
 	return nil
 }
 
@@ -1987,8 +2168,10 @@ func (o *onchainSource) ethFromPool(ctx context.Context, block uint64) (float64,
 	return p, err
 }
 
-// liquidityUSD: rough pool depth = 2 × the quote asset held by the pool
-// (v2/v3 only; v4 pools share one contract).
+// liquidityUSD: the pool's quote side in USD = the quote asset the pool
+// holds (balanceOf, every range of a v3 pool and uncollected fees included) ×
+// qUSD. v2/v3 only: v4 pools share one contract. Compared with
+// SCOUT_RUG_LIQ_USD as it is; current_liquidity_usd stores poolDepthUSD of it.
 func (o *onchainSource) liquidityUSD(ctx context.Context, st *onchainState, qUSD float64) (float64, bool) {
 	if st.Kind == "v4" || st.Quote == zeroAddr {
 		return 0, false
@@ -1997,7 +2180,7 @@ func (o *onchainSource) liquidityUSD(ctx context.Context, st *onchainState, qUSD
 	if err != nil {
 		return 0, false
 	}
-	return 2 * bigToFloat(word(b, 0)) / pow10(st.QuoteDec) * qUSD, true
+	return bigToFloat(word(b, 0)) / pow10(st.QuoteDec) * qUSD, true
 }
 
 // quoteSource names where a quote asset's USD price comes from (for diagnostics).

@@ -216,6 +216,10 @@ type webCallJSON struct {
 
 	CallMcapUSD   *float64 `json:"call_mcap_usd"`
 	LatestMcapUSD *float64 `json:"latest_mcap_usd"`
+
+	HasSAlpha         bool `json:"has_salpha_report"`
+	PerceptorReportID *int `json:"perceptor_report_id"`
+	SAlphaReportID    *int `json:"salpha_report_id"`
 }
 
 type webCallsJSON struct {
