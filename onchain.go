@@ -317,20 +317,19 @@ type rpcClient struct {
 	sfMu sync.Mutex
 	sf   map[string]*logFlight // identical eth_getLogs requests in flight: asked once, shared
 
-	// The log range adapts both ways: it halves when the node refuses or times
-	// out, and grows back towards maxChunk after a run of quick answers.
-	maxChunk   uint64
-	okStreak   atomic.Int64
-	ceiling    atomic.Uint64 // a size that failed recently …
-	ceilingEnd atomic.Int64  // … and until when (unix seconds) not to try it again
-	logs       *logCache     // finished eth_getLogs chunks (nil = off)
+	// eth_getLogs block ranges. Every scan starts at maxChunk (SCOUT_RPC_LOG_CHUNK)
+	// and keeps its own size: only a "range / result too large" refusal halves
+	// it, for that scan alone, and it grows back after a few answered ranges.
+	// Timeouts and other passing errors are retried at the same size.
+	maxChunk uint64
+	minChunk uint64
+	splits   atomic.Int64 // ranges split after a refusal (whole run, for -check output)
+	notes    rangeNotes   // rate-limited log lines about range size changes
+	logs     *logCache    // finished eth_getLogs chunks (nil = off)
 
 	mu   sync.Mutex
 	next time.Time
 	gap  time.Duration
-
-	chunk    atomic.Uint64 // current eth_getLogs block span
-	minChunk uint64
 
 	cacheMu sync.Mutex
 	times   map[uint64]int64 // block → timestamp
@@ -500,8 +499,10 @@ func newRPCClient(oc onchainConfig) *rpcClient {
 	c := &rpcClient{url: oc.RPCURL, http: &http.Client{Timeout: 60 * time.Second, Transport: tr},
 		gap: gap, minChunk: oc.MinLogChunk, slots: make(chan struct{}, oc.MaxInflight),
 		times: map[uint64]int64{}, meta: map[string]tokenMeta{}, labels: map[string]tokenLabel{}}
-	c.chunk.Store(oc.LogChunk)
 	c.maxChunk = oc.LogChunk
+	if c.minChunk > c.maxChunk {
+		c.minChunk = c.maxChunk // a configured maximum below the default minimum is respected
+	}
 	c.parallel = oc.Parallel
 	if oc.LogCache > 0 {
 		c.logs = newLogCache(oc.LogCache)
@@ -565,9 +566,13 @@ func (c *rpcClient) call(ctx context.Context, out any, method string, params ...
 			<-c.slots
 			lastErr = err
 		} else {
-			raw, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<20))
+			raw, _ := io.ReadAll(io.LimitReader(resp.Body, int64(maxResponseBytes)+1))
 			resp.Body.Close()
 			<-c.slots
+			if len(raw) > maxResponseBytes {
+				// Cut off: the answer is too big to hold (for eth_getLogs: too many logs in the range).
+				return fmt.Errorf("%s: %w", method, errResponseTooLarge)
+			}
 			if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500 {
 				lastErr = fmt.Errorf("%s: HTTP %s", method, resp.Status)
 			} else {
@@ -595,6 +600,11 @@ func (c *rpcClient) call(ctx context.Context, out any, method string, params ...
 }
 
 var rpcRetryBase = 2 * time.Second
+
+// maxResponseBytes: the largest JSON-RPC answer read (a var so tests can lower it).
+var maxResponseBytes = 64 << 20
+
+var errResponseTooLarge = errors.New("response too large")
 
 func hexU64(n uint64) string { return "0x" + strconv.FormatUint(n, 16) }
 
@@ -638,29 +648,62 @@ func (c *rpcClient) getLogs(ctx context.Context, address string, topics []any, f
 	return logs, err
 }
 
-// getLogsChunked walks [from, to] in chunks, halving the chunk whenever the
-// node refuses a range (too many blocks / results), and calls fn for each log
-// in order.
+// getLogsChunked walks [from, to] in block ranges and calls fn for each log in
+// block order.
+//
+// Each scan starts with ranges of SCOUT_RPC_LOG_CHUNK blocks (the ceiling) and
+// keeps its own size, so one scan's trouble never slows another scan down:
+//   - the node refuses a range as too large (too many blocks or results), or the
+//     range times out (see retryLogs): that range is asked again in halves, and
+//     this scan carries on at the smaller size. Ranges of minChunk blocks are not
+//     split any more: one that still fails fails the scan;
+//   - after rangeGrowAfter ranges in a row are answered at the smaller size, the
+//     size doubles again, up to the ceiling. The grown size is tried on one range
+//     first. When the node refuses it or it times out, the next attempt waits
+//     twice as long (up to rangeGrowAfterMax ranges, rangeGrowAfterMaxSlow after a
+//     time-out), so a fixed range limit, or a stretch of blocks the node reads
+//     slowly, is not hit over and over. Once a grown size is answered, or answers
+//     come back in a fraction of the time the last time-out took (the scan has
+//     reached blocks the node reads quickly), the wait is back to rangeGrowAfter;
+//   - rate limits and busy answers are retried at the same size (see retryLogs);
+//     they never make the ranges smaller.
 func (c *rpcClient) getLogsChunked(ctx context.Context, address string, topics []any, from, to uint64, fn func(rpcLog)) error {
 	progress := progressFrom(ctx)
+	label := scanLabelFrom(ctx)
 	events := 0
 	type span struct{ from, to uint64 }
 	type result struct {
-		logs []rpcLog
-		err  error
+		logs  []rpcLog
+		err   error
+		took  time.Duration // the last request for this range
+		asked bool          // the node was asked (false: answered from memory or by another scan's request)
 	}
 	par := c.parallel
 	if par < 1 {
 		par = 1
 	}
+	minSize := c.minChunk
+	if minSize < 1 {
+		minSize = 1
+	}
+	size := c.maxChunk
+	// probing: size was just doubled and not answered yet; untested: size changed
+	// and not answered yet (one range at a time until it is); timedOutAfter: how
+	// long the last range that timed out in this scan took to do so.
+	streak, growAfter, probing, untested := 0, rangeGrowAfter, false, false
+	var timedOutAfter time.Duration
 	for cur := from; cur <= to; {
-		size := c.chunk.Load()
-		// Plan the next few chunks. They end on multiples of the chunk size, so
-		// two scans of the same pool (repeat calls of a token) ask for identical
+		// Plan the next few ranges. They end on multiples of the size, so two
+		// scans of the same pool (repeat calls of a token) ask for identical
 		// ranges and the second one is answered from memory.
+		batchSize, batchProbing := size, probing
+		want := par
+		if untested {
+			want = 1 // one request finds out whether the new size works, not a batch of them
+		}
 		var spans []span
-		for b := cur; b <= to && len(spans) < par; {
-			end := b - b%size + size - 1
+		for b := cur; b <= to && len(spans) < want; {
+			end := b - b%batchSize + batchSize - 1
 			if end > to || end < b {
 				end = to
 			}
@@ -676,41 +719,84 @@ func (c *rpcClient) getLogsChunked(ctx context.Context, address string, topics [
 		for i, sp := range spans {
 			out[i] = make(chan result, 1)
 			go func(ch chan result, sp span) {
-				logs, err := c.fetchLogs(bctx, address, topics, sp.from, sp.to, size)
-				ch <- result{logs, err}
+				var r result
+				// A grown size that times out is not asked again: half of it is known to work.
+				r.logs, r.err = c.retryLogs(bctx, !batchProbing, func() ([]rpcLog, error) {
+					t0 := time.Now()
+					logs, asked, err := c.fetchLogs(bctx, address, topics, sp.from, sp.to, batchSize)
+					r.took, r.asked = time.Since(t0), asked
+					return logs, err
+				})
+				ch <- r
 			}(out[i], sp)
 		}
-		batchStart := time.Now()
-		done, failed := false, false
+		done := false
 		for i, sp := range spans {
 			r := <-out[i]
 			if r.err != nil {
 				cancel()
-				var re *rpcError
-				// The node refused the range, or took too long over it: smaller chunks.
-				if (errors.As(r.err, &re) || (isTimeout(r.err) && ctx.Err() == nil)) && size > c.minChunk {
-					half := size / 2
-					if half < c.minChunk {
-						half = c.minChunk
-					}
-					if c.chunk.CompareAndSwap(size, half) { // false: another scan shrank it already
-						c.ceiling.Store(size)
-						c.ceilingEnd.Store(time.Now().Add(chunkRetryAfter).Unix())
-						c.okStreak.Store(0)
-						log.Printf("node could not answer eth_getLogs %d-%d (%d blocks): %v — using %d-block ranges for now",
-							sp.from, sp.to, sp.to-sp.from+1, r.err, half)
-					}
-					cur, failed = sp.from, true // again from here, with smaller chunks
-					break
+				var refused *rangeRefusedError
+				n := sp.to - sp.from + 1
+				if !errors.As(r.err, &refused) {
+					return fmt.Errorf("eth_getLogs %d-%d: %w", sp.from, sp.to, r.err)
 				}
-				return fmt.Errorf("eth_getLogs %d-%d: %w", sp.from, sp.to, r.err)
+				if n <= minSize {
+					log.Printf("%seth_getLogs blocks %d-%d (%d blocks) %s at the smallest range size (%d blocks); this scan stops here (%v)",
+						labelPrefix(label), sp.from, sp.to, n, refused.reason(), minSize, refused.err)
+					return fmt.Errorf("eth_getLogs %d-%d: %w", sp.from, sp.to, r.err)
+				}
+				// Only this scan goes smaller; the refused range is asked again in halves.
+				next := batchSize
+				for next >= n && next > minSize { // (a short last range: below its own length)
+					next /= 2
+				}
+				if next < minSize {
+					next = minSize
+				}
+				if refused.timedOut() && (r.asked || timedOutAfter == 0) {
+					timedOutAfter = r.took
+				}
+				if probing {
+					// The grown size failed too: wait longer before the next try.
+					limit := rangeGrowAfterMax
+					if refused.timedOut() {
+						limit = rangeGrowAfterMaxSlow // each failed try costs a whole time-out
+					}
+					growAfter = max(min(growAfter*2, limit), growAfter)
+				}
+				size, streak, probing, untested = next, 0, false, true
+				c.splits.Add(1)
+				c.notes.say(true, "%seth_getLogs blocks %d-%d (%d blocks) %s (%v); this scan continues with %d-block ranges (max %d)",
+					labelPrefix(label), sp.from, sp.to, n, refused.reason(), refused.err, size, c.maxChunk)
+				cur = sp.from
+				break
 			}
 			for _, l := range r.logs {
 				fn(l)
 			}
 			events += len(r.logs)
+			if batchSize == size {
+				// Only a full-size range shows the size works (after a change the
+				// first range is often a shorter piece up to a multiple of the size).
+				if sp.to-sp.from+1 == size {
+					untested = false
+					if probing { // the grown size works: grow again at the normal pace
+						probing, growAfter = false, rangeGrowAfter
+					}
+				}
+				if timedOutAfter > 0 && r.asked && r.took*4 < timedOutAfter {
+					// Answered in a fraction of the time the last time-out took:
+					// these blocks are cheap for the node (e.g. past an unindexed stretch).
+					growAfter = rangeGrowAfter
+				}
+				if streak++; size < c.maxChunk && streak >= growAfter {
+					size, streak, probing, untested = min(size*2, c.maxChunk), 0, true, true
+					c.notes.say(false, "%seth_getLogs ranges back up to %d blocks (max %d) after %d answered ranges",
+						labelPrefix(label), size, c.maxChunk, growAfter)
+				}
+			}
 			if progress != nil {
-				progress(from, sp.to, to, events)
+				progress(from, sp.to, to, events, size)
 			}
 			if sp.to == to {
 				done = true
@@ -719,9 +805,6 @@ func (c *rpcClient) getLogsChunked(ctx context.Context, address string, topics [
 			cur = sp.to + 1
 		}
 		cancel()
-		if !failed {
-			c.maybeGrow(size, time.Since(batchStart))
-		}
 		if done {
 			break
 		}
@@ -729,34 +812,195 @@ func (c *rpcClient) getLogsChunked(ctx context.Context, address string, topics [
 	return nil
 }
 
-// chunkRetryAfter: how long a range size that failed is left alone before it is tried again.
-var chunkRetryAfter = 10 * time.Minute
+// rangeGrowAfter: answered ranges in a row after which a scan that had to go
+// smaller doubles its range size again. Each failure of a grown size doubles
+// this wait, up to rangeGrowAfterMax when it was refused as too large (a quick
+// answer) or rangeGrowAfterMaxSlow when it timed out (each try costs the node's
+// whole time limit, ~30 s on Nitro).
+const (
+	rangeGrowAfter        = 3
+	rangeGrowAfterMax     = 48
+	rangeGrowAfterMaxSlow = 192
+)
 
-// maybeGrow doubles the log range after a run of batches the node answered
-// quickly, so one refused or slow request does not leave every later scan
-// crawling in tiny steps.
-func (c *rpcClient) maybeGrow(size uint64, took time.Duration) {
-	if size >= c.maxChunk || c.chunk.Load() != size {
+// logsRetries: how often a busy or rate limiting node is asked for the same
+// range (at the same size) before the scan gives up for this run.
+const logsRetries = 4
+
+// rangeRefusedError: the node will not answer this range as asked; split it.
+type rangeRefusedError struct {
+	err   error
+	why   refusal
+	tries int // requests for this range at this size (call()'s own retries not counted)
+}
+
+type refusal int
+
+const (
+	refusedTooLarge      refusal = iota // the node said the range or the result is too large
+	refusedUnexplained                  // an unexplained error that came back on a retry
+	refusedNodeTimeout                  // the node answered "request timed out" (or similar)
+	refusedClientTimeout                // no answer within the client's time limit, call()'s retries used up
+)
+
+func (e *rangeRefusedError) Error() string { return e.err.Error() }
+func (e *rangeRefusedError) Unwrap() error { return e.err }
+
+func (e *rangeRefusedError) timedOut() bool {
+	return e.why == refusedNodeTimeout || e.why == refusedClientTimeout
+}
+
+// reason: what happened, for log lines ("… blocks A-B (N blocks) <reason> (error) …").
+func (e *rangeRefusedError) reason() string {
+	switch e.why {
+	case refusedUnexplained:
+		return "failed twice with an error the node does not explain, treated as too large"
+	case refusedNodeTimeout:
+		if e.tries > 1 {
+			return fmt.Sprintf("timed out on the node (%d tries)", e.tries)
+		}
+		return "timed out on the node"
+	case refusedClientTimeout:
+		return "got no answer in time (client time-out)"
+	}
+	return "refused as too large"
+}
+
+type logsErrKind int
+
+const (
+	logsOther         logsErrKind = iota // transport error (already retried in call) or cancelled
+	logsTooLarge                         // range / result too large: split the range
+	logsBusy                             // rate limit, busy node: same range again later
+	logsTimedOut                         // the node gave up on the request: once more, then split
+	logsClientTimeout                    // no answer within the client's time limit (call() retried it): split
+	logsUnexplained                      // a JSON-RPC error that says neither
+)
+
+// classifyLogsErr sorts an eth_getLogs error. Rate limits and busy answers are
+// load, whatever else they mention. A time-out is either load or a range the
+// node cannot read within its time limit (Nitro / geth walk blocks outside the
+// log index one by one, about 1 ms per block); retryLogs tells them apart by
+// asking once more. Only a refusal that names the range or the size of the
+// result counts as "too large".
+func classifyLogsErr(err error) logsErrKind {
+	if errors.Is(err, errResponseTooLarge) {
+		return logsTooLarge
+	}
+	var re *rpcError
+	if !errors.As(err, &re) {
+		if isTimeout(err) {
+			return logsClientTimeout
+		}
+		return logsOther
+	}
+	msg := strings.ToLower(re.Message)
+	has := func(words ...string) bool {
+		for _, w := range words {
+			if strings.Contains(msg, w) {
+				return true
+			}
+		}
+		return false
+	}
+	switch {
+	case has("rate limit", "ratelimit", "rate-limit", "request rate", "rate exceeded", "too many requests",
+		"request limit", "requests per", "quota", "credits", "throttl", "busy", "capacity", "overloaded"):
+		return logsBusy
+	case has("timed out", "timeout", "time out", "deadline"):
+		// "request timed out" (Nitro), "query timeout exceeded", "context deadline exceeded" (geth)
+		return logsTimedOut
+	case has("try again", "temporar", "unavailable", "not found", "syncing"):
+		return logsBusy
+	case has("range", "too large", "too big", "too wide", "more than", "too many", "exceed",
+		"response size", "result size", "max results", "results limit", "result limit", "log limit"):
+		return logsTooLarge
+	}
+	return logsUnexplained
+}
+
+// retryLogs runs one eth_getLogs request (fetch) and deals with its errors:
+//   - "range / result too large": returned as *rangeRefusedError, the caller splits the range;
+//   - busy or rate limiting (as a JSON-RPC error): asked again at the same size
+//     after a pause, up to logsRetries times, then returned as it is: never split;
+//   - the node timed out ("request timed out"): asked once more at the same size
+//     when retryTimeout (it may have been a passing hiccup), then returned as
+//     *rangeRefusedError: the range is too slow for the node, the caller splits it;
+//   - no answer within the client's time limit, after call()'s own retries:
+//     *rangeRefusedError as well, as a last resort;
+//   - an error the node does not explain: asked once more; if it comes back, it
+//     is treated as a refusal (nodes word their range limits in many ways);
+//   - other transport errors (resets, HTTP 429 / 5xx) were already retried with
+//     pauses by call(), at the same size, and are returned as they are.
+func (c *rpcClient) retryLogs(ctx context.Context, retryTimeout bool, fetch func() ([]rpcLog, error)) ([]rpcLog, error) {
+	unexplained, timedOut := false, false
+	for attempt := 1; ; attempt++ {
+		logs, err := fetch()
+		if err == nil || ctx.Err() != nil {
+			return logs, err
+		}
+		switch classifyLogsErr(err) {
+		case logsTooLarge:
+			return nil, &rangeRefusedError{err: err, why: refusedTooLarge, tries: attempt}
+		case logsBusy:
+			if attempt >= logsRetries {
+				return nil, err
+			}
+		case logsTimedOut:
+			if timedOut || !retryTimeout || attempt >= logsRetries {
+				return nil, &rangeRefusedError{err: err, why: refusedNodeTimeout, tries: attempt}
+			}
+			timedOut = true
+		case logsClientTimeout:
+			return nil, &rangeRefusedError{err: err, why: refusedClientTimeout, tries: attempt}
+		case logsUnexplained:
+			if unexplained {
+				return nil, &rangeRefusedError{err: err, why: refusedUnexplained, tries: attempt}
+			}
+			unexplained = true
+		default:
+			return nil, err
+		}
+		if err := sleepCtx(ctx, time.Duration(attempt)*rpcRetryBase); err != nil {
+			return nil, err
+		}
+	}
+}
+
+// rangeNoteEvery: at most one log line per this interval about range sizes
+// (several workers scan at once); the lines in between are counted.
+var rangeNoteEvery = 30 * time.Second
+
+type rangeNotes struct {
+	mu            sync.Mutex
+	last          time.Time
+	split, growth int // changes not shown since the last line
+}
+
+func (n *rangeNotes) say(split bool, format string, args ...any) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if !n.last.IsZero() && time.Since(n.last) < rangeNoteEvery {
+		if split {
+			n.split++
+		} else {
+			n.growth++
+		}
 		return
 	}
-	if took > 3*time.Second {
-		c.okStreak.Store(0)
-		return
+	line := fmt.Sprintf(format, args...)
+	if n.split+n.growth > 0 {
+		line += fmt.Sprintf(" [also %d range split(s) and %d grow-back(s) in all scans since the last such line]", n.split, n.growth)
 	}
-	if c.okStreak.Add(1) < 6 {
-		return
+	n.last, n.split, n.growth = time.Now(), 0, 0
+	log.Print(line)
+}
+
+func labelPrefix(label string) string {
+	if label == "" {
+		return ""
 	}
-	next := size * 2
-	if next > c.maxChunk {
-		next = c.maxChunk
-	}
-	if next >= c.ceiling.Load() && c.ceiling.Load() != 0 && time.Now().Unix() < c.ceilingEnd.Load() {
-		return // that size failed a moment ago
-	}
-	if c.chunk.CompareAndSwap(size, next) {
-		c.okStreak.Store(0)
-		log.Printf("node is answering quickly: eth_getLogs ranges back up to %d blocks", next)
-	}
+	return label + ": "
 }
 
 // isTimeout: the request ran into the client's time limit (not a cancelled run).
@@ -766,13 +1010,14 @@ func isTimeout(err error) bool {
 }
 
 // fetchLogs returns one chunk's logs in block order, from memory when this
-// exact full chunk was fetched before.
-func (c *rpcClient) fetchLogs(ctx context.Context, address string, topics []any, from, to, size uint64) ([]rpcLog, error) {
+// exact full chunk was fetched before. asked: this call sent the request to the
+// node itself (false: from memory, or shared with another scan's request).
+func (c *rpcClient) fetchLogs(ctx context.Context, address string, topics []any, from, to, size uint64) (logs []rpcLog, asked bool, err error) {
 	key := ""
 	if c.logs != nil && from%size == 0 && to-from+1 == size {
 		key = logCacheKey(address, topics, from, to)
 		if logs, ok := c.logs.get(key); ok {
-			return logs, nil
+			return logs, false, nil
 		}
 	}
 	// Several workers often want the very same range at the same moment (repeat
@@ -793,14 +1038,14 @@ func (c *rpcClient) fetchLogs(ctx context.Context, address string, topics []any,
 			select {
 			case <-fl.done:
 			case <-ctx.Done():
-				return nil, ctx.Err()
+				return nil, false, ctx.Err()
 			}
 			if fl.err != nil && isCanceled(fl.err) && ctx.Err() == nil {
 				continue // the asker was interrupted, we were not: ask ourselves
 			}
-			return fl.logs, fl.err
+			return fl.logs, false, fl.err
 		}
-		logs, err := c.getLogs(ctx, address, topics, from, to)
+		logs, err = c.getLogs(ctx, address, topics, from, to)
 		if err == nil {
 			sort.SliceStable(logs, func(i, j int) bool {
 				if logs[i].block() != logs[j].block() {
@@ -818,7 +1063,7 @@ func (c *rpcClient) fetchLogs(ctx context.Context, address string, topics []any,
 		delete(c.sf, fkey)
 		c.sfMu.Unlock()
 		close(fl.done)
-		return logs, err
+		return logs, true, err
 	}
 }
 
@@ -836,18 +1081,29 @@ func isCanceled(err error) bool {
 // Progress reporting for long log scans (a 30-day window is ~26M blocks).
 type progressKey struct{}
 
-type progressFunc func(from, done, to uint64, events int)
+// progressFunc: a scan of [from, to] has read through block done, found events
+// so far, and asks for ranges of size blocks right now.
+type progressFunc func(from, done, to uint64, events int, size uint64)
 
 func progressFrom(ctx context.Context) progressFunc {
 	p, _ := ctx.Value(progressKey{}).(progressFunc)
 	return p
 }
 
+type scanLabelKey struct{}
+
+// scanLabelFrom: who is scanning (e.g. "call 9163 [37/50]"), for log lines; "" if unknown.
+func scanLabelFrom(ctx context.Context) string {
+	s, _ := ctx.Value(scanLabelKey{}).(string)
+	return s
+}
+
 // withScanProgress returns a context under which log scans print a progress
 // line at most every `every` (and never for scans that finish sooner).
 func withScanProgress(ctx context.Context, label string, every time.Duration) context.Context {
 	last := time.Now()
-	return context.WithValue(ctx, progressKey{}, progressFunc(func(from, done, to uint64, events int) {
+	ctx = context.WithValue(ctx, scanLabelKey{}, label)
+	return context.WithValue(ctx, progressKey{}, progressFunc(func(from, done, to uint64, events int, size uint64) {
 		if time.Since(last) < every || done >= to {
 			return
 		}
@@ -856,7 +1112,7 @@ func withScanProgress(ctx context.Context, label string, every time.Duration) co
 		if to > from {
 			pct = float64(done-from) / float64(to-from) * 100
 		}
-		log.Printf("%s: scanning blocks %d → %d: %.0f%% (at %d, %d events so far)", label, from, to, pct, done, events)
+		log.Printf("%s: scanning blocks %d → %d: %.0f%% (at %d, %d events so far, %d-block ranges)", label, from, to, pct, done, events, size)
 	}))
 }
 
@@ -1264,17 +1520,20 @@ func (o *onchainSource) resolveV4(ctx context.Context, st *onchainState, token s
 		// Initialize(id, currency0, currency1, …): walk back from the window to find it.
 		var c0, c1 string
 		hi := to
+		span := o.rpc.maxChunk // this search's own range size: a refusal here changes no other scan
 		for step := 0; step < 400 && c0 == "" && hi > 0; step++ {
-			span := o.rpc.chunk.Load()
 			lo := uint64(1)
 			if hi > span {
 				lo = hi - span + 1
 			}
-			logs, err := o.rpc.getLogs(ctx, o.cfg.PoolManagerV4, []any{topicInitV4, id}, lo, hi)
+			logs, err := o.rpc.retryLogs(ctx, true, func() ([]rpcLog, error) {
+				return o.rpc.getLogs(ctx, o.cfg.PoolManagerV4, []any{topicInitV4, id}, lo, hi)
+			})
 			if err != nil {
-				var re *rpcError
-				if errors.As(err, &re) && span > o.rpc.minChunk {
-					o.rpc.chunk.Store(span / 2)
+				var refused *rangeRefusedError
+				if errors.As(err, &refused) && span > o.rpc.minChunk {
+					span = max(span/2, o.rpc.minChunk)
+					o.rpc.splits.Add(1)
 					continue
 				}
 				return false, err
@@ -1634,25 +1893,22 @@ func (o *onchainSource) feedAggregators(ctx context.Context, feed string) ([]str
 func (o *onchainSource) lastLogBefore(ctx context.Context, address string, topics []any, block uint64) (*rpcLog, error) {
 	hi := block
 	span := uint64(2000)
+	limit := o.rpc.maxChunk // lowered when the node refuses a range (this search only)
 	for hi > 0 && block-hi < o.cfg.PriceLookback {
-		if limit := o.rpc.chunk.Load(); span > limit {
+		if span > limit {
 			span = limit
 		}
 		lo := uint64(1)
 		if hi > span {
 			lo = hi - span + 1
 		}
-		logs, err := o.rpc.getLogs(ctx, address, topics, lo, hi)
+		logs, err := o.rpc.retryLogs(ctx, true, func() ([]rpcLog, error) { return o.rpc.getLogs(ctx, address, topics, lo, hi) })
 		if err != nil {
-			var re *rpcError
-			if errors.As(err, &re) && span > o.rpc.minChunk { // range refused: remember the limit, retry smaller
-				span /= 2
-				if span < o.rpc.minChunk {
-					span = o.rpc.minChunk
-				}
-				if span < o.rpc.chunk.Load() {
-					o.rpc.chunk.Store(span)
-				}
+			var refused *rangeRefusedError
+			if errors.As(err, &refused) && span > o.rpc.minChunk { // range refused or timed out: retry smaller (this search only)
+				span = max(span/2, o.rpc.minChunk)
+				limit = span
+				o.rpc.splits.Add(1)
 				continue
 			}
 			return nil, err
@@ -1764,7 +2020,7 @@ func (o *onchainSource) describe() string {
 	if o.cfg.RPS > 0 {
 		limit = fmt.Sprintf("%d req/s", o.cfg.RPS)
 	}
-	s := fmt.Sprintf("%d ranges per scan, up to %d requests in flight, %s; ", o.cfg.Parallel, cap(o.rpc.slots), limit) + fmt.Sprintf("on-chain pools via %s (v4 PoolManager %s, %d Chainlink feed(s) on Robinhood Chain)", o.cfg.RPCURL, o.cfg.PoolManagerV4, len(o.cfg.Feeds))
+	s := fmt.Sprintf("eth_getLogs ranges of up to %d blocks, %d ranges per scan, up to %d requests in flight, %s; ", o.rpc.maxChunk, o.cfg.Parallel, cap(o.rpc.slots), limit) + fmt.Sprintf("on-chain pools via %s (v4 PoolManager %s, %d Chainlink feed(s) on Robinhood Chain)", o.cfg.RPCURL, o.cfg.PoolManagerV4, len(o.cfg.Feeds))
 	if o.mainnet != nil {
 		s += fmt.Sprintf("; ETH/USD + %d other feed(s) from Ethereum mainnet via %s", len(o.cfg.MainnetFeeds)-1, o.cfg.MainnetRPCURL)
 	}

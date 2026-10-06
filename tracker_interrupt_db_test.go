@@ -68,11 +68,11 @@ func TestTrackerInterruptedLeavesCallUntouched(t *testing.T) {
 
 func TestScanProgressCallback(t *testing.T) {
 	var calls int
-	ctx := context.WithValue(context.Background(), progressKey{}, progressFunc(func(from, done, to uint64, events int) { calls++ }))
+	ctx := context.WithValue(context.Background(), progressKey{}, progressFunc(func(from, done, to uint64, events int, size uint64) { calls++ }))
 	if p := progressFrom(ctx); p == nil {
 		t.Fatal("no progress func")
 	} else {
-		p(1, 2, 3, 0)
+		p(1, 2, 3, 0, 100)
 	}
 	if calls != 1 || progressFrom(context.Background()) != nil {
 		t.Fatal("progress plumbing")

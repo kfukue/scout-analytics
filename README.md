@@ -236,7 +236,7 @@ Only use the feature columns as model inputs; everything about the future is an 
 | `SCOUT_RPC_URL` | `http://localhost:8540` | Robinhood Chain node (full or archive; must serve historical logs) |
 | `SCOUT_PRICE_LOOKBACK_BLOCKS` | `8640000` | full node: how far back (~10 days) to look for the last feed update / ETH swap |
 | `SCOUT_RPC_RPS` | `0` | max RPC requests per second (`0` = no limit, for your own node; set a number for a shared or public endpoint) |
-| `SCOUT_RPC_LOG_CHUNK` | `200000` | blocks per `eth_getLogs`; halved automatically if the node refuses a range |
+| `SCOUT_RPC_LOG_CHUNK` | `200000` | most blocks per `eth_getLogs`. Every scan starts at this size. When the node refuses a range as too large (too many blocks or results, or an answer over 64 MB), or the range times out twice, that range is asked again in halves, for that scan only (not below 200 blocks); the scan grows back to this size after 3 answered ranges. Rate limits and busy answers are retried at the same size and never make ranges smaller |
 | `SCOUT_MAINNET_RPC_URL` | none | Ethereum mainnet **archive** node; enables ETH/USD from mainnet Chainlink |
 | `SCOUT_MAINNET_CHAINLINK_FEEDS` | `eth=` ETH/USD feed | extra `token=feedOnEthereum` mappings |
 | `SCOUT_MAINNET_RPC_RPS` | `0` | max requests per second to the Ethereum node (`0` = no limit) |
@@ -381,7 +381,7 @@ call 10126 [1/37]: 0x129b…, posted 2026-09-28 14:02 (70h ago), status pending
 call 10126 [1/37]: pool found: uniswap-v3 0x…, paired with WETH (entry block 21300412)
 call 10126 [1/37]: entry price $0.0031 (1.03e-06 WETH × $3010, Chainlink on Ethereum mainnet)
 call 10126 [1/37]: +1h → 0.0052 (+67.7%), peak +120.4%, low -8.1%
-call 10126 [1/37]: scanning blocks 21726610 → 22164412: 46% (at 21926609, 12 events so far)
+call 10126 [1/37]: scanning blocks 21726610 → 22164412: 46% (at 21926609, 12 events so far, 200000-block ranges)
 call 10126 [1/37]: tracking in 14s, 212 RPC requests — next check 2026-10-01 14:12
 tracking: processed 37 call(s) — pending 112, tracking 37, done 4, repeat 3120; more due now
 tracking: idle — tracking 149, done 4, repeat 3120; next check in 42m10s
@@ -398,6 +398,41 @@ appears only when rows without a `post_kind` were classified (once, after upgrad
 Long block scans print a progress line every few seconds, and a status line is
 printed after every cycle (every `SCOUT_TRACK_INTERVAL`, even when idle), so a
 quiet terminal for more than a minute means something is stuck.
+
+**Block range size.** The start-up line `performance tracking on: … via eth_getLogs ranges
+of up to 200000 blocks, …` shows the `SCOUT_RPC_LOG_CHUNK` in effect. The progress line
+ends with the size that scan is using right now (`…, 200000-block ranges)`), and the
+`still working` heartbeat names the request it waits on (`eth_getLogs blocks A-B (N blocks)`).
+When the node refuses a range as too large or it times out, or the scan grows back, one
+line says so, at most one such line every 30 seconds for all workers together (the ones in
+between are counted at the end of the next line):
+
+```
+call 9163 [37/50]: eth_getLogs blocks 52000000-52199999 (200000 blocks) refused as too large (rpc error -32000: query returned more than 10000 results); this scan continues with 100000-block ranges (max 200000)
+call 8120 [12/50]: eth_getLogs blocks 31000000-31199999 (200000 blocks) timed out on the node (2 tries) (rpc error -32000: request timed out); this scan continues with 100000-block ranges (max 200000)
+call 9163 [37/50]: eth_getLogs ranges back up to 200000 blocks (max 200000) after 3 answered ranges [also 4 range split(s) and 2 grow-back(s) in all scans since the last such line]
+```
+
+The smaller size belongs to that one scan; other calls keep theirs and every new scan
+starts at the maximum. A node that rate limits or says it is busy gets the same range
+again after a pause; if it keeps doing so, the call stops for this cycle with the error
+and continues from its saved cursor next time. A range the node answers with `request
+timed out` (or `query timeout exceeded`, `context deadline exceeded`) is asked once more
+at the same size and then in halves; one that gets no answer at all within the client's
+60-second limit, 4 tries in a row, is split right away (the line then says `got no answer
+in time (client time-out)`). A grown size that times out is not asked
+twice, and each such failure doubles the wait before the next try (up to 192 answered
+ranges), so a scan over blocks the node reads slowly settles at the largest size that
+works and only tries a bigger one now and then; once the answers come back in a quarter
+of the time the time-out took (indexed blocks), it grows back at the normal pace.
+A Nitro node without full log history (`--execution.rpc.log-history` other than `0`;
+the default keeps about 9.4M blocks) reads older blocks one by one, about 1 ms per block,
+so it answers old ranges slowly and the tracker uses small ranges there (about 25000
+blocks at the default maximum). Ranges are not split below 200 blocks: one that still
+fails at that size stops the scan with the line
+`… (200 blocks) timed out on the node (2 tries) at the smallest range size (200 blocks); this scan stops here (…)`.
+An error the node does not explain is asked once more and, if it comes back, treated as
+"too large" (the line then says `failed twice with an error the node does not explain`).
 
 **Ctrl+C is safe.** A call that is interrupted mid-scan is left exactly as it was
 and picked up again on the next start. `gave_up` is only used when a call is past

@@ -1821,7 +1821,7 @@ func runPriceCheck(ctx context.Context, cfg *config, token, at string) error {
 	fmt.Printf("now:          %.12g %s (%+.1f%%), peak %+.1f%%, low %+.1f%% since the call; last trade block %d\n",
 		st.LastPriceQ, st.QuoteSym, (st.LastPriceQ/st.EntryPriceQ-1)*100, (st.RunMaxQ/st.EntryPriceQ-1)*100,
 		(st.RunMinQ/st.EntryPriceQ-1)*100, st.LastPriceBlock)
-	fmt.Printf("log chunk in use: %d blocks\n", o.rpc.chunk.Load())
+	fmt.Printf("log ranges:   up to %d blocks per eth_getLogs (SCOUT_RPC_LOG_CHUNK); %d range(s) split after the node refused them as too large or timed out\n", o.rpc.maxChunk, o.rpc.splits.Load())
 	if o.noState.Load() {
 		fmt.Println("node type:    full node (no historical state) — USD prices of the paired asset come from event logs")
 	} else {
