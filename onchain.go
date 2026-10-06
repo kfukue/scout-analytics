@@ -700,6 +700,16 @@ func (c *rpcClient) getLogs(ctx context.Context, address string, topics []any, f
 //   - rate limits and busy answers are retried at the same size (see retryLogs);
 //     they never make the ranges smaller.
 func (c *rpcClient) getLogsChunked(ctx context.Context, address string, topics []any, from, to uint64, fn func(rpcLog)) error {
+	return c.getLogsChunkedUpTo(ctx, address, topics, from, to, c.maxChunk, fn)
+}
+
+// getLogsChunkedUpTo is getLogsChunked with ranges of up to ceiling blocks
+// instead of SCOUT_RPC_LOG_CHUNK (searches for one rare, topic-filtered event
+// over a long history: a node with a full log index answers them quickly).
+func (c *rpcClient) getLogsChunkedUpTo(ctx context.Context, address string, topics []any, from, to, ceiling uint64, fn func(rpcLog)) error {
+	if ceiling < 1 {
+		ceiling = c.maxChunk
+	}
 	progress := progressFrom(ctx)
 	label := scanLabelFrom(ctx)
 	events := 0
@@ -718,7 +728,7 @@ func (c *rpcClient) getLogsChunked(ctx context.Context, address string, topics [
 	if minSize < 1 {
 		minSize = 1
 	}
-	size := c.maxChunk
+	size := ceiling
 	// probing: size was just doubled and not answered yet; untested: size changed
 	// and not answered yet (one range at a time until it is); timedOutAfter: how
 	// long the last range that timed out in this scan took to do so.
@@ -799,7 +809,7 @@ func (c *rpcClient) getLogsChunked(ctx context.Context, address string, topics [
 				size, streak, probing, untested = next, 0, false, true
 				c.splits.Add(1)
 				c.notes.say(true, "%seth_getLogs blocks %d-%d (%d blocks) %s (%v); this scan continues with %d-block ranges (max %d)",
-					labelPrefix(label), sp.from, sp.to, n, refused.reason(), refused.err, size, c.maxChunk)
+					labelPrefix(label), sp.from, sp.to, n, refused.reason(), refused.err, size, ceiling)
 				cur = sp.from
 				break
 			}
@@ -821,10 +831,10 @@ func (c *rpcClient) getLogsChunked(ctx context.Context, address string, topics [
 					// these blocks are cheap for the node (e.g. past an unindexed stretch).
 					growAfter = rangeGrowAfter
 				}
-				if streak++; size < c.maxChunk && streak >= growAfter {
-					size, streak, probing, untested = min(size*2, c.maxChunk), 0, true, true
+				if streak++; size < ceiling && streak >= growAfter {
+					size, streak, probing, untested = min(size*2, ceiling), 0, true, true
 					c.notes.say(false, "%seth_getLogs ranges back up to %d blocks (max %d) after %d answered ranges",
-						labelPrefix(label), size, c.maxChunk, growAfter)
+						labelPrefix(label), size, ceiling, growAfter)
 				}
 			}
 			if progress != nil {
@@ -1364,8 +1374,9 @@ type onchainState struct {
 	PonsSeen uint64 `json:"pons_grad_seen,omitempty"`  // PoolGraduated searched for through this block (while not found)
 	Hook     string `json:"pons_hook,omitempty"`       // the hook of the graduated v4 pool (the Pons hook)
 
-	warnedJump  bool // the 1e6× backstop was logged for this call in this run (not stored)
-	ponsChecked bool // graduated() was asked since this state was loaded (not stored)
+	warnedJump  bool   // the 1e6× backstop was logged for this call in this run (not stored)
+	ponsChecked bool   // graduated() was asked since this state was loaded (not stored)
+	ponsGradAt  uint64 // PoolGraduated block found while locating the close (not stored; ponsFindPool uses it)
 }
 
 // onchainStateVersion: calls tracked with an older state are tracked again from
@@ -1421,16 +1432,15 @@ func (o *onchainSource) discoverWith(ctx context.Context, token string, entryBlo
 		return nil, err
 	}
 	// A Pons V2 token names its bonding curve itself (quote assets never are one).
+	// A confirmed Pons token is never handed to the counterparty search below
+	// (on a full node its PoolManager-wide swap scan is very slow).
 	if accept == nil {
 		curve, quote, err := o.ponsCurveOfToken(ctx, token)
 		if err != nil {
 			return nil, err
 		}
 		if curve != "" {
-			st, ok, err := o.discoverPons(ctx, token, tm, entryBlock, curve, quote)
-			if err != nil || ok {
-				return st, err
-			}
+			return o.discoverPons(ctx, token, tm, entryBlock, curve, quote)
 		}
 	}
 	latest, err := o.rpc.blockNumber(ctx)
@@ -1516,10 +1526,7 @@ func (o *onchainSource) discoverWith(ctx context.Context, token string, entryBlo
 					return nil, perr
 				}
 				if pons {
-					ps, handled, perr := o.discoverPons(ctx, token, tm, entryBlock, c.addr, quote)
-					if perr != nil || handled {
-						return ps, perr
-					}
+					return o.discoverPons(ctx, token, tm, entryBlock, c.addr, quote)
 				}
 			}
 		}

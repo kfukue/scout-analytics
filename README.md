@@ -196,12 +196,30 @@ bonding curve first and move to a Uniswap v4 pool when they graduate.
   graduates after its 30d horizon does not keep its last curve price. A launch that is closed
   but never gets a pool keeps its last curve price.
 - **Called after the graduation:** tracked on the v4 pool from the start (`uniswap-v4`).
+- **Finding a graduation that already happened** (`graduated()` is true but the block is not
+  known yet: at discovery, or in a scan or latest pass whose cursor is past it): on an
+  archive node a bisection over `graduated()` at past blocks (about 25 `eth_call`s). On a
+  full node (no historical state, as on prod) the event logs, with **no look-back limit**
+  (`SCOUT_PRICE_LOOKBACK_BLOCKS` does not apply): the curve's `CurveCompleted` and the
+  factory's `PoolGraduated` for the token (token = topic 1), in windows around the call block
+  that double in size on both sides (starting at `SCOUT_DISCOVERY_BLOCKS`) until one of them
+  shows up or the whole chain has been searched, in ranges of up to 4M blocks (split
+  automatically if the node refuses them or times out). Both are filtered by address and
+  topic, which a node with a full log index (`--execution.rpc.log-history=0`) answers
+  quickly over any range: about 4 `eth_getLogs` per doubling, a few dozen for a graduation
+  a month from the call. Either event is enough (the close is placed at `PoolGraduated` when
+  `CurveCompleted` is missing; the pool's `Initialize` with the Pons hook is looked for when
+  `PoolGraduated` is missing). A confirmed Pons token never falls back to the generic
+  transfer-counterparty search (its PoolManager-wide swap scan is very slow on a full node):
+  if neither event is found, the call fails with "the curve has closed, but neither
+  CurveCompleted nor PoolGraduated was found in the event logs" and is tried again later.
 - **Node load per Pons call:** discovery 4–5 `eth_call`s (`curve()`, `factory()`, `token()`,
-  `pairToken()`, `graduated()`), plus about 25 historical `eth_call`s once when the curve has
-  already closed (to find the block; on a full node one backward `eth_getLogs` search
-  instead). Each scan or latest refresh of a token still on its curve costs one
-  `graduated()` call and the usual `eth_getLogs` ranges; the switch costs one or two
-  `eth_getLogs` for `PoolGraduated` and one for `Initialize`.
+  `pairToken()`, `graduated()`), plus, when the curve has already closed, the search above
+  (archive: ~25 `eth_call`s; full node: one failed historical `eth_call` per run, then
+  ~4 `eth_getLogs` per doubling of the distance from the call). Each scan or latest refresh
+  of a token still on its curve costs one `graduated()` call and the usual `eth_getLogs`
+  ranges; the switch costs one or two `eth_getLogs` for `PoolGraduated` and one for
+  `Initialize`.
 
 `scout_call_tracking.current_liquidity_usd` keeps its meaning: the pool's depth, **2 × the
 quote side** in USD (so a call rugged at $400 of quote side shows $800); v4 pools have none
@@ -272,6 +290,13 @@ graduation now: curve closed at block 123, v4 pool from block 456: PoolManager i
 ```
 A known Pons token that shows a `uniswap-…` pool instead was not recognised: check that
 before resetting the `no_pool` calls.
+
+Long scans print a progress line every 5 s (to stderr), e.g. a month of v4 swaps from the
+call to now, or a graduation search that is still widening:
+```
+price-check 0x…: scanning blocks 54660000 → 81940000: 37% (at 64754000, 1234 events so far, 200000-block ranges)
+price-check 0x…: pons graduation of 0x…: searched blocks 54087000 → 55233000 around the call block 54660000 (1% of blocks 1 → 81940000), not found yet
+```
 
 ### Backfill past calls (dataset without waiting 30 days)
 

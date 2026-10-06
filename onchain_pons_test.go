@@ -1,11 +1,16 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"fmt"
+	"log"
 	"math"
 	"math/big"
+	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -463,8 +468,9 @@ func TestPonsGraduatedBeforeCall(t *testing.T) {
 
 // A scan whose cursor is already past the graduation while the state does not
 // know it (e.g. overwritten): graduated() says the curve closed, the closing
-// block is found (bisection on an archive node, the event on a full node) and
-// the v4 swaps after the cursor are read.
+// block is found (bisection on an archive node, the events on a full node,
+// beyond the price look-back) and the v4 swaps after the cursor are read,
+// without the PoolManager-wide swap scan.
 func TestPonsCursorPastGraduation(t *testing.T) {
 	for _, full := range []bool{false, true} {
 		t.Run(map[bool]string{false: "archive", true: "full node"}[full], func(t *testing.T) {
@@ -472,7 +478,7 @@ func TestPonsCursorPastGraduation(t *testing.T) {
 			x.f.fullNode = full
 			late := x.grad + 50_000
 			x.fp.swap(late, 7e-8, 18)
-			o := testOnchain(t, x.f, nil)
+			o := testOnchain(t, x.f, map[string]string{"SCOUT_PRICE_LOOKBACK_BLOCKS": ponsFarLookback})
 			st := &onchainState{Kind: "pons", Pool: tPonsCurve, Curve: tPonsCurve, Token: x.fp.token, TokenDec: 18, Quote: zeroAddr,
 				QuoteDec: 18, QuoteSym: "ETH", EntryBlock: x.eb, EntryPriceQ: x.entryP, LastPriceQ: x.entryP, ScanBlock: x.grad + 20_000, Hook: defaultPonsHook}
 			if err := o.scan(context.Background(), st, x.f.latest, nil); err != nil {
@@ -481,6 +487,9 @@ func TestPonsCursorPastGraduation(t *testing.T) {
 			if st.PonsDone != x.closeB || st.PoolID != x.fp.poolID || math.Abs(st.LastPriceQ-7e-8)/7e-8 > 1e-9 || st.LastPriceBlock != late {
 				t.Fatalf("got closed %d pool %s last %v at %d, want %d %s 7e-8 at %d", st.PonsDone, st.PoolID, st.LastPriceQ, st.LastPriceBlock,
 					x.closeB, x.fp.poolID, late)
+			}
+			if n := x.f.pmSwapScans(); n != 0 {
+				t.Fatalf("got %d PoolManager-wide swap scans, want 0", n)
 			}
 		})
 	}
@@ -510,5 +519,235 @@ func TestPonsSweptWithoutPool(t *testing.T) {
 	}
 	if st.PonsDone != eb+100 || st.PoolID != "" || st.PonsSeen != f.latest || math.Abs(st.LastPriceQ-last)/last > 1e-12 || st.RugBlock != 0 {
 		t.Fatalf("got %+v, want closed at %d, no pool, last price %v", st, eb+100, last)
+	}
+}
+
+// dropLogs removes every log whose first topic is topic (an event a
+// launch did not emit, or a node that lost it).
+func (f *fakeChain) dropLogs(topic string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	kept := f.logs[:0]
+	for _, l := range f.logs {
+		if len(l.topics) > 0 && strings.EqualFold(l.topics[0], topic) {
+			continue
+		}
+		kept = append(kept, l)
+	}
+	f.logs = kept
+}
+
+// ponsFarLookback: SCOUT_PRICE_LOOKBACK_BLOCKS for the far-graduation tests,
+// far below the distance between the call and the graduation, so the search
+// provably does not depend on it.
+const ponsFarLookback = "1000"
+
+// tookAll returns how many requests of each method arrived since the last
+// took / tookAll, and starts counting again.
+func (f *fakeChain) tookAll() map[string]int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	n := f.count
+	f.count = map[string]int{}
+	return n
+}
+
+// ponsFar is a Pons launch on a full node (no historical state) whose curve
+// closes dist blocks before or after the call; the v4 pool is created 3000
+// blocks after the close, with v4 swaps after it (one just before the call
+// when the graduation came first) and a last trade 1000 blocks before the head.
+type ponsFar struct {
+	f                *fakeChain
+	fp               *fakePons
+	eb, closeB, grad uint64
+	entry            float64 // the v4 entry price (graduated before the call), else 0
+}
+
+func newPonsFar(t *testing.T, after bool, dist uint64) *ponsFar {
+	t.Helper()
+	x := &ponsFar{f: newFakeChain(t, 10*24*time.Hour)} // 8.64M blocks
+	f := x.f
+	f.fullNode = true
+	x.fp = newFakePons(f, "0x4444444444444444444444444444444444444444", tPonsCurve, zeroAddr, 18, 1.5, 1e9, false)
+	fp := x.fp
+	if after {
+		x.eb = f.latest - 6_000_000
+		fp.buy(x.eb-500, e18(0.2))
+		fp.buy(x.eb-50, e18(0.2))
+		x.closeB = x.eb + dist
+	} else {
+		x.eb = f.latest - 2_000_000
+		fp.buy(x.eb-dist-5000, e18(0.2))
+		x.closeB = x.eb - dist
+	}
+	fp.buy(x.closeB, e18(1))
+	fp.close(x.closeB)
+	x.grad = x.closeB + 3000
+	fp.graduate(x.grad, defaultPonsHook)
+	fp.decoySwap(x.grad + 1)
+	fp.swap(x.grad+1000, 2e-8, 18)
+	if !after {
+		fp.swap(x.eb-100, 3e-8, 18)
+		x.entry = 3e-8
+	}
+	fp.swap(f.latest-1000, 5e-8, 18) // the last trade
+	return x
+}
+
+// On a full node (no historical state) the graduation is found in the event
+// logs however far it is from the call, before or after it, beyond the price
+// look-back, with only CurveCompleted or only PoolGraduated as well, and on a
+// node that refuses ranges of more than 1M blocks; the PoolManager-wide swap
+// scan never runs and the token's transfers are never read.
+func TestPonsGraduationFarFromCallFullNode(t *testing.T) {
+	const dist = 2_000_000 // blocks between the call and the close (~2.3 days at 10 blocks/s)
+	for _, c := range []struct {
+		name                     string
+		after                    bool   // the curve closes after the call
+		noCompleted, noGraduated bool   // the event is missing
+		maxRange                 uint64 // the node's eth_getLogs range cap (0 = none)
+		maxLogs                  int    // eth_getLogs allowed for discover
+	}{
+		{"long before the call", false, false, false, 0, 40},
+		{"long after the call", true, false, false, 0, 40},
+		{"before the call, no CurveCompleted", false, true, false, 0, 40},
+		{"before the call, no PoolGraduated", false, false, true, 0, 40},
+		{"after the call, no CurveCompleted", true, true, false, 0, 40},
+		{"after the call, no PoolGraduated", true, false, true, 0, 40},
+		{"before the call, node caps ranges at 1M blocks", false, false, false, 1_000_000, 60},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			x := newPonsFar(t, c.after, dist)
+			f, fp := x.f, x.fp
+			f.maxRange = c.maxRange
+			if c.noCompleted {
+				f.dropLogs(topicCurveCompleted)
+			}
+			if c.noGraduated {
+				f.dropLogs(topicPoolGraduated)
+			}
+			o := testOnchain(t, f, map[string]string{"SCOUT_PRICE_LOOKBACK_BLOCKS": ponsFarLookback})
+			ctx := context.Background()
+			st, err := o.discover(ctx, fp.token, x.eb)
+			if err != nil {
+				t.Fatalf("discover (call %d, close %d, graduation %d): %v", x.eb, x.closeB, x.grad, err)
+			}
+			wantDone, wantKind := x.closeB, "pons"
+			if c.noCompleted {
+				wantDone = x.grad // the close is placed at the graduation: nothing trades in between
+			}
+			if !c.after {
+				wantKind = "v4"
+			}
+			if st.Kind != wantKind || st.PonsDone != wantDone {
+				t.Fatalf("got kind %s closed %d, want %s closed %d (call %d)", st.Kind, st.PonsDone, wantKind, wantDone, x.eb)
+			}
+			disc := f.tookAll()
+			if err := o.entryPrice(ctx, st, f.latest); err != nil {
+				t.Fatal(err)
+			}
+			if x.entry > 0 && math.Abs(st.EntryPriceQ-x.entry)/x.entry > 1e-9 {
+				t.Fatalf("entry: got %v, want the v4 swap's %v", st.EntryPriceQ, x.entry)
+			}
+			if err := o.scan(ctx, st, f.latest, nil); err != nil {
+				t.Fatal(err)
+			}
+			if st.PoolID != fp.poolID || st.PonsGrad != x.grad || st.Hook != defaultPonsHook || st.Kind != wantKind {
+				t.Fatalf("got kind %s pool %s from %d hook %s, want %s pool %s from %d", st.Kind, st.PoolID, st.PonsGrad, st.Hook, wantKind, fp.poolID, x.grad)
+			}
+			if math.Abs(st.LastPriceQ-5e-8)/5e-8 > 1e-9 || st.LastPriceBlock != f.latest-1000 {
+				t.Fatalf("now: got %v at block %d, want 5e-8 at %d", st.LastPriceQ, st.LastPriceBlock, f.latest-1000)
+			}
+			if n := f.pmSwapScans(); n != 0 {
+				t.Fatalf("got %d PoolManager-wide swap scans, want 0", n)
+			}
+			if n := f.queriesTo(fp.token); n != 0 {
+				t.Fatalf("got %d eth_getLogs on the token (transfer discovery), want 0", n)
+			}
+			if !o.noState.Load() {
+				t.Fatalf("noState not set after a refused historical eth_call")
+			}
+			rest := f.tookAll()
+			t.Logf("requests: discover %d eth_getLogs, %d eth_call, %d eth_blockNumber; entry and scan to now %d eth_getLogs, %d eth_call",
+				disc["eth_getLogs"], disc["eth_call"], disc["eth_blockNumber"], rest["eth_getLogs"], rest["eth_call"])
+			if disc["eth_getLogs"] > c.maxLogs {
+				t.Fatalf("discover asked %d eth_getLogs, want at most %d (the search is not cheap)", disc["eth_getLogs"], c.maxLogs)
+			}
+		})
+	}
+}
+
+// A graduation search under a progress context says how far it got while it
+// is still widening.
+func TestPonsSearchProgress(t *testing.T) {
+	old := ponsSearchProgressEvery
+	ponsSearchProgressEvery = 0
+	t.Cleanup(func() { ponsSearchProgressEvery = old })
+	var buf syncBuffer
+	log.SetOutput(&buf)
+	t.Cleanup(func() { log.SetOutput(os.Stderr) })
+	x := newPonsFar(t, false, 2_000_000)
+	o := testOnchain(t, x.f, nil)
+	ctx := withScanProgress(context.Background(), "price-check "+x.fp.token, time.Hour)
+	if _, err := o.discover(ctx, x.fp.token, x.eb); err != nil {
+		t.Fatal(err)
+	}
+	want := fmt.Sprintf("price-check %s: pons graduation of %s: searched blocks", x.fp.token, x.fp.token)
+	if out := buf.String(); !strings.Contains(out, want) || !strings.Contains(out, "not found yet") {
+		t.Fatalf("log output %q, want a line starting %q ... not found yet", out, want)
+	}
+}
+
+// syncBuffer is a bytes.Buffer safe for the log package's concurrent writers.
+type syncBuffer struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (s *syncBuffer) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.Write(p)
+}
+
+func (s *syncBuffer) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.String()
+}
+
+// A confirmed Pons token whose curve has closed (graduated() is true) but whose
+// close is in no event log: a clear error, never the generic counterparty
+// search (PoolManager-wide swap scan).
+func TestPonsCloseNotFoundIsAnError(t *testing.T) {
+	for _, c := range []struct {
+		name          string
+		noCurveGetter bool // the curve is found as a counterparty of the token's transfers
+	}{{"curve() getter", false}, {"curve as a counterparty", true}} {
+		t.Run(c.name, func(t *testing.T) {
+			f := newFakeChain(t, 10*24*time.Hour)
+			f.fullNode = true
+			fp := newFakePons(f, "0x4444444444444444444444444444444444444444", tPonsCurve, zeroAddr, 18, 1.5, 1e9, c.noCurveGetter)
+			eb := f.latest - 5_000_000
+			fp.buy(eb-500, e18(0.2))
+			fp.buy(eb+500, e18(0.2))
+			closeB := eb + 1_000_000
+			fp.close(closeB)
+			fp.graduate(closeB+3000, defaultPonsHook)
+			fp.swap(closeB+4000, 2e-8, 18)
+			f.dropLogs(topicCurveCompleted)
+			f.dropLogs(topicPoolGraduated)
+			o := testOnchain(t, f, map[string]string{"SCOUT_PRICE_LOOKBACK_BLOCKS": ponsFarLookback})
+			st, err := o.discover(context.Background(), fp.token, eb)
+			if !errors.Is(err, errPonsCloseNotFound) {
+				t.Fatalf("got %+v, %v; want errPonsCloseNotFound", st, err)
+			}
+			if !strings.Contains(err.Error(), fp.token) || !strings.Contains(err.Error(), tPonsCurve) {
+				t.Fatalf("error %q does not name the token and the curve", err)
+			}
+			if n := f.pmSwapScans(); n != 0 {
+				t.Fatalf("got %d PoolManager-wide swap scans, want 0", n)
+			}
+		})
 	}
 }
