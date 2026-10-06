@@ -119,8 +119,11 @@ func (s *scanner) trackOneOnchain(ctx context.Context, t *ScoutCallTracking, pos
 		t.EntryPriceUSD, t.EntryPriceSource, t.PriceUnit = nil, nil, nil
 		t.CurrentPriceUSD, t.CurrentLiquidityUSD, t.Rugged, t.PoolCreatedAt = nil, nil, nil, nil
 		pool, name, dex := st.Pool, "token / "+st.QuoteSym, "uniswap-"+st.Kind
-		if st.Kind == "v4" {
+		switch st.Kind {
+		case "v4":
 			pool = st.PoolID
+		case "pons":
+			dex = "pons-curve" // the bonding curve; the state follows the token to its v4 pool after the graduation
 		}
 		t.PoolAddress, t.PoolName, t.PoolDex = &pool, &name, &dex
 		log.Printf("%s: pool found: %s %s, paired with %s (entry block %d)", tag, dex, pool, st.QuoteSym, st.EntryBlock)

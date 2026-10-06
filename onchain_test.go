@@ -133,10 +133,22 @@ func (f *fakeChain) serve(w http.ResponseWriter, r *http.Request) {
 			}
 			match := true
 			for ti, want := range q.Topics {
-				ws, isStr := want.(string)
-				if isStr && (ti >= len(l.topics) || !strings.EqualFold(l.topics[ti], ws)) {
-					match = false
-				}
+				switch w := want.(type) {
+				case string: // this topic must be w
+					if ti >= len(l.topics) || !strings.EqualFold(l.topics[ti], w) {
+						match = false
+					}
+				case []any: // any one of these (an OR list, as the node treats it)
+					any1 := false
+					for _, o := range w {
+						if os, ok := o.(string); ok && ti < len(l.topics) && strings.EqualFold(l.topics[ti], os) {
+							any1 = true
+						}
+					}
+					if !any1 {
+						match = false
+					}
+				} // nil: any value
 			}
 			if match {
 				out = append(out, map[string]any{"address": l.addr, "topics": l.topics, "data": l.data,

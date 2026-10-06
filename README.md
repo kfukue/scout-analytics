@@ -126,7 +126,8 @@ is enough**, as long as it serves old event logs (`eth_getLogs`); an archive nod
 1. **Pool:** found from the token's own transfers around the call: the address it moved
    to/from most is checked on-chain and identified as a Uniswap **v2** pair, **v3** pool or a
    **v4** pool on the PoolManager (matched through the swaps in the same transactions).
-   No indexer or factory address needed.
+   No indexer or factory address needed. **Pons V2** tokens are recognised first and tracked
+   on their bonding curve (see "Pons V2 tokens" below).
 2. **Prices:** every trade, from the pool's events: v2 `Sync` (reserves), v3/v4 `Swap`
    (`sqrtPriceX96`). So peak and drawdown are exact, not candle approximations.
 3. **USD:** the pool price is in the pool's other asset. It's converted with a **Chainlink
@@ -163,6 +164,44 @@ the pool holds, valued in USD. A pool is rugged when its quote side is under
   too.
 - **Once rugged, always rugged.**
 - **Backstop:** a price more than 1,000,000× the entry price is skipped as invalid.
+- **Pons V2 bonding curve: no liquidity check.** A curve has no LP that can be pulled, and its
+  real reserve starts near zero and grows toward the graduation threshold, so the
+  `SCOUT_RUG_LIQ_USD` rule (and the empty-pool rule, and the `balanceOf` check after the last
+  horizon) does not apply while the token is on its curve. The price rule (< 5% of entry after
+  the last horizon) and the 1,000,000× backstop still do. After the graduation the token's v4
+  pool is checked like any other.
+
+**Pons V2 tokens (bonding curve).** Pons V2 (ponsfamily.com) launches trade on their own
+bonding curve first and move to a Uniswap v4 pool when they graduate.
+- **Detected** before the transfer heuristic: the token's `curve()` getter (one `eth_call`;
+  other tokens revert), checked against the curve's `factory()` (`SCOUT_PONS_FACTORY`) and
+  `token()`; the quote is the curve's `pairToken()` (the zero address = native ETH, priced like
+  ETH). A transfer counterparty that answers like the token's Pons curve is accepted too.
+  Such a call gets `pool_dex = pons-curve`, `pool_address` = the curve,
+  `entry_price_source = onchain-pons`.
+- **Prices** come from the curve's `CurveBuy` / `CurveSell` events: the quote that moved along
+  the curve ÷ the tokens, i.e. a buy's `quoteIn` minus fee and creator tax, a sell's
+  `quoteOut` plus fee and tax (the curve charges both on the quote leg). That is the trade's
+  **average** price, not the curve's spot price after it: after a trade that is large next to
+  the curve's reserve (a big dev buy, a dump) the two can be far apart, and the price stays
+  that average until the next trade (an entry on a big buy sits well below the spot price
+  after it; a dump is priced well above the bottom it leaves). Volumes in the pre-call stats
+  are the quote value before fee and tax.
+- **Graduation:** the curve closes (`CurveCompleted`; nothing trades on it afterwards), and
+  later — often in the same block — the factory creates the v4 pool (`PoolGraduated`). The
+  pool is the PoolManager's `Initialize` for the token's two currencies in that very block,
+  with the Pons hook (`SCOUT_PONS_HOOK`). Curve trades count up to the closing block, v4 swaps
+  from the pool's block on: one price history, the peak, low and candles run on across the
+  switch. This works in the horizon scan and in the latest-price pass, so a token that
+  graduates after its 30d horizon does not keep its last curve price. A launch that is closed
+  but never gets a pool keeps its last curve price.
+- **Called after the graduation:** tracked on the v4 pool from the start (`uniswap-v4`).
+- **Node load per Pons call:** discovery 4–5 `eth_call`s (`curve()`, `factory()`, `token()`,
+  `pairToken()`, `graduated()`), plus about 25 historical `eth_call`s once when the curve has
+  already closed (to find the block; on a full node one backward `eth_getLogs` search
+  instead). Each scan or latest refresh of a token still on its curve costs one
+  `graduated()` call and the usual `eth_getLogs` ranges; the switch costs one or two
+  `eth_getLogs` for `PoolGraduated` and one for `Initialize`.
 
 `scout_call_tracking.current_liquidity_usd` keeps its meaning: the pool's depth, **2 × the
 quote side** in USD (so a call rugged at $400 of quote side shows $800); v4 pools have none
@@ -221,6 +260,18 @@ are converted with the quote asset's USD price at the horizon (not at each trade
 ```
 prints the latest block, the block at the call time, the pool it found (v2/v3/v4, paired
 asset), the entry price, the USD conversion (or which feed to add) and the move since.
+For a Pons V2 token it prints `pons-curve`, the curve address, the quote token and the
+graduation status (curve closing block, v4 pool block and id, hook), as found at the call
+and again after reading up to now:
+```
+pool:         pons-curve bonding curve 0x… (kind pons)
+launchpad:    Pons V2 (curve 0x…, quote ETH 0x0000000000000000000000000000000000000000)
+graduation:   not graduated (still on the bonding curve)
+…
+graduation now: curve closed at block 123, v4 pool from block 456: PoolManager id 0x… (hook 0xe5e7…, token is currency1)
+```
+A known Pons token that shows a `uniswap-…` pool instead was not recognised: check that
+before resetting the `no_pool` calls.
 
 ### Backfill past calls (dataset without waiting 30 days)
 
@@ -273,6 +324,8 @@ Only use the feature columns as model inputs; everything about the future is an 
 | `SCOUT_STABLES` | USDG | tokens worth $1 |
 | `SCOUT_WETH`, `SCOUT_V4_POOL_MANAGER`, `SCOUT_ETH_USD_POOL` | Robinhood Chain addresses | override if needed |
 | `SCOUT_DISCOVERY_BLOCKS` | `18000` | ± blocks around the call searched for the token's transfers (widened automatically) |
+| `SCOUT_PONS_FACTORY` | `0x7eD598Bc…01EC7e` | Pons V2 launch factory; a token's curve must name it (`off` = Pons tokens not recognised) |
+| `SCOUT_PONS_HOOK` | `0xE5e70264…6Be044` | hook of graduated Pons v4 pools (`off` = any hook) |
 | `SCOUT_RUG_LIQ_USD` | `500` | rugged when the USD value of the pool's **quote side** (ETH/WETH, USDG, stock token …) is below this; settable in `.env`. `0` = USD check off, but an empty pool still counts. Negative values are rejected |
 | `SCOUT_TRACK_INTERVAL` | `1m` | how often due checks are processed |
 | `SCOUT_TRACK_WORKERS` | `8` | calls tracked at the same time (on-chain source) |
@@ -290,8 +343,8 @@ Other commands: `-track` (tracker only, forever, no Telegram), `-track-once` (pr
 
 A call whose pool was not found is `no_pool` and is tried again every 6 h by itself; once it
 is past its last horizon + 48 h a failed try makes it `gave_up`, and it is never tried again.
-After pool discovery learns something new (e.g. when Pons V2 support ships), make the
-tracker try those calls right away:
+After pool discovery learns something new (e.g. Pons V2 bonding curves, now supported), make
+the tracker try those calls right away:
 
 ```bash
 ./scoutanalytics -retry-no-pool -retry-dry-run                                    # look first: what would be reset

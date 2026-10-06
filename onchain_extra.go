@@ -328,7 +328,9 @@ type precallStats struct {
 func (st *onchainState) tradeOfLog(l rpcLog, prev *[2]*big.Int) (buy bool, vol float64, ok bool) {
 	data := unhex(l.Data)
 	var tok, quo *big.Int
-	switch st.Kind {
+	switch st.logKind(l) {
+	case "curve": // CurveBuy / CurveSell: direction from the event, volume before fee and tax
+		return curveTrade(l, st.QuoteDec)
 	case "v2": // Sync(reserve0, reserve1): compare with the previous reserves
 		r0, r1 := word(data, 0), word(data, 1)
 		p0, p1 := prev[0], prev[1]
@@ -388,9 +390,8 @@ func (o *onchainSource) precall(ctx context.Context, st *onchainState, entryTS i
 	}
 	var evs []ev
 	var prev [2]*big.Int
-	addr, topics := st.logFilter()
 	width := float64(st.EntryBlock - from)
-	err = o.rpc.getLogsChunked(ctx, addr, topics, from, st.EntryBlock, func(l rpcLog) {
+	err = o.scanLogs(ctx, st, from, st.EntryBlock, func(l rpcLog) {
 		p := st.priceOfLog(l)
 		if p <= 0 {
 			return

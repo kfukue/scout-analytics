@@ -1803,12 +1803,22 @@ func runPriceCheck(ctx context.Context, cfg *config, token, at string) error {
 	if err != nil {
 		return fmt.Errorf("pool discovery: %w", err)
 	}
-	pool := st.Pool
-	if st.Kind == "v4" {
+	pool, dex := st.Pool, "uniswap-"+st.Kind
+	switch st.Kind {
+	case "v4":
 		pool = "PoolManager " + st.Pool + " id " + st.PoolID
+	case "pons":
+		dex, pool = "pons-curve", "bonding curve "+st.Curve
 	}
-	fmt.Printf("pool:         uniswap-%s %s\n", st.Kind, pool)
-	fmt.Printf("pair:         token (%d dec) / %s %s (%d dec), token is token%d\n", st.TokenDec, st.QuoteSym, st.Quote, st.QuoteDec, map[bool]int{true: 0, false: 1}[st.TokenIs0])
+	fmt.Printf("pool:         %s %s (kind %s)\n", dex, pool, st.Kind)
+	if st.Kind == "pons" {
+		fmt.Printf("pair:         token (%d dec) / %s %s (%d dec)\n", st.TokenDec, st.QuoteSym, st.Quote, st.QuoteDec)
+	} else {
+		fmt.Printf("pair:         token (%d dec) / %s %s (%d dec), token is token%d\n", st.TokenDec, st.QuoteSym, st.Quote, st.QuoteDec, map[bool]int{true: 0, false: 1}[st.TokenIs0])
+	}
+	for _, line := range st.ponsSummary() {
+		fmt.Println(line) // as found at the call
+	}
 	if err := o.entryPrice(ctx, st, latest); err != nil {
 		return fmt.Errorf("entry price: %w", err)
 	}
@@ -1836,6 +1846,14 @@ func runPriceCheck(ctx context.Context, cfg *config, token, at string) error {
 	fmt.Printf("now:          %.12g %s (%+.1f%%), peak %+.1f%%, low %+.1f%% since the call; last trade block %d\n",
 		st.LastPriceQ, st.QuoteSym, (st.LastPriceQ/st.EntryPriceQ-1)*100, (st.RunMaxQ/st.EntryPriceQ-1)*100,
 		(st.RunMinQ/st.EntryPriceQ-1)*100, st.LastPriceBlock)
+	if st.Kind == "pons" {
+		for _, line := range st.ponsSummary() {
+			fmt.Println(strings.Replace(line, "graduation:  ", "graduation now:", 1))
+		}
+		if st.RugBlock > 0 {
+			fmt.Printf("rug:          rugged at block %d (after the graduation, by the v4 pool's liquidity)\n", st.RugBlock)
+		}
+	}
 	fmt.Printf("log ranges:   up to %d blocks per eth_getLogs (SCOUT_RPC_LOG_CHUNK); %d range(s) split after the node refused them as too large or timed out\n", o.rpc.maxChunk, o.rpc.splits.Load())
 	if o.noState.Load() {
 		fmt.Println("node type:    full node (no historical state) — USD prices of the paired asset come from event logs")

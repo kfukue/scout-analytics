@@ -1,8 +1,8 @@
 # Scout analytics: handoff to Claude Code
 
 Written 6 October 2026. Start Claude Code in the repo root; `.claude/settings.json`
-makes the session the product manager, which delegates to the `researcher` and
-`coder` agents in `.claude/agents/`.
+makes the session the product manager, which delegates to the agents in
+`.claude/agents/` (see "Agent setup").
 
 First message to give it:
 
@@ -25,8 +25,9 @@ Branch `scout-call-model`. Production runs `main`.
   from an in-memory snapshot refreshed every 15 seconds, plus a "Refresh now"
   button. Columns: Date | Token | Symbol | Calls | Perceptor | Status | Entry $ |
   Call MC | Latest MC | Latest % | Peak % | Worst drop % | 1h | 1d | 3d | 7d |
-  30d. Search, sorts, Perceptor filter, legend. Front end is plain JavaScript in
-  `frontend/` (no framework, no build step).
+  30d. Search, sorts, Perceptor filter, legend, and a per-row report detail
+  pane (Perceptor + sAlpha). Front end is plain JavaScript in `frontend/` (no
+  framework, no build step).
 - Model (`ml/`): labels for four holding periods, logistic baseline and
   LightGBM, time-split validation with pass/fail gates, scoring service. Not
   trained on real data yet: the tracker has to finish the history first.
@@ -66,9 +67,47 @@ Branch `scout-call-model`. Production runs `main`.
    - `-retry-launchpad a,b` limits it to launchpads or dexes (match ignores
      case, spaces and punctuation). `-retry-dry-run` only shows what would be
      reset.
-   - **Not run yet.** The owner plans to run it only after Pons V2 support and
-     the Longxyz/USD work are deployed: first a dry run without a filter, then
-     e.g. `-retry-no-pool -retry-launchpad pons_v2,pons -retry-gave-up`.
+   - **Not run yet.** The owner plans to run it after Pons V2 support is
+     deployed (steps under Next work item 1), and again after the Longxyz/USD
+     work.
+
+### Committed on `scout-call-model` (commit 8846dc6; may not be merged or deployed yet)
+
+1. **Report detail pane.** A toggle per row shows the Perceptor and sAlpha
+   reports, loaded from `GET /api/call?id=`; rows with an sAlpha report get an
+   "sA" badge. Empty sAlpha replies count as no report. The texts are held in a
+   separate in-memory map, and each refresh reads only ids not loaded yet.
+2. **Rug guard.**
+   - When the quote side of the pool is under `SCOUT_RUG_LIQ_USD` (default
+     $500, settable in `.env`) the call is rugged: −100% from the rug point,
+     peak = the pre-rug peak.
+   - An empty pool always counts as rugged.
+   - Bound prices (2^128) are ignored; a 1e6× backstop catches the rest.
+   - `current_liquidity_usd` stores 2 × the quote side.
+   - Fixed an old bug where an interrupted run valued the pool at $1/ETH in the
+     end check.
+   - Follow-up (minor): the gecko source still compares `reserve_usd` (both
+     sides), not the quote side.
+
+### Pending owner actions
+
+1. **Re-track reset, about 149 calls.** First calls with status
+   tracking/done/error and `current_liquidity_usd < 1000` (= quote side under
+   $500), plus the calls with impossible numbers (returns, peak or latest over
+   1e5%, or the 2^128 fingerprint).
+   - Prepared as four pgAdmin files in the session scratchpad
+     `retrack\pgadmin\`: A_count, B_reset (with an expected-count guard),
+     C_check, D_catchup. The owner uses **pgAdmin**, so no psql
+     meta-commands.
+   - Steps: deploy, run A, stop the trackers, run B, start the trackers, run C;
+     D only if needed.
+   - **Not run yet.** The owner is letting the overnight `-track` run finish
+     first.
+2. **After the reset's re-tracking has finished: ask about the Uniswap v4
+   calls** (see the top of "Open questions").
+3. **Tracking progress:** 1,546 of 4,618 tracked after 12+ hours. That is near
+   the ceiling of about 1,850–1,900, because the Pons V2 calls cannot be priced
+   until Pons support ships.
 
 ### Tracker speed: root cause and fix
 
@@ -148,7 +187,7 @@ tokens: GME, MSFT, TSLA, SPCX, CRCL, GOOGL, MU, NVDA, AMZN, SNDK. A full
   `scout_test` (the README's example URL uses that name but does not say it is
   required). See the rule above on running a throwaway Postgres.
 - `TestLatestPriceInterruptedLeavesRowUntouched` is flaky (see Next work
-  item 7).
+  item 7, smaller tracker improvements).
 - On-chain code uses the fake chain in `onchain_test.go`; never call real nodes.
 - `python -m pytest tests -q` in `ml/` (27 tests).
 - Page changes: check in a real browser at 1280px and 390px, light and dark.
@@ -157,57 +196,19 @@ tokens: GME, MSFT, TSLA, SPCX, CRCL, GOOGL, MU, NVDA, AMZN, SNDK. A full
 
 ## Next work (in order; one line of work at a time)
 
-1. **sAlpha report on the page** (owner asked again, 6 Oct; he wants it before
-   Pons V2).
-   - The @salpha_research_bot reply is already stored in `scout_investigations`
-     (tool code `salpha`, `report_text`, `report_url`). It arrives later than
-     Perceptor's, and sometimes not at all.
-   - Add a row detail pane: clicking a row expands it to show the Perceptor
-     summary and the sAlpha report text, rendered as plain text with
-     `textContent` only and keeping the CSP.
-   - Load the text on demand from a new endpoint, `GET /api/call?id=`, so the
-     list stays small. Use the latest completed report per token (contract
-     address, case-insensitive), as the Perceptor column does.
-   - Add a small marker in the row when an sAlpha report exists.
-   - Most imported history has no report; only live calls are scanned.
-   - Design notes:
-     - Before building, ask the owner to run this on prod to see what the
-       sAlpha data looks like (empty `report_text` against attachments, text
-       lengths, counts):
-
-       ```sql
-       SELECT i.status, count(*) n,
-              count(*) FILTER (WHERE coalesce(i.report_text,'') = '') empty_text,
-              avg(length(i.report_text))::int avg_len, max(length(i.report_text)) max_len,
-              count(*) FILTER (WHERE i.details ? 'files' OR i.details ? 'photos') with_attachments,
-              count(DISTINCT lower(c.contract_address)) tokens
-       FROM scout_investigations i
-       JOIN scout_investigation_tools t ON t.id = i.tool_id
-       LEFT JOIN scout_calls c ON c.id = i.call_id
-       WHERE t.code = 'salpha' GROUP BY 1;
-       ```
-     - Decide whether Perceptor's "summary" means `verdict_summary` or
-       `report_text`.
-     - Snapshot: keep a presence flag plus the latest investigation id per
-       token in the row snapshot (so in the pre-encoded row and in
-       `hashWebRows`). Load the text into a separate in-memory map keyed by
-       investigation id, reading only ids not already loaded, with a capped
-       length per report; note the resulting memory size. The text is never
-       queried per request.
-     - `GET /api/call?id=` has its own ETag; 400 for a bad id, 404 for an
-       unknown one, 503 before the first snapshot.
-     - Show the report link only if it starts with `https://`.
-     - Expanded rows stay open across the 30 s refresh, Refresh now and a
-       re-sort (track them by `call_id`). A 304 leaves them alone.
-     - Use a real toggle button with `aria-expanded`. Clicks on the links in a
-       row must not toggle it.
-     - Limit the pane text to the visible width of the scroll box (the table
-       is about 1,411 px wide). Use `pre-wrap` through a CSS class (CSP: no
-       inline style).
-     - Rerun the benchmark; browser check at 1280/390px, light and dark.
-     - Run it alone, on a clean tree.
-2. **Pons V2 support** (owner approved). 60% of first calls are Pons V2 and
-   almost none are priced.
+1. **Pons V2 support** (owner approved; **in progress**, a coder is building
+   it). 60% of first calls are Pons V2 and almost none are priced.
+   - Being built: discovery via the factory's `TokenLaunched`; prices from
+     `CurveBuy`/`CurveSell`; graduation handover to the v4 pool (Pons hook) in
+     both the horizon scan and the latest pass; `-price-check` shows curve
+     info.
+   - **No USD rug threshold on the curve** (the curve's real reserve starts
+     near 0); the 5% rule and the 1e6× backstop still apply.
+   - After deploy: `-price-check` on 2–3 Pons tokens; then
+     `-retry-no-pool -retry-dry-run`; then
+     `-retry-no-pool -retry-launchpad pons_v2 -retry-gave-up`. Expect mostly
+     `gave_up` in the dry run, since historical Pons calls are past the 32-day
+     deadline.
    - Pons V2 deploys one bonding curve per token. Factory
      0x7eD598BcEf8bd9Edd8C97A195C6d13f40801EC7e emits
      `TokenLaunched(token indexed, curve indexed, deployer indexed, pairToken, launchConfigId, graduationThreshold)`;
@@ -236,7 +237,8 @@ tokens: GME, MSFT, TSLA, SPCX, CRCL, GOOGL, MU, NVDA, AMZN, SNDK. A full
    - Example token 0x59e8ae5c2e1edf77d2169e0ae67524c43aaca393 (call 10214). The
      owner was asked to run a factory eth_getLogs (topic1 = token) to confirm
      the layout on chain.
-3. **USD source fix and data-loss bug**, in `quoteUSD`/`quoteViaPool`
+2. **USD source fix and data-loss bug** (next after Pons V2; covers most of
+   Longxyz), in `quoteUSD`/`quoteViaPool`
    (`onchain.go`, `onchain_extra.go`, `tracker_onchain.go`).
    - (a) The `quotePools[quote]=nil` cache lives for the whole process and
      ignores the block, and JSON-RPC errors are cached as "no pool". Separate
@@ -334,8 +336,16 @@ tokens: GME, MSFT, TSLA, SPCX, CRCL, GOOGL, MU, NVDA, AMZN, SNDK. A full
    - (f) After it ships: reset the stuck non-USD calls and the calls that hit
      the data-loss bug so they re-track in USD. Ask the owner first and give him
      the exact SQL.
-4. **Longxyz.** It trades against stock tokens, so it is probably covered by the
-   feeds plus item 3. Verify after item 3.
+3. **Longxyz.** It trades against stock tokens, so it is probably covered by the
+   feeds plus item 2. Verify after item 2.
+4. **Website follow-ups** (small, queued):
+   - sAlpha "declined" replies ("Not enough public signals…" / "Too little
+     liquidity…") show "sAlpha did not generate a report", with no badge.
+   - De-duplicate the Perceptor line (today "no red flags · No red flags
+     found").
+   - Rugged rows: Peak % shows "–", Status shows "rugged".
+   - Huge numbers in 10ⁿ notation (e.g. +3.9×10⁴⁷%), with the exact value in
+     the tooltip.
 5. **Push updates for new tokens.** The owner confirmed nothing needs to go from
    the page to the server, so use Server-Sent Events, not a WebSocket. When the
    listener records a new token and when its Perceptor or sAlpha report
@@ -353,8 +363,15 @@ tokens: GME, MSFT, TSLA, SPCX, CRCL, GOOGL, MU, NVDA, AMZN, SNDK. A full
      so in the README.
    - Keep the events endpoint cheap: one goroutine per client, heartbeat
      comment every 25 seconds, cap the number of clients.
-6. **Scatter plot** of call properties against return. Parked until the tracker
-   has finished and the model report shows which properties matter.
+6. **Charts and scatter plot** of call properties against return. The scatter
+   plot stays parked until the tracker has finished and the model report shows
+   which properties matter.
+   - Decided: Apache ECharts 6.1.x, vendored, with a custom theme and CSP-safe
+     tooltips (rules in the coder agent). amCharts 5 was compared: polished but
+     slow at 12k+ points, no box plot or symlog; its logo would have been
+     acceptable.
+   - A side-by-side demo is being built in the session scratchpad
+     `chartdemo\` for the owner to judge.
 7. **Smaller tracker improvements** (not started):
    - A rolling worker queue: today each 50-call cycle waits for its slowest
      call, about 70 s of idle time per new v4 call.
@@ -377,6 +394,17 @@ tokens: GME, MSFT, TSLA, SPCX, CRCL, GOOGL, MU, NVDA, AMZN, SNDK. A full
    - Suggested first step after the model report: @CallAnalyserRobinhood (same
      chain).
 
+## Agent setup
+
+- `.claude/agents/` has: `coder` (Go + plain JS, with the Go, JS, CSP and
+  charts rules), `ml-coder`, `react-coder` (adapted from wshobson/agents, MIT),
+  `infra` (approval-gated), `researcher` and `product-manager`.
+  `.claude/drafts/reviewer.md` awaits owner approval.
+- New agents load only after a Claude Code restart.
+- `.claude/` is untracked; the owner decides whether to commit it.
+- Pending (#5): tighten `settings.json`: allow read-only git, `node --check`
+  and the ml venv pytest path; widen the secret denials to `**/`.
+
 ## Already done (asked again recently)
 
 - Token names are read with the ERC-20 `name()` call and stored in
@@ -385,16 +413,23 @@ tokens: GME, MSFT, TSLA, SPCX, CRCL, GOOGL, MU, NVDA, AMZN, SNDK. A full
 
 ## Open questions for the owner
 
+- **REMINDER (the owner asked to be reminded): once the re-track reset's
+  re-tracking has finished (Pending owner actions, item 1), ask the owner
+  whether to also re-track the 1,166 Uniswap v4 calls.** They have no stored
+  liquidity (the old code never measured v4), so the liquidity filter cannot
+  select them, and drained v4 pools may still hold old results. About 2–4 hours
+  of tracker time.
 - Should `prior_calls`, `calls_prev_1h` and `calls_prev_24h` (model inputs)
   count real calls only? They still count update posts.
-- "Show the expanded pane with the questions": probably the sAlpha row detail
-  pane (Next work item 1). Ask the owner to confirm, and whether "the
-  questions" means something the pane should show.
-- Add a `reviewer` agent and a deploy checklist?
+- "Show the expanded pane with the questions": the report detail pane is now
+  committed. Ask the owner whether "the questions" means something the pane
+  should also show.
+- Approve the drafted `reviewer` agent (see "Agent setup"); add a deploy
+  checklist?
 - A staging copy of `assetdb` would let changes be run against real data
   before production.
 - Did he add the full 33-feed `SCOUT_CHAINLINK_FEEDS` line?
-- Result of the Pons factory eth_getLogs (item 2).
+- Result of the Pons factory eth_getLogs (Next work item 1).
 - Result of the error query under "Prod data findings".
 
 ## Deploying
