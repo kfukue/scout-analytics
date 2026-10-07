@@ -10,8 +10,9 @@
 --
 -- WHAT IT DOES (one transaction, all or nothing)
 --   1. Picks the calls (same selection as A_count.sql: first calls, status
---      tracking/done/error, pool_dex 'uniswap-v4', launchpad or dex = Pons V2)
---      and locks them.
+--      tracking/done/error, pool_dex 'uniswap-v4', launchpad or dex = Pons V2,
+--      on-chain state without a 'pons_curve' key, i.e. not written by the
+--      Pons-aware code) and locks them.
 --   2. If their number is not exactly expected_count, it STOPS with an error
 --      and changes nothing. Read the number in the error message, compare it
 --      with A, and only then set expected_count again.
@@ -33,13 +34,12 @@
 --
 -- NEVER RUN IT AGAIN AFTER THE TRACKER HAS STARTED
 --   Right after a successful run it finds 0 calls (they are all 'pending'), so
---   with the same expected_count it stops and changes nothing. But once the
---   tracker has re-tracked them, every token that had ALREADY graduated at its
---   call is correctly back on 'uniswap-v4' and matches the selection again: a
---   rerun would reset those correct results a second time (a wasted re-track,
---   no wrong data, but hours of node load). Do NOT lower or raise
---   expected_count to "make it run". For rows a tracker wrote back over the
---   reset, use D_catchup.sql.
+--   with the same expected_count it stops and changes nothing. Once the
+--   tracker has re-tracked them, the tokens back on 'uniswap-v4' carry a
+--   'pons_curve' key and are excluded, so a rerun should find nothing; any
+--   row it does find was written over the reset by a tracker still running
+--   the old code, and that is D_catchup.sql's job (or the PM's), not B's.
+--   Do NOT lower or raise expected_count to "make it run".
 --
 -- pgAdmin: run the whole file with F5. Auto-commit can stay ON (the file has
 -- its own BEGIN/COMMIT). The "WARNING: there is no transaction in progress"
@@ -68,6 +68,7 @@ WHERE t.status IN ('tracking','done','error')
   AND t.pool_dex = 'uniswap-v4'
   AND (   regexp_replace(lower(COALESCE(m.launchpad, '')), '[^a-z0-9]+', '', 'g') = 'ponsv2'
        OR regexp_replace(lower(COALESCE(m.dex, '')),       '[^a-z0-9]+', '', 'g') = 'ponsv2')
+  AND NOT COALESCE(jsonb_typeof(t.onchain) = 'object' AND t.onchain ? 'pons_curve', false)
 FOR UPDATE OF t;
 
 -- Stop (and roll everything back) unless the count is exactly expected_count.

@@ -10,7 +10,8 @@
 -- launchpad or dex, normalised, is 'ponsv2'.
 --
 -- Result: ONE row.
---   not_reset         Must be 0. Calls that match A/B's selection now and were
+--   not_reset         Must be 0. Calls that match A/B's selection now (which
+--                     excludes rows with a 'pons_curve' key) and were
 --                     last written BEFORE reset_at, i.e. B missed them.
 --                     (The latest-price pass never changes pool_dex, so this
 --                     stays meaningful while the tracker works.)
@@ -28,7 +29,9 @@
 --                     now tracked on the bonding curve (pool_dex 'pons-curve'):
 --                     the calls that were wrong before.
 --   now_on_v4         ... now on 'uniswap-v4' (graduated before the call: the
---                     old result was right and has been recomputed).
+--                     old result was right and has been recomputed). May also
+--                     count rows B excluded (already had 'pons_curve'; never
+--                     reset) once the tracker saves them again.
 --   now_other         ... any other status/pool (no_pool, gave_up, error, ...).
 --   v4_without_pons_state  Should be 0. Of now_on_v4, rows whose on-chain
 --                     state has no 'pons_curve' key, i.e. not written by the
@@ -47,7 +50,8 @@ pons AS (   -- Pons V2 first calls, as they are now
      OR regexp_replace(lower(COALESCE(m.dex, '')),       '[^a-z0-9]+', '', 'g') = 'ponsv2'),
 sel AS (    -- the selection of A and B, applied to the rows as they are now
   SELECT s.* FROM pons s
-  WHERE s.status IN ('tracking','done','error') AND s.pool_dex = 'uniswap-v4'),
+  WHERE s.status IN ('tracking','done','error') AND s.pool_dex = 'uniswap-v4'
+    AND NOT COALESCE(jsonb_typeof(s.onchain) = 'object' AND s.onchain ? 'pons_curve', false)),
 after AS (  -- Pons V2 first calls that existed before reset_at and were written at/after it
   SELECT s.* FROM pons s, params
   WHERE s.updated_at >= params.reset_at AND s.created_at < params.reset_at)
