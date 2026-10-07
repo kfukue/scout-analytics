@@ -1045,7 +1045,7 @@ func (s *webServer) handleCalls(w http.ResponseWriter, r *http.Request) {
 type webCallDetail struct {
 	CallID    int                 `json:"call_id"`
 	Perceptor *webPerceptorDetail `json:"perceptor"` // null = no completed Perceptor report
-	SAlpha    *webSAlphaDetail    `json:"salpha"`    // null = no completed sAlpha report with text
+	SAlpha    *webSAlphaDetail    `json:"salpha"`    // null = no completed sAlpha reply with text
 }
 
 // webPerceptorDetail: the token's latest completed Perceptor report.
@@ -1059,18 +1059,21 @@ type webPerceptorDetail struct {
 	Truncated bool      `json:"truncated"`
 }
 
-// webSAlphaDetail: the token's latest completed sAlpha report with text.
+// webSAlphaDetail: the token's latest completed sAlpha report with text, or,
+// when it has none, its latest reply that declines to report (Declined: the
+// page says sAlpha did not generate a report, Text is its reason).
 type webSAlphaDetail struct {
 	ID        int       `json:"id"`
-	Text      string    `json:"text"` // report_text, plain text
-	URL       *string   `json:"url"`  // https only
-	At        time.Time `json:"at"`   // completed_at, else requested_at
+	Text      string    `json:"text"`     // report_text, plain text
+	Declined  bool      `json:"declined"` // the reply only declines to report
+	URL       *string   `json:"url"`      // https only
+	At        time.Time `json:"at"`       // completed_at, else requested_at
 	Truncated bool      `json:"truncated"`
 }
 
 // webCallDetailVersion: part of the ETag of /api/call; raise it when the body
 // of a report changes form, so pages kept open ask again.
-const webCallDetailVersion = "1"
+const webCallDetailVersion = "2"
 
 // parseWebCallID reads the query of /api/call: exactly one id, a whole number
 // from 1 to 2^31−1, written plainly.
@@ -1127,7 +1130,7 @@ func (s *webServer) handleCall(w http.ResponseWriter, r *http.Request) {
 		d.Perceptor = &webPerceptorDetail{ID: e.id, Verdict: e.verdict, Label: e.label, Summary: e.summary, URL: e.url, At: e.at, Truncated: e.truncated}
 	}
 	if e := snap.reports[int(sid)]; sid != 0 && e != nil {
-		d.SAlpha = &webSAlphaDetail{ID: e.id, Text: e.text, URL: e.url, At: e.at, Truncated: e.truncated}
+		d.SAlpha = &webSAlphaDetail{ID: e.id, Text: e.text, Declined: e.declined, URL: e.url, At: e.at, Truncated: e.truncated}
 	}
 	writeJSON(w, r, http.StatusOK, &d)
 }

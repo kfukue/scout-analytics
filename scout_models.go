@@ -242,7 +242,8 @@ var ScoutWebHorizons = [5]string{"1h", "1d", "3d", "7d", "30d"}
 // report (any post of the token), nil when it was never scanned; PerceptorID is
 // that investigation's id. SAlphaID is the token's latest completed sAlpha
 // investigation whose report_text is not empty (nor only white space), nil
-// when there is none. The texts of both are read separately, by id
+// when there is none; a reply that only declines to report (see
+// salphaDeclinePhrases) is chosen only when the token has no real report. The texts of both are read separately, by id
 // (ScoutStore.SelectWebReports).
 type ScoutWebRow struct {
 	CallID          int
@@ -282,6 +283,9 @@ type ScoutWebRow struct {
 	// worked out by the website when it builds its snapshot (websnapshot.go)
 	usd     bool  // priced in USD: only then are the numbers shown
 	verdict uint8 // webBucket…: where the Perceptor filter puts the token
+	// salphaDeclined: the sAlpha report SAlphaID names only declines to report
+	// (set by webReportsFor from its text)
+	salphaDeclined bool
 	// callMcap: CalledAtMcap, else PostMcap. latestMcap: an estimate,
 	// (PostMcap, else CalledAtMcap) × LatestPrice ÷ PostPrice. "Else" = when the
 	// first is missing, zero, negative or not finite. Both nil unless every input
@@ -346,7 +350,9 @@ type ScoutWebCall struct {
 	CallMcapUSD   *float64 `json:"call_mcap_usd"`
 	LatestMcapUSD *float64 `json:"latest_mcap_usd"`
 	// The token's reports, whose texts GET /api/call returns: HasSAlpha says
-	// the token has an sAlpha report with text (an empty one counts as none);
+	// the token has an sAlpha report with text (an empty one counts as none,
+	// and so does a reply that declines to report: SAlphaReportID then still
+	// names it, so the detail can say that sAlpha did not report);
 	// the two ids are the investigations the detail shows (nil = none). A new
 	// report changes them, so the page knows to ask for the detail again.
 	HasSAlpha         bool `json:"has_salpha_report"`

@@ -368,9 +368,10 @@ func TestWebCallsOrderHorizonsAndFields(t *testing.T) {
 		t.Fatalf("sort=return %+v", r)
 	}
 	fx.wantOrder(t, "sort=return&dir=asc", "beta", "alpha", "gamma")
-	fx.wantOrder(t, "sort=peak", "alpha", "beta", "gamma")
-	fx.wantOrder(t, "sort=peak&dir=asc", "beta", "alpha", "gamma")
-	// 1h: beta +9, alpha +5, gamma +1; peak 11, 8, 2.
+	// beta is rugged: it shows no peak, so it sorts with the rows without one
+	fx.wantOrder(t, "sort=peak", "alpha", "gamma", "beta")
+	fx.wantOrder(t, "sort=peak&dir=asc", "alpha", "beta", "gamma")
+	// 1h: beta +9, alpha +5, gamma +1; peak (none: rugged), 8, 2.
 	fx.wantOrder(t, "sort=return&horizon=1h", "beta", "alpha", "gamma")
 	fx.wantOrder(t, "sort=return&horizon=1h&dir=asc", "gamma", "alpha", "beta")
 	fx.wantOrder(t, "sort=peak&horizon=1h&dir=asc", "gamma", "alpha", "beta")
@@ -465,6 +466,10 @@ func TestWebCallsOrderHorizonsAndFields(t *testing.T) {
 	b := by["beta"]
 	if fnum(b.EntryPriceUSD) != "1.5" || b.Rugged == nil || !*b.Rugged || strOrNil(b.TokenSymbol) != "BETA" { // no late entry → the call price; on-chain symbol
 		t.Fatalf("beta %+v", b)
+	}
+	// rugged: no peak, the return and worst drop as stored
+	if fnum(b.PeakPct) != "null" || fnum(b.ReturnPct) != "-20" || fnum(b.DrawdownPct) != "-35" || fnum(b.Return1hPct) != "9" {
+		t.Fatalf("beta (rugged): peak %s return %s drawdown %s 1h %s, want null -20 -35 9", fnum(b.PeakPct), fnum(b.ReturnPct), fnum(b.DrawdownPct), fnum(b.Return1hPct))
 	}
 	if g := by["gamma"]; g.TokenName != nil || fnum(g.ReturnPct) != "null" || fnum(g.EntryPriceUSD) != "0.6" || strOrNil(g.TrackingStatus) != "tracking" ||
 		strOrNil(g.GMGNURL) != "https://gmgn.ai/robinhood/token/"+caGamma {
@@ -637,7 +642,7 @@ func TestWebOneRowPerToken(t *testing.T) {
 		t.Fatalf("sort=return %+v", res)
 	}
 	fx.wantOrder(t, "sort=return&dir=asc", "beta", "rep", "alpha", "gamma")
-	fx.wantOrder(t, "sort=peak", "alpha", "rep", "beta", "gamma")
+	fx.wantOrder(t, "sort=peak", "alpha", "rep", "gamma", "beta") // beta is rugged: no peak
 	fx.wantOrder(t, "sort=return&horizon=1h", "beta", "alpha", "rep", "gamma")
 	fx.wantOrder(t, "sort=peak&horizon=1h&dir=asc", "gamma", "rep", "alpha", "beta")
 	if res := fx.wantOrder(t, "sort=return&usd_only=0", "alpha", "rep", "beta", "gave", "err", "pct", "sol", "xss", "virt", "gamma"); res.Total != 10 {

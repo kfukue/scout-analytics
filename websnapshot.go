@@ -80,6 +80,15 @@ const (
 
 var _ [webPerfPerRow]float64 = ScoutWebRow{}.Perf // the two sizes must agree
 
+// webPeakBits: the bits of ScoutWebRow.HasPerf that hold a peak.
+var webPeakBits = func() uint16 {
+	var b uint16
+	for h := range ScoutWebHorizons {
+		b |= 1 << (h*webPerfPerHorizon + webPerfPeak)
+	}
+	return b
+}()
+
 func webHorizonIndex(h string) (int, bool) {
 	for i, name := range ScoutWebHorizons {
 		if name == h {
@@ -166,6 +175,7 @@ type webReport struct {
 	label     *string // Perceptor: verdict_label
 	summary   *string // Perceptor: verdict_summary
 	text      string  // sAlpha: report_text
+	declined  bool    // sAlpha: the text only declines to report (salphaDeclined)
 	url       *string
 	truncated bool // a text was longer than webReportMaxBytes and was cut
 }
@@ -204,12 +214,35 @@ func newWebReport(r *ScoutWebReport) *webReport {
 		w.label, w.summary = cut(r.Label), cut(r.Summary)
 	case webToolSAlpha:
 		w.text, w.truncated = cutText(r.Text, webReportMaxBytes)
+		w.declined = salphaDeclined(w.text)
 	}
 	if r.URL != nil && strings.HasPrefix(*r.URL, "https://") && len(*r.URL) <= webReportMaxURL {
 		u := *r.URL
 		w.url = &u
 	}
 	return w
+}
+
+// salphaDeclinePhrases: sAlpha replies that contain one of these (compared
+// without regard to letter case) decline to report on the token, e.g. "Not
+// enough public signals to generate a report for this token." They are not
+// reports: the row shows no "sA" badge, the detail says that sAlpha did not
+// generate a report, and an older real report is preferred
+// (ScoutStore.SelectWebRows passes this list to its query). Lower case only.
+var salphaDeclinePhrases = []string{
+	"not enough public signals to generate a report",
+	"too little liquidity or trading activity to research yet",
+}
+
+// salphaDeclined reports whether an sAlpha reply only declines to report.
+func salphaDeclined(text string) bool {
+	t := strings.ToLower(text)
+	for _, p := range salphaDeclinePhrases {
+		if strings.Contains(t, p) {
+			return true
+		}
+	}
+	return false
 }
 
 // The tool codes whose reports the row detail shows.
@@ -263,6 +296,7 @@ func webReportsFor(rows []ScoutWebRow, old map[int]*webReport, got map[int]*Scou
 		r := &rows[i]
 		r.PerceptorID = keep(r.PerceptorID, webToolPerceptor)
 		r.SAlphaID = keep(r.SAlphaID, webToolSAlpha)
+		r.salphaDeclined = r.SAlphaID != nil && m[*r.SAlphaID].declined
 	}
 	return m
 }
@@ -354,7 +388,7 @@ func (c webConfig) webCall(r *ScoutWebRow) ScoutWebCall {
 		PerceptorVerd: r.PerceptorVerd, PerceptorURL: r.PerceptorURL,
 		CallCount: r.CallCount, LastCallDate: r.LastCallDate,
 		CallMcapUSD: r.callMcap, LatestMcapUSD: r.latestMcap,
-		HasSAlpha: r.SAlphaID != nil, PerceptorReportID: r.PerceptorID, SAlphaReportID: r.SAlphaID,
+		HasSAlpha: r.SAlphaID != nil && !r.salphaDeclined, PerceptorReportID: r.PerceptorID, SAlphaReportID: r.SAlphaID,
 	}
 }
 
@@ -407,6 +441,11 @@ func newWebSnapshot(rows []ScoutWebRow, updatePosts int, prev *webSnapshot, cfg 
 		// there at all (and so sort last).
 		if !r.usd {
 			r.EntryPrice, r.HasPerf = nil, 0
+		}
+		// A rugged call has no peak to show (the page shows a dash, and it
+		// sorts with the calls without one); its returns stay as stored.
+		if r.Rugged != nil && *r.Rugged {
+			r.HasPerf &^= webPeakBits
 		}
 		r.EntryPrice = finite(r.EntryPrice)
 		// The latest price follows the same rule; without the time it was read
@@ -608,6 +647,9 @@ func hashWebRows(rows []ScoutWebRow, updatePosts int, gmgn string) string {
 				flags |= 4
 			}
 		}
+		if r.salphaDeclined {
+			flags |= 8
+		}
 		buf = append(buf, flags)
 		opt(r.TrackingStatus)
 		buf = binary.LittleEndian.AppendUint16(buf, r.HasPerf)
@@ -626,7 +668,8 @@ func hashWebRows(rows []ScoutWebRow, updatePosts int, gmgn string) string {
 		optFlt(r.callMcap)
 		optFlt(r.latestMcap)
 		// the reports the detail shows (a new one changes the version, an
-		// empty sAlpha reply is never chosen, so it does not)
+		// empty sAlpha reply is never chosen, so it does not; whether the
+		// sAlpha one declines is in the flags above)
 		optInt(r.PerceptorID)
 		optInt(r.SAlphaID)
 		h.Write(buf)
