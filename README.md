@@ -121,7 +121,13 @@ you can check a post's parse before relying on it.
 
 For every call the scanner records how the token did afterwards, **straight from the chain**
 (Robinhood Chain, your node at `SCOUT_RPC_URL`, default `http://localhost:8540`). A **full node
-is enough**, as long as it serves old event logs (`eth_getLogs`); an archive node also works:
+is enough**, as long as it serves old event logs (`eth_getLogs`); an archive node also works.
+
+A moment (the call, a horizon, an hour boundary) is turned into a block one way everywhere:
+the **last block whose timestamp is at or before it**. The chain makes about 10 blocks a
+second, so "a block in that second" would not be one block; the search always runs down to
+that last block, so the answer does not depend on what earlier lookups cached.
+
 
 1. **Pool:** found from the token's own transfers around the call: the address it moved
    to/from most is checked on-chain and identified as a Uniswap **v2** pair, **v3** pool or a
@@ -171,10 +177,24 @@ is enough**, as long as it serves old event logs (`eth_getLogs`); an archive nod
    most recent (within `SCOUT_PRICE_LOOKBACK_BLOCKS`) is used, a WETH/ETH pool before a
    stablecoin pool, so the pool can change from block to block (one log line when it does:
    `prices: USD price of VIRTUAL (0x…) now from its USDG pool (uniswap-v3 0x…) (was …)`). A
-   block none of the known pools covers starts one more search around that block. What is
-   remembered (in memory, per process): pools found, and prices per asset and hour; "no
-   pool" for 1 hour and "no price yet" (pools, but no trade before that block) for 6 hours,
-   then asked again. A node error is never remembered as "no pool".
+   block none of the known pools covers starts one more search around that block. A search
+   around one block never decides for another block: when nothing near the block prices it,
+   a **whole-history search** looks at every v4 pool of the asset (`Initialize`, all
+   blocks) and every address its transfers went to or came from since its first transfer
+   (`token0()`/`token1()`, the busiest first). The asset counts as having **no USD source**
+   (the call is tracked in its units) only when that search has covered the whole history
+   and found no pool against WETH/ETH or a stablecoin; pools that exist but had no trade
+   before the block give "no price yet" (retried, capped as below). Cost: one search reads
+   at most 100,000 transfer logs and checks at most 256 addresses (a wallet costs one
+   `eth_call`, a contract two to four); the next search goes on from there, and until the
+   history is covered the answer is "USD pool search not finished": the call is retried
+   every 5 minutes (each try moves the search on), never capped or taken for "no USD source";
+   the progress is kept in memory, so a restart starts the search over. Once covered, a
+   later search reads only the new blocks. One search per asset runs at a time; other
+   workers wait for it. What is remembered (in memory, per process): pools found, the
+   searched history, and prices per asset and hour; "no pool anywhere" for 1 hour (for the
+   blocks the search covered) and "no price yet" (pools, but no trade before that block) for
+   6 hours, then asked again. A node error is never remembered.
 
    **Feed aggregators.** A Chainlink proxy can switch to a new aggregator. Its aggregator list
    is read again every hour (a switch is logged: `prices: chainlink 0x… switched aggregator:
@@ -185,7 +205,10 @@ is enough**, as long as it serves old event logs (`eth_getLogs`); an archive nod
    look-back but another one has, that one is used and a "stale aggregator" line is logged once.
 4. **Each horizon** (`1h, 1d, 3d, 7d, 30d`): price, **return %**, **max gain %**, **max drawdown %**
    → `scout_call_returns`. Swaps are scanned once: progress is kept per call, each check
-   only reads the new block range.
+   only reads the new block range. A long segment is read and stored in pieces of about 32
+   `SCOUT_RPC_LOG_CHUNK` ranges (about a week of blocks), each ending on a UTC hour (so no candle is split); after
+   each piece its candles and the scan position are saved, so a failure or a restart resumes
+   from the last stored piece instead of the segment's start, and no trade is counted twice.
 5. **Rugged** (see below): the pool's quote side under `SCOUT_RUG_LIQ_USD` ($500) at any
    price event, or an empty pool; and after the last horizon also price < 5% of entry.
 
@@ -320,7 +343,14 @@ A pair whose quote asset has no USD source at all (no feed, no pool against WETH
 stablecoin) is still tracked, **in that asset's units** (`price_unit` = e.g. `TSLA` instead of
 `usd`); the returns are then relative to the stock token. Only a definitive "no source" does
 this: a temporary failure at the entry (node error, or "no price yet": the asset's pools had
-not traded before the call block) leaves the call in `error` and it is tried again.
+not traded before the call block) leaves the call in `error` and it is tried again. "No price
+yet" has a cap: once the call is past its last horizon + 48 h (the same deadline as
+`gave_up`), the quote's pools will not get a trade before the call any more, so it counts as
+a definitive absence and the call is tracked in the quote asset's units, with one log line:
+```
+call 123 [1/5]: entry price 0.01 QT (no USD price of QT at the call block 6048010 after the last horizon + 48 h: … no price yet … — giving up on USD, tracked in QT)
+```
+A node error is never capped: it is retried for ever.
 
 **Chainlink feeds from the asset database.** When the database also holds the asset
 tracker's tables, the tracker reads feeds from them (read-only, no schema change):
@@ -337,7 +367,13 @@ only, if no read has worked yet):
 chainlink feeds: 12 on Robinhood Chain and 3 on Ethereum mainnet from the asset database; in use 13 Robinhood + 4 mainnet
 chainlink feeds: no asset tables (assets / chains / asset_chains) in this database — using the environment's feeds only
 ```
-`-price-check` does not open the database, so it only knows the environment's feeds.
+`-price-check` loads them the same way (read-only, no migration) when a database is
+configured, and says where its feeds came from; `SCOUT_DB=off` skips the database (environment
+feeds only), as does a database without the asset tables or one it cannot open:
+```
+feeds:        13 Robinhood Chain + 4 Ethereum mainnet Chainlink feed(s) in use; 12 + 3 of them from the asset database (asset_chains), the rest from SCOUT_*CHAINLINK_FEEDS (env wins on a conflict)
+feeds:        2 Robinhood Chain + 1 Ethereum mainnet Chainlink feed(s) in use, from SCOUT_*CHAINLINK_FEEDS only; 0 from the asset database (no asset tables)
+```
 Chainlink stock feeds run 24/5, so weekend conversions use Friday's price. Max gain/drawdown
 are converted with the quote asset's USD price at the horizon (not at each trade).
 
@@ -347,6 +383,11 @@ are converted with the quote asset's USD price at the horizon (not at each trade
 ```
 prints the latest block, the block at the call time, the pool it found (v2/v3/v4, paired
 asset), the entry price, the USD conversion (or which feed to add) and the move since.
+The last line, `node type:`, comes from asking the node for state (`eth_getBalance`) at the
+call block and at a mid-history block (half the latest block number), so it is right even for
+a pair that never needs old state: `archive node`, `full node (no historical state at the
+call block …)`, `full node that still keeps recent state` (state at the call block, none at
+mid-history), or `unknown` when the node did not answer.
 For a Pons V2 token it prints `pons-curve`, the curve address, the quote token and the
 graduation status (curve closing block, v4 pool block and id, hook), as found at the call
 and again after reading up to now:
@@ -424,7 +465,7 @@ Only use the feature columns as model inputs; everything about the future is an 
 | `SCOUT_PONS_HOOK` | `0xE5e70264…6Be044` | hook of graduated Pons v4 pools (`off` = any hook) |
 | `SCOUT_RUG_LIQ_USD` | `500` | rugged when the USD value of the pool's **quote side** (ETH/WETH, USDG, stock token …) is below this; settable in `.env`. `0` = USD check off, but an empty pool still counts. Negative values are rejected |
 | `SCOUT_TRACK_INTERVAL` | `1m` | how often due checks are processed |
-| `SCOUT_TRACK_WORKERS` | `8` | calls tracked at the same time (on-chain source) |
+| `SCOUT_TRACK_WORKERS` | `8` | calls tracked at the same time (on-chain source); a free worker takes the next due call at once (see "What the tracker logs") |
 | `SCOUT_RPC_PARALLEL` | `8` | block ranges of one scan fetched from the node at the same time |
 | `SCOUT_RPC_MAX_INFLIGHT` | `64` | most requests in flight to the node at once (workers × ranges, capped here) |
 | `SCOUT_RPC_LOG_CACHE` | `300000` | swap logs kept in memory so repeat calls of a token are not scanned twice (`0` = off) |
@@ -459,7 +500,7 @@ retry: 3 row(s) updated; a running tracker (-track or the listener) picks them u
 It needs only the database (no Telegram, no node) and exits. The summary (by status and by
 the post's launchpad / DEX) is printed before anything changes; the reset uses the same
 selection, in one transaction. A running `-track` (or listener) picks the rows up on its
-next cycle (`SCOUT_TRACK_INTERVAL`, after the batch it is working on); no restart needed.
+next cycle (within `SCOUT_TRACK_INTERVAL`, or as soon as a worker is free while it is busy); no restart needed.
 
 - **`-retry-no-pool`**: first calls with tracking status `no_pool` → `pending`, due now,
   `attempts` 0, error cleared. Their priority is kept, so live calls still go first.
@@ -567,11 +608,20 @@ four columns: the horizon scan position, running peak/low, results, candles, `st
 `next_check_at`, `attempts` and `updated_at` stay as they are, and no call is tracked again
 because of it.
 
+**Blocks read once where it is safe.** A refresh starts after the last block either scan has
+covered (its own cursor or the horizon scan block, whichever is further). A call whose
+horizon check is due is left to the horizon scan, which is about to read those blocks: the
+pass skips it (no node request) until that check is done, or for 10 minutes at most, and
+then reads only past the new scan block. Blocks the pass reads between horizons are read
+again by the horizon scan when the next horizon is due: the horizon scan needs every event
+for its candles and running peak/low (valued at each hour's USD rate), which the pass does
+not keep, so horizon results are exactly the same with or without the pass.
+
 **Schedule.** A call is due when it has no latest price yet, or the last one is older than
 `SCOUT_LATEST_REFRESH_RECENT` (15 minutes; calls younger than 30 days) or
 `SCOUT_LATEST_REFRESH_OLD` (a day; calls 30 days or older). The pass runs in every tracker
-cycle **after** the horizon checks, through the same workers (`SCOUT_TRACK_WORKERS`), and
-takes at most `SCOUT_LATEST_BATCH` calls: those younger than 30 days first, then the ones
+cycle **after** the horizon checks have been handed out, through the same workers
+(`SCOUT_TRACK_WORKERS`; a call is never with two workers at once), and takes at most `SCOUT_LATEST_BATCH` calls: those younger than 30 days first, then the ones
 not refreshed for the longest. Horizon work always goes first:
 
 - when the horizon batch of a cycle was full (more of it is waiting), only calls younger
@@ -606,14 +656,14 @@ After that a day costs about 5 requests per old token and about 100 per token yo
 ```
 posts: 9,871 call(s), 257 update(s) classified
 tracking: 3,120 repeat call(s) skipped — only the first call of each token is tracked
-tracking: 37 call(s) due now
-call 10126 [1/37]: 0x129b…, posted 2026-09-28 14:02 (70h ago), status pending
-call 10126 [1/37]: pool found: uniswap-v3 0x…, paired with WETH (entry block 21300412)
-call 10126 [1/37]: entry price $0.0031 (1.03e-06 WETH × $3010, Chainlink on Ethereum mainnet)
-call 10126 [1/37]: +1h → 0.0052 (+67.7%), peak +120.4%, low -8.1%
-call 10126 [1/37]: scanning blocks 21726610 → 22164412: 46% (at 21926609, 12 events so far, 200000-block ranges)
-call 10126 [1/37]: tracking in 14s, 212 RPC requests — next check 2026-10-01 14:12
-tracking: processed 37 call(s) — pending 112, tracking 37, done 4, repeat 3120; more due now
+tracking: 12+ call(s) due now
+call 10126 [#1]: 0x129b…, posted 2026-09-28 14:02 (70h ago), status pending
+call 10126 [#1]: pool found: uniswap-v3 0x…, paired with WETH (entry block 21300412)
+call 10126 [#1]: entry price $0.0031 (1.03e-06 WETH × $3010, Chainlink on Ethereum mainnet)
+call 10126 [#1]: +1h → 0.0052 (+67.7%), peak +120.4%, low -8.1%
+call 10126 [#1]: scanning blocks 21726610 → 22164412: 46% (at 21926609, 12 events so far, 200000-block ranges)
+call 10126 [#1]: tracking in 14s, 212 RPC requests — next check 2026-10-01 14:12
+tracking: processed 47 call(s), 3 in progress — pending 112, tracking 37, done 4, repeat 3120; more due now
 tracking: idle — tracking 149, done 4, repeat 3120; next check in 42m10s
 latest prices: 180 refreshed (12 changed) in 4.2s, 1,930 RPC requests, 5,430 waiting
 ```
@@ -624,6 +674,16 @@ call 812: …)`), not one line each. A pass that takes long says every 30 second
 `repeat` = later calls of a token already called, which are not tracked (see above); tracking
 rows of update posts stored by an earlier version are in this number too. The `posts:` line
 appears only when rows without a `post_kind` were classified (once, after upgrading).
+
+**Rolling queue.** The tracker reads due calls a few at a time (one per worker, at least 4;
+live calls first, then the longest due) and hands each to a worker as soon as one is free,
+so one slow call holds up only its own worker. A cycle hands out up to 50 calls and does
+not wait for them: `due now` counts the first read (`12+` = more were waiting),
+`[#n]` numbers the calls handed out since the start, `processed` counts the calls finished
+since the last status line, and `in progress` the ones still running. A call is never
+handed out twice at the same time. Ctrl+C stops the hand-outs; the calls in progress stop
+(keeping what they had scanned, with status and schedule as before) and the tracker exits
+once they have.
 
 Long block scans print a progress line every few seconds, and a status line is
 printed after every cycle (every `SCOUT_TRACK_INTERVAL`, even when idle), so a
@@ -638,9 +698,9 @@ line says so, at most one such line every 30 seconds for all workers together (t
 between are counted at the end of the next line):
 
 ```
-call 9163 [37/50]: eth_getLogs blocks 52000000-52199999 (200000 blocks) refused as too large (rpc error -32000: query returned more than 10000 results); this scan continues with 100000-block ranges (max 200000)
-call 8120 [12/50]: eth_getLogs blocks 31000000-31199999 (200000 blocks) timed out on the node (2 tries) (rpc error -32000: request timed out); this scan continues with 100000-block ranges (max 200000)
-call 9163 [37/50]: eth_getLogs ranges back up to 200000 blocks (max 200000) after 3 answered ranges [also 4 range split(s) and 2 grow-back(s) in all scans since the last such line]
+call 9163 [#137]: eth_getLogs blocks 52000000-52199999 (200000 blocks) refused as too large (rpc error -32000: query returned more than 10000 results); this scan continues with 100000-block ranges (max 200000)
+call 8120 [#112]: eth_getLogs blocks 31000000-31199999 (200000 blocks) timed out on the node (2 tries) (rpc error -32000: request timed out); this scan continues with 100000-block ranges (max 200000)
+call 9163 [#137]: eth_getLogs ranges back up to 200000 blocks (max 200000) after 3 answered ranges [also 4 range split(s) and 2 grow-back(s) in all scans since the last such line]
 ```
 
 The smaller size belongs to that one scan; other calls keep theirs and every new scan
@@ -926,6 +986,29 @@ firewall / reverse proxy, or bind it to `127.0.0.1`, if that is not what you wan
 other mode it applies the schema at startup (`SCOUT_DB_AUTO_MIGRATE`), and it reads the same
 `.env` (so `API_ID` / `API_HASH` must be present, although no Telegram connection is made).
 
+**Live updates need nothing new**: no setting, table or trigger. The listener (any mode that
+records calls) runs `SELECT pg_notify('scout_events', '{"kind":"call","call_id":812}')` after
+storing a new real call (not an update post, not a post stored again, not a call imported by
+`-backfill`), and
+`{"kind":"report","call_id":812,"tool":"perceptor","id":5120}` after storing a completed
+Perceptor or sAlpha report. A failed `NOTIFY` never fails the insert; it is logged (at most
+one line a minute) and the page then shows the row with the next regular refresh. You can
+watch them with `LISTEN scout_events;` in psql. `-web` opens **one extra database connection**
+for `LISTEN`, outside its pool (so it holds one more connection than before). If that
+connection cannot be opened or breaks, it logs
+`web: live updates: cannot listen for database events: … — retrying` (at most once a minute),
+tries again with a growing wait (1 s up to 1 minute), and meanwhile the page still gets the
+new rows, only as late as the regular refresh (`SCOUT_WEB_REFRESH`). After every
+(re)connection it reads the list once, since notifications sent while it was away are lost.
+Notifications less than a second apart make one read, and that read is the same single read
+as the background refresh and **Refresh now** (they share it; never two at a time).
+
+**Behind a reverse proxy**: pass the `Host` header through unchanged (the same-site check of
+`POST /api/refresh` and `GET /api/events`), do not buffer `GET /api/events` (the website sends
+`X-Accel-Buffering: no`, which nginx honours; for others turn response buffering off for that
+path), and keep the proxy's read timeout above 25 seconds (the stream sends a keep-alive line
+every 25 seconds).
+
 **Speed: the website answers from memory.** When it starts, the website reads the whole
 list once (one row per token, with the numbers of all five windows, plus the counts of the
 progress panel) and keeps it in memory as a *snapshot*. Every request for the list or the
@@ -936,8 +1019,10 @@ requests under way finish on the old one. The **Refresh now** button on the page
 read on demand (see below).
 
 - **What you see can be up to `SCOUT_WEB_REFRESH` old** (plus the fraction of a second the
-  read takes). A call stored by the listener, or a result written by the tracker, shows on the
-  page after the next refresh, or at once after **Refresh now**. "Updated hh:mm:ss" in the progress panel is the time the
+  read takes). A result written by the tracker shows on the page after the next refresh, or at
+  once after **Refresh now**. A **new call or a new Perceptor / sAlpha report** shows within
+  about a second (see "Live updates" below): the listener sends a Postgres `NOTIFY
+  scout_events` when it stores one, and the website, which `LISTEN`s, reads the list at once. "Updated hh:mm:ss" in the progress panel is the time the
   website last read the database, not the time the page asked.
 - **If the database cannot be read**, the website keeps answering from the snapshot it has and
   logs `web: could not refresh the snapshot: …` (at most one line a minute) until it works
@@ -1014,6 +1099,40 @@ other sites):
   moment, or while the background loop is reading, share one read. If the database cannot be
   read (or does not answer within 15 seconds) the page shows a short notice, "Could not
   refresh: … Still showing the data read at hh:mm:ss.", and keeps the rows it has.
+- **Live updates** — the page keeps a stream open (`GET /api/events`, Server-Sent Events;
+  "Live" in green next to "Updated" while it is open, "Live off: updates every 30 s" when it
+  is not). Nothing to set up; the 30-second refresh keeps running in any case, so a page
+  without the stream (refused, blocked by a proxy, an old browser) is at most 30 seconds behind.
+  - **A new call** goes on top of the table, briefly highlighted, when the table shows the
+    newest calls first (Date ▼) on page 1 and the token matches the search and the Perceptor
+    filter. Otherwise a **"N new — refresh"** button appears above the table; it switches to
+    the newest calls, page 1, and reloads.
+  - **A new Perceptor verdict, or a new sAlpha report or decline**, updates that token's row
+    in place (verdict, "sA" badge, an open detail panel).
+  - Each one also shows a **notice in the bottom-right corner**: token, verdict (or "sAlpha:
+    report available" / "did not generate a report") and a GMGN link. At most 4 are kept (2
+    on a narrow screen); each goes after a minute or with its × button.
+  - **Sound** (a checkbox next to "Updated"): a short beep for each notice, made by the browser
+    (Web Audio, no sound file). **Off by default**; the choice is kept in this browser
+    (`localStorage`). Browsers only play sound after a click or key press on the page.
+  - **Desktop alerts** (a button next to it): a system notification for each notice while
+    the tab is in the background. The browser asks for permission on the first click.
+    **Browsers allow this only on a secure page: `https://…` or `http://localhost` /
+    `http://127.0.0.1`. On a plain `http://<server IP>:8090` address the button stays greyed
+    out**; put the website behind an HTTPS reverse proxy to use it from another machine.
+  - **Only calls posted within the last hour are announced** (notice, sound, desktop alert,
+    "N new" count), by the browser's clock. An older call that appears in the list (a post
+    imported by `-backfill`) is added quietly: the page reloads its list once per burst of such
+    rows, without a notice. Calls stored by `-backfill` (status `backfill`) also send no
+    `NOTIFY`, so a backfill does not make the website re-read the database for every row; they
+    show up with its next regular refresh.
+  - Many changes at once (more than 20 in one read, e.g. a `-backfill`) or a gap in the stream
+    (the website restarted, or the page was away too long) make the page reload its list
+    instead of adding rows one by one.
+  - Over plain HTTP/1.1 a browser opens at most about 6 connections to one address, across
+    all its tabs; every open tab of this page holds one for its stream. With many tabs of the
+    page open in one browser, the other requests of those tabs can wait. HTTPS with HTTP/2
+    (a reverse proxy) does not have this limit.
 - **Calls** — the columns, in this order:
   Date (links to the post) | Token | Symbol (both link to GMGN) | Calls (`×N` when the token was
   called N > 1 times, empty otherwise; hover for "Called N times, last on …") | Perceptor |
@@ -1126,7 +1245,7 @@ Names come from arbitrary contracts: control characters are removed, the length 
 
 ### API
 
-The three `GET` endpoints answer from the snapshot (see above) and send `ETag`, `Cache-Control: no-cache`,
+`GET /api/summary`, `/api/calls` and `/api/call` answer from the snapshot (see above) and send `ETag`, `Cache-Control: no-cache`,
 `Vary: Accept-Encoding` and `X-Snapshot-At` (when the database was last read, RFC 3339). Send
 the `ETag` back as `If-None-Match` to get `304 Not Modified` while the data is unchanged. The
 `ETag` is a weak one (`W/"…"`): the same `ETag` means the same data; only the time stamps in
@@ -1283,6 +1402,56 @@ one listed call (`call_id` of a row of `/api/calls`), from memory:
   are let go. A request never reads the database. If that query fails, the whole refresh counts
   as failed and the snapshot before stays. A report that cannot be read at that moment is left
   out of the row until the next refresh.
+
+`GET /api/events` — live updates as a stream of
+[Server-Sent Events](https://html.spec.whatwg.org/multipage/server-sent-events.html)
+(`Content-Type: text/event-stream`, `Cache-Control: no-store`, never gzip-compressed, no
+`ETag`). It sends what changed in the list each time the website reads the database —
+whatever started the read (a notification from the listener, the background refresh, **Refresh
+now**) — by comparing the new snapshot with the one before. The events are built once per read,
+not per client, and no request reads the database.
+
+```
+retry: 5000
+: connected
+
+id: mf3k2a1-7
+event: call
+data: {"call_id":812,"horizon":"1d","row":{"call_id":812,"message_id":10002,…}}
+
+id: mf3k2a1-8
+event: report
+data: {"call_id":812,"tool":"perceptor","horizon":"1d","row":{…}}
+
+: ping
+```
+
+- `call` = a token row that was not in the snapshot before (a new token; a repeat call of a
+  listed token is not one). `report` = a listed token whose Perceptor verdict or report changed
+  (`tool: "perceptor"`), or that got a new sAlpha report or decline (`tool: "salpha"`); one row
+  can give both. `row` is the row exactly as `GET /api/calls?horizon=1d` returns it (so
+  `return_pct`, `peak_pct` and `drawdown_pct` are those of `horizon`, always `1d`). Rows that
+  leave the list send nothing.
+- `reload` = ask for the list again instead: `{"calls":25,"reports":3}` when one read found
+  more than 20 changes, `{"missed":true}` when events after the browser's `Last-Event-ID`
+  can no longer be sent (see below).
+- **Ids** are `<process>-<n>`. A browser that reconnects sends the last one it got as
+  `Last-Event-ID`, and gets only the events after it (the last 128 are kept), never one twice.
+  An id of an earlier run of the website, or one older than the kept events, gets
+  `reload` / `{"missed":true}` first.
+- **Keep-alive:** a comment line `: ping` every 25 seconds. `retry: 5000` tells the browser to
+  reconnect 5 seconds after the stream breaks.
+- **At most 50 streams at once**; one more gets `503` with `Retry-After: 60` and
+  `{"error": "…"}` (the page then stays on its 30-second refresh and tries again 2 minutes
+  later). A client that falls 64 events behind (it does not read) is disconnected, so it never
+  holds up the others; its browser reconnects and catches up through `Last-Event-ID`. The
+  stream also ends when the website stops.
+- **Same site only**, like `POST /api/refresh`: an `Origin` header of another host (or port,
+  or `null`) → `403`; no `Origin` (curl) is accepted. Any parameter → `400`; anything but
+  `GET` → `405`.
+- The server's read and write timeouts (10 s / 30 s) do not apply to the stream; each write
+  to it has 10 seconds instead.
+- Try it: `curl -N http://localhost:8090/api/events`.
 
 `POST /api/refresh` — "Refresh now": the website reads the database at once (the same read
 as the background refresh), puts the new snapshot in place and then answers. No parameters

@@ -22,9 +22,17 @@ import (
 // Only the first call of each token is tracked; later calls get status "repeat".
 // ---------------------------------------------------------------------------
 
-// trackBatch is how many due calls one cycle of horizon tracking takes. A full
-// batch means more are waiting.
+// trackBatch is how many due calls one cycle of horizon tracking hands out. A
+// cycle that hands out a full batch reports that more are waiting.
 const trackBatch = 50
+
+// trackChunkMin is the smallest number of due rows read from the database at a
+// time; with more workers, one read takes one row per worker (see horizon).
+const trackChunkMin = 4
+
+// latestDeferFor: how long the latest-price pass leaves a row alone whose
+// horizon check is due (or until that check is done, whichever comes first).
+var latestDeferFor = 10 * time.Minute
 
 // trackLoop processes due tracking rows every PriceCfg.Interval.
 func (s *scanner) trackLoop(ctx context.Context) {
@@ -44,10 +52,14 @@ func (s *scanner) trackLoop(ctx context.Context) {
 		log.Printf("performance tracking on: %s via %s (network %q, %d req/min)",
 			horizonNames(s.pc.Horizons), s.pc.BaseURL, s.pc.Network, s.pc.RPM)
 	}
+	// One pool of workers for the whole run: a call still running when a cycle
+	// ends keeps its worker, and the other workers go on with the next cycle.
+	r := s.newTrackRun()
+	defer r.close() // after Ctrl+C: waits for the calls in progress to put their rows back
 	t := time.NewTicker(s.pc.Interval)
 	defer t.Stop()
 	for {
-		more := s.trackCycle(ctx, trackBatch)
+		more := r.cycle(ctx, trackBatch)
 		if ctx.Err() != nil {
 			return
 		}
@@ -62,25 +74,311 @@ func (s *scanner) trackLoop(ctx context.Context) {
 	}
 }
 
-// trackCycle is one round of the tracker: the horizon checks that are due (up
-// to batch), the status line, token names, then the latest prices. more says
-// the horizon batch was full, so more of that work is waiting.
+// trackCycle is one cycle of the tracker on its own (see trackRun.cycle), with
+// every call it started finished when it returns.
 func (s *scanner) trackCycle(ctx context.Context, batch int) (more bool) {
+	r := s.newTrackRun()
+	defer r.close()
+	return r.cycle(ctx, batch)
+}
+
+// cycle is one round of the tracker: up to batch horizon checks that are due,
+// the status line, token names, then a latest-price pass. more says the
+// horizon batch was full, so more of that work is waiting. It returns once
+// everything is handed out: calls still running finish on their workers.
+func (r *trackRun) cycle(ctx context.Context, batch int) (more bool) {
+	s := r.s
 	if s.pc.Source == "onchain" {
 		s.reloadFeeds(ctx) // feeds added to (or removed from) the asset database since the last cycle
 	}
-	n := s.trackDue(ctx, batch)
+	if !s.prepareDue(ctx) {
+		return false
+	}
+	_, more = r.horizon(ctx, batch)
 	if ctx.Err() != nil {
 		return false
 	}
-	more = n == batch
-	s.logTrackingStatus(ctx, n)
+	s.logTrackingStatusRunning(ctx, int(r.horizonDone.Swap(0)), r.horizonBusy())
 	s.fillTokenNames(ctx)
 	// Latest prices come after the horizon work of the cycle. While a full
 	// horizon batch says more of that is waiting, only calls younger than 30
 	// days are refreshed; the older ones wait for a quieter cycle.
-	s.refreshLatest(ctx, more)
+	r.latest(ctx, more)
 	return more
+}
+
+// trackWorkers is how many calls are tracked at the same time. On-chain
+// tracking runs several (SCOUT_TRACK_WORKERS): the time goes into waiting for
+// the node, and they share one rate limit. The GeckoTerminal source stays one
+// at a time (its API allowance is small).
+func (s *scanner) trackWorkers() int {
+	if s.pc.Source != "onchain" {
+		return 1
+	}
+	return max(s.pc.Workers, 1)
+}
+
+// trackRun is the tracker's pool of workers, and the bookkeeping that gives
+// each call to one worker at a time. One goroutine (the dispatcher: trackLoop,
+// or trackDue / refreshLatest when called on their own) reads due rows from the
+// database a few at a time and hands each one out as soon as a worker is free,
+// so one slow call never holds up the others. Horizon checks and latest-price
+// refreshes share the workers; a call is never with two of them at once.
+type trackRun struct {
+	s       *scanner
+	workers int
+	jobs    chan trackJob  // buffered: the dispatcher sends only after taking a free token
+	free    chan struct{}  // one token per idle worker
+	wg      sync.WaitGroup // the workers
+	aux     sync.WaitGroup // latest-pass progress lines and summaries
+
+	seq         atomic.Int64 // horizon checks handed out so far (the "[#n]" in the log)
+	horizonDone atomic.Int64 // horizon checks finished since the last status line
+
+	// dueHorizon and trackRow are the database read and the work of one horizon
+	// check (replaced in tests).
+	dueHorizon func(ctx context.Context, n int) ([]ScoutCallTracking, error)
+	trackRow   func(ctx context.Context, t *ScoutCallTracking, pos string)
+
+	mu sync.Mutex
+	// claimed: call ids handed out, or read and waiting in the dispatcher.
+	// The value says which: true = a horizon check.
+	claimed  map[int]bool
+	fetching bool
+	// released: ids let go while a read was running. That read may have seen
+	// the row before its worker saved it, so its copy is dropped.
+	released map[int]bool
+	// deferred: rows the latest-price pass leaves to the horizon scan (their
+	// horizon check is due), until the time given or that check is done.
+	deferred map[int]time.Time
+}
+
+type trackJob struct {
+	id      int
+	horizon bool
+	run     func()
+}
+
+// newTrackRun starts the workers. close stops them.
+func (s *scanner) newTrackRun() *trackRun {
+	n := s.trackWorkers()
+	r := &trackRun{s: s, workers: n, jobs: make(chan trackJob, n), free: make(chan struct{}, n),
+		claimed: map[int]bool{}, released: map[int]bool{}, deferred: map[int]time.Time{}}
+	r.dueHorizon = func(ctx context.Context, n int) ([]ScoutCallTracking, error) {
+		return s.db.DueTracking(ctx, time.Now(), n)
+	}
+	r.trackRow = func(ctx context.Context, t *ScoutCallTracking, pos string) {
+		if s.pc.Source == "onchain" {
+			s.trackOneOnchain(ctx, t, pos)
+		} else {
+			s.trackOne(ctx, t)
+		}
+	}
+	for range n {
+		r.free <- struct{}{}
+		r.wg.Add(1)
+		go r.work()
+	}
+	return r
+}
+
+func (r *trackRun) work() {
+	defer r.wg.Done()
+	for j := range r.jobs {
+		j.run()
+		r.release(j.id, j.horizon)
+		if j.horizon {
+			r.horizonDone.Add(1)
+		}
+		r.free <- struct{}{}
+	}
+}
+
+// close waits for the calls handed out to finish, then stops the workers. Only
+// the dispatcher calls it, once, after its last hand-out.
+func (r *trackRun) close() {
+	close(r.jobs)
+	r.wg.Wait()
+	r.aux.Wait()
+}
+
+// acquire waits for an idle worker; false once ctx is done.
+func (r *trackRun) acquire(ctx context.Context) bool {
+	if ctx.Err() != nil {
+		return false
+	}
+	select {
+	case <-r.free:
+	case <-ctx.Done():
+		return false
+	}
+	if ctx.Err() != nil {
+		r.free <- struct{}{}
+		return false
+	}
+	return true
+}
+
+// fetch reads due rows with get, which is given the call ids already claimed
+// (to leave out, or to read that many more), and claims the rows it returns.
+// Rows already claimed are dropped, and so are rows let go while get ran: get
+// may have read them before their save. read is how many rows get returned.
+func (r *trackRun) fetch(horizon bool, get func(claimed []int) ([]ScoutCallTracking, error)) (rows []ScoutCallTracking, read int, err error) {
+	r.mu.Lock()
+	claimed := make([]int, 0, len(r.claimed))
+	for id := range r.claimed {
+		claimed = append(claimed, id)
+	}
+	r.fetching = true
+	r.mu.Unlock()
+	all, err := get(claimed)
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.fetching = false
+	stale := r.released
+	r.released = map[int]bool{}
+	if err != nil {
+		return nil, 0, err
+	}
+	for _, t := range all {
+		if _, busy := r.claimed[t.CallID]; busy || stale[t.CallID] {
+			continue
+		}
+		r.claimed[t.CallID] = horizon
+		rows = append(rows, t)
+	}
+	return rows, len(all), nil
+}
+
+// unclaim lets go of rows that were read but not handed out (nothing was
+// written for them).
+func (r *trackRun) unclaim(rows []ScoutCallTracking) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, t := range rows {
+		delete(r.claimed, t.CallID)
+	}
+}
+
+// release lets go of a row whose worker is done with it (and has saved it).
+func (r *trackRun) release(id int, horizon bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	delete(r.claimed, id)
+	if r.fetching {
+		r.released[id] = true
+	}
+	if horizon {
+		delete(r.deferred, id) // its horizon scan has moved on: the latest pass reads from there
+	}
+}
+
+// horizonBusy is how many horizon checks are with a worker or waiting in the
+// dispatcher.
+func (r *trackRun) horizonBusy() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	n := 0
+	for _, h := range r.claimed {
+		if h {
+			n++
+		}
+	}
+	return n
+}
+
+// deferLatest leaves rows to the horizon scan for a while (see latestDeferFor).
+func (r *trackRun) deferLatest(ids []int, now time.Time) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, id := range ids {
+		r.deferred[id] = now.Add(latestDeferFor)
+	}
+}
+
+// deferredIDs returns the rows still left to the horizon scan (and forgets
+// the others).
+func (r *trackRun) deferredIDs(now time.Time) []int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var ids []int
+	for id, until := range r.deferred {
+		if now.Before(until) {
+			ids = append(ids, id)
+		} else {
+			delete(r.deferred, id)
+		}
+	}
+	return ids
+}
+
+// horizon hands out up to limit due horizon checks, in the order of
+// DueTracking (live calls first, then the longest due), each as soon as a
+// worker is free. It reads the due rows a few at a time (one per worker, at
+// least trackChunkMin), so a live call that becomes due waits for at most that
+// many hand-outs. handed is how many it handed out; more says due rows are
+// left. It returns without waiting for the calls handed out.
+func (r *trackRun) horizon(ctx context.Context, limit int) (handed int, more bool) {
+	chunk := min(max(r.workers, trackChunkMin), trackBatch)
+	var buf []ScoutCallTracking
+	defer func() { r.unclaim(buf) }()
+	all := false // the last read returned every due row
+	first := true
+	for handed < limit {
+		if !r.acquire(ctx) {
+			return handed, false
+		}
+		if len(buf) == 0 {
+			if all {
+				r.free <- struct{}{}
+				return handed, false
+			}
+			want := min(chunk, limit-handed)
+			asked := 0
+			rows, read, err := r.fetch(true, func([]int) ([]ScoutCallTracking, error) {
+				// The horizon checks being worked on are still due in the
+				// database until they are saved: read that many more. (Rows with
+				// the latest-price pass are not due for a horizon check: it
+				// leaves those alone, see latestLeftToHorizon.)
+				asked = want + r.horizonBusy()
+				return r.dueHorizon(ctx, asked)
+			})
+			if err != nil {
+				r.free <- struct{}{}
+				if ctx.Err() == nil {
+					log.Printf("tracking: %v", err)
+				}
+				return handed, false
+			}
+			all = read < asked
+			if first && len(rows) > 0 {
+				first = false
+				plus := "+"
+				if all {
+					plus = ""
+				}
+				log.Printf("tracking: %d%s call(s) due now", len(rows), plus)
+			}
+			buf = rows
+			if len(buf) == 0 {
+				// Everything read is with a worker already (or was just saved).
+				r.free <- struct{}{}
+				return handed, !all
+			}
+		}
+		if ctx.Err() != nil {
+			r.free <- struct{}{}
+			return handed, false
+		}
+		t := buf[0]
+		buf = buf[1:]
+		handed++
+		n := r.seq.Add(1)
+		r.jobs <- trackJob{id: t.CallID, horizon: true, run: func() {
+			r.trackRow(ctx, &t, fmt.Sprintf(" [#%d]", n))
+		}}
+	}
+	return handed, len(buf) > 0 || !all
 }
 
 func horizonNames(hs []horizon) string {
@@ -120,75 +418,51 @@ func classifyPosts(ctx context.Context, st *ScoutStore) {
 	}
 }
 
-// trackDue processes up to limit due calls; returns how many were processed.
-// Only the first call of each token is tracked (see MarkRepeatTracking).
-func (s *scanner) trackDue(ctx context.Context, limit int) int {
-	// Posts stored before post_kind existed are classified first (one small
-	// lookup when none is left), so update posts are set aside below.
+// prepareDue gets the rows in shape before due rows are read: posts stored
+// before post_kind existed are classified (one small lookup when none is
+// left), so update posts are set aside, and only the first call of each token
+// stays tracked (MarkRepeatTracking: one statement; writes nothing when all is
+// in place). false: ctx is done.
+func (s *scanner) prepareDue(ctx context.Context) bool {
 	classifyPosts(ctx, s.db)
-	// Only the first call of each token is tracked: later calls are set aside
-	// before the due rows are read (one statement; writes nothing when all is in place).
 	if n, err := s.db.MarkRepeatTracking(ctx); err != nil {
-		log.Printf("tracking: repeat calls: %v", err)
 		if ctx.Err() != nil {
-			return 0
+			return false
 		}
+		log.Printf("tracking: repeat calls: %v", err)
 	} else if n > 0 {
 		log.Printf("tracking: %s repeat call(s) skipped — only the first call of each token is tracked", commas(n))
 	}
-	rows, err := s.db.DueTracking(ctx, time.Now(), limit)
-	if err != nil {
-		log.Printf("tracking: %v", err)
+	return ctx.Err() == nil
+}
+
+// trackDue processes up to limit due calls and returns how many it processed,
+// once all of them are finished. Only the first call of each token is tracked
+// (see MarkRepeatTracking).
+func (s *scanner) trackDue(ctx context.Context, limit int) int {
+	if !s.prepareDue(ctx) {
 		return 0
 	}
-	if len(rows) > 0 {
-		log.Printf("tracking: %d call(s) due now", len(rows))
-	}
-	// On-chain tracking runs several calls at once (SCOUT_TRACK_WORKERS): the
-	// time goes into waiting for the node, and they share one rate limit. The
-	// GeckoTerminal source stays one at a time (its API allowance is small).
-	workers := 1
-	if s.pc.Source == "onchain" {
-		workers = s.pc.Workers
-	}
-	if workers < 1 {
-		workers = 1
-	}
-	var n atomic.Int64
-	var wg sync.WaitGroup
-	next := make(chan int)
-	for w := 0; w < workers; w++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for i := range next {
-				pos := fmt.Sprintf(" [%d/%d]", i+1, len(rows))
-				if s.pc.Source == "onchain" {
-					s.trackOneOnchain(ctx, &rows[i], pos)
-				} else {
-					s.trackOne(ctx, &rows[i])
-				}
-				n.Add(1)
-			}
-		}()
-	}
-	for i := range rows {
-		if ctx.Err() != nil {
-			break
-		}
-		next <- i
-	}
-	close(next)
-	wg.Wait()
-	return int(n.Load())
+	r := s.newTrackRun()
+	n, _ := r.horizon(ctx, limit)
+	r.close()
+	return n
 }
 
 // logTrackingStatus prints a one-line summary so it's clear the tracker is alive
 // and how much is left.
 func (s *scanner) logTrackingStatus(ctx context.Context, processed int) {
+	s.logTrackingStatusRunning(ctx, processed, 0)
+}
+
+// logTrackingStatusRunning is logTrackingStatus with the number of calls still
+// being worked on (processed counts the finished ones).
+func (s *scanner) logTrackingStatusRunning(ctx context.Context, processed, running int) {
 	counts, nextDue, err := s.db.TrackingStats(ctx)
 	if err != nil {
-		log.Printf("tracking: status: %v", err)
+		if ctx.Err() == nil {
+			log.Printf("tracking: status: %v", err)
+		}
 		return
 	}
 	var parts []string
@@ -209,9 +483,12 @@ func (s *scanner) logTrackingStatus(ctx context.Context, processed int) {
 			next = "more due now"
 		}
 	}
-	if processed > 0 {
+	switch {
+	case running > 0:
+		log.Printf("tracking: processed %d call(s), %d in progress — %s; %s", processed, running, summary, next)
+	case processed > 0:
 		log.Printf("tracking: processed %d call(s) — %s; %s", processed, summary, next)
-	} else {
+	default:
 		log.Printf("tracking: idle — %s; %s", summary, next)
 	}
 }

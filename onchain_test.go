@@ -44,6 +44,11 @@ type fakeChain struct {
 	// f.mu held, possibly from several requests at once.
 	logsHook func(addr string, from, to uint64) string
 	fullNode bool // no historical state: eth_call at old blocks fails
+	// stateFrom (with fullNode): the oldest block whose state the node still
+	// keeps for eth_getBalance (0 = none but latest), like a full node holding
+	// recent state; balanceErr (optional): eth_getBalance answers this error.
+	stateFrom  uint64
+	balanceErr string
 	// callErr (optional): a JSON-RPC error message for an eth_call ("" = none),
 	// e.g. a busy node; to and sel are lower case.
 	callErr func(to, sel string, block uint64) string
@@ -242,6 +247,18 @@ func (f *fakeChain) serve(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		ok(res)
+	case "eth_getBalance":
+		var tag string
+		json.Unmarshal(req.Params[1], &tag)
+		if f.balanceErr != "" {
+			fail(f.balanceErr)
+			return
+		}
+		if f.fullNode && tag != "latest" && (f.stateFrom == 0 || num(tag) < f.stateFrom) {
+			fail("missing trie node 6b1f… (path ) state 0x… is not available")
+			return
+		}
+		ok("0x0")
 	default:
 		fail("unsupported " + req.Method)
 	}
@@ -404,6 +421,98 @@ func TestBlockAt(t *testing.T) {
 	}
 	if last, _ := o2.rpc.blockAt(ctx, g.timeOf(g.latest)+999); last != g.latest {
 		t.Fatalf("future timestamp should give latest")
+	}
+}
+
+// blockAt is deterministic: the last block with timestamp <= ts, whatever
+// earlier lookups left in the client's cache (and in whatever order), on a
+// chain with 10 blocks per second and on one with irregular block times.
+func TestBlockAtDeterministic(t *testing.T) {
+	ctx := context.Background()
+	regular := newFakeChain(t, 40*24*time.Hour)
+	irregular := newFakeChain(t, 40*24*time.Hour)
+	half := irregular.latest / 2
+	irregular.timeOf = func(n uint64) int64 {
+		if n <= half {
+			return irregular.t0 + int64(n)/20
+		}
+		return irregular.t0 + int64(half)/20 + int64(n-half)/4
+	}
+	// lastAtOrBefore: the reference answer, by brute force around a guess.
+	lastAtOrBefore := func(f *fakeChain, ts int64) uint64 {
+		lo, hi := uint64(1), f.latest
+		for hi-lo > 1 { // f.timeOf is non-decreasing
+			mid := lo + (hi-lo)/2
+			if f.timeOf(mid) <= ts {
+				lo = mid
+			} else {
+				hi = mid
+			}
+		}
+		return lo
+	}
+	for _, c := range []struct {
+		name string
+		f    *fakeChain
+	}{{"10 blocks/s", regular}, {"irregular", irregular}} {
+		f := c.f
+		target := time.Now().Add(-9*24*time.Hour - 17*time.Second).Unix()
+		if f == irregular {
+			target = f.timeOf(half + 123457)
+		}
+		want := lastAtOrBefore(f, target)
+		if f == regular && want != f.blockAtTime(time.Unix(target, 0)) {
+			t.Fatalf("%s: reference %d, fakeChain.blockAtTime %d", c.name, want, f.blockAtTime(time.Unix(target, 0)))
+		}
+		warmups := [][]int64{
+			nil,                             // cold cache
+			{target - 1, target + 1},        // the neighbouring seconds first
+			{target + 1, target - 1},        // … in the other order
+			{target - 3600, target, target}, // the same second twice
+			{target + 86400, target - 86400, target + 2, target - 2},
+		}
+		for i, warm := range warmups {
+			t.Run(fmt.Sprintf("%s/warmup-%d", c.name, i), func(t *testing.T) {
+				o := testOnchain(t, f, nil)
+				for _, ts := range warm {
+					if _, err := o.rpc.blockAt(ctx, ts); err != nil {
+						t.Fatal(err)
+					}
+				}
+				// Anchors inside the target second (which a search could stop on).
+				for _, n := range []uint64{want - 3, want - 1, want} {
+					if _, err := o.rpc.blockTime(ctx, n); err != nil {
+						t.Fatal(err)
+					}
+				}
+				got, err := o.rpc.blockAt(ctx, target)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if got != want {
+					t.Fatalf("blockAt(%d) after lookups %v: got block %d (time %d), want %d (time %d), the last block at or before it",
+						target, warm, got, f.timeOf(got), want, f.timeOf(want))
+				}
+			})
+		}
+	}
+	// The first block of a second asked for directly: still the last one.
+	f := regular
+	o := testOnchain(t, f, nil)
+	ts := f.timeOf(f.latest / 3)
+	first := uint64(ts-f.t0)*10 + 1
+	if _, err := o.rpc.blockTime(ctx, first); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := o.rpc.blockAt(ctx, ts); err != nil || n != first+9 {
+		t.Fatalf("blockAt(%d) with block %d (the second's first) cached: got %d (%v), want %d", ts, first, n, err, first+9)
+	}
+	// Before block 1: block 1; the same second as block 1: its last block.
+	if n, err := o.rpc.blockAt(ctx, f.t0-5); err != nil || n != 1 {
+		t.Fatalf("blockAt(before block 1): got %d (%v), want 1", n, err)
+	}
+	if n, err := o.rpc.blockAt(ctx, f.t0); err != nil || n != 10 {
+		t.Fatalf("blockAt(time of block 1): got %d (%v), want 10", n, err)
 	}
 }
 
@@ -1361,5 +1470,98 @@ func TestGetLogsTimeoutAtSmallestRange(t *testing.T) {
 	}
 	if w := "call 3 [1/1]: eth_getLogs blocks 0-199 (200 blocks) timed out on the node (2 tries) at the smallest range size (200 blocks); this scan stops here (rpc error -32000: request timed out)"; !strings.Contains(buf.String(), w) {
 		t.Fatalf("log is missing %q:\n%s", w, buf.String())
+	}
+}
+
+// noHeadCache turns blockNumber's head cache off for a test that moves the
+// fake chain's head and expects the client to see it at once.
+func noHeadCache(t *testing.T) {
+	t.Helper()
+	old := headCacheTTL
+	headCacheTTL = 0
+	t.Cleanup(func() { headCacheTTL = old })
+}
+
+// blockNumber's head cache: concurrent callers within the TTL share one
+// eth_blockNumber; after the TTL the head is read again (and a moved head is
+// seen); a failed read is never kept.
+func TestBlockNumberHeadCache(t *testing.T) {
+	ctx := context.Background()
+	f := newFakeChain(t, 24*time.Hour)
+	o := testOnchain(t, f, nil)
+	asked := func() int {
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		return f.count["eth_blockNumber"]
+	}
+	old := headCacheTTL
+	headCacheTTL = time.Hour // nothing expires during the first part
+	t.Cleanup(func() { headCacheTTL = old })
+
+	var wg sync.WaitGroup
+	got := make([]uint64, 16)
+	errs := make([]error, len(got))
+	for i := range got {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			got[i], errs[i] = o.rpc.blockNumber(ctx)
+		}()
+	}
+	wg.Wait()
+	for i := range got {
+		if errs[i] != nil || got[i] != f.latest {
+			t.Fatalf("caller %d: got %d (%v), want the head %d", i, got[i], errs[i], f.latest)
+		}
+	}
+	if n := asked(); n != 1 {
+		t.Fatalf("%d concurrent callers within the TTL: got %d eth_blockNumber, want 1", len(got), n)
+	}
+
+	// The TTL passes: the moved head is read.
+	f.mu.Lock()
+	f.latest += 50
+	want := f.latest
+	f.mu.Unlock()
+	headCacheTTL = 0
+	if n, err := o.rpc.blockNumber(ctx); err != nil || n != want {
+		t.Fatalf("after the TTL: got %d (%v), want the new head %d", n, err, want)
+	}
+	if n := asked(); n != 2 {
+		t.Fatalf("after the TTL: got %d eth_blockNumber in all, want 2", n)
+	}
+
+	// A node that does not answer: concurrent callers share one request
+	// (one round of retries, not one per caller), all get its error, and the
+	// error is not kept: the next call asks again.
+	headCacheTTL = time.Hour
+	o2 := testOnchain(t, f, nil)
+	var hits atomic.Int64
+	f.srv.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		time.Sleep(20 * time.Millisecond) // the callers below arrive meanwhile
+		http.Error(w, "down", http.StatusBadGateway)
+	})
+	fastRetries(t)
+	down := make([]error, 8)
+	for i := range down {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, down[i] = o2.rpc.blockNumber(ctx)
+		}()
+	}
+	wg.Wait()
+	for i, err := range down {
+		if err == nil {
+			t.Fatalf("node down, caller %d: got no error, want one", i)
+		}
+	}
+	if n := hits.Load(); n > 4 {
+		t.Fatalf("node down, %d concurrent callers: got %d requests, want at most 4 (one request with its retries)", len(down), n)
+	}
+	f.srv.Config.Handler = http.HandlerFunc(f.serve)
+	if n, err := o2.rpc.blockNumber(ctx); err != nil || n != want {
+		t.Fatalf("node back: got %d (%v), want %d (the failure was not kept)", n, err, want)
 	}
 }

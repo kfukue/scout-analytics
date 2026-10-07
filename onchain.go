@@ -344,8 +344,14 @@ type rpcClient struct {
 	requests atomic.Int64                // total JSON-RPC requests sent (for progress logs)
 	inflight atomic.Pointer[rpcInflight] // the request being waited on right now (for heartbeat logs)
 	head     atomic.Uint64               // newest block number seen (results near it are not cached)
-	parallel int                         // log chunks fetched at once per scan
-	slots    chan struct{}               // bounds the requests in flight
+	// blockNumber's cache: the last head read and when, and the request in
+	// progress (nil = none). Guarded by headMu.
+	headMu   sync.Mutex
+	headVal  uint64
+	headAt   time.Time
+	headFl   *headFlight
+	parallel int           // log chunks fetched at once per scan
+	slots    chan struct{} // bounds the requests in flight
 
 	sfMu sync.Mutex
 	sf   map[string]*logFlight // identical eth_getLogs requests in flight: asked once, shared
@@ -648,16 +654,74 @@ func blockTag(n uint64) string {
 	return hexU64(n)
 }
 
+// headCacheTTL: how long blockNumber reuses the head block it read last (a
+// var so tests can set it to 0).
+var headCacheTTL = time.Second
+
+// headFlight is one eth_blockNumber in progress; done is closed when n and err
+// are set.
+type headFlight struct {
+	done chan struct{}
+	n    uint64
+	err  error
+}
+
+// blockNumber returns the chain's head block (eth_blockNumber). An answer is
+// reused for headCacheTTL by every caller of this client (all workers share
+// it). One request at a time: callers that arrive while it runs take its
+// answer, an error included, instead of asking again (so a node that does not
+// answer costs one round of retries, not one per worker). An error is never
+// kept: the next call after it asks again.
 func (c *rpcClient) blockNumber(ctx context.Context) (uint64, error) {
+	for {
+		c.headMu.Lock()
+		if ttl := headCacheTTL; ttl > 0 && !c.headAt.IsZero() && time.Since(c.headAt) < ttl {
+			n := c.headVal
+			c.headMu.Unlock()
+			return n, nil
+		}
+		if fl := c.headFl; fl != nil {
+			c.headMu.Unlock()
+			select {
+			case <-fl.done:
+			case <-ctx.Done():
+				return 0, ctx.Err()
+			}
+			if fl.err != nil && ctx.Err() == nil && (errors.Is(fl.err, context.Canceled) || errors.Is(fl.err, context.DeadlineExceeded)) {
+				continue // the asker gave up (its context), not the node: ask again
+			}
+			return fl.n, fl.err
+		}
+		fl := &headFlight{done: make(chan struct{})}
+		c.headFl = fl
+		c.headMu.Unlock()
+
+		fl.n, fl.err = c.fetchBlockNumber(ctx)
+		c.headMu.Lock()
+		if fl.err == nil {
+			c.headVal, c.headAt = fl.n, time.Now()
+		}
+		c.headFl = nil
+		c.headMu.Unlock()
+		close(fl.done)
+		return fl.n, fl.err
+	}
+}
+
+// fetchBlockNumber asks the node for its head block (eth_blockNumber).
+func (c *rpcClient) fetchBlockNumber(ctx context.Context) (uint64, error) {
 	var s string
 	if err := c.call(ctx, &s, "eth_blockNumber"); err != nil {
 		return 0, err
 	}
 	n, err := strconv.ParseUint(strings.TrimPrefix(s, "0x"), 16, 64)
-	if err == nil && n > c.head.Load() {
+	if err != nil {
+		return 0, fmt.Errorf("eth_blockNumber: %w", err)
+	}
+	if n > c.head.Load() {
 		c.head.Store(n)
 	}
-	return n, err
+	return n, nil
 }
 
 // ethCall runs a read-only call at a block (0 = latest). An empty result or a
@@ -1196,9 +1260,19 @@ func (c *rpcClient) blockTime(ctx context.Context, n uint64) (int64, error) {
 	return ts, nil
 }
 
-// blockAt returns a block whose timestamp is at (or within ~1s before) ts:
-// interpolation search between known (block, time) anchors. Block times on
-// this chain are irregular, so the bracket is always kept.
+// blockAt returns the last block whose timestamp is at or before ts (the
+// chain makes several blocks per second, so "a block in that second" would not
+// be one block). The answer depends only on the chain, never on which blocks
+// earlier lookups cached: the search keeps the bracket t(lo) <= ts < t(hi)
+// (cached anchors only tighten it) and always runs until hi = lo+1.
+// Interpolation between the ends (a bisection after a step that did not halve
+// the bracket: block times on this chain are irregular) until a probe lands
+// within a second of ts; then a gallop from that end to the first block after
+// ts, and a bisection of what is left. A ts before block 1 gives block 1; a ts
+// at or after the latest block's time gives the latest block (later blocks in
+// the same second may still come). Every caller (entry, late entry, horizons,
+// hourly candles, pre-call window, score, mainnet block conversion,
+// -price-check) uses this one rule.
 func (c *rpcClient) blockAt(ctx context.Context, ts int64) (uint64, error) {
 	latest, err := c.blockNumber(ctx)
 	if err != nil {
@@ -1216,10 +1290,12 @@ func (c *rpcClient) blockAt(ctx context.Context, ts int64) (uint64, error) {
 	if err != nil {
 		return 0, err
 	}
-	if ts <= tLo {
+	if ts < tLo {
 		return lo, nil
 	}
 	tHi := tLatest
+	// blocks per second over the whole chain: the gallop's first step
+	rate := float64(hi-lo) / float64(max(tHi-tLo, 1))
 	// tighten the bracket with cached anchors
 	c.cacheMu.Lock()
 	for _, a := range c.anchors {
@@ -1232,27 +1308,64 @@ func (c *rpcClient) blockAt(ctx context.Context, ts int64) (uint64, error) {
 		}
 	}
 	c.cacheMu.Unlock()
-	for i := 0; i < 60 && hi-lo > 1 && ts-tLo > 1; i++ {
-		// interpolate, but never land on an end of the bracket
-		frac := float64(ts-tLo) / float64(tHi-tLo)
-		mid := lo + uint64(frac*float64(hi-lo))
-		if i%3 == 2 { // guard against slow convergence: bisect every third step
-			mid = lo + (hi-lo)/2
-		}
-		if mid <= lo {
-			mid = lo + 1
-		}
-		if mid >= hi {
-			mid = hi - 1
-		}
-		t, err := c.blockTime(ctx, mid)
+	probe := func(n uint64) (bool, error) { // n is at or before ts; the bracket is updated
+		t, err := c.blockTime(ctx, n)
 		if err != nil {
-			return 0, err
+			return false, err
 		}
 		if t <= ts {
-			lo, tLo = mid, t
-		} else {
-			hi, tHi = mid, t
+			lo, tLo = n, t
+			return true, nil
+		}
+		hi, tHi = n, t
+		return false, nil
+	}
+	inside := func(n uint64) uint64 { return min(max(n, lo+1), hi-1) }
+	// 1. Interpolate to the estimated first block after ts (time ts+1) until
+	//    one end is within a second of ts.
+	stalled := false
+	for i := 0; hi-lo > 1 && ts-tLo > 1 && tHi-ts > 1; i++ {
+		size := hi - lo
+		bisect := stalled || i >= 60
+		mid := lo + size/2
+		if !bisect {
+			frac := float64(ts+1-tLo) / float64(tHi-tLo)
+			mid = lo + uint64(frac*float64(size))
+		}
+		if _, err := probe(inside(mid)); err != nil {
+			return 0, err
+		}
+		stalled = !bisect && hi-lo > size/2
+	}
+	// 2. Gallop from the near end towards the first block after ts.
+	step := uint64(max(rate/2, 1))
+	if ts-tLo <= 1 {
+		for hi-lo > 1 {
+			before, err := probe(inside(lo + step))
+			if err != nil {
+				return 0, err
+			}
+			if !before {
+				break
+			}
+			step *= 2
+		}
+	} else {
+		for hi-lo > 1 {
+			before, err := probe(inside(hi - min(step, hi-lo-1)))
+			if err != nil {
+				return 0, err
+			}
+			if before {
+				break
+			}
+			step *= 2
+		}
+	}
+	// 3. Bisect what is left.
+	for hi-lo > 1 {
+		if _, err := probe(lo + (hi-lo)/2); err != nil {
+			return 0, err
 		}
 	}
 	return lo, nil
@@ -2609,6 +2722,24 @@ func (o *onchainSource) describe() string {
 		s += fmt.Sprintf("; ETH/USD + %d other feed(s) from Ethereum mainnet via %s", len(fm.mainnet)-1, o.cfg.MainnetRPCURL)
 	}
 	return s
+}
+
+// hasStateAt asks the node for state at a past block (eth_getBalance of the
+// zero address, which any block's state can answer): true = the node has it;
+// false with no error = the node refused it (no state for that block, as on a
+// full, non-archive node); an error = the node did not answer (busy, time-out,
+// transport), which says nothing about its type.
+func (o *onchainSource) hasStateAt(ctx context.Context, block uint64) (bool, error) {
+	var bal string
+	err := o.rpc.call(ctx, &bal, "eth_getBalance", zeroAddr, hexU64(block))
+	if err == nil {
+		return true, nil
+	}
+	var re *rpcError
+	if errors.As(err, &re) && isNoSuchValue(err) {
+		return false, nil
+	}
+	return false, fmt.Errorf("eth_getBalance at block %d: %w", block, err)
 }
 
 func init() {
