@@ -62,3 +62,19 @@ def test_single_json_row_matches_batch_row(synthetic_df):
                    for k, v in raw.items()}
         np.testing.assert_allclose(build_features(as_json, levels).iloc[0].to_numpy(),
                                    batch.iloc[i].to_numpy(), equal_nan=True)
+
+
+@pytest.mark.parametrize("col", ["rugged", "current_liquidity_usd", "current_price_usd",
+                                 "current_anything_added_later", "entry_price_source",
+                                 "pool_dex", "pool_address", "pool_name", "pool_created_at",
+                                 "pool_anything_added_later", "latest_price_usd"])
+def test_tracker_discoveries_are_forbidden(col):
+    assert C.is_forbidden(col), col
+    with pytest.raises(ValueError, match="forbidden"):
+        assert_no_leakage(["liq_usd", col])
+
+
+def test_post_fields_known_at_the_call_stay_allowed():
+    for col in ("launchpad", "dex", "quote_asset", "liq_usd", "mcap_usd"):
+        assert not C.is_forbidden(col), col
+    assert "launchpad" in C.FEATURES and "dex" in C.FEATURES

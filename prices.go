@@ -38,7 +38,7 @@ type priceConfig struct {
 	KeyHeader string
 	RPM       int
 	Horizons  []horizon
-	RugLiqUSD float64 // = Onchain.RugLiqUSD (SCOUT_RUG_LIQ_USD); the gecko source compares its pool reserve (both sides) with it
+	RugLiqUSD float64 // = Onchain.RugLiqUSD (SCOUT_RUG_LIQ_USD); the gecko source compares half its pool reserve (the quote side) with it
 	Enabled   bool
 	Interval  time.Duration // tracker loop interval
 	Workers   int           // calls tracked at the same time (on-chain source)

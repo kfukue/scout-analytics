@@ -77,3 +77,36 @@ def test_update_posts_are_never_usable():
 def test_thresholds_come_from_config(monkeypatch):
     monkeypatch.setitem(BUCKETS["3day"], "runner", ("ret_late_3d", ">=", 10.0))
     assert build_labels(pd.DataFrame([row(ret_late_3d=12)]))["runner_3day"][0] == 1
+
+
+def test_extreme_outcomes_are_excluded_not_clipped():
+    df = pd.DataFrame([
+        row(ret_late_7d=10),                                       # normal
+        row(ret_late_7d=2e5),                                      # medium ret above the cap
+        row(ret_late_7d=10, max_gain_late_1d=float("inf")),        # short runner column: inf
+        row(ret_late_7d=1e5),                                      # exactly the cap: kept
+        row(ret_late_7d=-100.0),                                   # total loss: a real label
+        row(ret_late_7d=10, max_gain_7d=1e9, ret_7d=1e9),          # huge but not label-relevant
+        row(ret_late_7d=10, ret_late_30d=3.9e47),                  # long bucket column -> all buckets
+        row(ret_late_7d=None)])                                    # missing: not extreme
+    L = build_labels(df)
+    assert L["extreme"].tolist() == [False, True, True, False, False, False, True, False]
+    assert L["usable_medium"].tolist() == [True, False, False, True, True, True, False, False]
+    for b in BUCKETS:
+        assert not L[f"usable_{b}"][L["extreme"]].any(), b
+        assert L[f"net_ret_{b}"][L["extreme"]].isna().all(), b
+    assert L["collapse_medium"][4] == 1 and L["net_ret_medium"][4] == pytest.approx(-100.0)
+    assert L["net_ret_medium"][3] == pytest.approx(1e5)          # kept as is, never clipped
+
+
+def test_outcome_columns_cover_every_label_and_simulation_column():
+    from scout_ml.labels import outcome_columns
+    cols = set(outcome_columns())
+    for cfg in BUCKETS.values():
+        assert {cfg["runner"][0], cfg["collapse"][0], cfg["ret_col"]} <= cols
+
+
+def test_cap_comes_from_config(monkeypatch):
+    from scout_ml import labels
+    monkeypatch.setattr(labels, "MAX_OUTCOME_PCT", 50.0)
+    assert build_labels(pd.DataFrame([row(ret_late_7d=60)]))["extreme"][0]

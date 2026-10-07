@@ -60,9 +60,30 @@ VIEW_COLUMNS = (IDENTITY + ["dex", "launchpad"] + NUMERIC_RAW
 # latest_* (the price and return as of the tracker's most recent look) are
 # outcomes that keep moving after the call: never features.
 LATEST = ["latest_price_usd", "latest_return_pct", "latest_checked_at", "latest_trade_at"]
+# What the tracker finds out AFTER the call (pool discovery, rug check, current
+# price/liquidity): never inputs, whether or not the view exports them. The
+# post's own `dex` and `launchpad` are known at the call and stay allowed.
+TRACKER_DISCOVERY = ["rugged", "current_liquidity_usd", "current_price_usd",
+                     "entry_price_source", "pool_dex", "pool_address", "pool_name",
+                     "pool_created_at"]
 FORBIDDEN_COLUMNS = (set(BOOKKEEPING) - {"quote_asset"} | set(IDENTITY)
-                     | {"pre_vol_unit", "token_name", "post_kind"} | set(LATEST))
-FORBIDDEN_PREFIXES = ("ret_", "max_gain_", "max_dd_", "latest_")
+                     | {"pre_vol_unit", "token_name", "post_kind"} | set(LATEST)
+                     | set(TRACKER_DISCOVERY))
+FORBIDDEN_PREFIXES = ("ret_", "max_gain_", "max_dd_", "latest_", "current_", "pool_")
+
+# --- Extreme outcomes ------------------------------------------------------
+# A drained or broken pool can give absurd outcomes (e.g. +3.9e47 %). A row
+# with ANY label-relevant outcome (the raw, before-tax value of a column used
+# by some bucket's runner, collapse or ret_col) above this cap is EXCLUDED
+# from every bucket (training, validation, simulation), not clipped, and
+# counted in the report. A missing outcome is not extreme. -100 % (total loss)
+# is a real outcome and is kept.
+MAX_OUTCOME_PCT = 1e5
+# The money simulation (mean net return of the top 10% vs all calls) credits
+# each call with at most this net return, so that one legitimate but huge
+# winner below MAX_OUTCOME_PCT cannot decide "beats buy-everything" on its
+# own. Labels are not affected. +1000 % = 11x.
+SIM_MAX_RET_PCT = 1000.0
 
 # --- Derived features (built in features.build_features) -------------------
 DERIVED = (["liq_to_mcap", "live_usd_to_liq", "live_usd_to_mcap", "mcap_vs_called"]

@@ -18,6 +18,11 @@ buy and sell tax. Thresholds, feature lists and pass gates are in
 `scout_ml/config.py`. The view's `latest_*` columns (price and return as of the
 tracker's most recent look) are outcomes that keep moving: they are never
 features, and the leakage guard refuses any column whose name starts with `latest_`.
+The same holds for what the tracker discovers after the call: `rugged`,
+`current_liquidity_usd`, `current_price_usd`, `entry_price_source` and the
+pool it found (`pool_dex`, `pool_address`, ...; any `current_*` or `pool_*`
+column). The post's own `dex` and `launchpad` are known at the call and stay
+features.
 
 ## Install
 
@@ -60,6 +65,16 @@ Update posts (`post_kind = update`, a "$TOKEN hit 3X ..." post about an earlier
 call) are not calls: they are excluded from training and simulation whatever
 else their row says, and counted on their own line ("excluded, update post (not
 a call)"). `post_kind` itself can never become a model input.
+
+Extreme outcomes: a drained or broken pool can produce absurd returns (e.g.
++3.9e47 %). A call whose label or simulation outcome (any bucket's runner,
+collapse or return column, before tax) is above `MAX_OUTCOME_PCT` (100,000 %)
+is excluded from every bucket, not clipped, and counted on its own line
+("excluded, extreme outcome"). A total loss (-100 %) is a real outcome and is
+kept. In the money simulation each call's net return counts at most
+`SIM_MAX_RET_PCT` (+1,000 %), so one huge winner cannot decide "beats
+buy-everything" alone; labels are not affected. Both caps are in
+`scout_ml/config.py`.
 
 ## Read the report
 

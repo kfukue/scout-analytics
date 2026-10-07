@@ -1,7 +1,7 @@
 """Render report.md from the results dict produced by train.py."""
 import math
 
-from .config import BUCKETS, GATES, LABELS, SKIP_FRAC, TOP_FRAC
+from .config import BUCKETS, GATES, LABELS, MAX_OUTCOME_PCT, SIM_MAX_RET_PCT, SKIP_FRAC, TOP_FRAC
 
 
 def fmt(v, digits=3) -> str:
@@ -36,6 +36,8 @@ def render(res: dict) -> str:
            f"- excluded, no pool (never tradable; out of training and simulation): {d['no_pool']}",
            f"- excluded, repeat call not tracked (only the first call of each token is tracked): {d.get('repeat', 0)}",
            f"- excluded, price_unit not 'usd': {d['not_usd']}",
+           f"- excluded, extreme outcome (a label/simulation outcome above {MAX_OUTCOME_PCT:,.0f} %; "
+           f"bogus pool data): {d.get('extreme', 0)}",
            f"- rows left before per-bucket outcome availability: {d['eligible']}\n",
            table(["bucket", "outcome not available yet", "usable rows"],
                  [[b, d["eligible"] - r["usable"], r["usable"]] for b, r in res["buckets"].items()]),
@@ -75,7 +77,8 @@ def render(res: dict) -> str:
              f"{g['windows_beating']}/{g['windows_evaluated']}", "all", g["walk_forward_ok"]]]))
         out.append(f"Money simulation on test (mean net {cfg['ret_col']}, %): top {TOP_FRAC:.0%} "
                    f"by runner score = {fmt(t['sim_top_mean'], 1)} over {t['sim_n_top']} calls; "
-                   f"all calls = {fmt(t['sim_all_mean'], 1)}.\n")
+                   f"all calls = {fmt(t['sim_all_mean'], 1)} (each call's net return capped at "
+                   f"+{SIM_MAX_RET_PCT:,.0f} %).\n")
         out.append(f"**Bucket result: {'PASS' if g['passed'] else 'FAIL'}**\n")
         out.append("### Walk-forward (expanding weekly windows)\n")
         out.append(table(["week", "from", "train n", "test n", "runner AUC", "top lift",

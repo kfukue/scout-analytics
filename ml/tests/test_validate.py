@@ -73,3 +73,27 @@ def test_metrics_do_not_crash_on_one_class():
     m = V.model_metrics(np.zeros(20), np.full(20, 0.1))
     assert np.isnan(m["roc_auc"]) and m["base_rate"] == 0.0
     assert len(V.calibration_table(np.arange(100) % 2, np.linspace(0, 1, 100))) == 10
+
+
+def test_one_huge_winner_cannot_decide_the_simulation(monkeypatch):
+    """Top 10% = 2 calls: -90% and one +50,000% winner (below MAX_OUTCOME_PCT,
+    so not excluded). The other 18 calls make +600%. Uncapped, the one winner
+    makes the top beat buy-everything; capped at SIM_MAX_RET_PCT it does not."""
+    n = 20
+    score = np.arange(n, 0, -1, dtype=float)          # rows 0 and 1 are the top 10%
+    ret = np.full(n, 600.0)
+    ret[0], ret[1] = -90.0, 50_000.0
+    y = np.zeros(n)
+    y[[0, 2, 3]] = 1
+    capped = V.trading_metrics(y, score, y, None, ret)
+    assert V.SIM_MAX_RET_PCT == 1000.0
+    assert capped["sim_n_top"] == 2
+    assert capped["sim_top_mean"] == pytest.approx((-90 + 1000) / 2), capped
+    assert capped["sim_all_mean"] == pytest.approx((-90 + 1000 + 18 * 600) / n), capped
+    assert capped["sim_beats_all"] is False, capped
+    monkeypatch.setattr(V, "SIM_MAX_RET_PCT", np.inf)
+    uncapped = V.trading_metrics(y, score, y, None, ret)
+    assert uncapped["sim_beats_all"] is True, uncapped    # what the cap prevents
+    # the cap never touches losses: -100% stays -100%
+    all_lost = V.trading_metrics(y, score, y, None, np.full(n, -100.0))
+    assert all_lost["sim_top_mean"] == -100.0 and all_lost["sim_all_mean"] == -100.0

@@ -4,7 +4,7 @@ import operator
 import numpy as np
 import pandas as pd
 
-from .config import BUCKETS, LABELS, NO_POOL_STATUSES, REPEAT_STATUS, UPDATE_KIND
+from .config import BUCKETS, LABELS, MAX_OUTCOME_PCT, NO_POOL_STATUSES, REPEAT_STATUS, UPDATE_KIND
 from .features import num, text
 
 _OPS = {">=": operator.ge, ">": operator.gt, "<=": operator.le, "<": operator.lt}
@@ -26,10 +26,27 @@ def to_bool(s: pd.Series) -> pd.Series:
     return s.astype(str).str.strip().str.lower().isin(["true", "t", "1", "1.0"])
 
 
+def outcome_columns() -> list:
+    """Every outcome column some bucket's label or simulation reads."""
+    cols = {cfg[k][0] for cfg in BUCKETS.values() for k in LABELS}
+    cols |= {cfg["ret_col"] for cfg in BUCKETS.values()}
+    return sorted(cols)
+
+
+def extreme_outcome(df: pd.DataFrame) -> pd.Series:
+    """True where any label-relevant raw outcome is above MAX_OUTCOME_PCT
+    (+inf included; NaN = not known yet = not extreme)."""
+    hit = pd.Series(False, index=df.index)
+    for col in outcome_columns():
+        hit |= num(df, col) > MAX_OUTCOME_PCT  # NaN compares False
+    return hit
+
+
 def build_labels(df: pd.DataFrame) -> pd.DataFrame:
     """Per row: `update` (an update post, not a call: never usable), `no_pool`,
     `repeat` (the part of `no_pool` that is an untracked repeat call, reported
-    separately), `not_usd`, and for each bucket `usable_<b>`,
+    separately), `not_usd`, `extreme` (an outcome above MAX_OUTCOME_PCT: never
+    usable), and for each bucket `usable_<b>`,
     `runner_<b>`, `collapse_<b>` (NaN where unusable) and `net_ret_<b>`."""
     out = pd.DataFrame(index=df.index)
     out["update"] = text(df, "post_kind") == UPDATE_KIND
@@ -37,11 +54,12 @@ def build_labels(df: pd.DataFrame) -> pd.DataFrame:
                       | text(df, "tracking_status").isin(NO_POOL_STATUSES))
     out["repeat"] = out["no_pool"] & (text(df, "tracking_status") == REPEAT_STATUS)
     out["not_usd"] = text(df, "price_unit") != "usd"
+    out["extreme"] = extreme_outcome(df)
     rugged = to_bool(df["rugged"]) if "rugged" in df.columns else pd.Series(False, index=df.index)
     buy, sell = num(df, "tax_buy_pct"), num(df, "tax_sell_pct")
     for b, cfg in BUCKETS.items():
         needed = {cfg["runner"][0], cfg["collapse"][0], cfg["ret_col"]}
-        usable = ~out["update"] & ~out["no_pool"] & ~out["not_usd"]
+        usable = ~out["update"] & ~out["no_pool"] & ~out["not_usd"] & ~out["extreme"]
         for col in needed:
             usable &= num(df, col).notna()
         out[f"usable_{b}"] = usable

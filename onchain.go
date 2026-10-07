@@ -13,6 +13,7 @@ import (
 	"math/big"
 	"net"
 	"net/http"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -418,7 +419,7 @@ func isNoSuchValue(err error) bool {
 	}
 	var re *rpcError
 	if !errors.As(err, &re) {
-		return err.Error() == "empty result"
+		return errors.Is(err, errEmptyResult)
 	}
 	// A node that is busy or rate limiting also answers with a JSON-RPC error.
 	msg := strings.ToLower(re.Message)
@@ -668,10 +669,14 @@ func (c *rpcClient) ethCall(ctx context.Context, to, data string, block uint64) 
 	}
 	b := unhex(s)
 	if len(b) == 0 {
-		return nil, errors.New("empty result")
+		return nil, errEmptyResult
 	}
 	return b, nil
 }
+
+// errEmptyResult: an eth_call that returned no data (no such function, or no
+// contract at the address).
+var errEmptyResult = errors.New("empty result")
 
 func (c *rpcClient) getLogs(ctx context.Context, address string, topics []any, from, to uint64) ([]rpcLog, error) {
 	var logs []rpcLog
@@ -1391,14 +1396,25 @@ type onchainSource struct {
 	// node): historical values are then read from event logs instead.
 	noState atomic.Bool
 
-	mu          sync.Mutex
-	aggregators map[string][]string // feed proxy → aggregator contracts that emit AnswerUpdated
+	// feeds: the Chainlink feeds in use (SCOUT_CHAINLINK_FEEDS /
+	// SCOUT_MAINNET_CHAINLINK_FEEDS merged with the asset database's, env
+	// wins). Replaced as a whole, never changed in place (feeds_db.go).
+	feeds   atomic.Pointer[feedMaps]
+	dbFeeds dbFeeds // the asset database's feeds (feeds_db.go)
+
+	// now is the clock of the cache expiries (nil = time.Now; tests set it).
+	now func() time.Time
+
+	mu        sync.Mutex
+	feedInfos map[string]*feedInfo // feed proxy → its aggregators (re-read after feedInfoTTL)
+	feedWarn  map[string]bool      // feed warnings already logged (stale aggregator …)
 
 	mainnet *rpcClient // Ethereum archive node (nil unless SCOUT_MAINNET_RPC_URL is set)
 
 	hourBlocks map[int64]uint64         // UTC hour → block at that time
-	hourQuotes map[string]float64       // "quote|hour" → USD price of the quote asset
-	quotePools map[string]*onchainState // quote asset → its own WETH/stable pool (nil = none)
+	hourQuotes map[string]float64       // "quote|hour" → USD price of the quote asset (found prices only)
+	usdPools   map[string]*usdPoolSet   // asset → its own WETH / stablecoin pools (onchain_extra.go)
+	v4Pools    map[string]*v4TokenPools // token → its v4 pools (from the PoolManager's Initialize events)
 }
 
 func newOnchainSource(oc onchainConfig) *onchainSource {
@@ -1406,11 +1422,21 @@ func newOnchainSource(oc onchainConfig) *onchainSource {
 		oc.PriceLookback = 8_640_000
 	}
 	o := &onchainSource{cfg: oc, rpc: newRPCClient(oc), hourBlocks: map[int64]uint64{},
-		hourQuotes: map[string]float64{}, quotePools: map[string]*onchainState{}}
+		hourQuotes: map[string]float64{}, usdPools: map[string]*usdPoolSet{}, v4Pools: map[string]*v4TokenPools{},
+		feedInfos: map[string]*feedInfo{}, feedWarn: map[string]bool{}}
+	o.feeds.Store(&feedMaps{rh: oc.Feeds, mainnet: oc.MainnetFeeds})
 	if oc.MainnetRPCURL != "" {
 		o.mainnet = newRPCClient(onchainConfig{RPCURL: oc.MainnetRPCURL, RPS: oc.MainnetRPS})
 	}
 	return o
+}
+
+// clock: the time for cache expiries.
+func (o *onchainSource) clock() time.Time {
+	if o.now != nil {
+		return o.now()
+	}
+	return time.Now()
 }
 
 var (
@@ -1433,7 +1459,7 @@ func (o *onchainSource) discoverWith(ctx context.Context, token string, entryBlo
 	}
 	// A Pons V2 token names its bonding curve itself (quote assets never are one).
 	// A confirmed Pons token is never handed to the counterparty search below
-	// (on a full node its PoolManager-wide swap scan is very slow).
+	// (which knows nothing of the curve).
 	if accept == nil {
 		curve, quote, err := o.ponsCurveOfToken(ctx, token)
 		if err != nil {
@@ -1443,64 +1469,10 @@ func (o *onchainSource) discoverWith(ctx context.Context, token string, entryBlo
 			return o.discoverPons(ctx, token, tm, entryBlock, curve, quote)
 		}
 	}
-	latest, err := o.rpc.blockNumber(ctx)
+	cands, from, to, err := o.transferCounterparties(ctx, token, entryBlock)
 	if err != nil {
 		return nil, err
 	}
-	// Widen the window until the token shows transfers (thinly traded tokens).
-	type cand struct {
-		addr string
-		n    int
-		txs  map[string]bool
-	}
-	var cands []*cand
-	var from, to uint64
-	for _, mult := range []uint64{1, 4, 16, 64} {
-		span := o.cfg.DiscoveryBlocks * mult
-		from = 1
-		if entryBlock > span {
-			from = entryBlock - span
-		}
-		to = entryBlock + span
-		if to > latest {
-			to = latest
-		}
-		byAddr := map[string]*cand{}
-		err := o.rpc.getLogsChunked(ctx, token, []any{topicTransfer}, from, to, func(l rpcLog) {
-			if len(l.Topics) < 3 {
-				return
-			}
-			for _, t := range l.Topics[1:3] {
-				a := addrFromWord(unhex(t))
-				if a == zeroAddr || a == token {
-					continue
-				}
-				c := byAddr[a]
-				if c == nil {
-					c = &cand{addr: a, txs: map[string]bool{}}
-					byAddr[a] = c
-				}
-				c.n++
-				c.txs[l.TxHash] = true
-			}
-		})
-		if err != nil {
-			return nil, err
-		}
-		cands = cands[:0]
-		for _, c := range byAddr {
-			cands = append(cands, c)
-		}
-		if len(cands) > 0 {
-			break
-		}
-	}
-	sort.Slice(cands, func(i, j int) bool {
-		if cands[i].n != cands[j].n {
-			return cands[i].n > cands[j].n
-		}
-		return cands[i].addr < cands[j].addr
-	})
 	limit := 8
 	if accept != nil {
 		limit = 32 // the wanted pool is rarely the busiest counterparty
@@ -1546,15 +1518,83 @@ func (o *onchainSource) discoverWith(ctx context.Context, token string, entryBlo
 	return nil, errNoPool
 }
 
+// counterparty is an address the token was transferred to or from: n
+// transfers, in the transactions txs.
+type counterparty struct {
+	addr string
+	n    int
+	txs  map[string]bool
+}
+
+// transferCounterparties lists who the token was transferred to or from
+// around block at (the busiest first, ties by address), in a window that
+// widens until the token shows transfers (thinly traded tokens). from and to
+// are the window that was read.
+func (o *onchainSource) transferCounterparties(ctx context.Context, token string, at uint64) (cands []*counterparty, from, to uint64, err error) {
+	latest, err := o.rpc.blockNumber(ctx)
+	if err != nil {
+		return nil, 0, 0, err
+	}
+	for _, mult := range []uint64{1, 4, 16, 64} {
+		span := o.cfg.DiscoveryBlocks * mult
+		from = 1
+		if at > span {
+			from = at - span
+		}
+		to = at + span
+		if to > latest {
+			to = latest
+		}
+		byAddr := map[string]*counterparty{}
+		err := o.rpc.getLogsChunked(ctx, token, []any{topicTransfer}, from, to, func(l rpcLog) {
+			if len(l.Topics) < 3 {
+				return
+			}
+			for _, t := range l.Topics[1:3] {
+				a := addrFromWord(unhex(t))
+				if a == zeroAddr || a == token {
+					continue
+				}
+				c := byAddr[a]
+				if c == nil {
+					c = &counterparty{addr: a, txs: map[string]bool{}}
+					byAddr[a] = c
+				}
+				c.n++
+				c.txs[l.TxHash] = true
+			}
+		})
+		if err != nil {
+			return nil, 0, 0, err
+		}
+		cands = cands[:0]
+		for _, c := range byAddr {
+			cands = append(cands, c)
+		}
+		if len(cands) > 0 {
+			break
+		}
+	}
+	sort.Slice(cands, func(i, j int) bool {
+		if cands[i].n != cands[j].n {
+			return cands[i].n > cands[j].n
+		}
+		return cands[i].addr < cands[j].addr
+	})
+	return cands, from, to, nil
+}
+
 // resolveV2V3 checks whether addr is a v2 pair or v3 pool containing token.
 func (o *onchainSource) resolveV2V3(ctx context.Context, st *onchainState, token, addr string) (bool, error) {
+	// Wallets and routers have no token0(): not a pool. A node that is busy or
+	// rate limiting is an error (tried again later), never "not a pool".
 	b0, err := o.rpc.ethCall(ctx, addr, selToken0, 0)
 	if err != nil {
-		return false, nonRPC(err) // wallets and routers have no token0()
+		return false, transientCallErr(err)
 	}
 	b1, err := o.rpc.ethCall(ctx, addr, selToken1, 0)
 	if err != nil {
-		return false, nonRPC(err)
+		return false, transientCallErr(err)
 	}
 	t0, t1 := addrFromWord(b0), addrFromWord(b1)
 	switch token {
@@ -1577,82 +1617,212 @@ func (o *onchainSource) resolveV2V3(ctx context.Context, st *onchainState, token
 	return false, nil
 }
 
-// nonRPC keeps transport errors and drops contract-level ones (revert / no code).
-func nonRPC(err error) error {
-	var re *rpcError
-	if errors.As(err, &re) || err.Error() == "empty result" {
+// transientCallErr keeps the eth_call errors that say nothing about the
+// contract (transport, busy or rate-limited node) and drops a revert or an
+// empty result (nil).
+func transientCallErr(err error) error {
+	if isRevert(err) || isNoSuchValue(err) {
 		return nil
 	}
 	return err
 }
 
-// resolveV4 finds the v4 pool id the token traded in (the pool whose Swap
-// events share transactions with the token's transfers) and its currencies.
-func (o *onchainSource) resolveV4(ctx context.Context, st *onchainState, token string, txs map[string]bool, from, to uint64, accept func(string) bool) (bool, error) {
-	counts := map[string]int{}
-	err := o.rpc.getLogsChunked(ctx, o.cfg.PoolManagerV4, []any{topicSwapV4}, from, to, func(l rpcLog) {
-		if len(l.Topics) >= 2 && txs[l.TxHash] {
-			counts[l.Topics[1]]++
-		}
-	})
-	if err != nil {
-		return false, err
+// isRevert: the contract itself refused the call (JSON-RPC code 3, or an
+// "execution reverted" message), whatever its reason says (a revert reason
+// can read "rate limit" too).
+func isRevert(err error) bool {
+	var re *rpcError
+	if !errors.As(err, &re) {
+		return false
 	}
-	ids := make([]string, 0, len(counts))
-	for id := range counts {
-		ids = append(ids, id)
+	return re.Code == 3 || strings.Contains(strings.ToLower(re.Message), "revert")
+}
+
+// nonRPC keeps transport errors and drops contract-level ones (revert / no code).
+func nonRPC(err error) error {
+	var re *rpcError
+	if errors.As(err, &re) || errors.Is(err, errEmptyResult) {
+		return nil
 	}
-	sort.Slice(ids, func(i, j int) bool {
-		if counts[ids[i]] != counts[ids[j]] {
-			return counts[ids[i]] > counts[ids[j]]
+	return err
+}
+
+// v4Pool is one v4 pool as its Initialize event on the PoolManager describes it:
+// Initialize(bytes32 indexed id, address indexed currency0, address indexed
+// currency1, uint24 fee, int24 tickSpacing, address hooks, uint160
+// sqrtPriceX96, int24 tick).
+type v4Pool struct {
+	id          string
+	c0, c1      string
+	fee         uint64
+	tickSpacing int64
+	hooks       string // "" when the event's data is too short to say
+	block       uint64 // the Initialize block: the pool's creation
+}
+
+// v4TokenPools: every v4 pool of one token initialised in blocks [1, through].
+type v4TokenPools struct {
+	pools   []v4Pool
+	through uint64
+}
+
+// v4PoolOfInit decodes an Initialize log (false when it is not one).
+func v4PoolOfInit(l rpcLog) (v4Pool, bool) {
+	if len(l.Topics) < 4 || !strings.EqualFold(l.Topics[0], topicInitV4) {
+		return v4Pool{}, false
+	}
+	p := v4Pool{id: strings.ToLower(l.Topics[1]), c0: addrFromWord(unhex(l.Topics[2])),
+		c1: addrFromWord(unhex(l.Topics[3])), block: l.block()}
+	d := unhex(l.Data) // fee, tickSpacing, hooks, sqrtPriceX96, tick
+	if len(d) >= 32 {
+		p.fee = word(d, 0).Uint64()
+	}
+	if len(d) >= 2*32 {
+		p.tickSpacing = signedWord(d, 1).Int64()
+	}
+	if len(d) >= 3*32 {
+		p.hooks = addrFromWord(d[64:96])
+	}
+	return p, true
+}
+
+// v4PoolsOf lists the token's v4 pools created in blocks [1, to]: the
+// PoolManager's Initialize events with the token as currency0 (topic 2) or as
+// currency1 (topic 3). Two requests over the whole history, filtered by address
+// and indexed topics, which a node with a full log index answers quickly over
+// any range (split automatically if the node refuses the range or times out).
+// What was searched is kept per token, so a later search only reads the new
+// blocks.
+func (o *onchainSource) v4PoolsOf(ctx context.Context, token string, to uint64) ([]v4Pool, error) {
+	o.mu.Lock()
+	known := o.v4Pools[token]
+	var pools []v4Pool
+	from := uint64(1)
+	if known != nil {
+		pools = slices.Clone(known.pools)
+		from = known.through + 1
+	}
+	o.mu.Unlock()
+	if from <= to {
+		seen := map[string]bool{}
+		for _, p := range pools {
+			seen[p.id] = true
 		}
-		return ids[i] < ids[j]
-	})
-	for _, id := range ids {
-		// Initialize(id, currency0, currency1, …): walk back from the window to find it.
-		var c0, c1 string
-		hi := to
-		span := o.rpc.maxChunk // this search's own range size: a refusal here changes no other scan
-		for step := 0; step < 400 && c0 == "" && hi > 0; step++ {
-			lo := uint64(1)
-			if hi > span {
-				lo = hi - span + 1
-			}
-			logs, err := o.rpc.retryLogs(ctx, true, func() ([]rpcLog, error) {
-				return o.rpc.getLogs(ctx, o.cfg.PoolManagerV4, []any{topicInitV4, id}, lo, hi)
+		for _, topics := range [][]any{
+			{topicInitV4, nil, addrTopic(token)},      // token = currency0
+			{topicInitV4, nil, nil, addrTopic(token)}, // token = currency1
+		} {
+			// One range for the whole span (a ceiling above to: no split at a multiple).
+			err := o.rpc.getLogsChunkedUpTo(ctx, o.cfg.PoolManagerV4, topics, from, to, to+1, func(l rpcLog) {
+				if p, ok := v4PoolOfInit(l); ok && !seen[p.id] && (p.c0 == token || p.c1 == token) {
+					seen[p.id] = true
+					pools = append(pools, p)
+				}
 			})
 			if err != nil {
-				var refused *rangeRefusedError
-				if errors.As(err, &refused) && span > o.rpc.minChunk {
-					span = max(span/2, o.rpc.minChunk)
-					o.rpc.splits.Add(1)
-					continue
-				}
-				return false, err
+				return nil, fmt.Errorf("v4 pools of %s (Initialize in blocks %d-%d): %w", token, from, to, err)
 			}
-			if len(logs) > 0 && len(logs[0].Topics) >= 4 {
-				c0, c1 = addrFromWord(unhex(logs[0].Topics[2])), addrFromWord(unhex(logs[0].Topics[3]))
-			}
-			if lo == 1 {
-				break
-			}
-			hi = lo - 1
 		}
-		switch token {
-		case c0:
-			st.TokenIs0, st.Quote = true, c1
-		case c1:
-			st.TokenIs0, st.Quote = false, c0
-		default:
-			continue // a multi-hop leg through another pool
+		// Only settled history counts as searched: blocks near the chain's tip are
+		// read again next time (a pool found there twice is kept once).
+		through := to
+		if h := o.rpc.head.Load(); h > 1000 && through > h-1000 {
+			through = h - 1000
 		}
-		if accept != nil && !accept(st.Quote) {
+		o.mu.Lock()
+		if cur := o.v4Pools[token]; cur == nil || cur.through < through {
+			o.v4Pools[token] = &v4TokenPools{pools: pools, through: through}
+		}
+		o.mu.Unlock()
+	}
+	out := make([]v4Pool, 0, len(pools))
+	for _, p := range pools {
+		if p.block <= to {
+			out = append(out, p)
+		}
+	}
+	return out, nil
+}
+
+// v4SwapIDBatch: pool ids asked for in one Swap filter (topic 1 as a list).
+const v4SwapIDBatch = 32
+
+// resolveV4 finds the v4 pool the token traded in around the call. Its pools
+// come from the PoolManager's Initialize events (v4PoolsOf); no Initialize =
+// no v4 pool, and nothing else is asked. The pools whose other currency passes
+// accept are then checked for swaps in [from, to] with the pool id as a filter
+// (topic 1, indexed). The pool with the most swaps in the same transactions as
+// the token's transfers wins (ties: the lowest id); a pool with none is not
+// taken. The PoolManager's swaps are never read unfiltered: that is every v4
+// trade on the chain.
+func (o *onchainSource) resolveV4(ctx context.Context, st *onchainState, token string, txs map[string]bool, from, to uint64, accept func(string) bool) (bool, error) {
+	ranked, err := o.v4Ranked(ctx, token, txs, from, to, accept)
+	if err != nil || len(ranked) == 0 {
+		return false, err
+	}
+	p := ranked[0]
+	st.TokenIs0, st.Quote = p.c0 == token, p.c1
+	if !st.TokenIs0 {
+		st.Quote = p.c0
+	}
+	st.Kind, st.Pool, st.PoolID = "v4", o.cfg.PoolManagerV4, p.id
+	return true, nil
+}
+
+// v4Ranked lists the token's v4 pools whose other currency passes accept and
+// that swapped in [from, to] in the same transactions as the token's
+// transfers (txs): the most such swaps first, ties by the lowest id. See
+// resolveV4.
+func (o *onchainSource) v4Ranked(ctx context.Context, token string, txs map[string]bool, from, to uint64, accept func(string) bool) ([]v4Pool, error) {
+	pools, err := o.v4PoolsOf(ctx, token, to)
+	if err != nil {
+		return nil, err
+	}
+	byID := map[string]v4Pool{}
+	var ids []string
+	for _, p := range pools {
+		quote := p.c1
+		if p.c1 == token {
+			quote = p.c0
+		}
+		if accept != nil && !accept(quote) {
 			continue
 		}
-		st.Kind, st.Pool, st.PoolID = "v4", o.cfg.PoolManagerV4, id
-		return true, nil
+		byID[p.id] = p
+		ids = append(ids, p.id)
 	}
-	return false, nil
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	sort.Strings(ids) // the same filters (and log cache keys) every time
+	counts := map[string]int{}
+	for batch := range slices.Chunk(ids, v4SwapIDBatch) {
+		var idTopic any = batch[0]
+		if len(batch) > 1 {
+			list := make([]any, len(batch))
+			for i, id := range batch {
+				list[i] = id
+			}
+			idTopic = list
+		}
+		err := o.rpc.getLogsChunked(ctx, o.cfg.PoolManagerV4, []any{topicSwapV4, idTopic}, from, to, func(l rpcLog) {
+			if len(l.Topics) >= 2 && txs[l.TxHash] {
+				counts[strings.ToLower(l.Topics[1])]++
+			}
+		})
+		if err != nil {
+			return nil, fmt.Errorf("v4 swaps of %s's pools: %w", token, err)
+		}
+	}
+	var out []v4Pool
+	for _, id := range ids {
+		if counts[id] > 0 {
+			out = append(out, byID[id])
+		}
+	}
+	// ids are sorted, and the sort is stable: equal counts keep the lowest id first.
+	sort.SliceStable(out, func(i, j int) bool { return counts[out[i].id] > counts[out[j].id] })
+	return out, nil
 }
 
 // Uniswap v3/v4 ticks run from -maxTick to +maxTick. A swap that ends within
@@ -1933,51 +2103,92 @@ func (o *onchainSource) entryPrice(ctx context.Context, st *onchainState, latest
 	return nil
 }
 
-// quoteUSD: USD value of one unit of the pool's quote asset at a block.
-// ok=false when no source is configured (prices then stay in quote units).
+// quoteUSD: USD value of one unit of an asset (a pool's quote asset) at a
+// block (0 = latest). The one lookup for every USD conversion (entry, candles,
+// horizons, the latest pass, score, -price-check). Sources, in order:
+//  1. a stablecoin (SCOUT_STABLES) = $1;
+//  2. a Chainlink feed on Robinhood Chain (SCOUT_CHAINLINK_FEEDS + the asset database);
+//  3. a Chainlink feed on Ethereum mainnet (SCOUT_MAINNET_CHAINLINK_FEEDS + the
+//     asset database); for ETH / WETH then the WETH/USDG pool (SCOUT_ETH_USD_POOL);
+//  4. the asset's own pool against WETH / native ETH × ETH/USD;
+//  5. the asset's own pool against a stablecoin (4 and 5: quoteViaPools).
+//
+// ok=false with no error: every source is definitively absent (prices then
+// stay in quote units; errNoUSDSource where an error is needed). An error is
+// temporary (the node, "no price yet"): try again later. A source that fails
+// for a temporary reason is never skipped for the next one.
 func (o *onchainSource) quoteUSD(ctx context.Context, quote string, block uint64) (float64, bool, error) {
+	quote = strings.ToLower(quote)
 	p, ok, err := o.quoteUSDDirect(ctx, quote, block)
-	if ok || err != nil {
+	if ok || err != nil || o.isETH(quote) {
 		return p, ok, err
 	}
-	// No feed for this asset (e.g. VIRTUAL, a stock token): price it from its own
-	// pool against WETH or a stablecoin.
-	return o.quoteViaPool(ctx, quote, block)
+	// No feed for this asset (e.g. VIRTUAL, a stock token without one): price
+	// it from its own pools against WETH or a stablecoin.
+	return o.quoteViaPools(ctx, quote, block)
 }
 
-// quoteUSDDirect: stablecoins, Chainlink feeds and the WETH/USDG pool.
+// isETH: native ETH (the zero address) or WETH.
+func (o *onchainSource) isETH(asset string) bool {
+	return asset == zeroAddr || asset == o.cfg.WETH
+}
+
+// feedFor: the asset's feed in m (ETH and WETH fall back to the "eth" entry).
+func (o *onchainSource) feedFor(m map[string]string, asset string) string {
+	f := m[asset]
+	if f == "" && o.isETH(asset) {
+		f = m["eth"]
+	}
+	return f
+}
+
+// quoteUSDDirect: sources 1-3 of quoteUSD (stablecoins, Chainlink feeds, and
+// for ETH the WETH/USDG pool). Never an asset's own pool.
 func (o *onchainSource) quoteUSDDirect(ctx context.Context, quote string, block uint64) (float64, bool, error) {
 	quote = strings.ToLower(quote)
 	if o.cfg.Stables[quote] {
 		return 1, true, nil
 	}
-	isETH := quote == zeroAddr || quote == o.cfg.WETH
-	// 1. A Chainlink feed on Ethereum mainnet, read on the mainnet archive node at
+	fm := o.feedMaps()
+	// 2. A Chainlink feed on Robinhood Chain. A feed with no update within the
+	//    look-back says nothing about this block: the next source is asked.
+	if feed := o.feedFor(fm.rh, quote); feed != "" {
+		p, err := o.chainlink(ctx, feed, block)
+		if err == nil {
+			return p, true, nil
+		}
+		if !errors.Is(err, errFeedNoData) {
+			return 0, false, err
+		}
+		o.warnOnce("nodata|"+feed+"|"+quote, "prices: %v — trying the next USD source for %s", err, quote)
+	}
+	// 3. A Chainlink feed on Ethereum mainnet, read on the mainnet archive node at
 	//    the block with the same timestamp (ETH/USD by default).
 	if o.mainnet != nil {
-		mf := o.cfg.MainnetFeeds[quote]
-		if mf == "" && isETH {
-			mf = o.cfg.MainnetFeeds["eth"]
-		}
-		if mf != "" {
-			p, err := o.mainnetFeed(ctx, mf, block)
+		if feed := o.feedFor(fm.mainnet, quote); feed != "" {
+			p, err := o.mainnetFeed(ctx, feed, block)
 			return p, err == nil, err
 		}
 	}
-	// 2. A Chainlink feed on Robinhood Chain.
-	feed := o.cfg.Feeds[quote]
-	if feed == "" && isETH {
-		feed = o.cfg.Feeds["eth"]
-	}
-	if feed != "" {
-		p, err := o.chainlink(ctx, feed, block)
-		return p, err == nil, err
-	}
-	if isETH && o.cfg.EthUSDPool != "" {
+	if o.isETH(quote) && o.cfg.EthUSDPool != "" {
 		p, err := o.ethFromPool(ctx, block)
 		return p, err == nil, err
 	}
 	return 0, false, nil
+}
+
+// warnOnce logs a line once per key for the life of the process.
+func (o *onchainSource) warnOnce(key, format string, args ...any) {
+	o.mu.Lock()
+	if o.feedWarn == nil {
+		o.feedWarn = map[string]bool{}
+	}
+	seen := o.feedWarn[key]
+	o.feedWarn[key] = true
+	o.mu.Unlock()
+	if !seen {
+		log.Printf(format, args...)
+	}
 }
 
 // mainnetBlockFor converts a Robinhood Chain block number into the Ethereum
@@ -2033,8 +2244,37 @@ func (o *onchainSource) mainnetFeed(ctx context.Context, feed string, block uint
 	return p, nil
 }
 
+// errFeedNoData: a Chainlink feed with no AnswerUpdated within the look-back
+// before the block (on a node without historical state). Not an error of the
+// node: quoteUSD then asks the next source.
+var errFeedNoData = errors.New("no Chainlink update within the look-back")
+
+// topicAggregatorConfirmed: AggregatorConfirmed(address indexed previous,
+// address indexed latest), emitted by AggregatorProxy v0.7+ when it switches
+// to a new aggregator. The v0.6 proxies (EACAggregatorProxy, most Ethereum
+// feeds) emit nothing when they switch.
+var topicAggregatorConfirmed = topicOf("AggregatorConfirmed(address,address)")
+
+// feedInfoTTL: how long a feed's aggregator list is trusted before it is read
+// again (a proxy can switch to a new aggregator at any time).
+const feedInfoTTL = time.Hour
+
+// feedInfo: the aggregators behind a Chainlink proxy.
+type feedInfo struct {
+	aggs     []string     // the phase aggregators, oldest phase first; the current one last
+	confirms []aggConfirm // the proxy's AggregatorConfirmed events, oldest first (v0.7+ proxies)
+	through  uint64       // AggregatorConfirmed read through this block
+	at       time.Time    // read at
+}
+
+type aggConfirm struct {
+	block        uint64
+	prev, latest string
+}
+
 // chainlink returns a feed's price as of a block: latestRoundData() at that
-// block on an archive node, else the last AnswerUpdated event at or before it.
+// block on an archive node, else the last AnswerUpdated event at or before it
+// of the aggregator in use at that block (feedLogAt).
 func (o *onchainSource) chainlink(ctx context.Context, feed string, block uint64) (float64, error) {
 	fm, err := o.rpc.tokenInfo(ctx, feed) // decimals() of the feed
 	if err != nil {
@@ -2052,27 +2292,26 @@ func (o *onchainSource) chainlink(ctx context.Context, feed string, block uint64
 		if block == 0 {
 			return 0, fmt.Errorf("chainlink %s: %v", feed, err)
 		}
+		if err != nil && !isNoSuchValue(err) {
+			// A busy node or a transport error, not missing state: try again
+			// later (not "no update", which would move on to the next source).
+			return 0, fmt.Errorf("chainlink %s at block %d: %w", feed, block, err)
+		}
 		stateErr = err // historical state unavailable (full node): use the feed's events
 	}
-	aggs, err := o.feedAggregators(ctx, feed)
+	fi, err := o.feedAggregators(ctx, feed)
 	if err != nil {
 		return 0, err
 	}
-	var best *rpcLog
-	for _, agg := range aggs {
-		l, err := o.lastLogBefore(ctx, agg, []any{topicAnswerUpdated}, block)
-		if err != nil {
-			return 0, fmt.Errorf("chainlink %s: %w", feed, err)
-		}
-		if l != nil && (best == nil || l.block() > best.block()) {
-			best = l
-		}
+	best, err := o.feedLogAt(ctx, feed, fi, block)
+	if err != nil {
+		return 0, fmt.Errorf("chainlink %s: %w", feed, err)
 	}
 	if best == nil || len(best.Topics) < 2 {
 		if stateErr != nil {
-			return 0, fmt.Errorf("chainlink %s: no historical state on this node (%v) and no AnswerUpdated event found before block %d", feed, stateErr, block)
+			return 0, fmt.Errorf("chainlink %s: no historical state on this node (%v) and no AnswerUpdated event found before block %d: %w", feed, stateErr, block, errFeedNoData)
 		}
-		return 0, fmt.Errorf("chainlink %s: no AnswerUpdated event found before block %d", feed, block)
+		return 0, fmt.Errorf("chainlink %s: no AnswerUpdated event found before block %d: %w", feed, block, errFeedNoData)
 	}
 	p := bigToFloat(signedWord(unhex(best.Topics[1]), 0)) / pow10(fm.Decimals)
 	if p <= 0 {
@@ -2084,25 +2323,86 @@ func (o *onchainSource) chainlink(ctx context.Context, feed string, block uint64
 	return p, nil
 }
 
-// feedAggregators lists the contracts that emit a feed's AnswerUpdated events:
-// every phase aggregator behind the proxy (or the address itself if it isn't a proxy).
-func (o *onchainSource) feedAggregators(ctx context.Context, feed string) ([]string, error) {
-	o.mu.Lock()
-	if a, ok := o.aggregators[feed]; ok {
-		o.mu.Unlock()
-		return a, nil
+// feedLogAt: the last AnswerUpdated at or before block (within the look-back)
+// of the aggregator the proxy used at that block (nil = none):
+//   - a proxy that logs its switches (AggregatorConfirmed, v0.7+): the
+//     aggregator confirmed last at or before the block (before the first
+//     switch: the one it replaced);
+//   - otherwise (v0.6 proxies log nothing): the newest phase whose aggregator
+//     had reported by then. An old aggregator that keeps reporting after the
+//     switch is never read past the new one's first report.
+//
+// When the aggregator the proxy names for that block has nothing within the
+// look-back but another phase has, that one is used and the stale aggregator
+// is logged (once per feed and aggregator).
+func (o *onchainSource) feedLogAt(ctx context.Context, feed string, fi *feedInfo, block uint64) (*rpcLog, error) {
+	if len(fi.confirms) > 0 {
+		active := fi.confirms[0].prev
+		for _, c := range fi.confirms {
+			if c.block <= block {
+				active = c.latest
+			}
+		}
+		if active != zeroAddr && active != "" {
+			l, err := o.lastLogBefore(ctx, active, []any{topicAnswerUpdated}, block)
+			if err != nil || l != nil {
+				return l, err
+			}
+		}
+		for i := len(fi.aggs) - 1; i >= 0; i-- {
+			if fi.aggs[i] == active {
+				continue
+			}
+			l, err := o.lastLogBefore(ctx, fi.aggs[i], []any{topicAnswerUpdated}, block)
+			if err != nil {
+				return nil, err
+			}
+			if l != nil {
+				o.warnOnce("stale|"+feed+"|"+active, "prices: chainlink %s: aggregator %s (in use at block %d by the proxy's AggregatorConfirmed) has no AnswerUpdated within the look-back — using %s instead",
+					feed, active, block, fi.aggs[i])
+				return l, nil
+			}
+		}
+		return nil, nil
 	}
+	for i := len(fi.aggs) - 1; i >= 0; i-- { // newest phase first
+		l, err := o.lastLogBefore(ctx, fi.aggs[i], []any{topicAnswerUpdated}, block)
+		if err != nil || l != nil {
+			return l, err
+		}
+	}
+	return nil, nil
+}
+
+// feedAggregators lists the contracts behind a feed proxy (every phase
+// aggregator, or the address itself if it isn't a proxy) and the proxy's
+// AggregatorConfirmed events. Cached for feedInfoTTL; when the proxy's current
+// aggregator differs from the one read before, the switch is logged.
+func (o *onchainSource) feedAggregators(ctx context.Context, feed string) (*feedInfo, error) {
+	now := o.clock()
+	o.mu.Lock()
+	old := o.feedInfos[feed]
 	o.mu.Unlock()
+	if old != nil && now.Sub(old.at) < feedInfoTTL {
+		return old, nil
+	}
+	var desc []string // newest phase first
 	seen := map[string]bool{}
-	var out []string
 	add := func(a string) {
 		if a != zeroAddr && !seen[a] {
 			seen[a] = true
-			out = append(out, a)
+			desc = append(desc, a)
 		}
 	}
+	current := ""
+	if ab, err := o.rpc.ethCall(ctx, feed, selAggregator, 0); err == nil {
+		current = addrFromWord(ab)
+		add(current)
+	} else if err := nonRPC(err); err != nil {
+		return nil, err
+	}
 	if b, err := o.rpc.ethCall(ctx, feed, selPhaseID, 0); err == nil {
-		for i := word(b, 0).Int64(); i >= 1 && len(out) < 10; i-- {
+		for i := word(b, 0).Int64(); i >= 1 && len(desc) < 10; i-- {
 			if ab, err := o.rpc.ethCall(ctx, feed, selPhaseAggregator+fmt.Sprintf("%064x", i), 0); err == nil {
 				add(addrFromWord(ab))
 			} else if err := nonRPC(err); err != nil {
@@ -2112,21 +2412,48 @@ func (o *onchainSource) feedAggregators(ctx context.Context, feed string) ([]str
 	} else if err := nonRPC(err); err != nil {
 		return nil, err
 	}
-	if ab, err := o.rpc.ethCall(ctx, feed, selAggregator, 0); err == nil {
-		add(addrFromWord(ab))
-	} else if err := nonRPC(err); err != nil {
-		return nil, err
-	}
-	if len(out) == 0 {
+	if len(desc) == 0 {
 		add(feed) // not a proxy: the address emits the events itself
 	}
-	o.mu.Lock()
-	if o.aggregators == nil {
-		o.aggregators = map[string][]string{}
+	fi := &feedInfo{at: now}
+	for i := len(desc) - 1; i >= 0; i-- {
+		fi.aggs = append(fi.aggs, desc[i])
 	}
-	o.aggregators[feed] = out
+	// The proxy's own switch events: a handful over its whole life, one
+	// request (split only if the node refuses), then only the new blocks.
+	head, err := o.rpc.blockNumber(ctx)
+	if err != nil {
+		return nil, err
+	}
+	from := uint64(1)
+	if old != nil {
+		fi.confirms, from = slices.Clone(old.confirms), old.through+1
+	}
+	if from <= head {
+		err := o.rpc.getLogsChunkedUpTo(ctx, feed, []any{topicAggregatorConfirmed}, from, head, head+1, func(l rpcLog) {
+			if len(l.Topics) >= 3 {
+				fi.confirms = append(fi.confirms, aggConfirm{block: l.block(),
+					prev: addrFromWord(unhex(l.Topics[1])), latest: addrFromWord(unhex(l.Topics[2]))})
+			}
+		})
+		if err != nil {
+			return nil, fmt.Errorf("chainlink %s: AggregatorConfirmed events: %w", feed, err)
+		}
+		fi.through = head
+	} else {
+		fi.through = old.through
+	}
+	sort.SliceStable(fi.confirms, func(i, j int) bool { return fi.confirms[i].block < fi.confirms[j].block })
+	if old != nil && len(old.aggs) > 0 && current != "" && old.aggs[len(old.aggs)-1] != current {
+		log.Printf("prices: chainlink %s switched aggregator: %s → %s", feed, old.aggs[len(old.aggs)-1], current)
+	}
+	o.mu.Lock()
+	if o.feedInfos == nil {
+		o.feedInfos = map[string]*feedInfo{}
+	}
+	o.feedInfos[feed] = fi
 	o.mu.Unlock()
-	return out, nil
+	return fi, nil
 }
 
 // lastLogBefore finds the latest matching log at or before block, searching
@@ -2134,15 +2461,22 @@ func (o *onchainSource) feedAggregators(ctx context.Context, feed string) ([]str
 // first small window; quiet ones, e.g. a stock feed over a weekend, need more),
 // up to PriceLookback blocks.
 func (o *onchainSource) lastLogBefore(ctx context.Context, address string, topics []any, block uint64) (*rpcLog, error) {
+	return o.lastLogBetween(ctx, address, topics, 1, block)
+}
+
+// lastLogBetween is lastLogBefore that also stops at block floor (a log
+// before floor is not looked for).
+func (o *onchainSource) lastLogBetween(ctx context.Context, address string, topics []any, floor, block uint64) (*rpcLog, error) {
+	floor = max(floor, 1)
 	hi := block
 	span := uint64(2000)
 	limit := o.rpc.maxChunk // lowered when the node refuses a range (this search only)
-	for hi > 0 && block-hi < o.cfg.PriceLookback {
+	for hi >= floor && hi > 0 && block-hi < o.cfg.PriceLookback {
 		if span > limit {
 			span = limit
 		}
-		lo := uint64(1)
-		if hi > span {
+		lo := floor
+		if hi > span && hi-span+1 > floor {
 			lo = hi - span + 1
 		}
 		logs, err := o.rpc.retryLogs(ctx, true, func() ([]rpcLog, error) { return o.rpc.getLogs(ctx, address, topics, lo, hi) })
@@ -2166,7 +2500,7 @@ func (o *onchainSource) lastLogBefore(ctx context.Context, address string, topic
 		if best != nil {
 			return best, nil
 		}
-		if lo == 1 {
+		if lo == floor {
 			break
 		}
 		hi = lo - 1
@@ -2247,17 +2581,17 @@ func (o *onchainSource) liquidityUSD(ctx context.Context, st *onchainState, qUSD
 	return bigToFloat(word(b, 0)) / pow10(st.QuoteDec) * qUSD, true
 }
 
-// quoteSource names where a quote asset's USD price comes from (for diagnostics).
+// quoteSource names where a quote asset's USD price comes from (for
+// diagnostics): a direct source, or the own pool used last.
 func (o *onchainSource) quoteSource(quote string) string {
 	quote = strings.ToLower(quote)
 	if d := o.quoteSourceDirect(quote); d != "none" {
 		return d
 	}
 	o.mu.Lock()
-	qp := o.quotePools[quote]
-	o.mu.Unlock()
-	if qp != nil {
-		return "its " + qp.QuoteSym + " pool (uniswap-" + qp.Kind + ")"
+	defer o.mu.Unlock()
+	if ps := o.usdPools[quote]; ps != nil && ps.source != "" {
+		return ps.source
 	}
 	return "none"
 }
@@ -2267,9 +2601,12 @@ func (o *onchainSource) describe() string {
 	if o.cfg.RPS > 0 {
 		limit = fmt.Sprintf("%d req/s", o.cfg.RPS)
 	}
-	s := fmt.Sprintf("eth_getLogs ranges of up to %d blocks, %d ranges per scan, up to %d requests in flight, %s; ", o.rpc.maxChunk, o.cfg.Parallel, cap(o.rpc.slots), limit) + fmt.Sprintf("on-chain pools via %s (v4 PoolManager %s, %d Chainlink feed(s) on Robinhood Chain)", o.cfg.RPCURL, o.cfg.PoolManagerV4, len(o.cfg.Feeds))
+	fm := o.feedMaps()
+	s := fmt.Sprintf("eth_getLogs ranges of up to %d blocks, %d ranges per scan, up to %d requests in flight, %s; ", o.rpc.maxChunk, o.cfg.Parallel, cap(o.rpc.slots), limit) +
+		fmt.Sprintf("on-chain pools via %s (v4 PoolManager %s, %d Chainlink feed(s) on Robinhood Chain, %d of them from the asset database)",
+			o.cfg.RPCURL, o.cfg.PoolManagerV4, len(fm.rh), fm.dbRH)
 	if o.mainnet != nil {
-		s += fmt.Sprintf("; ETH/USD + %d other feed(s) from Ethereum mainnet via %s", len(o.cfg.MainnetFeeds)-1, o.cfg.MainnetRPCURL)
+		s += fmt.Sprintf("; ETH/USD + %d other feed(s) from Ethereum mainnet via %s", len(fm.mainnet)-1, o.cfg.MainnetRPCURL)
 	}
 	return s
 }
