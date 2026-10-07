@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"maps"
 	"math"
 	"sync/atomic"
 	"time"
@@ -145,9 +146,13 @@ func (s *scanner) trackOneOnchain(ctx context.Context, t *ScoutCallTracking, pos
 	if t.EntryPriceUSD == nil {
 		q, ok, err := o.quoteUSD(ctx, st.Quote, st.EntryBlock)
 		if err != nil {
+			// Temporary (the node, or no trade yet in the quote's own pools):
+			// tried again later, never switched to quote units for it.
 			fail(TrackError, fmt.Errorf("USD price of %s: %w", st.QuoteSym, err), backoff(t.Attempts))
 			return
 		}
+		// ok=false: every USD source is definitively absent; the call is
+		// tracked in quote units.
 		unit, p := "usd", st.EntryPriceQ*q
 		st.EntryQuoteUSD = q
 		if !ok { // no USD source for this quote asset: keep everything in quote units
@@ -222,9 +227,16 @@ func (s *scanner) trackOneOnchain(ctx context.Context, t *ScoutCallTracking, pos
 			fail(TrackError, fmt.Errorf("block at +%s: %w", h.Name, err), backoff(t.Attempts))
 			return
 		}
+		// The segment up to this horizon is worked out on a copy of the state
+		// (scan cursor, extremes, rug): it replaces the state only once the
+		// segment's candles are stored. A failure before that (node, USD
+		// price, candle times, database) leaves the state as it was, so the
+		// next run reads the same segment again and nothing is lost or counted
+		// twice (candle upserts add up event counts).
+		work := st.clone()
 		// Scan the swaps up to this horizon, building candles on the way. Event
 		// times come from the block number (see timeOfBlock).
-		segFrom, segTo := st.ScanBlock, hBlock
+		segFrom, segTo := work.ScanBlock, hBlock
 		tFrom, err := o.rpc.blockTime(ctx, segFrom)
 		if err != nil {
 			fail(TrackError, fmt.Errorf("time of block %d: %w", segFrom, err), backoff(t.Attempts))
@@ -244,9 +256,9 @@ func (s *scanner) trackOneOnchain(ctx context.Context, t *ScoutCallTracking, pos
 				}
 				return
 			}
-			buf.add(ts, p, block > st.LateBlock)
+			buf.add(ts, p, block > work.LateBlock)
 		}
-		if err := o.scan(ctx, st, hBlock, obs); err != nil {
+		if err := o.scan(ctx, work, hBlock, obs); err != nil {
 			fail(TrackError, fmt.Errorf("swaps to +%s: %w", h.Name, err), backoff(t.Attempts))
 			return
 		}
@@ -258,14 +270,11 @@ func (s *scanner) trackOneOnchain(ctx context.Context, t *ScoutCallTracking, pos
 			if !inUSD {
 				return 1, nil
 			}
-			return o.quoteUSDHour(ctx, st.Quote, hour)
+			return o.quoteUSDHour(ctx, work.Quote, hour)
 		}
 		candles, err := buf.list(scale)
 		if err == nil {
-			err = buf.foldExtremes(st, scale)
-		}
-		if err == nil {
-			err = s.db.UpsertCandles(ctx, t.CallID, candles)
+			err = buf.foldExtremes(work, scale)
 		}
 		if err != nil {
 			fail(TrackError, fmt.Errorf("candles to +%s: %w", h.Name, err), backoff(t.Attempts))
@@ -273,17 +282,24 @@ func (s *scanner) trackOneOnchain(ctx context.Context, t *ScoutCallTracking, pos
 		}
 		// Drained at or before this horizon's end (found by this scan, or ahead
 		// of it by the latest pass): -100%, no USD rate needed.
-		rugged := st.RugBlock > 0 && st.RugBlock <= hBlock
+		rugged := work.RugBlock > 0 && work.RugBlock <= hBlock
 		q := 1.0
 		if inUSD && !rugged {
 			var ok bool
-			if q, ok, err = o.quoteUSD(ctx, st.Quote, hBlock); err != nil || !ok {
+			if q, ok, err = o.quoteUSD(ctx, work.Quote, hBlock); err != nil || !ok {
 				if err == nil {
-					err = errors.New("no USD source")
+					err = errNoUSDSource
 				}
-				fail(TrackError, fmt.Errorf("USD price of %s at +%s: %w", st.QuoteSym, h.Name, err), backoff(t.Attempts))
+				fail(TrackError, fmt.Errorf("USD price of %s at +%s: %w", work.QuoteSym, h.Name, err), backoff(t.Attempts))
 				return
 			}
+		}
+		if err := s.db.UpsertCandles(ctx, t.CallID, candles); err != nil {
+			fail(TrackError, fmt.Errorf("candles to +%s: %w", h.Name, err), backoff(t.Attempts))
+			return
+		}
+		st = work // the segment is stored: it is the state from now on
+		if inUSD && !rugged {
 			lastQ, lastQKnown = q, true
 		}
 		if !s.saveHorizonOnchain(ctx, t, st, h, due, entryQ, q, rugged, fail, tag) {
@@ -329,6 +345,17 @@ func (s *scanner) trackOneOnchain(ctx context.Context, t *ScoutCallTracking, pos
 	t.Rugged = &rug
 	t.Status = TrackDone
 	t.NextCheckAt = now
+}
+
+// clone is a deep copy of the state (the horizon step works on one).
+func (st *onchainState) clone() *onchainState {
+	c := *st
+	c.Done = maps.Clone(st.Done)
+	if st.RugLiquidityUSD != nil {
+		v := *st.RugLiquidityUSD
+		c.RugLiquidityUSD = &v
+	}
+	return &c
 }
 
 // flagRugged marks a call whose pool was drained: rugged, and, when the quote

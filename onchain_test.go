@@ -43,11 +43,17 @@ type fakeChain struct {
 	// answer it with a JSON-RPC error (non-empty return) or sleep. Called without
 	// f.mu held, possibly from several requests at once.
 	logsHook func(addr string, from, to uint64) string
-	fullNode bool           // no historical state: eth_call at old blocks fails
-	callTags []string       // block tag of every eth_call received
-	queries  []fakeLogQuery // every eth_getLogs the chain answered (address, topics, range)
-	count    map[string]int
-	srv      *httptest.Server
+	fullNode bool // no historical state: eth_call at old blocks fails
+	// callErr (optional): a JSON-RPC error message for an eth_call ("" = none),
+	// e.g. a busy node; to and sel are lower case.
+	callErr func(to, sel string, block uint64) string
+	// dataCalls: eth_call handlers that see the whole call data (arguments),
+	// asked before calls; "to|selector".
+	dataCalls map[string]func(data string, block uint64) (string, bool)
+	callTags  []string       // block tag of every eth_call received
+	queries   []fakeLogQuery // every eth_getLogs the chain answered (address, topics, range)
+	count     map[string]int
+	srv       *httptest.Server
 }
 
 // fakeLogQuery is one eth_getLogs request as the chain received it.
@@ -206,8 +212,23 @@ func (f *fakeChain) serve(w http.ResponseWriter, r *http.Request) {
 			sel = sel[:10]
 		}
 		f.callTags = append(f.callTags, tag)
+		if f.callErr != nil {
+			if msg := f.callErr(strings.ToLower(c.To), strings.ToLower(sel), num(tag)); msg != "" {
+				fail(msg)
+				return
+			}
+		}
 		if f.fullNode && tag != "latest" {
 			fail("missing trie node 6b1f… (path ) state 0x… is not available")
+			return
+		}
+		if dh := f.dataCalls[strings.ToLower(c.To)+"|"+sel]; dh != nil {
+			res, good := dh(strings.ToLower(c.Data), num(tag))
+			if !good {
+				fail("execution reverted")
+				return
+			}
+			ok(res)
 			return
 		}
 		h := f.calls[strings.ToLower(c.To)+"|"+sel]

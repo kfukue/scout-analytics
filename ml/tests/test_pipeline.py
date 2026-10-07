@@ -57,8 +57,32 @@ def test_update_posts_are_excluded_and_counted_on_their_own_line(synthetic_df, t
     assert data["update"] == 50 and data["rows"] == plain["rows"]
     # every row is in exactly one line of the report
     for d in (plain, data):
-        assert d["update"] + d["no_pool"] + d["repeat"] + d["not_usd"] + d["eligible"] == d["rows"]
+        assert (d["update"] + d["no_pool"] + d["repeat"] + d["not_usd"] + d["extreme"]
+                + d["eligible"] == d["rows"])
     assert data["eligible"] < plain["eligible"]
+
+
+def test_extreme_outcomes_are_excluded_and_counted(synthetic_df, tmp_path, monkeypatch):
+    from scout_ml.labels import build_labels
+    df = synthetic_df.copy()
+    df["post_kind"] = "call"
+    L = build_labels(df)
+    base = int((~L["no_pool"] & ~L["not_usd"] & L["extreme"]).sum())   # the generator makes a few itself
+    idx = df.index[(~L["no_pool"] & ~L["not_usd"] & ~L["extreme"]).to_numpy()]
+    df.loc[idx[:5], "ret_late_7d"] = 2e5                 # medium label column
+    df.loc[idx[5:7], "max_gain_late_1d"] = float("inf")  # short runner column
+    df.loc[idx[7:9], "max_gain_7d"] = 1e9                # not label-relevant: kept
+    df.loc[idx[9], "ret_late_3d"] = 1e5                  # exactly the cap: kept
+    df.loc[idx[10:13], ["post_kind", "ret_late_7d"]] = ["update", 2e5]  # counted as update
+    report = render_report_for(df, tmp_path, monkeypatch)
+    want = base + 7
+    line = f"- excluded, extreme outcome (a label/simulation outcome above 100,000 %; bogus pool data): {want}"
+    assert line in report, [r for r in report.splitlines() if "extreme" in r]
+    data = json.loads((tmp_path / "v" / "meta.json").read_text())["data"]
+    assert data["extreme"] == want and data["update"] == 3, data
+    assert data["eligible"] == len(idx) - 10, (data["eligible"], len(idx))
+    assert (data["update"] + data["no_pool"] + data["repeat"] + data["not_usd"] + data["extreme"]
+            + data["eligible"] == data["rows"])
 
 
 def render_report_for(df, root, monkeypatch):

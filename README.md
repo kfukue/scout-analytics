@@ -125,17 +125,64 @@ is enough**, as long as it serves old event logs (`eth_getLogs`); an archive nod
 
 1. **Pool:** found from the token's own transfers around the call: the address it moved
    to/from most is checked on-chain and identified as a Uniswap **v2** pair, **v3** pool or a
-   **v4** pool on the PoolManager (matched through the swaps in the same transactions).
-   No indexer or factory address needed. **Pons V2** tokens are recognised first and tracked
-   on their bonding curve (see "Pons V2 tokens" below).
+   **v4** pool on the PoolManager. No indexer or factory address needed.
+   - **v4** (when the PoolManager is among those addresses): the token's pools come from the
+     PoolManager's `Initialize` events, which index both currencies: two `eth_getLogs` over the
+     whole history (token as currency0, token as currency1), each one request on a node with a
+     full log index (split automatically if the node refuses the range or times out). Then
+     those pools' `Swap`s around the call, filtered by pool id (indexed; up to 32 ids per
+     request). The pool with the most swaps in the same transactions as the token's transfers
+     wins (ties: the lowest pool id); for an asset's own USD pools (step 3) only pools against
+     WETH/ETH or a stablecoin count. No `Initialize` = no v4 pool: nothing else is asked.
+     The PoolManager's swaps are never read unfiltered (that is every v4 trade on the chain,
+     tens of thousands of logs per window). The pools found are kept in memory per token, so
+     a later lookup only reads the new blocks.
+   - **Node load per discovery:** the token's `Transfer`s around the call (widened ×4, ×16, ×64
+     while there are none; only these are widened), a few `eth_call`s per v2/v3 candidate,
+     and for v4 the 2 `Initialize` requests plus about 1 `Swap` request per 32 candidate pools
+     (per `SCOUT_RPC_LOG_CHUNK` range of the window).
+   - **Pons V2** tokens are recognised first and tracked on their bonding curve (see "Pons V2
+     tokens" below).
 2. **Prices:** every trade, from the pool's events: v2 `Sync` (reserves), v3/v4 `Swap`
    (`sqrtPriceX96`). So peak and drawdown are exact, not candle approximations.
-3. **USD:** the pool price is in the pool's other asset. It's converted with a **Chainlink
-   feed** as of that block, `$1` for stablecoins (USDG), and for ETH the WETH/USDG v3 pool if
-   no ETH feed is configured. On an archive node the value is read from contract state
-   (`latestRoundData()` / `slot0()` at the block); on a **full node** (no historical state) it
-   comes from event logs instead: the feed aggregator's last `AnswerUpdated` and the pool's
-   last `Swap` at or before the block. This is detected automatically.
+3. **USD:** the pool price is in the pool's other asset (the quote asset). One lookup
+   converts it everywhere (entry, candles, horizons, latest pass, scoring, `-price-check`),
+   as of the block, trying in this order:
+   1. a stablecoin (`SCOUT_STABLES`, USDG) = `$1`;
+   2. a **Chainlink feed on Robinhood Chain** (`SCOUT_CHAINLINK_FEEDS` plus the asset
+      database, see "Chainlink feeds from the asset database" below);
+   3. a **Chainlink feed on Ethereum mainnet** (`SCOUT_MAINNET_CHAINLINK_FEEDS` plus the
+      asset database; needs `SCOUT_MAINNET_RPC_URL`); for ETH/WETH then the WETH/USDG v3
+      pool (`SCOUT_ETH_USD_POOL`);
+   4. the asset's **own pool against WETH / native ETH** × ETH/USD;
+   5. the asset's **own pool against a stablecoin**.
+
+   On an archive node feeds and pools are read from contract state (`latestRoundData()` /
+   `slot0()` at the block); on a **full node** (no historical state) from event logs: the
+   last `AnswerUpdated` of the aggregator the feed used at that block, and the pool's last
+   `Swap` at or before the block. This is detected automatically. A source that fails for a
+   temporary reason (node busy, time-out) is an error and the call is tried again later; the
+   next source is only asked when one is definitively absent (no feed configured, or a feed
+   with no update within `SCOUT_PRICE_LOOKBACK_BLOCKS`).
+
+   **Own pools (4, 5).** The asset's pools against WETH/ETH or a stablecoin are found like a
+   token's pool (its transfers around the first block asked, v4 through `Initialize`); up to
+   3 of each kind are kept. For every block the pool whose last trade at or before it is the
+   most recent (within `SCOUT_PRICE_LOOKBACK_BLOCKS`) is used, a WETH/ETH pool before a
+   stablecoin pool, so the pool can change from block to block (one log line when it does:
+   `prices: USD price of VIRTUAL (0x…) now from its USDG pool (uniswap-v3 0x…) (was …)`). A
+   block none of the known pools covers starts one more search around that block. What is
+   remembered (in memory, per process): pools found, and prices per asset and hour; "no
+   pool" for 1 hour and "no price yet" (pools, but no trade before that block) for 6 hours,
+   then asked again. A node error is never remembered as "no pool".
+
+   **Feed aggregators.** A Chainlink proxy can switch to a new aggregator. Its aggregator list
+   is read again every hour (a switch is logged: `prices: chainlink 0x… switched aggregator:
+   0x… → 0x…`). For a past block the tracker reads the aggregator the proxy used then: from the
+   proxy's `AggregatorConfirmed` events (AggregatorProxy v0.7+), else the newest phase
+   aggregator that had reported by that block, so an old aggregator that keeps reporting after
+   the switch is not read. If the aggregator named for a block has no update within the
+   look-back but another one has, that one is used and a "stale aggregator" line is logged once.
 4. **Each horizon** (`1h, 1d, 3d, 7d, 30d`): price, **return %**, **max gain %**, **max drawdown %**
    → `scout_call_returns`. Swaps are scanned once: progress is kept per call, each check
    only reads the new block range.
@@ -210,7 +257,7 @@ bonding curve first and move to a Uniswap v4 pool when they graduate.
   a month from the call. Either event is enough (the close is placed at `PoolGraduated` when
   `CurveCompleted` is missing; the pool's `Initialize` with the Pons hook is looked for when
   `PoolGraduated` is missing). A confirmed Pons token never falls back to the generic
-  transfer-counterparty search (its PoolManager-wide swap scan is very slow on a full node):
+  transfer-counterparty search (which knows nothing of the curve):
   if neither event is found, the call fails with "the curve has closed, but neither
   CurveCompleted nor PoolGraduated was found in the event logs" and is tried again later.
 - **Node load per Pons call:** discovery 4–5 `eth_call`s (`curve()`, `factory()`, `token()`,
@@ -224,7 +271,8 @@ bonding curve first and move to a Uniswap v4 pool when they graduate.
 `scout_call_tracking.current_liquidity_usd` keeps its meaning: the pool's depth, **2 × the
 quote side** in USD (so a call rugged at $400 of quote side shows $800); v4 pools have none
 unless they rugged. The rule above describes the on-chain source; `SCOUT_PRICE_SOURCE=gecko`
-compares GeckoTerminal's `reserve_usd` (both sides) with the same number.
+compares half of GeckoTerminal's `reserve_usd` (which counts both sides) with the same number,
+and stores `reserve_usd` itself as the depth.
 
 **Only the first call of each token is tracked.** The channel often calls the same token
 again; following every repeat would cost days of node time for the same price history. The
@@ -259,16 +307,37 @@ that time, and reads `latestRoundData()` of the feed there (`0x5f4eC3Df…5b8419
 The Robinhood node then only has to serve logs (a full node is enough). Other mainnet feeds
 can be mapped to a paired asset with `SCOUT_MAINNET_CHAINLINK_FEEDS=0xQuoteTokenOnRobinhood=0xFeedOnEthereum`.
 
-Order of sources for a paired asset's USD price: stablecoin ($1) → mainnet Chainlink feed
-(if `SCOUT_MAINNET_RPC_URL` is set) → Chainlink feed on Robinhood Chain → WETH/USDG pool (ETH only).
+Order of sources for a paired asset's USD price: stablecoin ($1) → Chainlink feed on
+Robinhood Chain → mainnet Chainlink feed (if `SCOUT_MAINNET_RPC_URL` is set) → WETH/USDG pool
+(ETH only) → the asset's own WETH/ETH pool → its own stablecoin pool (see "USD" above).
 
 **Long.xyz tokens trade against Stock Tokens** (NVDA, TSLA, …), so add their Chainlink feeds:
 
 ```
 SCOUT_CHAINLINK_FEEDS=eth=0xEthUsdFeed,0xNvdaToken=0xNvdaFeed,0xTslaToken=0xTslaFeed
 ```
-A pair whose quote asset has no feed is still tracked, **in that asset's units**
-(`price_unit` = e.g. `TSLA` instead of `usd`); the returns are then relative to the stock token.
+A pair whose quote asset has no USD source at all (no feed, no pool against WETH/ETH or a
+stablecoin) is still tracked, **in that asset's units** (`price_unit` = e.g. `TSLA` instead of
+`usd`); the returns are then relative to the stock token. Only a definitive "no source" does
+this: a temporary failure at the entry (node error, or "no price yet": the asset's pools had
+not traded before the call block) leaves the call in `error` and it is tried again.
+
+**Chainlink feeds from the asset database.** When the database also holds the asset
+tracker's tables, the tracker reads feeds from them (read-only, no schema change):
+`asset_chains (asset_id, chain_id, chainlink_data_feed_contract_address)` joined to
+`assets (id, contract_address, chain_id)` and `chains (id, chain_id = EVM chain id)`. Tokens on
+Robinhood Chain (EVM 4663) with a feed on chain 4663 are added to `SCOUT_CHAINLINK_FEEDS`,
+with a feed on chain 1 to `SCOUT_MAINNET_CHAINLINK_FEEDS`. Addresses are compared in lower
+case; when two assets share a contract address the lowest asset id wins; on a conflict the
+environment wins. The feeds are read when the tracker starts and again every cycle (one small
+query, 10 s time-out), and replaced as a whole. Without those tables (or when the query
+fails) one line is logged and the tracker carries on with the feeds it has (the environment's
+only, if no read has worked yet):
+```
+chainlink feeds: 12 on Robinhood Chain and 3 on Ethereum mainnet from the asset database; in use 13 Robinhood + 4 mainnet
+chainlink feeds: no asset tables (assets / chains / asset_chains) in this database — using the environment's feeds only
+```
+`-price-check` does not open the database, so it only knows the environment's feeds.
 Chainlink stock feeds run 24/5, so weekend conversions use Friday's price. Max gain/drawdown
 are converted with the quote asset's USD price at the horizon (not at each trade).
 
@@ -284,10 +353,12 @@ and again after reading up to now:
 ```
 pool:         pons-curve bonding curve 0x… (kind pons)
 launchpad:    Pons V2 (curve 0x…, quote ETH 0x0000000000000000000000000000000000000000)
-graduation:   not graduated (still on the bonding curve)
+graduation:   graduated after the call: curve closed at block 123, v4 pool from block 456: PoolManager id 0x… (hook 0xe5e7…, token is currency1)
 …
-graduation now: curve closed at block 123, v4 pool from block 456: PoolManager id 0x… (hook 0xe5e7…, token is currency1)
+graduation now: graduated after the call: curve closed at block 123, v4 pool from block 456: PoolManager id 0x… (hook 0xe5e7…, token is currency1)
 ```
+(`not graduated (still on the bonding curve)` while it is; for a curve that closed after the
+call the pool is looked up for the first line too, as the scan does.)
 A known Pons token that shows a `uniswap-…` pool instead was not recognised: check that
 before resetting the `no_pool` calls.
 
@@ -339,13 +410,13 @@ Only use the feature columns as model inputs; everything about the future is an 
 | `SCOUT_PERF_HORIZONS` | `1h,1d,3d,7d,30d` | up to 40d |
 | `SCOUT_PRICE_SOURCE` | `onchain` | `gecko` = GeckoTerminal API instead (candles, ~10 req/min, no node needed) |
 | `SCOUT_RPC_URL` | `http://localhost:8540` | Robinhood Chain node (full or archive; must serve historical logs) |
-| `SCOUT_PRICE_LOOKBACK_BLOCKS` | `8640000` | full node: how far back (~10 days) to look for the last feed update / ETH swap |
+| `SCOUT_PRICE_LOOKBACK_BLOCKS` | `8640000` | how far back (~10 days) to look for the last feed update, ETH swap, or trade in an asset's own USD pool (a pool with no trade that recent is not used for that block) |
 | `SCOUT_RPC_RPS` | `0` | max RPC requests per second (`0` = no limit, for your own node; set a number for a shared or public endpoint) |
 | `SCOUT_RPC_LOG_CHUNK` | `200000` | most blocks per `eth_getLogs`. Every scan starts at this size. When the node refuses a range as too large (too many blocks or results, or an answer over 64 MB), or the range times out twice, that range is asked again in halves, for that scan only (not below 200 blocks); the scan grows back to this size after 3 answered ranges. Rate limits and busy answers are retried at the same size and never make ranges smaller |
 | `SCOUT_MAINNET_RPC_URL` | none | Ethereum mainnet **archive** node; enables ETH/USD from mainnet Chainlink |
-| `SCOUT_MAINNET_CHAINLINK_FEEDS` | `eth=` ETH/USD feed | extra `token=feedOnEthereum` mappings |
+| `SCOUT_MAINNET_CHAINLINK_FEEDS` | `eth=` ETH/USD feed | extra `token=feedOnEthereum` mappings; the asset database's mainnet feeds are added (these win on a conflict) |
 | `SCOUT_MAINNET_RPC_RPS` | `0` | max requests per second to the Ethereum node (`0` = no limit) |
-| `SCOUT_CHAINLINK_FEEDS` | none | feeds **on Robinhood Chain**: `token=feed,…`; use `eth` for WETH/native ETH |
+| `SCOUT_CHAINLINK_FEEDS` | none | feeds **on Robinhood Chain**: `token=feed,…`; use `eth` for WETH/native ETH; the asset database's feeds are added (these win on a conflict) |
 | `SCOUT_STABLES` | USDG | tokens worth $1 |
 | `SCOUT_WETH`, `SCOUT_V4_POOL_MANAGER`, `SCOUT_ETH_USD_POOL` | Robinhood Chain addresses | override if needed |
 | `SCOUT_DISCOVERY_BLOCKS` | `18000` | ± blocks around the call searched for the token's transfers (widened automatically) |
@@ -431,7 +502,7 @@ The on-chain tracker also stores what a model needs (state version 2):
 
 | What | Where | Notes |
 |---|---|---|
-| Dollar prices for every pair | `scout_call_tracking.price_unit` | A quote asset without a Chainlink feed (VIRTUAL, a stock token) is priced from its own WETH or stablecoin pool. It stays in quote units only if no such pool exists. |
+| Dollar prices for every pair | `scout_call_tracking.price_unit` | A quote asset without a Chainlink feed (VIRTUAL, a stock token) is priced from its own WETH/ETH or stablecoin pools (per block, the one that traded last). It stays in quote units only if no such pool exists. |
 | Realistic entry | `scout_call_tracking.entry_late_price_usd`, `scout_call_returns.*_late_pct` | The pool price `SCOUT_ENTRY_DELAY` (default `60s`) after the post, and return / peak / drawdown measured from it. |
 | Price path | `scout_call_candles` | 5-minute candles for the first 24 hours, hourly candles for the whole window. Only buckets with trades. |
 | Trading before the call | `scout_call_precall` | Swaps, buys, sells, volume and price change in the 5, 15 and 60 minutes before the post. |
@@ -597,6 +668,8 @@ An error the node does not explain is asked once more and, if it comes back, tre
 and picked up again on the next start. `gave_up` is only used when a call is past
 its last horizon and still has no pool or no trades. Calls an older version
 marked `gave_up`/`error` with `context canceled` are reset automatically at startup.
+
+**Ops scripts.** `ops/` holds one-off SQL scripts run by hand (see each folder's README).
 
 ## Where clean reports go
 
@@ -962,8 +1035,9 @@ other sites):
   except on a link (the post, GMGN, the Perceptor report) or while selecting text. The button
   is a real button: Tab to it and press Enter or Space; it says whether the row is open
   (`aria-expanded`). The panel shows:
-  - **Perceptor**: the verdict ("no red flags", "caution", "red flags"), the verdict line of
-    the report and its time, the summary, and "Open the Perceptor report" (https links only);
+  - **Perceptor**: the verdict once (the report's own verdict line, e.g. "No red flags found",
+    or the words "no red flags" / "caution" / "red flags" when it has none) and its time, the
+    summary, and "Open the Perceptor report" (https links only);
     "No Perceptor report" when the token was never scanned. It is the same report the
     Perceptor column shows.
   - **sAlpha**: the text of the token's latest completed sAlpha report, as plain text with its
@@ -971,7 +1045,12 @@ other sites):
     sAlpha's replies are empty; an empty reply (or one of white space only) counts as no
     report**: the latest reply that has text is shown, whichever post of the token it was made
     for, and "No sAlpha report" when there is none. A reply that failed, timed out or was
-    rate-limited never counts.
+    rate-limited never counts. **A reply that declines** ("Not enough public signals to
+    generate a report for this token.", "Too little liquidity or trading activity to research
+    yet."; the phrase list is `salphaDeclinePhrases` in `websnapshot.go`, matched anywhere in
+    the text, upper/lower case ignored) **is not a report either**: an older real report is
+    shown instead, however old; when the token has none, the panel says "sAlpha did not
+    generate a report" with the reason and time in grey.
   - A text longer than 32 KB is cut there and marked "Cut at 32 KB."; a long one scrolls
     inside the panel. The panel is never wider than the visible part of the table box, also on
     a phone while the table is scrolled sideways.
@@ -983,7 +1062,14 @@ other sites):
   the list (after a reset), the panel says "Not available in the data now shown; refresh the
   page."
 - **sA** — a small "sA" badge next to the Perceptor verdict (or its dash) marks a token that
-  has an sAlpha report with text (hover for a hint). An empty reply gives no badge.
+  has an sAlpha report with text (hover for a hint). An empty reply, or one that declines,
+  gives no badge.
+- **Rugged** — a call the tracker flagged `rugged` (`scout_call_tracking.rugged`, also while
+  it is still tracking) shows a red "rugged" badge in Status instead of the tracking status
+  (which is in its tooltip), a dash for **Peak %** in every window (the API sends
+  `peak_pct: null`, and `sort=peak` lists it with the rows without a peak), and a dash for
+  Latest MC (its latest price is 0). The returns are shown as stored (−100% for the windows
+  after the rug).
 - **Perceptor** — the column shows the verdict of the token's Perceptor report as words:
   "no red flags", "caution", "red flags" (linked to the report, in a new tab), or "–" when
   there is none. The "Perceptor" select next to the search box filters the list: All reports,
@@ -1013,10 +1099,19 @@ other sites):
   **Latest MC** (after "Call MC") is an **estimate**, since the latest market cap is not
   stored: the post's market cap (the Mcap line first, else "called at", by the same rule) ×
   the latest price ÷ the price at the post. It assumes the token supply has not changed. Both are written
-  compactly (`$850`, `$45.2k`, `$1.3M`, `$2.1B`); hover for the exact amount. A dash when
+  compactly (`$850`, `$45.2k`, `$1.3M`, `$2.1B`, and from $1 trillion on in powers of ten:
+  `$9.3×10³⁸`); hover for the exact amount. A dash when
   neither figure of the post is usable, when there is no latest price (Latest MC), and for calls not
   priced in USD. The legend under the table says that Latest MC is an estimate and how it is
   worked out.
+
+- **Huge numbers** — a percentage of ±1,000,000% or more is written in powers of ten
+  (`+3.9×10⁴⁷%`), and so is a dollar amount of $1 trillion or more (Entry $, Call MC, Latest
+  MC), with superscript digits, so the columns keep their width; the exact value is in the
+  tooltip.
+- **Look** — light and dark follow the system setting (`prefers-color-scheme`); the style
+  follows the owner's design reference (cards with a light border, a top bar, pill badges,
+  a system font stack). `style.css` only; no web fonts or other sites are loaded.
 
 **Token names.** The tracker reads each token's own `name()` and `symbol()` from its contract
 and stores them in `scout_call_tracking.token_name` / `token_symbol_onchain` (on-chain price
@@ -1099,7 +1194,9 @@ return of each window, whatever the `horizon`: each is exactly the `return_pct` 
 has when that window is asked for (`null` until the window is recorded). The page shows these
 five as its 1h … 30d columns; `return_pct` is kept for older clients. `entry_price_usd`,
 `return_pct`, `peak_pct`, `drawdown_pct` and the five window returns are `null` unless
-`price_unit` is `usd`. `gmgn_url` is `null` for anything that is not a plain `0x…` address.
+`price_unit` is `usd`. `peak_pct` is also `null` when `rugged` is `true` (the returns and
+`drawdown_pct` stay as stored). `gmgn_url` is `null` for anything that is not a plain `0x…`
+address.
 
 `latest_return_pct` and `latest_price_usd` are the return (from the same entry) and the price
 as of the tracker's most recent reading, `latest_at` when it was read
@@ -1145,9 +1242,11 @@ a call and say which reports `GET /api/call` returns for it (per token, like the
 `perceptor_report_id` = the id (`scout_investigations.id`) of the Perceptor investigation the
 verdict comes from; `salpha_report_id` = the id of the token's latest completed sAlpha
 investigation (tool `salpha`, `status = completed`, newest `requested_at`, contract address
-with upper/lower case ignored) **whose `report_text` is not empty and not only white space**;
-`has_salpha_report` = `salpha_report_id` is not `null`. A new report of either tool changes
-them, and so the `ETag` of `/api/calls`; an empty sAlpha reply changes nothing.
+with upper/lower case ignored) **whose `report_text` is not empty and not only white space**,
+a real report always before a reply that declines (see the row detail above);
+`has_salpha_report` = `salpha_report_id` is not `null` and that reply is not a decline. A new
+report of either tool changes them, and so the `ETag` of `/api/calls`; an empty sAlpha reply
+changes nothing.
 
 `GET /api/call?id=<call_id>` — the row detail: the Perceptor and sAlpha reports of the token of
 one listed call (`call_id` of a row of `/api/calls`), from memory:
@@ -1157,14 +1256,16 @@ one listed call (`call_id` of a row of `/api/calls`), from memory:
  "perceptor": {"id": 5120, "verdict": "caution", "label": "Caution", "summary": "Top 10 hold 40%",
    "url": "https://www.perceptor.info/r/deb9d3118ec1480e985032f9472c87c0",
    "at": "2026-10-01T14:31:02Z", "truncated": false},
- "salpha": {"id": 5121, "text": "Smart money: 3 wallets bought…", "url": null,
+ "salpha": {"id": 5121, "text": "Smart money: 3 wallets bought…", "declined": false, "url": null,
    "at": "2026-10-01T14:31:40Z", "truncated": false}}
 ```
 - `perceptor` = the report of `perceptor_report_id` (`null` when there is none): `verdict` is
   `clean`, `caution`, `red_flags` or `unknown`; `label` and `summary` are the report's
   `verdict_label` and `verdict_summary` (either may be `null`).
-- `salpha` = the report of `salpha_report_id` (`null` when the token has no sAlpha report with
+- `salpha` = the report of `salpha_report_id` (`null` when the token has no sAlpha reply with
   text): `text` is its `report_text`, plain text from a bot (show it as text, never as HTML).
+  `declined` = the reply only declines to report (`text` is then its reason); the page shows
+  "sAlpha did not generate a report".
 - `url` = the report's link, `null` unless it starts with `https://` (and is at most 2,048
   characters). `at` = `completed_at`, else `requested_at`. `truncated` = a text was longer
   than 32 KB and is cut there (at a character boundary).

@@ -1819,7 +1819,18 @@ func runPriceCheck(ctx context.Context, cfg *config, token, at string) error {
 	} else {
 		fmt.Printf("pair:         token (%d dec) / %s %s (%d dec), token is token%d\n", st.TokenDec, st.QuoteSym, st.Quote, st.QuoteDec, map[bool]int{true: 0, false: 1}[st.TokenIs0])
 	}
-	for _, line := range st.ponsSummary() {
+	atCall := st
+	if st.Kind == "pons" && st.PonsDone > 0 && st.PoolID == "" {
+		// The curve closed after the call: discovery did not look for the pool.
+		// Look it up on a copy, for this line only (the scan below does it too).
+		c := *st
+		if err := o.ponsFindPool(ctx, &c, latest); err != nil {
+			fmt.Printf("graduation:   v4 pool lookup: ERROR %v\n", err)
+		} else {
+			atCall = &c
+		}
+	}
+	for _, line := range atCall.ponsSummary() {
 		fmt.Println(line) // as found at the call
 	}
 	if err := o.entryPrice(ctx, st, latest); err != nil {

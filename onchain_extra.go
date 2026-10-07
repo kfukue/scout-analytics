@@ -4,100 +4,357 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"math"
 	"math/big"
+	"slices"
 	"strings"
 	"time"
 )
 
 // ---------------------------------------------------------------------------
-// Quote asset → USD through the asset's own pool (no Chainlink feed needed)
+// Asset → USD through the asset's own pools (no Chainlink feed needed)
 // ---------------------------------------------------------------------------
 
-// quoteViaPool prices a quote asset (e.g. VIRTUAL or a stock token) from the
-// pool it trades in against WETH or a stablecoin: the pool's last trade at or
-// before the block × the USD price of that pool's other side.
-func (o *onchainSource) quoteViaPool(ctx context.Context, quote string, block uint64) (float64, bool, error) {
-	quote = strings.ToLower(quote)
-	if quote == zeroAddr {
-		return 0, false, nil
+var (
+	// errNoUSDSource: every USD source of an asset is definitively absent (no
+	// stablecoin, no feed, no pool against WETH / ETH / a stablecoin).
+	errNoUSDSource = errors.New("no USD source")
+	// errNoPriceYet: the asset has pools against WETH / a stablecoin, but none
+	// of them traded within the look-back before the block. Temporary: tried
+	// again later (other pools may turn up).
+	errNoPriceYet = errors.New("no price yet")
+)
+
+const (
+	usdNoPoolTTL    = time.Hour     // "no pool" is asked again after this
+	usdNoPriceTTL   = 6 * time.Hour // "no price yet" at a block is asked again after this
+	usdPoolsPerTier = 3             // own pools kept per kind (WETH / ETH, stablecoin)
+)
+
+// usdPoolSet: what is known about one asset's own pools. Changed under o.mu only.
+type usdPoolSet struct {
+	sym         string
+	pools       []*onchainState      // every acceptable pool found (de-duplicated)
+	anchors     []uint64             // the blocks the pool search ran around
+	noPoolUntil time.Time            // the search found no pool: none until then
+	noPrice     map[uint64]time.Time // block → "no price yet" until then
+	source      string               // the pool used last (quoteSource, and the change log)
+	sourceRef   string               // … with its address / id
+}
+
+// usdPoolTier: 1 = the pool's other side is WETH / native ETH (× ETH/USD),
+// 2 = a stablecoin ($1), 0 = not a USD pool.
+func (o *onchainSource) usdPoolTier(other string) int {
+	other = strings.ToLower(other)
+	switch {
+	case o.isETH(other):
+		return 1
+	case o.cfg.Stables[other]:
+		return 2
 	}
-	o.mu.Lock()
-	qp, known := o.quotePools[quote]
-	o.mu.Unlock()
-	if !known {
-		at := block
-		if at == 0 {
-			var err error
-			if at, err = o.rpc.blockNumber(ctx); err != nil {
-				return 0, false, err
-			}
-		}
-		direct := func(q string) bool {
-			q = strings.ToLower(q)
-			return q != quote && o.quoteSourceDirect(q) != "none"
-		}
-		found, err := o.discoverWith(ctx, quote, at, direct)
-		if err != nil && !errors.Is(err, errNoPool) {
-			if nonRPC(err) != nil || ctx.Err() != nil {
-				return 0, false, err // transport problem: try again later
-			}
-			err = errNoPool // not a token contract we can read
-		}
-		if err == nil {
-			qm, err := o.rpc.tokenInfo(ctx, found.Quote)
-			if err != nil {
-				return 0, false, err
-			}
-			found.QuoteDec, found.QuoteSym = qm.Decimals, qm.Symbol
-			qp = found
-		}
-		o.mu.Lock()
-		o.quotePools[quote] = qp // nil = this asset has no usable pool; don't look again
-		o.mu.Unlock()
-	}
-	if qp == nil {
-		return 0, false, nil
-	}
-	at := block
-	if at == 0 {
-		var err error
-		if at, err = o.rpc.blockNumber(ctx); err != nil {
+	return 0
+}
+
+// quoteViaPools prices an asset (e.g. VIRTUAL or a stock token) from its own
+// pools against WETH / native ETH (source 4) or a stablecoin (source 5): the
+// last trade at or before the block × the USD price of the pool's other side.
+// The pool whose last trade at or before the block is the most recent wins
+// (within SCOUT_PRICE_LOOKBACK_BLOCKS; ties: a WETH / ETH pool first), so the
+// pool can differ from block to block.
+//
+// Caching: the pools found are kept (a block none of them covers starts one
+// more search around that block); "no pool" is kept for usdNoPoolTTL and "no
+// price yet" at a block for usdNoPriceTTL; an error of the node is never kept.
+func (o *onchainSource) quoteViaPools(ctx context.Context, asset string, block uint64) (float64, bool, error) {
+	asset = strings.ToLower(asset)
+	if block == 0 {
+		b, err := o.rpc.blockNumber(ctx)
+		if err != nil {
 			return 0, false, err
 		}
+		block = b
 	}
-	addr, topics := qp.logFilter()
-	l, err := o.lastLogBefore(ctx, addr, topics, at)
+	now := o.clock()
+	reach := o.cfg.DiscoveryBlocks * 64 // the widest window of a search
+	o.mu.Lock()
+	set := o.usdPools[asset]
+	if set == nil {
+		set = &usdPoolSet{}
+		o.usdPools[asset] = set
+	}
+	noPool := now.Before(set.noPoolUntil)
+	retryAt, noPrice := set.noPrice[block]
+	pools := slices.Clone(set.pools)
+	prefer := ""
+	if set.sourceRef != "" {
+		prefer = set.sourceRef[strings.LastIndex(set.sourceRef, " ")+1:]
+	}
+	anchored := false
+	for _, a := range set.anchors {
+		if a <= block+reach && block <= a+reach {
+			anchored = true
+		}
+	}
+	o.mu.Unlock()
+	if noPool {
+		return 0, false, nil
+	}
+	if noPrice && now.Before(retryAt) {
+		return 0, false, fmt.Errorf("%s at block %d: %w (its pools have no trade within %d blocks before it; asked again after %s)",
+			asset, block, errNoPriceYet, o.cfg.PriceLookback, retryAt.Local().Format("15:04"))
+	}
+	search := func() error {
+		sym, found, err := o.discoverUSDPools(ctx, asset, block)
+		if err != nil {
+			return fmt.Errorf("own pools of %s: %w", asset, err)
+		}
+		pools = o.addUSDPools(asset, sym, block, found)
+		anchored = true
+		return nil
+	}
+	if len(pools) == 0 {
+		if err := search(); err != nil {
+			return 0, false, err
+		}
+		if len(pools) == 0 {
+			o.mu.Lock()
+			set.noPoolUntil = now.Add(usdNoPoolTTL)
+			o.mu.Unlock()
+			return 0, false, nil
+		}
+	}
+	p, src, ok, err := o.priceViaPools(ctx, pools, block, prefer)
+	if err == nil && !ok && !anchored {
+		// None of the known pools traded before this block: look for others
+		// around it (once; the result is kept like the first search's).
+		if err = search(); err == nil {
+			p, src, ok, err = o.priceViaPools(ctx, pools, block, prefer)
+		}
+	}
 	if err != nil {
 		return 0, false, err
 	}
-	if l == nil {
-		return 0, false, fmt.Errorf("no trades in the %s pool of quote asset %s before block %d", qp.QuoteSym, quote, at)
+	if !ok {
+		until := now.Add(usdNoPriceTTL)
+		o.mu.Lock()
+		if set.noPrice == nil {
+			set.noPrice = map[uint64]time.Time{}
+		}
+		for b, t := range set.noPrice {
+			if !now.Before(t) {
+				delete(set.noPrice, b)
+			}
+		}
+		set.noPrice[block] = until
+		o.mu.Unlock()
+		return 0, false, fmt.Errorf("%s at block %d: %w (its pools have no trade within %d blocks before it)", asset, block, errNoPriceYet, o.cfg.PriceLookback)
 	}
-	p := qp.priceOfLog(*l)
-	if p <= 0 {
-		return 0, false, fmt.Errorf("bad price in the pool of quote asset %s", quote)
-	}
-	q, ok, err := o.quoteUSDDirect(ctx, qp.Quote, block)
-	if err != nil || !ok {
-		return 0, false, err
-	}
-	return p * q, true, nil
+	o.noteUSDSource(asset, src)
+	return p, true, nil
 }
 
-// quoteSourceDirect is quoteSource without the pool fallback ("none" = no feed,
-// not a stablecoin, not ETH).
+// addUSDPools merges pools found by a search around block into the asset's
+// set and returns them all.
+func (o *onchainSource) addUSDPools(asset, sym string, block uint64, found []*onchainState) []*onchainState {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	set := o.usdPools[asset]
+	if sym != "" {
+		set.sym = sym
+	}
+	set.anchors = append(set.anchors, block)
+	have := map[string]bool{}
+	for _, p := range set.pools {
+		have[p.poolRef()] = true
+	}
+	for _, p := range found {
+		if !have[p.poolRef()] {
+			have[p.poolRef()] = true
+			set.pools = append(set.pools, p)
+		}
+	}
+	if len(set.pools) > 0 {
+		set.noPoolUntil = time.Time{}
+	}
+	return slices.Clone(set.pools)
+}
+
+// noteUSDSource records the pool an asset was priced from, and logs one line
+// when it is not the one used before.
+func (o *onchainSource) noteUSDSource(asset string, src *onchainState) {
+	short := "its " + src.QuoteSym + " pool (uniswap-" + src.Kind + ")"
+	ref := short + " " + src.poolRef()
+	o.mu.Lock()
+	set := o.usdPools[asset]
+	prev, sym := set.sourceRef, set.sym
+	set.source, set.sourceRef = short, ref
+	o.mu.Unlock()
+	if prev == ref {
+		return
+	}
+	if prev == "" {
+		log.Printf("prices: USD price of %s (%s) from %s", sym, asset, ref)
+		return
+	}
+	log.Printf("prices: USD price of %s (%s) now from %s (was %s)", sym, asset, ref, prev)
+}
+
+// priceViaPools: the asset's price in USD at block from the pool whose last
+// trade at or before it is the most recent (ties: a WETH / ETH pool first),
+// × the USD price of that pool's other side. ok=false: none of the pools has
+// a usable trade within the look-back. The pool used last (prefer) is read
+// first; once a pool has a trade at block X the others are only searched in
+// [X, block], so a quiet pool costs little.
+func (o *onchainSource) priceViaPools(ctx context.Context, pools []*onchainState, block uint64, prefer string) (float64, *onchainState, bool, error) {
+	type hit struct {
+		st   *onchainState
+		l    rpcLog
+		p    float64
+		tier int
+	}
+	ordered := make([]*onchainState, 0, len(pools))
+	for _, st := range pools {
+		if o.usdPoolTier(st.Quote) == 0 {
+			continue
+		}
+		if st.poolRef() == prefer {
+			ordered = append([]*onchainState{st}, ordered...)
+			continue
+		}
+		ordered = append(ordered, st)
+	}
+	var best *hit
+	for _, st := range ordered {
+		floor := uint64(1)
+		if best != nil {
+			floor = best.l.block()
+		}
+		addr, topics := st.logFilter()
+		l, err := o.lastLogBetween(ctx, addr, topics, floor, block)
+		if err != nil {
+			return 0, nil, false, fmt.Errorf("last trade in the %s pool %s: %w", st.QuoteSym, st.poolRef(), err)
+		}
+		if l == nil {
+			continue
+		}
+		p := st.priceOfLog(*l)
+		if p <= 0 {
+			continue // a drained pool (or a bound price): not a price
+		}
+		h := &hit{st: st, l: *l, p: p, tier: o.usdPoolTier(st.Quote)}
+		switch {
+		case best == nil, l.block() > best.l.block():
+			best = h
+		case l.block() == best.l.block() && (h.tier < best.tier || (h.tier == best.tier && l.index() > best.l.index())):
+			best = h
+		}
+	}
+	if best == nil {
+		return 0, nil, false, nil
+	}
+	q, ok, err := o.quoteUSDDirect(ctx, best.st.Quote, block)
+	if err != nil {
+		return 0, nil, false, fmt.Errorf("USD price of %s: %w", best.st.QuoteSym, err)
+	}
+	if !ok {
+		// ETH has no USD source (none configured, or no update within the
+		// look-back): only the stablecoin pools can price the asset.
+		var stable []*onchainState
+		for _, st := range pools {
+			if o.usdPoolTier(st.Quote) == 2 {
+				stable = append(stable, st)
+			}
+		}
+		if best.tier == 2 || len(stable) == 0 {
+			return 0, nil, false, nil
+		}
+		return o.priceViaPools(ctx, stable, block, prefer)
+	}
+	return best.p * q, best.st, true, nil
+}
+
+// discoverUSDPools finds the asset's pools against WETH / native ETH or a
+// stablecoin: the v2/v3 pools among who the asset was transferred to or from
+// around block at, and its v4 pools (Initialize events) that traded in the
+// same transactions. At most usdPoolsPerTier of each kind, the busiest
+// first. No pool and no error: the asset has none (or is not a token we can
+// read); an error is the node's and is never taken for "no pool".
+func (o *onchainSource) discoverUSDPools(ctx context.Context, asset string, at uint64) (string, []*onchainState, error) {
+	tm, err := o.rpc.tokenInfo(ctx, asset)
+	if err != nil {
+		if ctx.Err() == nil && (isRevert(err) || isNoSuchValue(err)) {
+			return "", nil, nil // not a token contract we can read
+		}
+		return "", nil, err
+	}
+	accept := func(q string) bool {
+		q = strings.ToLower(q)
+		return q != asset && o.usdPoolTier(q) > 0
+	}
+	cands, from, to, err := o.transferCounterparties(ctx, asset, at)
+	if err != nil {
+		return "", nil, err
+	}
+	if len(cands) > 32 {
+		cands = cands[:32] // the wanted pool is rarely the busiest counterparty
+	}
+	var found []*onchainState
+	n := [3]int{}
+	keep := func(st *onchainState) {
+		if t := o.usdPoolTier(st.Quote); t > 0 && n[t] < usdPoolsPerTier {
+			n[t]++
+			found = append(found, st)
+		}
+	}
+	for _, c := range cands {
+		if c.addr == o.cfg.PoolManagerV4 {
+			ranked, err := o.v4Ranked(ctx, asset, c.txs, from, to, accept)
+			if err != nil {
+				return "", nil, err
+			}
+			for _, p := range ranked {
+				st := &onchainState{Kind: "v4", Pool: o.cfg.PoolManagerV4, PoolID: p.id, TokenIs0: p.c0 == asset,
+					TokenDec: tm.Decimals, EntryBlock: at, Quote: p.c1}
+				if !st.TokenIs0 {
+					st.Quote = p.c0
+				}
+				keep(st)
+			}
+			continue
+		}
+		st := &onchainState{TokenDec: tm.Decimals, EntryBlock: at}
+		ok, err := o.resolveV2V3(ctx, st, asset, c.addr)
+		if err != nil {
+			return "", nil, err
+		}
+		if ok && accept(st.Quote) {
+			keep(st)
+		}
+	}
+	for _, st := range found {
+		qm, err := o.rpc.tokenInfo(ctx, st.Quote)
+		if err != nil {
+			return "", nil, err
+		}
+		st.QuoteDec, st.QuoteSym = qm.Decimals, qm.Symbol
+	}
+	return tm.Symbol, found, nil
+}
+
+// quoteSourceDirect is quoteSource without the pools ("none" = not a
+// stablecoin, no feed, and not ETH with the WETH/USDG pool). In quoteUSD's order.
 func (o *onchainSource) quoteSourceDirect(quote string) string {
 	quote = strings.ToLower(quote)
-	isETH := quote == zeroAddr || quote == o.cfg.WETH
+	fm := o.feedMaps()
 	switch {
 	case o.cfg.Stables[quote]:
 		return "stablecoin = $1"
-	case o.mainnet != nil && (o.cfg.MainnetFeeds[quote] != "" || (isETH && o.cfg.MainnetFeeds["eth"] != "")):
-		return "Chainlink on Ethereum mainnet"
-	case o.cfg.Feeds[quote] != "" || (isETH && o.cfg.Feeds["eth"] != ""):
+	case o.feedFor(fm.rh, quote) != "":
 		return "Chainlink on Robinhood Chain"
-	case isETH && o.cfg.EthUSDPool != "":
+	case o.mainnet != nil && o.feedFor(fm.mainnet, quote) != "":
+		return "Chainlink on Ethereum mainnet"
+	case o.isETH(quote) && o.cfg.EthUSDPool != "":
 		return "WETH/USDG pool"
 	}
 	return "none"
@@ -167,7 +424,8 @@ func (o *onchainSource) timeOfBlock(ctx context.Context, block uint64, est int64
 	return 0, fmt.Errorf("could not place block %d in time (near %s)", block, time.Unix(est, 0).UTC().Format(time.RFC3339))
 }
 
-// quoteUSDHour: USD price of the quote asset at a UTC hour boundary (cached).
+// quoteUSDHour: USD price of the quote asset at a UTC hour boundary. Found
+// prices are cached; an error or no source is asked again next time.
 func (o *onchainSource) quoteUSDHour(ctx context.Context, quote string, hour int64) (float64, error) {
 	key := strings.ToLower(quote) + "|" + fmt.Sprint(hour)
 	o.mu.Lock()
@@ -185,7 +443,7 @@ func (o *onchainSource) quoteUSDHour(ctx context.Context, quote string, hour int
 		return 0, err
 	}
 	if !found {
-		return 0, errors.New("no USD source")
+		return 0, fmt.Errorf("%s: %w", quote, errNoUSDSource)
 	}
 	o.mu.Lock()
 	o.hourQuotes[key] = q

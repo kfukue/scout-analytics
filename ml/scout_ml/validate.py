@@ -6,7 +6,8 @@ import numpy as np
 import pandas as pd
 from sklearn.metrics import average_precision_score, brier_score_loss, roc_auc_score
 
-from .config import GATES, MIN_WINDOW_TEST_ROWS, SKIP_FRAC, TOP_FRAC, TRAIN_FRAC, VAL_FRAC
+from .config import (GATES, MIN_WINDOW_TEST_ROWS, SIM_MAX_RET_PCT, SKIP_FRAC, TOP_FRAC,
+                     TRAIN_FRAC, VAL_FRAC)
 
 
 def time_split(dates: pd.Series, tokens: pd.Series, horizon_days: float) -> dict:
@@ -80,13 +81,15 @@ def trading_metrics(y_runner, runner_score, y_collapse, collapse_score, net_ret)
     lift            = runner rate in the top 10% by runner score / base rate
     collapse_removed= share of all collapses that sit in the 30% of calls with
                       the highest collapse score (i.e. avoided by skipping them)
-    sim_*           = mean net return of the top 10% vs buying every call
+    sim_*           = mean net return of the top 10% vs buying every call, each
+                      call's net return capped at SIM_MAX_RET_PCT (so that one
+                      huge winner cannot decide the comparison on its own)
     """
     out = {"top_lift": np.nan, "collapse_removed": np.nan, "sim_top_mean": np.nan,
            "sim_all_mean": np.nan, "sim_n_top": 0, "sim_beats_all": False}
     if runner_score is not None and len(runner_score):
         y, top = np.asarray(y_runner, dtype=float), top_mask(runner_score, TOP_FRAC)
-        ret = np.asarray(net_ret, dtype=float)
+        ret = np.minimum(np.asarray(net_ret, dtype=float), SIM_MAX_RET_PCT)
         if y.mean() > 0:
             out["top_lift"] = float(y[top].mean() / y.mean())
         out.update(sim_top_mean=float(ret[top].mean()), sim_all_mean=float(ret.mean()),

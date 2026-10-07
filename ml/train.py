@@ -149,7 +149,8 @@ def train(df: pd.DataFrame, out_root, version: str | None = None) -> Path:
     df = df.sort_values("message_date").reset_index(drop=True)
     L = build_labels(df)
     call = ~L["update"]  # update posts are not calls: out of training, counted on their own
-    eligible = call & ~L["no_pool"] & ~L["not_usd"]
+    extreme = call & ~L["no_pool"] & ~L["not_usd"] & L["extreme"]
+    eligible = call & ~L["no_pool"] & ~L["not_usd"] & ~L["extreme"]
     cat_levels = learn_cat_levels(df[eligible])
     X_all = build_features(df, cat_levels)
 
@@ -161,6 +162,7 @@ def train(df: pd.DataFrame, out_root, version: str | None = None) -> Path:
         "update": int(L["update"].sum()),
         "no_pool": int((call & L["no_pool"] & ~L["repeat"]).sum()), "repeat": int((call & L["repeat"]).sum()),
         "not_usd": int((call & ~L["no_pool"] & L["not_usd"]).sum()),
+        "extreme": int(extreme.sum()),
         "eligible": int(eligible.sum()),
         "coverage": {c: float(blank[c].notna().mean()) for c in raw_cols}}}
     reference = {}

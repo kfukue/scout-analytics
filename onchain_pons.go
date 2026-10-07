@@ -599,8 +599,7 @@ func (o *onchainSource) scanLogs(ctx context.Context, st *onchainState, from, to
 //     v4 state on the Pons pool, so the normal v4 rules apply from the start.
 //   - Closed, but the close cannot be found in the event logs: an error (the
 //     call is tried again later). A confirmed Pons token never goes to the
-//     generic counterparty search (its PoolManager-wide swap scan is very slow
-//     on a full node).
+//     generic counterparty search (which knows nothing of the curve).
 func (o *onchainSource) discoverPons(ctx context.Context, token string, tm tokenMeta, entryBlock uint64, curve, quote string) (*onchainState, error) {
 	qm, err := o.rpc.tokenInfo(ctx, quote)
 	if err != nil {
@@ -634,14 +633,21 @@ func (st *onchainState) ponsSummary() []string {
 		return nil
 	}
 	out := []string{fmt.Sprintf("launchpad:    Pons V2 (curve %s, quote %s %s)", st.Curve, st.QuoteSym, st.Quote)}
+	if st.PonsDone == 0 {
+		return append(out, "graduation:   not graduated (still on the bonding curve)")
+	}
+	when := ""
+	if st.EntryBlock > 0 && st.PonsDone > st.EntryBlock {
+		when = "graduated after the call: "
+	}
 	switch {
-	case st.PonsDone == 0:
-		out = append(out, "graduation:   not graduated (still on the bonding curve)")
-	case st.PoolID == "":
-		out = append(out, fmt.Sprintf("graduation:   curve closed at block %d; no v4 pool yet (searched through block %d)", st.PonsDone, st.PonsSeen))
-	default:
-		out = append(out, fmt.Sprintf("graduation:   curve closed at block %d, v4 pool from block %d: PoolManager id %s (hook %s, token is currency%d)",
-			st.PonsDone, st.PonsGrad, st.PoolID, st.Hook, map[bool]int{true: 0, false: 1}[st.TokenIs0]))
+	case st.PoolID != "":
+		out = append(out, fmt.Sprintf("graduation:   %scurve closed at block %d, v4 pool from block %d: PoolManager id %s (hook %s, token is currency%d)",
+			when, st.PonsDone, st.PonsGrad, st.PoolID, st.Hook, map[bool]int{true: 0, false: 1}[st.TokenIs0]))
+	case st.PonsSeen >= st.PonsDone:
+		out = append(out, fmt.Sprintf("graduation:   %scurve closed at block %d; no v4 pool yet (searched through block %d)", when, st.PonsDone, st.PonsSeen))
+	default: // the pool was not looked for (yet)
+		out = append(out, fmt.Sprintf("graduation:   %scurve closed at block %d; v4 pool not looked up", when, st.PonsDone))
 	}
 	return out
 }

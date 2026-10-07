@@ -32,6 +32,7 @@ func (s *scanner) trackLoop(ctx context.Context) {
 		return
 	}
 	if s.pc.Source == "onchain" {
+		s.reloadFeeds(ctx) // the asset database's Chainlink feeds, before the first line names them
 		log.Printf("performance tracking on: %s via %s; %d call(s) at a time", horizonNames(s.pc.Horizons), s.onchain.describe(), max(s.pc.Workers, 1))
 		if s.pc.LatestOn {
 			log.Printf("latest prices on: refreshed every %s for calls under 30 days old, every %s for older ones; at most %s call(s) per cycle (SCOUT_LATEST_REFRESH=off turns this off)",
@@ -65,6 +66,9 @@ func (s *scanner) trackLoop(ctx context.Context) {
 // to batch), the status line, token names, then the latest prices. more says
 // the horizon batch was full, so more of that work is waiting.
 func (s *scanner) trackCycle(ctx context.Context, batch int) (more bool) {
+	if s.pc.Source == "onchain" {
+		s.reloadFeeds(ctx) // feeds added to (or removed from) the asset database since the last cycle
+	}
 	n := s.trackDue(ctx, batch)
 	if ctx.Err() != nil {
 		return false
@@ -405,16 +409,21 @@ func (s *scanner) trackOne(ctx context.Context, t *ScoutCallTracking) {
 			}
 		}
 	}
-	rug := false
-	if t.CurrentLiquidityUSD != nil && *t.CurrentLiquidityUSD < s.pc.RugLiqUSD {
-		rug = true
-	}
+	rug := t.CurrentLiquidityUSD != nil && geckoRugged(*t.CurrentLiquidityUSD, s.pc.RugLiqUSD)
 	if t.CurrentPriceUSD != nil && *t.CurrentPriceUSD < *t.EntryPriceUSD*0.05 {
 		rug = true
 	}
 	t.Rugged = &rug
 	t.Status = TrackDone
 	t.NextCheckAt = now
+}
+
+// geckoRugged: GeckoTerminal's reserve_usd counts both sides of the pool;
+// SCOUT_RUG_LIQ_USD is meant for the quote side, taken as half the reserve
+// (current_liquidity_usd keeps the reserve itself: the pool's depth, like the
+// on-chain source's 2 × the quote side).
+func geckoRugged(reserveUSD, rugLiqUSD float64) bool {
+	return reserveUSD/2 < rugLiqUSD
 }
 
 // firstCheckAt: the first price check is right after the shortest horizon.
