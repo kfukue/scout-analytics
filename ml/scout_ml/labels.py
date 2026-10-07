@@ -42,24 +42,52 @@ def extreme_outcome(df: pd.DataFrame) -> pd.Series:
     return hit
 
 
+def repeat_call(df: pd.DataFrame, update: pd.Series) -> pd.Series:
+    """True for a call that is not the first call of its token.
+
+    First call = the website's and the tracker's rule: among the rows that are
+    not update posts, the lowest (message_date, call_id) per contract address,
+    compared without regard to letter case. `tracking_status = repeat` always
+    counts as a repeat, even when the row kept results from before it was set
+    aside; a later call left at `done` by an older tracker counts too."""
+    rep = text(df, "tracking_status") == REPEAT_STATUS
+    if "contract_address" not in df.columns or "message_date" not in df.columns:
+        return rep
+    ca = text(df, "contract_address").str.lower()
+    when = pd.to_datetime(df["message_date"], utc=True, errors="coerce", format="ISO8601")
+    order = pd.DataFrame({"ca": ca, "when": when, "id": num(df, "call_id"), "pos": range(len(df))},
+                         index=df.index)
+    calls = order[~update & ca.notna() & when.notna()]
+    calls = calls.sort_values(["when", "id", "pos"], na_position="last")
+    later = calls["ca"].duplicated(keep="first")
+    return rep | later.reindex(df.index, fill_value=False)
+
+
 def build_labels(df: pd.DataFrame) -> pd.DataFrame:
-    """Per row: `update` (an update post, not a call: never usable), `no_pool`,
-    `repeat` (the part of `no_pool` that is an untracked repeat call, reported
-    separately), `not_usd`, `extreme` (an outcome above MAX_OUTCOME_PCT: never
-    usable), and for each bucket `usable_<b>`,
-    `runner_<b>`, `collapse_<b>` (NaN where unusable) and `net_ret_<b>`."""
+    """Per row: `update` (an update post, not a call: never usable), `repeat`
+    (not the first call of its token: never usable), `no_pool`, `not_usd`,
+    `extreme` (an outcome above MAX_OUTCOME_PCT: never usable), and for each
+    bucket `usable_<b>`, `runner_<b>`, `collapse_<b>` (NaN where unusable) and
+    `net_ret_<b>`.
+
+    A bucket uses a row only once all of that bucket's outcome columns are
+    present. The view has an outcome only after its horizon was computed, so a
+    call still `tracking` (e.g. 1d-7d done, 30d not due yet) is used by the
+    short buckets and left out of `long` as not labelled yet, never counted as
+    a negative; that holds even when it is already flagged `rugged`."""
     out = pd.DataFrame(index=df.index)
     out["update"] = text(df, "post_kind") == UPDATE_KIND
+    out["repeat"] = ~out["update"] & repeat_call(df, out["update"])
     out["no_pool"] = (num(df, "entry_late_price_usd").isna()
                       | text(df, "tracking_status").isin(NO_POOL_STATUSES))
-    out["repeat"] = out["no_pool"] & (text(df, "tracking_status") == REPEAT_STATUS)
     out["not_usd"] = text(df, "price_unit") != "usd"
     out["extreme"] = extreme_outcome(df)
     rugged = to_bool(df["rugged"]) if "rugged" in df.columns else pd.Series(False, index=df.index)
     buy, sell = num(df, "tax_buy_pct"), num(df, "tax_sell_pct")
     for b, cfg in BUCKETS.items():
         needed = {cfg["runner"][0], cfg["collapse"][0], cfg["ret_col"]}
-        usable = ~out["update"] & ~out["no_pool"] & ~out["not_usd"] & ~out["extreme"]
+        usable = (~out["update"] & ~out["repeat"] & ~out["no_pool"] & ~out["not_usd"]
+                  & ~out["extreme"])
         for col in needed:
             usable &= num(df, col).notna()
         out[f"usable_{b}"] = usable

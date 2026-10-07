@@ -1,5 +1,7 @@
 # Re-track the suspicious first calls (pgAdmin version)
 
+**Status: DONE** (run 6 Oct, 151 calls). Do not run B again.
+
 > **One-off, October 2026.** These scripts re-track the calls that were tracked
 > under the old rug rules. Selection: quote-side liquidity < $500 (stored as
 > `current_liquidity_usd < 1000`), or impossible numbers. They are run **by

@@ -53,6 +53,38 @@ def test_walk_forward_windows_expand_and_respect_embargo(calls):
             assert dates[w["test"]].max() < w["start"] + pd.Timedelta(days=7)
 
 
+def test_token_grouping_ignores_letter_case():
+    """0xAbC and 0xabc are one token: both calls land on the same side."""
+    dates = pd.Series(pd.Timestamp("2026-08-01", tz="UTC") + pd.to_timedelta(np.arange(100), unit="D"))
+    tokens = pd.Series([f"0xT{i}" for i in range(100)])
+    tokens[95] = "0xt5"                                  # a late call of token 5, other case
+    s = V.time_split(dates, tokens, 1)
+    assert s["train"][5] and not s["test"][95] and not s["val"][95]
+    for w in V.walk_forward_windows(dates, tokens, 1):
+        assert not w["test"][95]
+
+
+@pytest.mark.parametrize("bucket,windows,with_train", [
+    ("short", 10, 10), ("3day", 10, 10), ("medium", 9, 8), ("long", 6, 2)])
+def test_fold_counts_for_the_first_real_dataset(bucket, windows, with_train):
+    """First real export: calls from 25 Jul 2026, exported 7 Oct 2026; a bucket
+    has labels up to the export minus its horizon. Documents how many weekly
+    walk-forward windows each bucket gets (see RUNBOOK.md)."""
+    from scout_ml.config import BUCKETS
+    h = BUCKETS[bucket]["horizon_days"]
+    start, export = pd.Timestamp("2026-07-25", tz="UTC"), pd.Timestamp("2026-10-07T12:00", tz="UTC")
+    end = export - pd.Timedelta(days=h)
+    n = int(4000 * (end - start) / (export - start))
+    dates = pd.Series(start + (end - start) * np.linspace(0, 1, n))
+    tokens = pd.Series(np.arange(n)).astype(str)
+    ws = list(V.walk_forward_windows(dates, tokens, h))
+    assert len(ws) == windows
+    assert sum(bool(w["train"].any()) for w in ws) == with_train
+    if bucket == "long":                                 # 30-day embargo: next to nothing to train on
+        s = V.time_split(dates, tokens, h)
+        assert s["val"].sum() == 0 and s["train"].sum() < 0.1 * n
+
+
 def test_trading_metrics_and_gates():
     y_run = np.array([1, 1, 0, 0, 0, 0, 0, 0, 0, 0] * 2)
     score = np.where(y_run == 1, 0.9, 0.1)

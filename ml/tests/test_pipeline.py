@@ -13,7 +13,11 @@ BUCKET_KEYS = ["short", "3day", "medium", "long"]
 
 def test_synthetic_csv_has_exact_view_columns(synthetic_df):
     assert list(synthetic_df.columns) == C.VIEW_COLUMNS
-    assert synthetic_df["contract_address"].duplicated().mean() > 0.1      # repeat calls
+    assert synthetic_df["contract_address"].str.lower().duplicated().mean() > 0.1  # repeat calls
+    assert (synthetic_df["tracking_status"] == "repeat").sum() > 100
+    assert (synthetic_df["post_kind"] == "update").sum() > 50
+    assert {"onchain-pons", "onchain-v2"} <= set(synthetic_df["entry_price_source"].dropna())
+    assert "pons-curve" in set(synthetic_df["pool_dex"].dropna())
     assert synthetic_df["holders"].isna().mean() > 0.1                     # missingness
     assert set(synthetic_df["rugged"].dropna().astype(str).str.lower()) == {"true", "false"}
 
@@ -37,24 +41,30 @@ def test_end_to_end_training_artifacts(trained):
             assert {"base_rate", "roc_auc", "pr_auc", "brier"} <= set(m["labels"]["runner"][model])
         assert m["labels"]["runner"]["lightgbm"]["roc_auc"] > 0.55   # planted signal is found
         assert len(m["labels"]["runner"]["calibration"]) == 10
-    report = (vdir / "report.md").read_text()
+    assert meta["data"]["repeat"] > 0 and meta["data"]["update"] > 0
+    # coverage is measured on the usable calls: repeats and updates have no pool data
+    assert meta["data"]["coverage"]["pre_swaps_60m"] > 0.65
+    report = (vdir / "report.md").read_text(encoding="utf-8")
     for needle in ("Feature coverage", "Class balance", "no pool", "Walk-forward",
                    "calibration by decile", "Bucket result:", "gain share", "Money simulation"):
         assert needle in report, needle
 
 
 def test_update_posts_are_excluded_and_counted_on_their_own_line(synthetic_df, tmp_path, monkeypatch):
-    assert "- excluded, update post (not a call): 0" in render_report_for(synthetic_df, tmp_path / "a", monkeypatch)
+    n_upd = int((synthetic_df["post_kind"] == "update").sum())
+    assert n_upd > 0
+    assert (f"- excluded, update post (not a call): {n_upd}"
+            in render_report_for(synthetic_df, tmp_path / "a", monkeypatch))
     df = synthetic_df.copy()
-    df["post_kind"] = "call"
-    df.loc[df.index[:50], "post_kind"] = "update"
-    df.loc[df.index[50:60], "post_kind"] = None  # not classified yet: a call
+    calls = df.index[(df["post_kind"] != "update").to_numpy()]
+    df.loc[calls[:50], "post_kind"] = "update"
+    df.loc[calls[50:60], "post_kind"] = None  # not classified yet: a call
     vdir = tmp_path / "b" / "v"
     report = render_report_for(df, tmp_path / "b", monkeypatch)
-    assert "- excluded, update post (not a call): 50" in report
+    assert f"- excluded, update post (not a call): {n_upd + 50}" in report
     plain = json.loads((tmp_path / "a" / "v" / "meta.json").read_text())["data"]
     data = json.loads((vdir / "meta.json").read_text())["data"]
-    assert data["update"] == 50 and data["rows"] == plain["rows"]
+    assert data["update"] == n_upd + 50 and data["rows"] == plain["rows"]
     # every row is in exactly one line of the report
     for d in (plain, data):
         assert (d["update"] + d["no_pool"] + d["repeat"] + d["not_usd"] + d["extreme"]
@@ -65,21 +75,25 @@ def test_update_posts_are_excluded_and_counted_on_their_own_line(synthetic_df, t
 def test_extreme_outcomes_are_excluded_and_counted(synthetic_df, tmp_path, monkeypatch):
     from scout_ml.labels import build_labels
     df = synthetic_df.copy()
-    df["post_kind"] = "call"
     L = build_labels(df)
-    base = int((~L["no_pool"] & ~L["not_usd"] & L["extreme"]).sum())   # the generator makes a few itself
-    idx = df.index[(~L["no_pool"] & ~L["not_usd"] & ~L["extreme"]).to_numpy()]
+    first = ~L["update"] & ~L["repeat"]
+    base = int((first & ~L["no_pool"] & ~L["not_usd"] & L["extreme"]).sum())  # the generator makes a few
+    idx = df.index[(first & ~L["no_pool"] & ~L["not_usd"] & ~L["extreme"]).to_numpy()]
+    # tokens posted once, so that turning a call into an update promotes no later call
+    once = df["contract_address"].str.lower().map(df["contract_address"].str.lower().value_counts()) == 1
+    single = [i for i in idx if once[i]]
     df.loc[idx[:5], "ret_late_7d"] = 2e5                 # medium label column
     df.loc[idx[5:7], "max_gain_late_1d"] = float("inf")  # short runner column
     df.loc[idx[7:9], "max_gain_7d"] = 1e9                # not label-relevant: kept
     df.loc[idx[9], "ret_late_3d"] = 1e5                  # exactly the cap: kept
-    df.loc[idx[10:13], ["post_kind", "ret_late_7d"]] = ["update", 2e5]  # counted as update
+    df.loc[single[-3:], ["post_kind", "ret_late_7d"]] = ["update", 2e5]  # counted as update
     report = render_report_for(df, tmp_path, monkeypatch)
     want = base + 7
     line = f"- excluded, extreme outcome (a label/simulation outcome above 100,000 %; bogus pool data): {want}"
     assert line in report, [r for r in report.splitlines() if "extreme" in r]
     data = json.loads((tmp_path / "v" / "meta.json").read_text())["data"]
-    assert data["extreme"] == want and data["update"] == 3, data
+    n_upd = int((synthetic_df["post_kind"] == "update").sum())
+    assert data["extreme"] == want and data["update"] == n_upd + 3, data
     assert data["eligible"] == len(idx) - 10, (data["eligible"], len(idx))
     assert (data["update"] + data["no_pool"] + data["repeat"] + data["not_usd"] + data["extreme"]
             + data["eligible"] == data["rows"])
@@ -89,7 +103,7 @@ def render_report_for(df, root, monkeypatch):
     """Run train() with no bucket to train (fast): only the data section matters."""
     monkeypatch.setattr(C, "BUCKETS", {})
     out = train_mod.train(df, root, version="v")
-    return (out / "report.md").read_text()
+    return (out / "report.md").read_text(encoding="utf-8")
 
 
 def _client(monkeypatch, model_dir):
@@ -176,7 +190,7 @@ def test_too_little_data_is_reported_not_raised(tmp_path):
     meta = json.loads((vdir / "meta.json").read_text())
     assert meta["models"] == [] and not list(vdir.glob("*.joblib"))
     assert all("usable rows (need 300)" in m["skipped"] for m in meta["metrics"].values())
-    assert (vdir / "report.md").read_text().count("**SKIPPED:**") == 4
+    assert (vdir / "report.md").read_text(encoding="utf-8").count("**SKIPPED:**") == 4
 
 
 def test_rare_label_is_skipped_with_message(synthetic_df, tmp_path, monkeypatch):
@@ -191,4 +205,4 @@ def test_rare_label_is_skipped_with_message(synthetic_df, tmp_path, monkeypatch)
     col = meta["metrics"]["3day"]["labels"]["collapse"]
     assert "skipped" in col and any("WARNING: positive rate" in m for m in col["messages"])
     assert meta["metrics"]["3day"]["gates"]["collapse_ok"] is False
-    assert "model skipped" in (vdir / "report.md").read_text()
+    assert "model skipped" in (vdir / "report.md").read_text(encoding="utf-8")

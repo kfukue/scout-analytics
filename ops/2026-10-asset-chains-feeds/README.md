@@ -1,5 +1,7 @@
 # Seed the Robinhood Chain stock-token feeds (pgAdmin version)
 
+**Status: DONE** (run 7 Oct, 33 feeds). Running B again inserts nothing.
+
 > **One-off, October 2026.** These scripts add the 33 Robinhood stock tokens
 > and their Chainlink price feeds to the MAIN API's shared tables (`chains`,
 > `assets`, `asset_chains`), where the scout program's feed loader

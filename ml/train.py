@@ -149,8 +149,9 @@ def train(df: pd.DataFrame, out_root, version: str | None = None) -> Path:
     df = df.sort_values("message_date").reset_index(drop=True)
     L = build_labels(df)
     call = ~L["update"]  # update posts are not calls: out of training, counted on their own
-    extreme = call & ~L["no_pool"] & ~L["not_usd"] & L["extreme"]
-    eligible = call & ~L["no_pool"] & ~L["not_usd"] & ~L["extreme"]
+    first = call & ~L["repeat"]  # later calls of a token: out of training, counted on their own
+    extreme = first & ~L["no_pool"] & ~L["not_usd"] & L["extreme"]
+    eligible = first & ~L["no_pool"] & ~L["not_usd"] & ~L["extreme"]
     cat_levels = learn_cat_levels(df[eligible])
     X_all = build_features(df, cat_levels)
 
@@ -160,11 +161,13 @@ def train(df: pd.DataFrame, out_root, version: str | None = None) -> Path:
         "rows": len(df), "first_date": df["message_date"].min().strftime("%Y-%m-%d"),
         "last_date": df["message_date"].max().strftime("%Y-%m-%d"),
         "update": int(L["update"].sum()),
-        "no_pool": int((call & L["no_pool"] & ~L["repeat"]).sum()), "repeat": int((call & L["repeat"]).sum()),
-        "not_usd": int((call & ~L["no_pool"] & L["not_usd"]).sum()),
+        "repeat": int((call & L["repeat"]).sum()), "no_pool": int((first & L["no_pool"]).sum()),
+        "not_usd": int((first & ~L["no_pool"] & L["not_usd"]).sum()),
         "extreme": int(extreme.sum()),
         "eligible": int(eligible.sum()),
-        "coverage": {c: float(blank[c].notna().mean()) for c in raw_cols}}}
+        # over the rows training can use (repeat calls and update posts have no pool data)
+        "coverage": {c: float(blank[c][eligible].notna().mean()) if eligible.any() else 0.0
+                     for c in raw_cols}}}
     reference = {}
     for b in C.BUCKETS:
         res["buckets"][b], ref = _train_bucket(b, df, X_all, L, out_dir)
@@ -184,7 +187,7 @@ def train(df: pd.DataFrame, out_root, version: str | None = None) -> Path:
             "models": models, "runner_reference": reference,
             "data": res["data"], "metrics": res["buckets"]}
     (out_dir / "meta.json").write_text(json.dumps(_json_safe(meta), indent=1, allow_nan=False))
-    (out_dir / "report.md").write_text(render(res))
+    (out_dir / "report.md").write_text(render(res), encoding="utf-8")
     (Path(out_root) / "LATEST").write_text(version + "\n")
     return out_dir
 

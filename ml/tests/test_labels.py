@@ -54,10 +54,54 @@ def test_usable_needs_usd_outcome_and_a_pool():
         row(ret_late_7d=None, entry_late_price_usd=None, tracking_status="repeat"),  # untracked repeat call
         row(ret_late_7d=10, tracking_status="repeat")])  # set aside after it was tracked: results kept
     L = build_labels(df)
-    assert L["usable_medium"].tolist() == [True, False, False, False, False, False, True]
+    assert L["usable_medium"].tolist() == [True, False, False, False, False, False, False]
     assert L["no_pool"].tolist() == [False, False, False, True, True, True, False]
-    assert L["repeat"].tolist() == [False, False, False, False, False, True, False]
-    assert np.isnan(L["runner_medium"][1])
+    assert L["repeat"].tolist() == [False, False, False, False, False, True, True]
+    assert np.isnan(L["runner_medium"][1]) and np.isnan(L["runner_medium"][6])
+
+
+def test_repeat_calls_are_never_usable_whatever_their_status():
+    """Only the first call of a token counts (lowest message_date, then call_id;
+    address case ignored; update posts are never a first call). Later calls are
+    excluded even when an older tracker left them `done` with results."""
+    df = pd.DataFrame([
+        row(call_id=1, contract_address="0xAAA", message_date="2026-08-01T10:00:00Z", ret_late_7d=10),
+        row(call_id=2, contract_address="0xaaa", message_date="2026-08-02T10:00:00Z", ret_late_7d=10),
+        row(call_id=3, contract_address="0xBBB", message_date="2026-08-01T09:00:00Z", ret_late_7d=10,
+            post_kind="update"),                                        # update first: not a call
+        row(call_id=4, contract_address="0xBBB", message_date="2026-08-01T11:00:00Z", ret_late_7d=10),
+        row(call_id=6, contract_address="0xCCC", message_date="2026-08-03T10:00:00Z", ret_late_7d=10),
+        row(call_id=5, contract_address="0xCCC", message_date="2026-08-03T10:00:00Z", ret_late_7d=10),
+        row(call_id=7, contract_address="0xDDD", message_date="2026-08-04T10:00:00Z", ret_late_7d=10,
+            tracking_status="repeat")])                                 # flagged by the tracker
+    L = build_labels(df)
+    assert L["repeat"].tolist() == [False, True, False, False, True, False, True]
+    assert L["update"].tolist() == [False, False, True, False, False, False, False]
+    assert L["usable_medium"].tolist() == [True, False, False, True, False, True, False]
+    assert L["runner_medium"][[1, 4, 6]].isna().all()
+
+
+def test_horizon_not_due_yet_is_unlabelled_per_bucket_not_negative():
+    """A call still `tracking`: 1d/3d/7d computed, 30d not due (NULL in the
+    view). Short buckets use it; `long` leaves it out (NaN), even when the
+    tracker has already flagged it rugged (rugs are flagged at once)."""
+    early = dict(max_gain_late_1d=150, ret_late_1d=-60, ret_late_3d=-70, ret_late_7d=-80)
+    df = pd.DataFrame([
+        row(tracking_status="tracking", ret_late_30d=None, **early),
+        row(tracking_status="tracking", ret_late_30d=None, rugged="true", **early),
+        row(tracking_status="tracking", ret_late_30d="", rugged="false", **early),  # CSV empty string
+        row(tracking_status="done", ret_late_30d=-95.0, **early),
+        row(tracking_status="tracking", max_gain_late_1d=None, ret_late_1d=10)])     # 1d half-known
+    L = build_labels(df)
+    assert L["usable_long"].tolist() == [False, False, False, True, False]
+    assert L["runner_long"][:3].isna().all() and L["collapse_long"][:3].isna().all()
+    assert L["net_ret_long"][:3].isna().all()
+    assert L["collapse_long"][3] == 1 and L["runner_long"][3] == 0
+    for b in ("short", "3day", "medium"):
+        assert L[f"usable_{b}"][:4].all(), b
+        assert (L[f"collapse_{b}"][:4] == 1).all(), b
+    assert L["runner_short"][:4].tolist() == [1, 1, 1, 1]
+    assert not L["usable_short"][4]                       # needs max_gain_late_1d too
 
 
 def test_update_posts_are_never_usable():

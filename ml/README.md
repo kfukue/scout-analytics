@@ -26,8 +26,11 @@ features.
 
 ## Install
 
-    pip install -r requirements.txt          # Python 3.11
+    pip install -r requirements.txt          # Python 3.11 or newer
     pip install 'psycopg[binary]'            # only for train.py --dsn
+
+Step-by-step commands for a training run on the prod server (venv, export,
+train, report, cleanup): [`RUNBOOK.md`](RUNBOOK.md).
 
 ## Export data
 
@@ -36,7 +39,10 @@ features.
 CSV with a header, one column per view column, empty string for NULL,
 `true`/`false`, RFC3339 timestamps. No database at hand:
 `python make_synthetic.py --out calls.csv` writes invented data in the same
-layout (for testing the pipeline only; its metrics mean nothing).
+layout, including repeat calls and update posts (for testing the pipeline only;
+its metrics mean nothing; `--end` sets the time of the newest call).
+`tests/test_view_columns.py` checks that the expected columns match the view in
+`../scoutanalytics.sql`.
 
 ## Train
 
@@ -54,13 +60,25 @@ How it validates (no random splits):
   (early stopping + calibration), test = latest 15%;
 - embargo: train/validation rows posted less than the bucket horizon before
   the next boundary are dropped, so no outcome window reaches into a later part;
-- all calls of a token go to the part where its first call falls;
+- all calls of a token go to the part where its first call falls (address
+  compared without regard to letter case);
 - walk-forward: train up to week N, test on week N+1, for every week.
 
 Calls without a pool (`no_pool`, `gave_up`, or no late entry price) and rows
 whose prices are not in USD are excluded; the report says how many. The tracker
-follows only the first call of each token: later calls have `tracking_status =
-repeat` and no outcomes, so they are excluded too and counted on their own line.
+follows only the first call of each token (lowest `message_date`, then
+`call_id`, address case ignored, update posts never count as a first call).
+Every later call is excluded and counted on its own line ("excluded, repeat
+call"), whatever its row says: `tracking_status = repeat` rows that kept results
+from before they were set aside, and later calls an older tracker left at
+`done`, are excluded too.
+
+A bucket uses a call only once all of that bucket's outcome columns are
+present; the view has an outcome only after its horizon was computed. A call
+still `tracking` (1d-7d done, 30d not due yet) is used by the short buckets and
+left out of `long` as not labelled yet, never counted as a negative, even when
+it is already flagged rugged. The report lists these per bucket ("not labelled
+yet").
 Update posts (`post_kind = update`, a "$TOKEN hit 3X ..." post about an earlier
 call) are not calls: they are excluded from training and simulation whatever
 else their row says, and counted on their own line ("excluded, update post (not
@@ -84,7 +102,8 @@ buy-everything" alone; labels are not affected. Both caps are in
    skipping the 30% highest collapse scores removes >= 40% of collapses; the
    top-10% simulation beats buy-everything in every walk-forward week.
 2. **Data and exclusions**, **Feature coverage** - how much data there was and
-   which columns are mostly empty.
+   which columns are mostly empty (coverage is measured on the calls left
+   after the exclusions).
 3. Per bucket: class balance (with warnings for labels under 10% / over 90%
    and for skipped models), test metrics for LightGBM and the logistic
    baseline (ROC AUC, PR AUC, Brier), the gate values, the money simulation,

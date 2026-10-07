@@ -10,6 +10,11 @@ from .config import (GATES, MIN_WINDOW_TEST_ROWS, SIM_MAX_RET_PCT, SKIP_FRAC, TO
                      TRAIN_FRAC, VAL_FRAC)
 
 
+def _token_key(tokens: pd.Series) -> pd.Series:
+    """Contract address without regard to letter case (the website's rule)."""
+    return pd.Series(tokens).astype(str).str.lower()
+
+
 def time_split(dates: pd.Series, tokens: pd.Series, horizon_days: float) -> dict:
     """Boolean masks `train`/`val`/`test` (aligned to `dates`) plus boundaries.
 
@@ -19,6 +24,7 @@ def time_split(dates: pd.Series, tokens: pd.Series, horizon_days: float) -> dict
       t2 - horizon are dropped, so no outcome window overlaps a later part.
     """
     dates = pd.to_datetime(dates, utc=True)
+    tokens = _token_key(tokens)
     ordered = dates.sort_values()
     n = len(ordered)
     t1 = ordered.iloc[min(int(n * TRAIN_FRAC), n - 1)]
@@ -34,7 +40,7 @@ def walk_forward_windows(dates: pd.Series, tokens: pd.Series, horizon_days: floa
     """Expanding weekly windows: train on everything before week N+1 (minus the
     embargo), test on week N+1. Same token-grouping rule as `time_split`."""
     dates = pd.to_datetime(dates, utc=True)
-    first = dates.groupby(tokens.to_numpy()).transform("min")
+    first = dates.groupby(_token_key(tokens).to_numpy()).transform("min")
     gap, week = pd.Timedelta(days=horizon_days), pd.Timedelta(days=7)
     start, k = dates.min().floor("D"), 1
     while start + k * week <= dates.max():

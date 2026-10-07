@@ -1,5 +1,7 @@
 # Repair the calls hurt by the old USD lookup (pgAdmin version)
 
+**Status: DONE** (run 7 Oct, 50 calls + 1 nudge). Do not run B again.
+
 > **One-off, October 2026.** These scripts re-track the calls that the tracker,
 > before the USD-source fix, switched to quote units for good or let lose a
 > segment of candles and peak/low. They are run **by hand in pgAdmin**; the
