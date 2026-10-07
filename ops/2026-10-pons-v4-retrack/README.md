@@ -1,5 +1,7 @@
 # Re-track Pons V2 calls tracked on their v4 pool (pgAdmin version)
 
+**Status: DONE** (run 6 Oct, 539 calls). Do not run B again.
+
 > **One-off, October 2026.** These scripts re-track the Pons V2 calls that the
 > tracker, before Pons V2 support, priced on their Uniswap v4 pool. They are
 > run **by hand in pgAdmin**; the program never executes them (nothing under
