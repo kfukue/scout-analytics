@@ -648,21 +648,31 @@ type webServer struct {
 	errLog    logLimiter
 	failing   bool
 	lastRows  int // rows of the last snapshot (−1 = none yet)
+
+	// events: the open live-update streams (GET /api/events); every refresh
+	// publishes what changed (events.go)
+	events *webEventHub
+	// sseHeartbeat: how often a quiet stream gets a comment line
+	// (webSSEHeartbeat; shorter in tests)
+	sseHeartbeat time.Duration
 }
 
 // webRefreshCall is one read of the database; done is closed when it has
 // ended, err is its result (set before done is closed).
 type webRefreshCall struct {
-	done   chan struct{}
-	err    error
-	manual bool // started by "Refresh now"
+	done    chan struct{}
+	err     error
+	manual  bool      // started by "Refresh now"
+	started time.Time // when the read began (refreshAfter)
 }
 
-// newWebServer builds the site: GET /api/summary, GET /api/calls, POST
-// /api/refresh and the page. The API answers 503 until refresh has succeeded once.
+// newWebServer builds the site: GET /api/summary, GET /api/calls, GET
+// /api/call, GET /api/events, POST /api/refresh and the page. The API answers
+// 503 until refresh has succeeded once.
 func newWebServer(st *ScoutStore, cfg webConfig, static fs.FS) (*webServer, error) {
 	s := &webServer{st: st, cfg: cfg, static: static, mux: http.NewServeMux(), lastRows: -1,
-		errLog: logLimiter{every: webErrorLogEvery}, life: context.Background(), manualWait: webManualRefreshWait}
+		errLog: logLimiter{every: webErrorLogEvery}, life: context.Background(), manualWait: webManualRefreshWait,
+		events: newWebEventHub(webEventsMaxClients, webEventsClientBuf), sseHeartbeat: webSSEHeartbeat}
 	if st != nil {
 		s.readRows = st.SelectWebRows
 		s.readReports = st.SelectWebReports
@@ -677,6 +687,7 @@ func newWebServer(st *ScoutStore, cfg webConfig, static fs.FS) (*webServer, erro
 	s.mux.HandleFunc("/api/summary", s.handleSummary)
 	s.mux.HandleFunc("/api/calls", s.handleCalls)
 	s.mux.HandleFunc("/api/call", s.handleCall)
+	s.mux.HandleFunc("/api/events", s.handleEvents)
 	s.mux.HandleFunc(webRefreshPath, s.handleRefresh)
 	s.mux.HandleFunc("/api/", func(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusNotFound, "no such endpoint")
@@ -721,7 +732,7 @@ func (s *webServer) startRefreshLocked(manual bool) *webRefreshCall {
 		s.joins.Add(1)
 		return c
 	}
-	c := &webRefreshCall{done: make(chan struct{}), manual: manual}
+	c := &webRefreshCall{done: make(chan struct{}), manual: manual, started: time.Now()}
 	s.inflight = c
 	go func() {
 		err := s.readSnapshot(s.life)
@@ -784,7 +795,10 @@ func (s *webServer) readSnapshot(ctx context.Context) error {
 	snap.loadedAt = time.Now().UTC().Truncate(time.Millisecond)
 	snap.answers = &webAnswers{} // answers carry loadedAt: none is taken over from the snapshot before
 	snap.reports = reports
+	prev := s.snap.Load()
 	s.snap.Store(snap)
+	// the open pages hear what changed (never blocks)
+	s.publishSnapshotEvents(prev, snap)
 	if s.failing {
 		s.failing, s.errLog.last = false, time.Time{}
 		if s.lastRows >= 0 {
@@ -1157,6 +1171,9 @@ func runWeb(ctx context.Context, st *ScoutStore, cfg webConfig) error {
 	if err != nil {
 		return err
 	}
+	// everything started here stops with ctx, or when serving fails
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	srv.life = ctx // reads stop when the website stops, not when a request ends
 	if err := srv.refresh(ctx); err != nil {
 		return fmt.Errorf("could not read the calls from the database for the first snapshot: %w", err)
@@ -1165,14 +1182,37 @@ func runWeb(ctx context.Context, st *ScoutStore, cfg webConfig) error {
 	if err != nil {
 		return fmt.Errorf("listen on SCOUT_WEB_ADDR=%q: %w", cfg.Addr, err)
 	}
-	go srv.refreshLoop(ctx)
-	log.Printf("website on http://%s (%s; read-only, no login; data read again every %s) — Ctrl+C to stop", ln.Addr(), from, cfg.Refresh)
+	var wg sync.WaitGroup
+	defer wg.Wait()
+	defer srv.events.close() // ends the open streams (before waiting for the loops)
+	defer cancel()
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		srv.refreshLoop(ctx)
+	}()
+	// live updates: a database notification refreshes at once (debounced)
+	kick := make(chan struct{}, 1)
+	go func() {
+		defer wg.Done()
+		srv.notifyLoop(ctx, kick, webNotifyDebounce)
+	}()
+	if st != nil {
+		dial := dialScoutEvents(st.Pool.Config().ConnConfig)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			listenScoutEvents(ctx, dial, kick, defaultWebListenTimings)
+		}()
+	}
+	log.Printf("website on http://%s (%s; read-only, no login; data read again every %s, and at once on new calls and reports) — Ctrl+C to stop", ln.Addr(), from, cfg.Refresh)
 	return serveWeb(ctx, ln, srv)
 }
 
-// serveWeb serves h on ln until ctx is cancelled, then lets requests in flight finish.
-func serveWeb(ctx context.Context, ln net.Listener, h http.Handler) error {
-	srv := &http.Server{
+// newWebHTTPServer is the HTTP server of the website. Its read and write
+// timeouts are for ordinary requests; GET /api/events lifts them for its stream.
+func newWebHTTPServer(h http.Handler) *http.Server {
+	return &http.Server{
 		Handler:           h,
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
@@ -1180,6 +1220,15 @@ func serveWeb(ctx context.Context, ln net.Listener, h http.Handler) error {
 		IdleTimeout:       60 * time.Second,
 		MaxHeaderBytes:    32 << 10,
 	}
+}
+
+// serveWeb serves h on ln until ctx is cancelled, then lets requests in flight finish.
+func serveWeb(ctx context.Context, ln net.Listener, h http.Handler) error {
+	return serveWebWith(ctx, ln, newWebHTTPServer(h))
+}
+
+// serveWebWith is serveWeb with a server of the caller's (tests set short timeouts).
+func serveWebWith(ctx context.Context, ln net.Listener, srv *http.Server) error {
 	errc := make(chan error, 1)
 	go func() { errc <- srv.Serve(ln) }()
 	select {

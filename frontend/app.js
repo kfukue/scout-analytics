@@ -605,6 +605,20 @@
     rows.appendChild(frag);
     for (var j = 0; j < reopen.length; j++) { refreshDetail(reopen[j]); }
 
+    var pages = renderPager(data);
+    // the newest calls are on view now: nothing left to announce
+    if (state.sort === 'date' && state.dir === 'desc' && state.page === 1) { setNewCount(0); }
+
+    if (calls.length === 0) {
+      if (state.page > pages) { state.page = pages; loadCalls(false); return; }
+      setMessage(state.q ? 'No calls match this search.' : (state.verdict ? 'No calls match this filter.' : 'No calls yet.'), false);
+    } else {
+      setMessage('', false);
+    }
+  }
+
+  // The pager and the total under the table; returns the number of pages.
+  function renderPager(data) {
     var total = isNum(data.total) ? data.total : 0;
     var per = isNum(data.per) && data.per > 0 ? data.per : PER_PAGE;
     var pages = Math.max(1, Math.ceil(total / per));
@@ -613,13 +627,7 @@
     $('next').disabled = state.page >= pages;
     $('total').textContent = fmtInt(total) + (total === 1 ? ' call' : ' calls') +
       (data.usd_only ? ' (priced in USD only)' : '');
-
-    if (calls.length === 0) {
-      if (state.page > pages) { state.page = pages; loadCalls(false); return; }
-      setMessage(state.q ? 'No calls match this search.' : (state.verdict ? 'No calls match this filter.' : 'No calls yet.'), false);
-    } else {
-      setMessage('', false);
-    }
+    return pages;
   }
 
   // Asks for JSON. With an etag the server may answer 304 ("what you have is
@@ -885,12 +893,425 @@
     });
   }
 
+  // ---- Live updates (Server-Sent Events) -----------------------------------
+  //
+  // GET api/events streams what changed in the list: "call" (a new token row),
+  // "report" (a token's Perceptor verdict or sAlpha report changed) and
+  // "reload" (many changes at once, or events were missed). A new row goes on
+  // top of the table only when the table shows the newest calls first, on page
+  // 1, and the row matches the search and the Perceptor filter; otherwise a
+  // "N new — refresh" button appears. Only a call posted within the last hour
+  // is announced (notice, sound, desktop alert); an older one (a post imported
+  // by -backfill) reaches the table quietly, with one reload of the page per
+  // burst of such rows. The 30-second refresh keeps running in
+  // any case, so a page without live updates (refused, unsupported, broken
+  // connection) still stays current.
+
+  var LIVE_URL = 'api/events';
+  var LIVE_RETRY_MS = 120000; // after the server refused the stream (e.g. too many open pages)
+  var NOTICE_MAX = 4;
+  var NOTICE_MS = 60000;
+  var FRESH_MS = 6000;
+  var RECENT_CALL_MS = 3600000; // a call posted longer ago than this is not announced
+  var QUIET_LOAD_MS = 1000; // old calls arriving within this time make one reload of the list
+  var quietLoadTimer = null;
+  var live = { es: null, retryTimer: null, newCount: 0 };
+  var prefs = { sound: false, desktop: false };
+  var audioCtx = null;
+
+  function readPref(name) {
+    try { return window.localStorage.getItem('scout.' + name) === '1'; } catch (e) { return false; }
+  }
+
+  function writePref(name, on) {
+    try {
+      window.localStorage.setItem('scout.' + name, on ? '1' : '0');
+    } catch (e) {
+      // storage blocked (private mode, settings): the choice lasts while the page is open
+    }
+  }
+
+  var LIVE_TEXT = {
+    connecting: 'Live: connecting…',
+    on: 'Live',
+    off: 'Live off: updates every 30 s',
+    unsupported: 'Updates every 30 s'
+  };
+
+  function setLiveState(st) {
+    var n = $('live-state');
+    n.textContent = LIVE_TEXT[st] || '';
+    n.classList.toggle('live-on', st === 'on');
+    n.title = st === 'on' ? 'New calls and reports appear as soon as they are recorded'
+      : st === 'connecting' ? 'Connecting to live updates; the list still refreshes every 30 seconds'
+        : 'No live updates; the list refreshes every 30 seconds';
+  }
+
+  function verdictBucket(v) {
+    return (v === 'clean' || v === 'caution' || v === 'red_flags') ? v : 'not_scanned';
+  }
+
+  // Whether a row passes the search and the Perceptor filter of the page, the
+  // way the server decides it (search: name, symbol or address contains the
+  // text, letter case ignored).
+  function rowMatchesFilters(c) {
+    if (state.verdict && verdictBucket(c.perceptor_verdict) !== state.verdict) { return false; }
+    if (state.q) {
+      var q = state.q.toLowerCase();
+      var fields = [c.token_name, c.token_symbol, c.contract_address];
+      for (var i = 0; i < fields.length; i++) {
+        if (typeof fields[i] === 'string' && fields[i].toLowerCase().indexOf(q) >= 0) { return true; }
+      }
+      return false;
+    }
+    return true;
+  }
+
+  // The table shows the newest calls first, on page 1: a new row goes on top.
+  function viewTakesNewRows() {
+    return state.sort === 'date' && state.dir === 'desc' && state.page === 1 &&
+      shown.data !== null && Array.isArray(shown.data.calls) && !callsErrorShown;
+  }
+
+  function findRow(key) {
+    // key is digits only (callKey), so it is safe in the selector
+    return key ? $('rows').querySelector('tr.call-row[data-call-id="' + key + '"]') : null;
+  }
+
+  function shownIndex(key) {
+    var calls = shown.data && Array.isArray(shown.data.calls) ? shown.data.calls : [];
+    for (var i = 0; i < calls.length; i++) {
+      if (callKey(calls[i]) === key) { return i; }
+    }
+    return -1;
+  }
+
+  function markFresh(tr) {
+    tr.classList.add('fresh');
+    setTimeout(function () { tr.classList.remove('fresh'); }, FRESH_MS);
+  }
+
+  function removeRow(key) {
+    var tr = findRow(key);
+    if (tr && tr.parentNode) { tr.parentNode.removeChild(tr); }
+    var dr = detailRows[key];
+    if (dr && dr.parentNode) { dr.parentNode.removeChild(dr); }
+  }
+
+  function setNewCount(n) {
+    live.newCount = n;
+    var b = $('new-calls');
+    b.hidden = n <= 0;
+    b.textContent = n > 0 ? fmtInt(n) + ' new — refresh' : '';
+    b.title = n > 0 ? 'Show the newest calls first, from page 1' : '';
+  }
+
+  function showNewest() {
+    setNewCount(0);
+    if (state.sort !== 'date' || state.dir !== 'desc' || state.page !== 1) {
+      state.sort = 'date';
+      state.dir = 'desc';
+      state.page = 1;
+      renderHeaders();
+    }
+    refresh();
+  }
+
+  // Whether a call was posted within the last hour, by this browser's clock (a
+  // date in the future counts as recent). A missing or unreadable date does not.
+  function isRecentCall(c, nowMs) {
+    var t = (c && typeof c.message_date === 'string') ? Date.parse(c.message_date) : NaN;
+    if (!isFinite(t)) { return false; }
+    return nowMs - t <= RECENT_CALL_MS;
+  }
+
+  // One quiet reload of the list for a burst of old calls (e.g. a -backfill),
+  // instead of one per event.
+  function scheduleQuietLoad() {
+    if (quietLoadTimer !== null) { return; }
+    quietLoadTimer = setTimeout(function () {
+      quietLoadTimer = null;
+      loadCalls(true);
+    }, QUIET_LOAD_MS);
+  }
+
+  // A new token row: on top of the table when the view allows it. A call
+  // posted more than an hour ago is old news: no notice, no sound, no desktop
+  // alert, no "N new" count (it is not among the newest calls); the list is
+  // reloaded quietly, once per burst.
+  function onLiveCall(d) {
+    var c = d.row;
+    var key = callKey(c);
+    if (!key) { return; }
+    if (!isRecentCall(c, Date.now())) {
+      if (rowMatchesFilters(c) && !findRow(key)) { scheduleQuietLoad(); }
+      return;
+    }
+    liveNotice('call', c, '');
+    if (!rowMatchesFilters(c) || findRow(key)) { return; }
+    if (!viewTakesNewRows()) { setNewCount(live.newCount + 1); return; }
+    var calls = shown.data.calls;
+    var newer = calls.length === 0 || new Date(c.message_date).getTime() >= new Date(calls[0].message_date).getTime();
+    if (d.horizon !== state.horizon || !newer) {
+      loadCalls(true); // the server's snapshot already has the row: ask for the page
+      return;
+    }
+    var rows = $('rows');
+    var tr = buildRow(c);
+    rows.insertBefore(tr, rows.firstChild);
+    markFresh(tr);
+    rowReports[key] = reportIds(c);
+    calls.unshift(c);
+    shown.data.total = (isNum(shown.data.total) ? shown.data.total : 0) + 1;
+    var per = isNum(shown.data.per) && shown.data.per > 0 ? shown.data.per : PER_PAGE;
+    while (calls.length > per) { removeRow(callKey(calls.pop())); }
+    shown.sig = callsSignature(shown.data);
+    renderPager(shown.data);
+    setMessage('', false);
+  }
+
+  // A report changed: the row's verdict and badge, in place.
+  function onLiveReport(d) {
+    var c = d.row;
+    var key = callKey(c);
+    if (!key) { return; }
+    liveNotice('report', c, d.tool);
+    var tr = findRow(key);
+    if (!tr) { return; }
+    if (!rowMatchesFilters(c)) { loadCalls(true); return; } // no longer in this filter
+    var i = shownIndex(key);
+    if (d.horizon !== state.horizon && i >= 0) {
+      // the event carries another window's numbers: keep the ones shown
+      var old = shown.data.calls[i];
+      c.return_pct = old.return_pct;
+      c.peak_pct = old.peak_pct;
+      c.drawdown_pct = old.drawdown_pct;
+    }
+    var fresh = buildRow(c);
+    if (openRows[key]) { setExpanded(fresh, key, true); }
+    tr.parentNode.replaceChild(fresh, tr);
+    markFresh(fresh);
+    rowReports[key] = reportIds(c);
+    if (i >= 0) {
+      shown.data.calls[i] = c;
+      shown.sig = callsSignature(shown.data);
+    }
+    if (openRows[key]) { refreshDetail(key); }
+  }
+
+  function onLiveReload(d) {
+    var n = d && isNum(d.calls) ? d.calls : 0;
+    if (n > 0 && !viewTakesNewRows()) { setNewCount(live.newCount + n); }
+    if (n > 0) { showNotice('New calls', fmtInt(n) + (n === 1 ? ' new call' : ' new calls'), '', '', ''); }
+    refresh();
+  }
+
+  function tokenLabel(c) {
+    var name = (typeof c.token_name === 'string' && c.token_name.trim() !== '') ? c.token_name : shortAddress(c.contract_address);
+    if (typeof c.token_symbol === 'string' && c.token_symbol.trim() !== '' && c.token_symbol !== name) {
+      name += ' (' + c.token_symbol + ')';
+    }
+    return name;
+  }
+
+  // The notice of an event: token, verdict and a GMGN link; a sound and a
+  // desktop notification when they are switched on.
+  function liveNotice(kind, c, tool) {
+    var title, text, cls;
+    if (kind === 'report' && tool === 'salpha') {
+      title = 'sAlpha';
+      if (c.has_salpha_report === true) {
+        text = 'report available';
+        cls = 'sa-badge';
+      } else {
+        text = 'did not generate a report';
+        cls = 'muted';
+      }
+    } else {
+      title = kind === 'call' ? 'New call' : 'Perceptor';
+      var pv = Object.prototype.hasOwnProperty.call(VERDICT_TEXT, c.perceptor_verdict) ? VERDICT_TEXT[c.perceptor_verdict] : null;
+      text = pv ? pv.text : (kind === 'call' ? 'not scanned yet' : 'no readable verdict');
+      cls = pv ? pv.cls : 'muted';
+    }
+    var name = tokenLabel(c);
+    showNotice(title, name, text, cls, c.gmgn_url);
+    beep(kind === 'call' ? 880 : 660);
+    desktopNotify(title + ': ' + name, text, callKey(c));
+  }
+
+  function showNotice(title, name, text, cls, url) {
+    var box = $('live-notices');
+    var li = el('li', 'live-note');
+    li.appendChild(el('strong', 'live-note-title', title));
+    li.appendChild(el('span', 'live-note-token', name));
+    if (text) { li.appendChild(el('span', cls, text)); }
+    if (isHttps(url)) { li.appendChild(linkOrText(url, 'GMGN', 'live-note-link')); }
+    var close = el('button', 'live-note-close', '×');
+    close.type = 'button';
+    close.setAttribute('aria-label', 'Dismiss: ' + title + ' ' + name);
+    li.appendChild(close);
+    box.insertBefore(li, box.firstChild);
+    while (box.children.length > NOTICE_MAX) { box.removeChild(box.lastChild); }
+    setTimeout(function () { if (li.parentNode) { li.parentNode.removeChild(li); } }, NOTICE_MS);
+  }
+
+  // ---- Sound (Web Audio, no file) and desktop notifications ----------------
+
+  function audioReady() {
+    var AC = window.AudioContext || window.webkitAudioContext;
+    if (!AC) { return false; }
+    if (!audioCtx) {
+      try { audioCtx = new AC(); } catch (e) { return false; }
+    }
+    if (audioCtx.state === 'suspended' && typeof audioCtx.resume === 'function') {
+      var p = audioCtx.resume();
+      if (p && typeof p.catch === 'function') { p.catch(function () { /* resumes with the next click */ }); }
+    }
+    return true;
+  }
+
+  // A short beep; browsers only let a page play sound after a click on it.
+  function beep(freq) {
+    if (!prefs.sound || !audioCtx || audioCtx.state !== 'running') { return; }
+    var t = audioCtx.currentTime;
+    var osc = audioCtx.createOscillator();
+    var gain = audioCtx.createGain();
+    osc.type = 'sine';
+    osc.frequency.value = freq;
+    gain.gain.setValueAtTime(0.0001, t);
+    gain.gain.exponentialRampToValueAtTime(0.2, t + 0.01);
+    gain.gain.exponentialRampToValueAtTime(0.0001, t + 0.18);
+    osc.connect(gain);
+    gain.connect(audioCtx.destination);
+    osc.start(t);
+    osc.stop(t + 0.2);
+  }
+
+  function setSound(on) {
+    prefs.sound = on && audioReady();
+    writePref('sound', prefs.sound);
+    $('sound').checked = prefs.sound;
+  }
+
+  // Desktop notifications need a secure page: https, or localhost.
+  function desktopSupported() {
+    return typeof window.Notification === 'function' && window.isSecureContext === true;
+  }
+
+  function renderDesktopButton() {
+    var b = $('desktop');
+    if (!desktopSupported()) {
+      b.disabled = true;
+      b.setAttribute('aria-pressed', 'false');
+      b.title = 'Desktop alerts only work on https:// or localhost';
+      return;
+    }
+    var denied = window.Notification.permission === 'denied';
+    var on = prefs.desktop && window.Notification.permission === 'granted';
+    b.disabled = denied;
+    b.setAttribute('aria-pressed', on ? 'true' : 'false');
+    b.title = denied ? 'Desktop alerts are blocked in the browser settings for this site'
+      : on ? 'Desktop alerts are on (shown while this tab is in the background); click to turn off'
+        : 'Show a desktop alert for new calls and reports while this tab is in the background';
+  }
+
+  function toggleDesktop() {
+    if (!desktopSupported()) { return; }
+    if (prefs.desktop) {
+      prefs.desktop = false;
+      writePref('desktop', false);
+      renderDesktopButton();
+      return;
+    }
+    var answered = false;
+    var done = function (perm) {
+      if (answered) { return; }
+      answered = true;
+      prefs.desktop = perm === 'granted';
+      writePref('desktop', prefs.desktop);
+      renderDesktopButton();
+    };
+    var p = window.Notification.requestPermission(done); // older browsers: the callback
+    if (p && typeof p.then === 'function') { p.then(done, function () { done('denied'); }); }
+  }
+
+  function desktopNotify(title, body, key) {
+    if (!prefs.desktop || !desktopSupported() || window.Notification.permission !== 'granted' || !document.hidden) { return; }
+    try {
+      var n = new window.Notification(title, { body: body, tag: 'scout-' + (key || 'event') });
+      n.addEventListener('click', function () { window.focus(); n.close(); });
+    } catch (e) {
+      // some browsers only allow notifications from a service worker: the in-page notice is shown anyway
+    }
+  }
+
+  // ---- The stream ------------------------------------------------------------
+
+  function liveData(ev) {
+    var d;
+    try { d = JSON.parse(ev.data); } catch (e) { return null; }
+    return (d && typeof d === 'object') ? d : null;
+  }
+
+  function startLive() {
+    live.retryTimer = null;
+    if (typeof window.EventSource !== 'function') { setLiveState('unsupported'); return; }
+    var es = new window.EventSource(LIVE_URL);
+    live.es = es;
+    setLiveState('connecting');
+    es.addEventListener('open', function () { setLiveState('on'); });
+    es.addEventListener('error', function () {
+      if (es.readyState !== 2) { setLiveState('connecting'); return; } // the browser reconnects by itself
+      // refused (e.g. 503: too many open pages) or not a stream: try again later
+      es.close();
+      if (live.es === es) { live.es = null; }
+      setLiveState('off');
+      if (live.retryTimer === null) { live.retryTimer = setTimeout(startLive, LIVE_RETRY_MS); }
+    });
+    es.addEventListener('call', function (ev) {
+      var d = liveData(ev);
+      if (d && d.row && typeof d.row === 'object') { onLiveCall(d); }
+    });
+    es.addEventListener('report', function (ev) {
+      var d = liveData(ev);
+      if (d && d.row && typeof d.row === 'object') { onLiveReport(d); }
+    });
+    es.addEventListener('reload', function (ev) { onLiveReload(liveData(ev)); });
+  }
+
+  function bindLive() {
+    $('new-calls').addEventListener('click', showNewest);
+    $('live-notices').addEventListener('click', function (ev) {
+      var t = ev.target;
+      if (!t || typeof t.closest !== 'function') { return; }
+      var btn = t.closest('.live-note-close');
+      var li = btn ? btn.closest('li') : null;
+      if (li && li.parentNode) { li.parentNode.removeChild(li); }
+    });
+    $('sound').addEventListener('change', function (ev) { setSound(ev.target.checked); });
+    $('desktop').addEventListener('click', toggleDesktop);
+    // browsers start sound only after a click or a key on the page
+    var unlock = function () {
+      if (prefs.sound) { audioReady(); }
+      document.removeEventListener('pointerdown', unlock);
+      document.removeEventListener('keydown', unlock);
+    };
+    document.addEventListener('pointerdown', unlock);
+    document.addEventListener('keydown', unlock);
+    prefs.sound = readPref('sound');
+    $('sound').checked = prefs.sound;
+    prefs.desktop = readPref('desktop');
+    renderDesktopButton();
+  }
+
   bind();
+  bindLive();
   // a reload can keep the old choice in the select: start from "All reports"
   $('verdict').value = '';
   renderHeaders();
   loadSummary();
   loadCalls(false);
+  startLive();
 
   // Background refresh every 30 seconds, but not while the tab is hidden. When
   // the tab is shown again and the last refresh is older than that, refresh at once.
