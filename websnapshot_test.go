@@ -273,6 +273,9 @@ func referencePage(rows []ScoutWebRow, f ScoutWebCallsFilter) (ids []int, total 
 		if r.PriceUnit == nil || *r.PriceUnit != "usd" || r.HasPerf&(1<<i) == 0 {
 			return 0, false
 		}
+		if f.Sort == "peak" && r.Rugged != nil && *r.Rugged {
+			return 0, false // a rugged call shows no peak
+		}
 		return r.Perf[i], true
 	}
 	// PostgreSQL's order of float8: NaN is above every number
@@ -1121,6 +1124,7 @@ type webCallDetailJSON struct {
 	SAlpha *struct {
 		ID        int     `json:"id"`
 		Text      string  `json:"text"`
+		Declined  bool    `json:"declined"`
 		URL       *string `json:"url"`
 		At        string  `json:"at"`
 		Truncated bool    `json:"truncated"`

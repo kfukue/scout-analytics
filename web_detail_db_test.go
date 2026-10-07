@@ -90,6 +90,9 @@ func TestWebDetailSelection(t *testing.T) {
 	// alpha: the latest sAlpha reply is empty, an older one has text; Perceptor clean
 	alphaOld := inv(invSeed{tool: salpha, call: "alpha", ca: caAlpha, at: 5 * time.Hour, status: done, text: "alpha: 3 smart wallets"})
 	inv(invSeed{tool: salpha, call: "alpha", ca: caAlpha, at: 10 * time.Hour, status: done, text: ""})
+	// … and a newer reply that declines to report: the older real one still wins
+	inv(invSeed{tool: salpha, call: "alpha", ca: caAlpha, at: 20 * time.Hour, status: done,
+		text: "NOT ENOUGH public signals to generate a report for this token."})
 	alphaPerc := inv(invSeed{tool: perc, call: "alpha", ca: caAlpha, at: 1 * time.Hour, status: done,
 		summary: sp("Top 10 hold 40%; LP locked"), url: sp("https://www.perceptor.info/r/alpha")})
 	// gamma: Perceptor only (stored with the address in lower case), and a
@@ -97,6 +100,11 @@ func TestWebDetailSelection(t *testing.T) {
 	gammaPerc := inv(invSeed{tool: perc, call: "gamma", ca: strings.ToLower(caGamma), at: 3 * time.Hour, status: done,
 		summary: sp("Liquidity PULLED"), url: sp("https://www.perceptor.info/r/gamma"), completed: 3*time.Hour + 30*time.Second})
 	inv(invSeed{tool: perc, call: "gamma", ca: caGamma, at: 9 * time.Hour, status: "failed", summary: sp("failed")})
+	// gamma's sAlpha replies only decline: the latest one is shown, as a decline
+	inv(invSeed{tool: salpha, call: "gamma", ca: caGamma, at: 4 * time.Hour, status: done,
+		text: "Too little liquidity or trading activity to research yet."})
+	gammaDecl := inv(invSeed{tool: salpha, call: "gamma", ca: caGamma, at: 6 * time.Hour, status: done,
+		text: "Not enough public signals to generate a report for this token.", url: sp("https://salpha.example/r/gamma")})
 	// sol: links that are not https are not shown
 	solPerc := inv(invSeed{tool: perc, call: "sol", ca: caSol, at: 6 * time.Hour, status: done, url: sp("http://www.perceptor.info/r/plain")})
 	solSA := inv(invSeed{tool: salpha, call: "sol", ca: caSol, at: 6 * time.Hour, status: done, text: "sol text", url: sp("javascript:alert(1)")})
@@ -116,7 +124,7 @@ func TestWebDetailSelection(t *testing.T) {
 		return *p
 	}
 	for k, want := range map[string][3]int{ // has sAlpha (0/1), Perceptor id, sAlpha id
-		"alpha": {1, alphaPerc, alphaOld}, "beta": {1, 0, betaNew}, "gamma": {0, gammaPerc, 0},
+		"alpha": {1, alphaPerc, alphaOld}, "beta": {1, 0, betaNew}, "gamma": {0, gammaPerc, gammaDecl},
 		"sol": {1, solPerc, solSA}, "virt": {0, 0, 0}, "gave": {0, 0, 0},
 	} {
 		c, ok := byKey[k]
@@ -153,8 +161,15 @@ func TestWebDetailSelection(t *testing.T) {
 		t.Errorf("alpha: %+v %+v", d.Perceptor, d.SAlpha)
 	}
 	d = detail("gamma")
-	if d.SAlpha != nil || d.Perceptor == nil || d.Perceptor.ID != gammaPerc || *d.Perceptor.Summary != "Liquidity PULLED" || d.Perceptor.At != "2026-09-01T03:00:30Z" {
-		t.Errorf("gamma: %+v %+v", d.Perceptor, d.SAlpha)
+	if d.Perceptor == nil || d.Perceptor.ID != gammaPerc || *d.Perceptor.Summary != "Liquidity PULLED" || d.Perceptor.At != "2026-09-01T03:00:30Z" {
+		t.Errorf("gamma: %+v", d.Perceptor)
+	}
+	if d.SAlpha == nil || d.SAlpha.ID != gammaDecl || !d.SAlpha.Declined ||
+		d.SAlpha.Text != "Not enough public signals to generate a report for this token." {
+		t.Errorf("gamma: salpha %+v, want the latest decline (id %d, declined)", d.SAlpha, gammaDecl)
+	}
+	if d := detail("alpha"); d.SAlpha == nil || d.SAlpha.Declined || d.SAlpha.ID != alphaOld {
+		t.Errorf("alpha: salpha %+v, want the older real report %d", d.SAlpha, alphaOld)
 	}
 	d = detail("sol")
 	if d.Perceptor == nil || d.Perceptor.URL != nil || d.SAlpha == nil || d.SAlpha.URL != nil || d.SAlpha.Text != "sol text" {
@@ -177,7 +192,7 @@ func TestWebDetailSelection(t *testing.T) {
 			seen[id] = true
 		}
 	}
-	for _, id := range []int{betaNew, alphaOld, alphaPerc, gammaPerc, solPerc, solSA} {
+	for _, id := range []int{betaNew, alphaOld, alphaPerc, gammaPerc, gammaDecl, solPerc, solSA} {
 		if !seen[id] {
 			t.Errorf("text %d never read", id)
 		}

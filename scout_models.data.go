@@ -1264,18 +1264,24 @@ const (
 	// webSAlphaSQL: each token's latest completed sAlpha investigation by the
 	// same rule, among those whose report_text has something other than white
 	// space (about half of sAlpha's replies are empty: they count as no report,
-	// so an older one with text is taken instead).
+	// so an older one with text is taken instead). A reply that only declines
+	// ("Not enough public signals …": its text contains one of the phrases of
+	// $1, lower case, see salphaDeclinePhrases) is taken only when the token
+	// has no real report: any real report, however old, comes first.
 	webSAlphaSQL = `(SELECT DISTINCT ON (lower(i.contract_address)) lower(i.contract_address) AS ca, i.id
 		FROM scout_investigations i JOIN scout_investigation_tools sat ON sat.id = i.tool_id AND sat.code = 'salpha'
 		WHERE i.status = 'completed' AND i.report_text ~ '[^[:space:]]'
-		ORDER BY lower(i.contract_address), i.requested_at DESC, i.id DESC)`
+		ORDER BY lower(i.contract_address),
+			EXISTS (SELECT 1 FROM unnest($1::text[]) AS d(phrase) WHERE strpos(lower(i.report_text), d.phrase) > 0),
+			i.requested_at DESC, i.id DESC)`
 	webSAlphaJoinSQL = ` LEFT JOIN ` + webSAlphaSQL + ` sa ON sa.ca = fc.ca`
 )
 
 // webRowsSQL loads the website's whole list in one statement: each token's
 // first call with its tracking row (and its latest price), the late-entry
 // results of the five windows, how often the token was called, its latest
-// Perceptor report, the id of its latest sAlpha report with text and the
+// Perceptor report, the id of its latest sAlpha report with text (a real
+// report before a decline; $1 = salphaDeclinePhrases) and the
 // market caps of the post. It reads the
 // tables directly (not scout_call_dataset_v, whose per-row lookups the website
 // does not need). Ordered by call id.
@@ -1327,7 +1333,7 @@ func (st *ScoutStore) SelectWebRows(ctx context.Context) ([]ScoutWebRow, int, er
 	if err := tx.QueryRow(ctx, `SELECT count(*) FROM scout_calls WHERE post_kind = 'update'`).Scan(&updatePosts); err != nil {
 		return nil, 0, err
 	}
-	rows, err := tx.Query(ctx, webRowsSQL)
+	rows, err := tx.Query(ctx, webRowsSQL, salphaDeclinePhrases)
 	if err != nil {
 		return nil, 0, err
 	}

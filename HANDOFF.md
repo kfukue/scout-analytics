@@ -1,180 +1,204 @@
 # Scout analytics: handoff to Claude Code
 
-Written 6 October 2026. Start Claude Code in the repo root; `.claude/settings.json`
+Written 6–7 October 2026. Start Claude Code in the repo root; `.claude/settings.json`
 makes the session the product manager, which delegates to the agents in
 `.claude/agents/` (see "Agent setup").
 
 First message to give it:
 
-> Read telegrambot/scoutanalytics/HANDOFF.md and README.md, then build the
-> items under "Next work" in order. Report after each one.
+> Read telegrambot/scoutanalytics/HANDOFF.md and README.md, then check
+> "Prod state and pending owner actions" with me before starting "Next work".
 
-## State of the code
+## What the system is
 
 Branch `scout-call-model`. Production runs `main`.
 
 - Listener: reads @scoutrobinhood, tells real calls from "hit 3X" update posts
   (`postkind.go`), sends new tokens to @perceptor0xBot and @salpha_research_bot,
   delivers to the private group, records to Postgres.
-- Tracker (`-track`): on-chain prices from Uniswap v2/v3/v4 pools, returns at
-  1h/1d/3d/7d/30d, 5-minute and hourly candles, pre-call trading stats, token
-  names from `name()`. Only the first real call of each token is tracked; later
-  calls get status `repeat`. A latest-price pass keeps a current return per
-  token (every 15 minutes under 30 days old, daily after).
-- Website (`-web`, port 8090, no login, read-only): one row per token, served
-  from an in-memory snapshot refreshed every 15 seconds, plus a "Refresh now"
-  button. Columns: Date | Token | Symbol | Calls | Perceptor | Status | Entry $ |
-  Call MC | Latest MC | Latest % | Peak % | Worst drop % | 1h | 1d | 3d | 7d |
-  30d. Search, sorts, Perceptor filter, legend, and a per-row report detail
-  pane (Perceptor + sAlpha). Front end is plain JavaScript in `frontend/` (no
-  framework, no build step).
+- Tracker (`-track`): on-chain prices from Uniswap v2/v3/v4 pools and Pons V2
+  bonding curves, returns at 1h/1d/3d/7d/30d, 5-minute and hourly candles,
+  pre-call trading stats, token names from `name()`. Only the first real call of
+  each token is tracked; later calls get status `repeat`. A latest-price pass
+  keeps a current return per token.
+- Website (`-web`, no login, read-only): one row per token from an in-memory
+  snapshot refreshed every 15 seconds, a "Refresh now" button, 17 columns,
+  search, sorts, Perceptor filter, legend and a per-row report detail pane.
+  Plain JavaScript in `frontend/` (no framework, no build step).
 - Model (`ml/`): labels for four holding periods, logistic baseline and
   LightGBM, time-split validation with pass/fail gates, scoring service. Not
-  trained on real data yet: the tracker has to finish the history first.
+  trained on real data yet.
 
-### Shipped and merged to `main`
+## 1. Shipped
 
-1. "Latest %": the latest-price pass and the website column (commit 514b073).
-2. eth_getLogs range size (commit af8e8fe): the range size is kept per scan; a
-   range is split only on a "too large" refusal or a node "request timed out"
-   (after one retry); it grows back after 3 full-size answers; the floor is 200
-   blocks; progress lines show the range size.
-3. Market cap columns (commit 9894e0f): Call MC and Latest MC.
-   - Call MC = the first valid figure of `called_at_mcap_usd`, `mcap_usd` (a 0
-     or NaN called-at value falls back to `mcap_usd`; the fallback shipped in
-     1f4e206).
-   - Latest MC = `COALESCE(mcap_usd, called_at_mcap_usd)` ×
-     `latest_price_usd` ÷ at-post `entry_price_usd` (an estimate; assumes
-     supply has not changed).
-   - Both sortable (`call_mc`, `latest_mc`); a dash for non-USD or invalid
-     inputs.
-4. "Refresh now" button, new column order and per-window returns (commit
-   1f4e206).
-   - Order: Date | Token | Symbol | Calls | Perceptor | Status | Entry $ |
-     Call MC | Latest MC | Latest % | Peak % | Worst drop % | 1h | 1d | 3d |
-     7d | 30d.
-   - The 1h/1d/3d/7d/30d selector switches only Peak % and Worst drop %. The
-     five window columns sort with `return_1h` … `return_30d`.
-   - `POST /api/refresh`: coalesced with the background loop, 5 s global rate
-     limit, same-origin check, waits at most 15 s (then 504), 503 on a database
-     failure. Every other request is still answered from the snapshot.
-   - Same commit: the Call MC first-valid-figure fallback, and the
-     `TestWebGzip` fix (the test now expects SVG to be compressed).
-5. `-retry-no-pool` (commit 8ed80f9): one-shot, database-only command that sets
-   `no_pool` first calls back to `pending`, due now.
-   - `-retry-gave-up` also includes `gave_up` calls; those without an entry
-     price get their on-chain state cleared so the pool is discovered again.
-   - `-retry-launchpad a,b` limits it to launchpads or dexes (match ignores
-     case, spaces and punctuation). `-retry-dry-run` only shows what would be
-     reset.
-   - **Not run yet.** The owner plans to run it after Pons V2 support is
-     deployed (steps under Next work item 1), and again after the Longxyz/USD
-     work.
+Committed and pushed on `scout-call-model`, merged to `main` through PRs
+(#10–#14); prod runs `main`.
 
-### Committed on `scout-call-model` (commit 8846dc6; may not be merged or deployed yet)
+- Latest % (514b073); eth_getLogs range-size fix (af8e8fe); Call MC and Latest
+  MC columns (9894e0f); Refresh now and the 17-column layout (1f4e206);
+  `-retry-no-pool` (8ed80f9).
+- Report detail pane (`GET /api/call`) and the rug guard (8846dc6): quote side
+  under `SCOUT_RUG_LIQ_USD` (default $500, set in `.env`) means rugged, −100%
+  from the rug point; bound prices (2^128) ignored; 1e6× backstop.
+- Pons V2 support (d39f399, 730b1c2): curve pricing from `CurveBuy`/`CurveSell`,
+  graduation to the v4 pool through the Pons hook, no USD rug check on the curve,
+  graduation found from indexed logs (no look-back limit), no PoolManager
+  fallback for Pons.
+- In 40e1888 (the subject line only mentions ops and ML):
+  - v4 pool discovery via `Initialize` (no PoolManager-wide scan; the old
+    400-step backward walk is gone).
+  - USD-source fix: one lookup chain everywhere (stablecoin → Robinhood feed →
+    mainnet feed → own pool against ETH or a stablecoin, chosen per block); no
+    cached errors; the data-loss fix (state is saved only when every step of a
+    horizon segment succeeds); feeds loaded from `asset_chains`, with the env
+    var winning on conflict; Chainlink aggregator switches handled; the gecko
+    source uses reserve/2.
+  - Ops scripts (pgAdmin, A/B/C/D): `ops/2026-10-rug-retrack`,
+    `ops/2026-10-pons-v4-retrack`, `ops/2026-10-asset-chains-feeds`.
+  - ML: outcomes over `MAX_OUTCOME_PCT = 1e5` excluded, simulation return capped
+    at `SIM_MAX_RET_PCT = +1000%` (owner approved), tracker columns forbidden as
+    model inputs.
+- 4cd2bd5 (Pons-v4 re-track skips rows already tracked by the Pons-aware code)
+  is pushed on `scout-call-model` but not yet merged to `main`. It changes only
+  the ops scripts, which the owner runs from the branch checkout.
 
-1. **Report detail pane.** A toggle per row shows the Perceptor and sAlpha
-   reports, loaded from `GET /api/call?id=`; rows with an sAlpha report get an
-   "sA" badge. Empty sAlpha replies count as no report. The texts are held in a
-   separate in-memory map, and each refresh reads only ids not loaded yet.
-2. **Rug guard.**
-   - When the quote side of the pool is under `SCOUT_RUG_LIQ_USD` (default
-     $500, settable in `.env`) the call is rugged: −100% from the rug point,
-     peak = the pre-rug peak.
-   - An empty pool always counts as rugged.
-   - Bound prices (2^128) are ignored; a 1e6× backstop catches the rest.
-   - `current_liquidity_usd` stores 2 × the quote side.
-   - Fixed an old bug where an interrupted run valued the pool at $1/ETH in the
-     end check.
-   - Follow-up (minor): the gecko source still compares `reserve_usd` (both
-     sides), not the quote side.
+## 2. Not yet committed (owner must commit and push)
 
-### Pending owner actions
+The website follow-ups and restyle (Mantine-style, after oca.lylelabs.io):
 
-1. **Re-track reset, about 149 calls.** First calls with status
-   tracking/done/error and `current_liquidity_usd < 1000` (= quote side under
-   $500), plus the calls with impossible numbers (returns, peak or latest over
-   1e5%, or the 2^128 fingerprint).
-   - Prepared as four pgAdmin files in the session scratchpad
-     `retrack\pgadmin\`: A_count, B_reset (with an expected-count guard),
-     C_check, D_catchup. The owner uses **pgAdmin**, so no psql
-     meta-commands.
-   - Steps: deploy, run A, stop the trackers, run B, start the trackers, run C;
-     D only if needed.
-   - **Not run yet.** The owner is letting the overnight `-track` run finish
-     first.
-2. **After the reset's re-tracking has finished: ask about the Uniswap v4
-   calls** (see the top of "Open questions").
-3. **Tracking progress:** 1,546 of 4,618 tracked after 12+ hours. That is near
-   the ceiling of about 1,850–1,900, because the Pons V2 calls cannot be priced
-   until Pons support ships.
+- sAlpha declines ("Not enough public signals…", "Too little liquidity…") show
+  "sAlpha did not generate a report", with no badge.
+- One Perceptor line (no more "no red flags · No red flags found").
+- Rugged rows: the API sends no peak; Status shows only the "rugged" badge
+  (owner approved).
+- Huge numbers in 10ⁿ notation, exact value in the tooltip.
 
-### Tracker speed: root cause and fix
+`git status` on 7 October shows exactly these uncommitted files, all under
+`telegrambot/scoutanalytics/`:
 
-The Nitro node (offchainlabs/nitro-node v3.11.2, run with `docker run` on the
-prod server) indexed logs only for the last 9.4M blocks (the default
-`execution.rpc.log-history`). Older ranges were walked at about 1 ms per block,
-timed out at 30 s and shrank ranges to 3,120 blocks. The owner added
-`--execution.rpc.log-history=0`. A probe (`logprobe.sh`, in the owner's
-`~/Documents` on the server) then showed deep history indexed: 200k blocks about
-40M back in 14 s, about 55M back in 12 s. After the restart a call takes 1-2
-minutes and 14-380 requests, against more than an hour and 7,000 before.
+- modified: `frontend/app.js`, `frontend/index.html`, `frontend/style.css`,
+  `scout_models.data.go`, `scout_models.go`, `web.go`, `web_db_test.go`,
+  `web_detail_db_test.go`, `websnapshot.go`, `websnapshot_test.go`
+- untracked: `websnapshot_rug_test.go`
+- also untracked: `.claude/` at the repo root (see "Agent setup").
 
-Status at restart: pending 4166, tracking 142, done 642, no_pool 67, error 26,
-gave_up 8, repeat 5486.
+Run the reviewer agent on this diff before giving the owner commit commands.
 
-### Chainlink feeds on prod
+## 3. Prod state and pending owner actions
 
-`.env` on the server has `SCOUT_CHAINLINK_FEEDS` for 10 verified Robinhood stock
-tokens: GME, MSFT, TSLA, SPCX, CRCL, GOOGL, MU, NVDA, AMZN, SNDK. A full
-33-token line was offered; the owner may have added it.
+1. **Pons-v4 re-track** (`ops/2026-10-pons-v4-retrack`): B ran on 539 calls,
+   `reset_at` 2026-10-06 23:16:27.758076-07. At the last C: 35 re-tracked (6
+   went back to the curve, so they had wrong entries; 20 on v4), race 0. Re-run
+   C until `waiting` = 0.
+2. **Rug re-track** (`ops/2026-10-rug-retrack`): 151 calls, `reset_at`
+   2026-10-06 15:13:37.355323-07. At the last C: 36 re-tracked, race 0. Confirm
+   it finished.
+3. **asset_chains seed** (`ops/2026-10-asset-chains-feeds`): run
+   `A_inspect.sql`, fill the EDIT values in B (`asset_type_id`, the chain row
+   values, `expected_count` 33), run B, then C. Token addresses are verified;
+   feed addresses come from the owner's paste.
+4. **USD repair:** calls stuck in a non-USD `price_unit` (ORBIO-type Pons
+   quotes, HOODon, RDDT, meme quotes) and calls that lost candle segments
+   ("candles to +…" errors). The selection SQL exists (in the USD coder's
+   report); it still has to become a tested pgAdmin script set in `ops/` like
+   the others (Next work 1).
+5. **REMINDER (the owner asked to be reminded):** decide whether to re-track
+   the 1,166 old Uniswap v4 calls. They have no stored liquidity (the old code
+   never measured v4), so the liquidity filter cannot select them. About 2–4
+   hours of tracker time.
+6. Commit and push the website work (section 2), merge, and deploy (restart
+   `-web`).
+7. Decide about `stash@{0}` ("On codex/scout-dashboard: scout-dashboard before
+   main sync 2026-10-06"; touches the scout README, `main.go`,
+   `scout_models.data.go`, `scoutanalytics.sql`, `tracker.go` and a test). It
+   is probably superseded and will not move to the new repo. (`stash@{1..3}`
+   are old GitHub Desktop stashes from other branches.)
+8. After the backlog clears, run the launchpad queries: status by launchpad;
+   error kinds; 3 sample CAs per unpriced launchpad. O1 Rwa: 59 of 60 were
+   just pending. Possible gaps: Lunch Pair V4 (0 done), Pools Trade.
+9. **Prod settings** (for reference):
+   - `-track` with `SCOUT_RPC_RPS=300 SCOUT_TRACK_WORKERS=12
+     SCOUT_RPC_PARALLEL=4 SCOUT_RPC_MAX_INFLIGHT=48`, latest-price pass on.
+   - `SCOUT_CHAINLINK_FEEDS` in `.env` (10–33 stock feeds); the web port is
+     `SCOUT_WEB_ADDR` in `.env`.
+   - Nitro runs with `--execution.rpc.log-history=0` (full log index; a full
+     node, not an archive). Keep it, or old ranges slow down again.
+10. Prod uses **pgAdmin** for SQL. Ops scripts must have no psql
+    meta-commands, and the `expected_count`/`reset_at` EDIT lines must be
+    marked with `<<< EDIT` on the exact line (the owner has twice edited the
+    wrong line).
 
-- Token addresses are verified against Robinhood's registry,
-  `https://api.robinhood.com/rhj/prices/<SYMBOL>` (chain 4663).
-- Use each feed's "Standard Proxy" address.
-- Robinhood feeds price one token (share × uiMultiplier), so they are used
-  directly.
-- HOODon (0xfb5b5778d45ae47f15323fb59b666c655174a79c) is not a Robinhood token
-  (probably Ondo) and has no feed. RDDT is official but has no feed in
-  Chainlink's list.
+## 4. Next work (code), in order
 
-### Prod data findings (owner's SQL)
+1. USD-repair pgAdmin scripts (item 3.4), in `ops/` with the same A/B/C/D
+   layout, tested against a throwaway Postgres.
+2. `settings.json`: add `PowerShell(git push:*)` to deny (Bash rules do not
+   cover the PowerShell tool) and the matching PowerShell allows.
+3. Small fixes:
+   - `-price-check` should load the DB feeds (`main.go`, two lines);
+   - cap retries for an entry whose quote first traded after the call (then
+     fall back to quote units);
+   - deterministic choice of the call-time block;
+   - the "node type" wording.
+4. Tracker efficiency: a rolling worker queue (today each cycle waits for its
+   slowest call); the latest pass re-reads blocks the horizon scan reads later;
+   checkpoints within a horizon segment; head-block caching; the flaky test
+   `TestLatestPriceInterruptedLeavesRowUntouched`.
+5. Open question: should `prior_calls`, `calls_prev_1h` and `calls_prev_24h`
+   (model inputs) count update posts? They still do.
+6. Support for other launchpads, after item 3.8.
+7. **Train the baseline model** (the goal of the prediction plan) once the
+   backlog and re-tracks are done; ml-coder agent.
+8. Scatter plot with ECharts 6.1 (decided; the demo was in a former scratchpad
+   and is gone after the restart; rules in `coder.md`, "Charts").
+9. Push updates via Server-Sent Events (`GET /api/events`; the listener
+   `NOTIFY`s, the web process `LISTEN`s and refreshes its snapshot).
+10. Other call sources (Call Analyser channels; parked).
+11. DEPLOY.md / infra.
 
-- First calls by launchpad: Pons V2 2,774 (60%; done 8, no_pool 66, pending
-  2,654), Uniswap V4 697, Longxyz 423, Uniswap V3 124, Pons (v1) 119, then about
-  40 small launchpads.
-- The 26 errors were mostly transient: 12 "connection refused" during the Nitro
-  restart, 12 "bad response" (oversized replies, probably from the old code),
-  1 SNDK "no trades in the USDG pool", 1 GOO "no USD source".
-- 35 calls are stuck in non-USD units. Stock tokens: HOODon 9, GME 5, RDDT 3,
-  MSFT 3, TSLA 2, SPCX 2, CRCL, GOOGL, MU, NVDA, AMZN 1 each. Meme and other
-  quotes: PIPEDOG 4, PONS 3, SHIB 2, VIRTUAL 1.
-- Still to confirm: that the "bad response" errors recover under the new code.
-  Ask the owner to run:
-  `SELECT left(error,40) kind, count(*), max(last_checked_at), min(next_check_at) FROM scout_call_tracking WHERE status='error' GROUP BY 1`
+## 5. Repo migration (on hold until the pending tasks are done)
+
+- Plan: `git filter-repo --subdirectory-filter telegrambot/scoutanalytics` on a
+  fresh clone of **`https://github.com/kfukue/geth-analytics.git`** (the real
+  remote, not geth-analytics-api), from `origin/scout-call-model`.
+- New module `github.com/kfukue/scoutanalytics`, `package main` at the root.
+- Copy `database/database.go` to `internal/database` unchanged (same `.env`);
+  new `.gitignore`; copy `.claude/` with paths rewritten; docs to `go run .`.
+- Pre-checks done: no secrets ever in history (all refs); `origin/main` has
+  nothing the branch lacks; `codex/scout-dashboard` is local-only with no
+  unique commits; 28 commits.
+- Blockers: the uncommitted website work (section 2) and the stash decision
+  (item 3.7).
+- Prod cut-over: copy `.env`; stop the old listener before starting the new one
+  (never two on one Telegram session); copy `scout.session.json` and
+  `scoutanalytics_data/`; start with `go run .`; rollback = restart the old one.
+- Later: `MaxConns` for `SCOUT_DATABASE_URL` is hard-coded to 4 and needs
+  raising for 12 workers; `database.go` fatally requires `.env` in the working
+  directory.
 
 ## Rules the owner has set
 
-- Never print, commit or copy `.env`, `scout.session.json`, `scoutanalytics_data/`.
+- Never print, commit or copy `.env`, `scout.session.json`,
+  `scoutanalytics_data/`.
 - No new database tables without asking; extend existing ones. Every statement
   in `scoutanalytics.sql` must be safe to repeat (it runs at every start).
   Views are dropped and recreated at startup, dependents first.
+- Shared tables (`assets`, `chains`, `asset_chains`) are never altered; the
+  tracker only SELECTs from them. Change rows with SQL, not the API's
+  `/assetChains` routes.
 - Website speed is the priority: requests are answered from the snapshot and
   must not query the database (the only exception is the rate-limited
-  `POST /api/refresh`). Keep p95 under 10 ms; rerun the benchmark
-  (`go test -run xxx -bench BenchmarkWebSnapshot`) after touching it.
+  `POST /api/refresh`). Keep p95 under 10 ms; rerun
+  `go test -run xxx -bench BenchmarkWebSnapshot -benchmem` after touching it.
 - Only real calls are scanned, delivered and tracked; one row per token.
 - The owner commits and pushes; agents' git commit and push are blocked by
   permissions. Never commit to `main`.
 - Say "tested locally" unless it ran on the prod server. Flag anything that
   makes the tracker redo history or adds ongoing node load before shipping it.
-- Ask the owner before resetting calls, and give him the exact SQL.
+- Ask the owner before resetting calls; give him pgAdmin scripts (see 3.10).
 - One line of work at a time on this database: two branches migrating the same
   schema caused both production startup failures so far.
-- One coder at a time on overlapping files: parallel coders in the same tree
-  mixed their README edits.
-- A coder that runs a throwaway Postgres uses its own scratchpad directory and
-  its own port, then stops it and deletes the directory when done.
+- At most **3** coding agents in parallel, each on disjoint files.
 - The owner prefers not to set up a local test database. For prod data he runs
   read-only queries and pastes the results.
 
@@ -182,269 +206,72 @@ tokens: GME, MSFT, TSLA, SPCX, CRCL, GOOGL, MU, NVDA, AMZN, SNDK. A full
 
 - `go vet ./telegrambot/scoutanalytics` and
   `go test -race ./telegrambot/scoutanalytics`. Database tests need
-  `SCOUT_TEST_DATABASE_URL` pointing at a throwaway Postgres; without it they
-  are skipped. `TestOpenScoutStoreSelection` needs that database to be named
-  `scout_test` (the README's example URL uses that name but does not say it is
-  required). See the rule above on running a throwaway Postgres.
-- `TestLatestPriceInterruptedLeavesRowUntouched` is flaky (see Next work
-  item 7, smaller tracker improvements).
+  `SCOUT_TEST_DATABASE_URL` pointing at a throwaway Postgres named
+  `scout_test` (`TestOpenScoutStoreSelection` needs that name), run with
+  `-p 1`; without it they are skipped.
+- Throwaway Postgres: `initdb` in the agent's own scratchpad subdirectory, its
+  own port on 127.0.0.1, `pg_ctl stop` and delete the directory at the end.
+  Never touch the Windows Postgres service on port 5432.
+- `TestLatestPriceInterruptedLeavesRowUntouched` is flaky (about 1 run in 10,
+  old code too); rerun before treating it as real.
 - On-chain code uses the fake chain in `onchain_test.go`; never call real nodes.
-- `python -m pytest tests -q` in `ml/` (27 tests).
-- Page changes: check in a real browser at 1280px and 390px, light and dark.
-  Build DOM with `textContent` only (token names come from arbitrary contracts)
-  and keep the Content-Security-Policy (no inline script or style).
-
-## Next work (in order; one line of work at a time)
-
-1. **Pons V2 support** (owner approved; **in progress**, a coder is building
-   it). 60% of first calls are Pons V2 and almost none are priced.
-   - Being built: discovery via the factory's `TokenLaunched`; prices from
-     `CurveBuy`/`CurveSell`; graduation handover to the v4 pool (Pons hook) in
-     both the horizon scan and the latest pass; `-price-check` shows curve
-     info.
-   - **No USD rug threshold on the curve** (the curve's real reserve starts
-     near 0); the 5% rule and the 1e6× backstop still apply.
-   - After deploy: `-price-check` on 2–3 Pons tokens; then
-     `-retry-no-pool -retry-dry-run`; then
-     `-retry-no-pool -retry-launchpad pons_v2 -retry-gave-up`. Expect mostly
-     `gave_up` in the dry run, since historical Pons calls are past the 32-day
-     deadline.
-   - Pons V2 deploys one bonding curve per token. Factory
-     0x7eD598BcEf8bd9Edd8C97A195C6d13f40801EC7e emits
-     `TokenLaunched(token indexed, curve indexed, deployer indexed, pairToken, launchConfigId, graduationThreshold)`;
-     a zero pairToken means ETH.
-   - The curve emits `CurveBuy(buyer indexed, recipient indexed, quoteIn, tokensOut, fee, tax)`,
-     `CurveSell(seller indexed, recipient indexed, tokensIn, quoteOut, fee, tax)`
-     and `CurveCompleted`. It has `token()`, `pairToken()` and `getReserves()`,
-     but no `token0()`.
-   - At the threshold (4.2 ETH) the token graduates to a Uniswap v4 pool behind
-     hook 0xE5e702641Ea86F4ae6cC3cDaeD2B886f976Be044; the factory emits
-     `PoolGraduated`.
-   - Pons V1 (factory 0xA5aAb3F0c6EeadF30Ef1D3Eb997108E976351feB) used Uniswap
-     v3 and already works.
-   - Source: github.com/ponsdotdev/pons-labs
-     (`contractsV2/src/v2/PonsV2BondingCurve.sol`); docs.ponsfamily.com/v2.
-     Check in the source whether CurveBuy's `quoteIn` is gross or net of fee.
-   - Design: in `resolveV2V3`, when `token0()` fails, try `token()`/`pairToken()`
-     and set `Kind="pons"`. `logFilter`/`priceOfLog`/`tradeOfLog` cover the
-     curve events, with the price taken from the execution price. Hand over to
-     the v4 pool at graduation, keeping the running extremes. When the call was
-     before graduation, prefer the curve in discovery. `pool_dex = "pons-curve"`.
-   - Estimate: about 150-250 lines plus tests. No schema change, no state
-     version bump. `no_pool` calls retry every 6 hours on their own. The 2
-     `gave_up` Pons calls need a reset (cheap with the full index; ask the owner
-     first): `-retry-no-pool` covers this after deploy (see "Shipped", item 5).
-   - Example token 0x59e8ae5c2e1edf77d2169e0ae67524c43aaca393 (call 10214). The
-     owner was asked to run a factory eth_getLogs (topic1 = token) to confirm
-     the layout on chain.
-2. **USD source fix and data-loss bug** (next after Pons V2; covers most of
-   Longxyz), in `quoteUSD`/`quoteViaPool`
-   (`onchain.go`, `onchain_extra.go`, `tracker_onchain.go`).
-   - (a) The `quotePools[quote]=nil` cache lives for the whole process and
-     ignores the block, and JSON-RPC errors are cached as "no pool". Separate
-     "no pool" from "lookup failed"; give negative cache entries an expiry;
-     search around the block and around head, and widen when no acceptable
-     pool is found; keep every acceptable pool and choose one per block.
-   - (b) Lookup order everywhere: stablecoin → Robinhood feed → mainnet feed →
-     asset/WETH pool (v2/v3/v4) × mainnet ETH/USD → asset/stable pool. Robinhood
-     feeds come before mainnet because they cover every stock token and price
-     the token itself; with the full log index they are cheap. ETH/USD stays on
-     mainnet Chainlink.
-   - (c) **Data-loss bug:** the horizon step advances `scan_block` and saves it
-     even when candle conversion fails afterwards, so the candles and peak/low
-     of that segment are lost for good. Work on a copy of the state and commit
-     only when every step succeeds.
-   - (d) Handle Chainlink aggregator changes on the log-based (full-node) feed
-     path.
-   - (e) Load feeds from the existing shared table `asset_chains` (`asset_id`,
-     `chain_id`, `chainlink_data_feed_contract_address`; primary key
-     asset_id + chain_id; defined in the sibling repo
-     `lyle-labs-libraries\assetChain\asset-chain-link-feed.sql`). Join `assets`
-     (by contract address, compared with `lower()`) and `chains` (EVM chain_id
-     4663 for Robinhood, 1 for mainnet). Reload each cycle and swap atomically.
-     Database rows add to the env vars; the env vars win on conflict. Do not add
-     an `is_active` column: altering a shared table risks a migration permission
-     failure, so delete a row to deactivate it. Edit rows with SQL, not the
-     API's `/assetChains` routes, which are buggy and can crash the API.
-     Stock-token asset rows need `ignore_market_data=true` and
-     `import_geth=false`.
-     - Prod check results (owner ran them):
-       - `chains` has only Ethereum (id 2, chain_id 1). There is **no Robinhood
-         Chain row** (chain_id 4663).
-       - `asset_chains` columns are exactly: `asset_id int NOT NULL`,
-         `chain_id int NOT NULL`,
-         `chainlink_data_feed_contract_address text NOT NULL`,
-         `created_by text NOT NULL`, `created_at timestamptz NOT NULL`,
-         `updated_by text NOT NULL`, `updated_at timestamptz NOT NULL`.
-       - There are **0 assets on chain 4663**.
-     - So this needs a **seed SQL script** that the owner reviews and runs
-       himself on prod (the tracker itself only SELECTs from these tables). It
-       must be safe to run twice:
-       - insert the `chains` row for Robinhood Chain (chain_id 4663) if missing;
-       - insert about 33 `assets` rows for the Robinhood stock tokens
-         (`ignore_market_data=true`, `import_geth=false`), matched by
-         `lower(contract_address)` + chain so it never duplicates;
-       - insert the 33 `asset_chains` feed rows (Standard Proxy addresses).
-     - Before writing the script, ask the owner to run `information_schema`
-       queries for the live NOT NULL columns (and defaults) of `assets` and
-       `chains`, e.g.
-       `SELECT table_name,column_name,data_type,is_nullable,column_default FROM information_schema.columns WHERE table_name IN ('assets','chains') ORDER BY table_name,ordinal_position`.
-     - The 33 pairs (token on Robinhood Chain = Chainlink Standard Proxy feed on
-       Robinhood Chain). Tokens come from `api.robinhood.com/rhj/prices/<SYM>`,
-       feeds from Chainlink's Robinhood page. Only the original 10 (GME, MSFT,
-       TSLA, SPCX, CRCL, GOOGL, MU, NVDA, AMZN, SNDK) were compared
-       byte-for-byte; the other 23 came through a web-summarising tool and must
-       be re-checked with `curl https://api.robinhood.com/rhj/prices/<SYM>`
-       before seeding. RDDT (0x05b37fb53a299a1b874a619e1c4c404d52c36f4c) is
-       official but has no feed. HOODon is not a Robinhood token.
-
-       ```
-       AAPL  0xaF3D76f1834A1d425780943C99Ea8A608f8a93f9=0x6B22A786bAa607d76728168703a39Ea9C99f2cD0
-       AMD   0x86923f96303D656E4aa86D9d42D1e57ad2023fdC=0x943A29E7ae51A4798823ca9eEd2ed533B2A22C72
-       AMZN  0x12f190a9F9d7D37a250758b26824B97CE941bF54=0xD5a1508ceD74c084eBf3cBe853e2C968fB2a651C
-       ASML  0x47F93d52cBeC7C6D2CfC080e154002370a60dAEA=0xB4106147E8cce40b7d46124090d373A71b70f87D
-       BABA  0xad25Ac6C84D497db898fa1E8387bf6Af3532a1c4=0x62Cc8F9b5f56a33c9C8A60c8B92779f523c4E984
-       CLSK  0xcBB95BBF36099d34dA091dc6Fa6F49EfA257Cee3=0x810c12D3a554Bc47fd39597Fe3b3AAC4941F50eF
-       COIN  0x6330D8C3178a418788dF01a47479c0ce7CCF450b=0xA3a468A452940B7D6b69991207B508c609a98Ef2
-       CRCL  0xdF0992E440dD0be65BD8439b609d6D4366bf1CB5=0x6652eDf64bA3731C4F2D3ce821A0Fb1f1f6b482a
-       CRWV  0x5f10A1C971B69e47e059e1dC91901B59b3fB49C3=0xe1b3aABCAFAd1c94708dc1367dcfF8Aa4407487C
-       DELL  0x941AE714EC6D8130c7B75d67160Ca08f1e7d11Dd=0x1C6c8cADBe02E19129c39dDB92281cE4c0bf206b
-       EWY   0x7f0aBeF0C07280F82c6a08ead09dEd6BAE2C13Fc=0xEFdf54610B62A7753Ec30bDc380847c12D32e1D1
-       GME   0x1b0E319c6A659F002271B69dB8A7df2F911c153E=0x27C71df6A64fB476468EdF256CF72c038baB5B67
-       GOOGL 0x2e0847E8910a9732eB3fb1bb4b70a580ADAD4FE3=0xF6f373a037c30F0e5010d854385cA89185AE638b
-       INTC  0xc72b96e0E48ecd4DC75E1e45396e26300BC39681=0x3f390C5C24628Ac7C489515402235FeAD71D1913
-       IONQ  0x558378E000D634A36593E338eBacdd6207640EfE=0x22EfeC4919baf55F360E0EDee4AbEB26DE4971eb
-       META  0xc0D6457C16Cc70d6790Dd43521C899C87ce02f35=0x7C38C00C30BEe9378381E7B6135d7283356D71b1
-       MSFT  0xe93237C50D904957Cf27E7B1133b510C669c2e74=0x45C3C877C15E6BA2EBB19eA114Ea508d14C1Af2E
-       MSTR  0xec262a75e413fAfD0dF80480274532C79D42da09=0x396118bdFB181e6240E74D243F266B061c0edc3D
-       MU    0xfF080c8ce2E5feadaCa0Da81314Ae59D232d4afD=0x425EEFdCf05ed6526C3cE61Af99429A228a6d596
-       NBIS  0x9D9c6684F596F66a64C030B93A886D51Fd4D7931=0xE1D87B116Ba0fe898998f1D140339D1fA1E09705
-       NVDA  0xd0601CE157Db5bdC3162BbaC2a2C8aF5320D9EEC=0x379EC4f7C378F34a1B47E4F3cbeBCbAC3E8E9F15
-       ORCL  0xb0992820E760d836549ba69BC7598b4af75dEE03=0x0e6a64a2B58A6693a531E6c555f3A5d042eEA844
-       PLTR  0x894E1EC2D74FFE5AEF8Dc8A9e84686acCB964F2A=0x820ABedFF239034956B7A9d2F0a331f9F075eB4c
-       QQQ   0xD5f3879160bc7c32ebb4dC785F8a4F505888de68=0x80901d846d5D7B030F26B480776EE3b29374C2ae
-       RGTI  0x284358abc07F9359f19f4b5b4aC91901Be2597Ba=0x2A045cF1C49c61c166C036d2f06FA2D2d984f765
-       RKLB  0x3b14C39E89D60D627b42a1A4CA45b5bb45Fc12e2=0x045477BF65Aef6f4F2386ad0164579e48381CC74
-       SLV   0x411eFb0E7f985935DAec3D4C3ebaEa0d0AD7D89f=0x209b73908e92Ae021826eD79609845451Ecba2ce
-       SNDK  0xB90A19fF0Af67f7779afF50A882A9CfF42446400=0xfb133Fa4B7b385802B693a293606682Df47109A3
-       SPCX  0x4a0E65A3EcceC6dBe60AE065F2e7bb85Fae35eEa=0xB265810950ba6c5C0Ff821c9963014a56fD8Bffb
-       SPY   0x117cc2133c37B721F49dE2A7a74833232B3B4C0C=0x319724394D3A0e3669269846abE664Cd621f9f6A
-       TSLA  0x322F0929c4625eD5bAd873c95208D54E1c003b2d=0x4A1166a659A55625345e9515b32adECea5547C38
-       TSM   0x58FfE4a942d3885bAa22D7520691F611EF09e7AA=0x874cF94aa8eC88Fd9560094dD065f2fB3E41Fc2F
-       USO   0xa30FA36Db767ad9eD3f7a60fC79526fB4d56D344=0x75a9c76Ef439e2C7c2E5a34Ab105EcFe3766431c
-       ```
-   - (f) After it ships: reset the stuck non-USD calls and the calls that hit
-     the data-loss bug so they re-track in USD. Ask the owner first and give him
-     the exact SQL.
-3. **Longxyz.** It trades against stock tokens, so it is probably covered by the
-   feeds plus item 2. Verify after item 2.
-4. **Website follow-ups** (small, queued):
-   - sAlpha "declined" replies ("Not enough public signals…" / "Too little
-     liquidity…") show "sAlpha did not generate a report", with no badge.
-   - De-duplicate the Perceptor line (today "no red flags · No red flags
-     found").
-   - Rugged rows: Peak % shows "–", Status shows "rugged".
-   - Huge numbers in 10ⁿ notation (e.g. +3.9×10⁴⁷%), with the exact value in
-     the tooltip.
-5. **Push updates for new tokens.** The owner confirmed nothing needs to go from
-   the page to the server, so use Server-Sent Events, not a WebSocket. When the
-   listener records a new token and when its Perceptor or sAlpha report
-   arrives, the open page should update without waiting for the next refresh
-   and show a notice.
-   - Transport: `GET /api/events` (Server-Sent Events, no new dependency).
-   - The website is a separate process from the listener. Have the listener
-     `NOTIFY` a Postgres channel after it records a call or an investigation;
-     the web process `LISTEN`s, refreshes its snapshot immediately, compares it
-     with the previous one, and emits `call` and `report` events.
-   - In the page: add the new row at the top when the current filters allow it,
-     show an in-page notice with the token, verdict and a GMGN link, and offer
-     an optional sound. Browser desktop notifications only work on HTTPS or
-     localhost, so on a plain `http://<server address>` they will not appear; say
-     so in the README.
-   - Keep the events endpoint cheap: one goroutine per client, heartbeat
-     comment every 25 seconds, cap the number of clients.
-6. **Charts and scatter plot** of call properties against return. The scatter
-   plot stays parked until the tracker has finished and the model report shows
-   which properties matter.
-   - Decided: Apache ECharts 6.1.x, vendored, with a custom theme and CSP-safe
-     tooltips (rules in the coder agent). amCharts 5 was compared: polished but
-     slow at 12k+ points, no box plot or symlog; its logo would have been
-     acceptable.
-   - A side-by-side demo is being built in the session scratchpad
-     `chartdemo\` for the owner to judge.
-7. **Smaller tracker improvements** (not started):
-   - A rolling worker queue: today each 50-call cycle waits for its slowest
-     call, about 70 s of idle time per new v4 call.
-   - `resolveV4` walks back up to 400 × 200k blocks to find `Initialize` (call
-     10439 read back to August); cache pool-id currencies.
-   - `blockAt` makes uncached head requests.
-   - Checkpoint within a horizon segment.
-   - The latest pass re-reads blocks that the horizon scan reads later.
-   - Flaky test `TestLatestPriceInterruptedLeavesRowUntouched`: fails about 1
-     run in 10, on old code as well.
-8. **Other call sources** (parked).
-   - Best candidates: the Call Analyser channels (@CallAnalyserRobinhood,
-     @CallAnalyserETH, @CallAnalyserBase), an aggregator with named callers in a
-     parseable format, so the tracker can rank callers by measured ROI. No
-     independent win-rate data exists anywhere.
-   - Other public call channels were reviewed and not selected.
-   - Adding a source needs multi-channel support, a parser per source, a
-     caller-name field and a network field. ETH/Base pricing needs a node per
-     chain.
-   - Suggested first step after the model report: @CallAnalyserRobinhood (same
-     chain).
-
-## Agent setup
-
-- `.claude/agents/` has: `coder` (Go + plain JS, with the Go, JS, CSP and
-  charts rules), `ml-coder`, `react-coder` (adapted from wshobson/agents, MIT),
-  `infra` (approval-gated), `researcher` and `product-manager`.
-  `.claude/drafts/reviewer.md` awaits owner approval.
-- New agents load only after a Claude Code restart.
-- `.claude/` is untracked; the owner decides whether to commit it.
-- Pending (#5): tighten `settings.json`: allow read-only git, `node --check`
-  and the ml venv pytest path; widen the secret denials to `**/`.
-
-## Already done (asked again recently)
-
-- Token names are read with the ERC-20 `name()` call and stored in
-  `scout_call_tracking.token_name` (and `token_symbol_onchain`). The tracker
-  fills 200 tokens per cycle.
-
-## Open questions for the owner
-
-- **REMINDER (the owner asked to be reminded): once the re-track reset's
-  re-tracking has finished (Pending owner actions, item 1), ask the owner
-  whether to also re-track the 1,166 Uniswap v4 calls.** They have no stored
-  liquidity (the old code never measured v4), so the liquidity filter cannot
-  select them, and drained v4 pools may still hold old results. About 2–4 hours
-  of tracker time.
-- Should `prior_calls`, `calls_prev_1h` and `calls_prev_24h` (model inputs)
-  count real calls only? They still count update posts.
-- "Show the expanded pane with the questions": the report detail pane is now
-  committed. Ask the owner whether "the questions" means something the pane
-  should also show.
-- Approve the drafted `reviewer` agent (see "Agent setup"); add a deploy
-  checklist?
-- A staging copy of `assetdb` would let changes be run against real data
-  before production.
-- Did he add the full 33-feed `SCOUT_CHAINLINK_FEEDS` line?
-- Result of the Pons factory eth_getLogs (Next work item 1).
-- Result of the error query under "Prod data findings".
+- `ml/`: `python -m pytest tests -q` with the ml venv.
+- Go files are CRLF: check gofmt on LF copies.
+- Page changes: check at 1280px and 390px, light and dark. DOM with
+  `textContent` only, and keep the Content-Security-Policy (no inline script or
+  style).
+- Ops SQL: run A/B/C/D against the throwaway Postgres before handing them over.
 
 ## Deploying
 
 The owner commits and pushes `scout-call-model` from the PC, merges it into
-`main`, and deploys `main` on the server: `git checkout main && git pull`, then
-restart the three processes:
+`main` with a PR, and deploys `main` on the server: `git checkout main && git
+pull`, then restarts the processes that changed:
 
 - `go run ./telegrambot/scoutanalytics -listen-only`
 - `SCOUT_RPC_RPS=300 SCOUT_TRACK_WORKERS=12 SCOUT_RPC_PARALLEL=4 SCOUT_RPC_MAX_INFLIGHT=48 go run ./telegrambot/scoutanalytics -track`
-  with the latest-price pass on (the owner wants latest prices).
-  `SCOUT_RPC_LOG_CHUNK` is unset (default 200000).
-- `go run ./telegrambot/scoutanalytics -web`. If a reverse proxy is put in
-  front of it, it must pass the `Host` header unchanged, or the same-origin
-  check makes `POST /api/refresh` (Refresh now) return 403.
+  (latest-price pass on; `SCOUT_RPC_LOG_CHUNK` unset, default 200000).
+- `go run ./telegrambot/scoutanalytics -web`. A reverse proxy in front must
+  pass the `Host` header unchanged, or the same-origin check makes
+  `POST /api/refresh` return 403.
 
-The Nitro node runs with `--execution.rpc.log-history=0`; keep it, or the
-tracker slows down again on old ranges.
+After a tracker change: `-price-check` on 2–3 affected tokens before the full
+run.
+
+## Agent setup
+
+- `.claude/agents/`: `coder` (Go + plain JS website, with the Go, JS, CSP and
+  Charts rules), `ml-coder`, `react-coder`, `infra` (approval-gated),
+  `reviewer` (approved; run it before giving commit commands), `researcher`,
+  `product-manager`.
+- At most 3 coding agents in parallel (owner's limit).
+- `.claude/` is untracked; the owner decides whether to commit it.
+- `settings.json` was tightened: read-only git, `node --check` and the ml venv
+  pytest are allowed; secrets are denied in any folder; clutter is listed in
+  `.git/info/exclude`. Still missing: the PowerShell `git push` deny (Next
+  work 2).
+- New or changed agents load only after a Claude Code restart.
+- Lessons:
+  - Parallel coders must have disjoint files (parallel README edits got mixed
+    before).
+  - Usage limits cut agents off mid-task, so a restarted agent must first check
+    `git status` and the files for partial work.
+  - Each throwaway Postgres gets its own scratchpad directory and port and is
+    deleted afterwards.
+
+## Reference
+
+- Pons V2: factory 0x7eD598BcEf8bd9Edd8C97A195C6d13f40801EC7e
+  (`TokenLaunched`, `PoolGraduated`); one bonding curve per token; graduates
+  at 4.2 ETH to a Uniswap v4 pool behind hook
+  0xE5e702641Ea86F4ae6cC3cDaeD2B886f976Be044. Pons V1 (factory
+  0xA5aAb3F0c6EeadF30Ef1D3Eb997108E976351feB) uses Uniswap v3. Source:
+  github.com/ponsdotdev/pons-labs.
+- Robinhood stock tokens: addresses from
+  `https://api.robinhood.com/rhj/prices/<SYMBOL>` (chain 4663); feeds are
+  Chainlink "Standard Proxy" addresses; the 33 pairs are in
+  `ops/2026-10-asset-chains-feeds/B_seed.sql`. HOODon
+  (0xfb5b5778d45ae47f15323fb59b666c655174a79c) is not a Robinhood token; RDDT
+  is official but has no feed.
+- Token names are read with ERC-20 `name()` into
+  `scout_call_tracking.token_name` (and `token_symbol_onchain`).

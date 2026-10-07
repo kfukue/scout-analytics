@@ -110,9 +110,28 @@
 
   function fmtTime(d) { return pad2(d.getHours()) + ':' + pad2(d.getMinutes()) + ':' + pad2(d.getSeconds()); }
 
+  // Huge values in scientific notation with superscript digits, so a column
+  // never widens: 3.9e47 → "3.9×10⁴⁷" (one decimal; 9.96e47 → "1.0×10⁴⁸").
+  var SUPERSCRIPT = { '0': '⁰', '1': '¹', '2': '²', '3': '³', '4': '⁴', '5': '⁵', '6': '⁶', '7': '⁷', '8': '⁸', '9': '⁹', '-': '⁻' };
+  function sciText(a) {
+    var parts = Math.abs(a).toExponential(1).split('e');
+    var exp = String(Number(parts[1]));
+    var sup = '';
+    for (var i = 0; i < exp.length; i++) { sup += SUPERSCRIPT[exp.charAt(i)] || ''; }
+    return parts[0] + '×10' + sup;
+  }
+  var HUGE_PCT = 1e6;  // |%| from here on: scientific notation
+  var HUGE_USD = 1e12; // $ from here on ($1T)
+
+  // The exact amount, for a title: all digits, grouped.
+  function exactText(v, maxFraction) {
+    return v.toLocaleString('en-US', { maximumFractionDigits: maxFraction });
+  }
+
   function fmtPrice(v) {
     if (!isNum(v)) { return DASH; }
     if (v <= 0) { return '$0'; }
+    if (Math.round(v) >= HUGE_USD) { return '$' + sciText(v); }
     if (v >= 1000) { return '$' + v.toLocaleString('en-US', { maximumFractionDigits: 0 }); }
     if (v >= 1) { return '$' + v.toFixed(2); }
     // small prices: three significant digits, written out (no exponent)
@@ -120,40 +139,58 @@
     return '$' + v.toFixed(digits);
   }
 
-  // Market cap, compact: $850, $45.2k, $1.3M, $2.1B. A dash when there is none
-  // (or it is not a positive number). One decimal; a value that would round up
-  // to 1000 of a unit is written in the next one ($999,960 → $1.0M).
-  var MCAP_UNITS = [[1e3, 'k'], [1e6, 'M'], [1e9, 'B'], [1e12, 'T']];
+  // Market cap, compact: $850, $45.2k, $1.3M, $2.1B, then $1.0×10¹² from $1T
+  // on. A dash when there is none (or it is not a positive number). One
+  // decimal; a value that would round up to 1000 of a unit is written in the
+  // next one ($999,960 → $1.0M).
+  var MCAP_UNITS = [[1e3, 'k'], [1e6, 'M'], [1e9, 'B']];
   function fmtMcap(v) {
     if (!isNum(v) || v <= 0) { return DASH; }
     if (v < 1) { return '<$1'; }
     if (Math.round(v) < 1000) { return '$' + Math.round(v); }
     for (var i = 0; i < MCAP_UNITS.length; i++) {
       var body = (v / MCAP_UNITS[i][0]).toFixed(1);
-      if (Number(body) < 1000 || i === MCAP_UNITS.length - 1) { return '$' + body + MCAP_UNITS[i][1]; }
+      if (Number(body) < 1000) { return '$' + body + MCAP_UNITS[i][1]; }
     }
-    return DASH;
+    return '$' + sciText(v);
   }
 
   // A market cap cell; the exact amount (and what it is) on hover.
   function mcapCell(v, what) {
     var td = el('td', 'num mc', fmtMcap(v));
-    if (isNum(v) && v > 0) { td.title = what + ': $' + v.toLocaleString('en-US', { maximumFractionDigits: 0 }); }
+    if (isNum(v) && v > 0) { td.title = what + ': $' + exactText(v, 0); }
     return td;
   }
 
-  // Signed percentage: the sign is always written, so colour is never the only cue.
+  // Signed percentage: the sign is always written, so colour is never the only
+  // cue. From ±1,000,000% on: scientific notation (+3.9×10⁴⁷%).
   function fmtPct(v) {
     if (!isNum(v)) { return DASH; }
     var a = Math.abs(v);
     var body = a >= 1000 ? a.toLocaleString('en-US', { maximumFractionDigits: 0 }) : a.toFixed(1);
-    if (Number(body.replace(/,/g, '')) === 0) { return '0.0%'; }
+    var n = Number(body.replace(/,/g, ''));
+    if (n === 0) { return '0.0%'; }
+    if (n >= HUGE_PCT) { body = sciText(a); }
     return (v > 0 ? '+' : '−') + body + '%';
   }
+
+  // The exact percentage, for the title of a number written in scientific notation.
+  function exactPct(v) { return (v > 0 ? '+' : v < 0 ? '−' : '') + exactText(Math.abs(v), 2) + '%'; }
+
+  function isHugePct(v) { return isNum(v) && fmtPct(v).indexOf('×') >= 0; }
 
   function pctCell(v) {
     var td = el('td', 'num', fmtPct(v));
     if (isNum(v) && fmtPct(v) !== '0.0%') { td.classList.add(v > 0 ? 'pos' : 'neg'); }
+    if (isHugePct(v)) { td.title = exactPct(v); }
+    return td;
+  }
+
+  // Peak % of a rugged call: none (the pool was drained).
+  function peakCell(c) {
+    if (c.rugged !== true) { return pctCell(c.peak_pct); }
+    var td = el('td', 'num', DASH);
+    td.title = 'No peak: the pool was rugged';
     return td;
   }
 
@@ -187,6 +224,7 @@
     if (label) { td.appendChild(el('span', 'age', label)); }
 
     var tip = [];
+    if (isHugePct(v)) { tip.push(exactPct(v)); }
     if (!isNaN(readAt)) { tip.push('Price as of ' + fmtDate(c.latest_at)); }
     if (!isNaN(tradeAt)) { tip.push('last trade ' + fmtDate(c.latest_trade_at)); }
     if (tip.length) { td.title = tip.join('; ') + (quiet ? ' (no recent trades)' : ''); }
@@ -279,12 +317,16 @@
     }
     tr.appendChild(tdPerc);
 
-    var tdStatus = el('td');
+    // Status: "rugged" replaces the tracking status (which goes in the title).
+    var tdStatus = el('td', 'status');
     var st = c.tracking_status;
-    tdStatus.appendChild(document.createTextNode(st ? (STATUS_TEXT[st] || String(st)) : DASH));
+    var stText = st ? (STATUS_TEXT[st] || String(st)) : DASH;
     if (c.rugged === true) {
-      tdStatus.appendChild(document.createTextNode(' · '));
-      tdStatus.appendChild(el('span', 'flag', 'rugged'));
+      var rug = el('span', 'badge badge-rug', 'rugged');
+      rug.title = 'Rugged: the pool was drained (tracking status: ' + stText + ')';
+      tdStatus.appendChild(rug);
+    } else {
+      tdStatus.textContent = stText;
     }
     tr.appendChild(tdStatus);
 
@@ -298,11 +340,13 @@
       td.colSpan = NO_USD_SPAN; // latest, peak, worst drop and the windows
       tr.appendChild(td);
     } else {
-      tr.appendChild(el('td', 'num', fmtPrice(c.entry_price_usd)));
+      var tdEntry = el('td', 'num', fmtPrice(c.entry_price_usd));
+      if (isNum(c.entry_price_usd) && fmtPrice(c.entry_price_usd).indexOf('×') >= 0) { tdEntry.title = '$' + exactText(c.entry_price_usd, 0); }
+      tr.appendChild(tdEntry);
       tr.appendChild(mcapCell(c.call_mcap_usd, 'Market cap in the post'));
       tr.appendChild(mcapCell(c.latest_mcap_usd, 'Estimate (market cap in the post × latest price ÷ price at the post)'));
       tr.appendChild(latestCell(c));
-      tr.appendChild(pctCell(c.peak_pct));
+      tr.appendChild(peakCell(c));
       tr.appendChild(pctCell(c.drawdown_pct));
       for (var w = 0; w < WINDOW_FIELDS.length; w++) {
         var wc = pctCell(c[WINDOW_FIELDS[w]]);
@@ -374,8 +418,10 @@
       return sec;
     }
     var pv = Object.prototype.hasOwnProperty.call(VERDICT_TEXT, p.verdict) ? VERDICT_TEXT[p.verdict] : null;
-    var parts = [pv ? el('span', pv.cls, pv.text) : el('span', 'muted', 'verdict not readable')];
-    if (typeof p.label === 'string' && p.label.trim() !== '' && (!pv || p.label.toLowerCase() !== pv.text)) { parts.push(p.label); }
+    // the verdict once: Perceptor's own label when there is one ("No red flags
+    // found"), else the words of the list ("no red flags")
+    var label = typeof p.label === 'string' ? p.label.trim() : '';
+    var parts = [pv ? el('span', pv.cls, label || pv.text) : el('span', 'muted', label || 'verdict not readable')];
     if (typeof p.at === 'string') { parts.push(fmtDate(p.at)); }
     sec.appendChild(reportMeta(parts));
     if (typeof p.summary === 'string' && p.summary.trim() !== '') {
@@ -389,6 +435,15 @@
   function salphaSection(s) {
     var sec = el('section', 'report');
     sec.appendChild(el('h3', 'report-title', 'sAlpha'));
+    if (s && typeof s === 'object' && s.declined === true) {
+      // sAlpha replied, but only to decline ("Not enough public signals …")
+      sec.appendChild(el('p', 'report-declined', 'sAlpha did not generate a report'));
+      var why = [];
+      if (typeof s.text === 'string' && s.text.trim() !== '') { why.push('Reason: ' + s.text.trim()); }
+      if (typeof s.at === 'string') { why.push(fmtDate(s.at)); }
+      if (why.length) { sec.appendChild(reportMeta(why)); }
+      return sec;
+    }
     if (!s || typeof s !== 'object' || typeof s.text !== 'string' || s.text.trim() === '') {
       sec.appendChild(el('p', 'muted', 'No sAlpha report'));
       return sec;

@@ -11,8 +11,12 @@
 <script src="app.js" defer></script>
 </head>
 <body>
+<header class="topbar">
+  <div class="topbar-inner">
+    <h1>Scout calls</h1>
+  </div>
+</header>
 <main>
-  <h1>Scout calls</h1>
 
   <section class="panel" aria-labelledby="progress-title">
     <div class="panel-head">
@@ -107,12 +111,13 @@
         <div><dt>no pool</dt><dd>No trading pool found for the token yet. Retried later.</dd></div>
         <div><dt>error</dt><dd>Something failed, for example a node error. Retried later.</dd></div>
         <div><dt>gave up</dt><dd>More than 30 days old and still no pool or no trades.</dd></div>
-        <div><dt><span class="flag">rugged</span></dt><dd>Shown after the status when the pool was drained or the price fell below 5% of entry.</dd></div>
+        <div><dt><span class="badge badge-rug">rugged</span></dt><dd>Shown in Status, in place of the tracking status (hover over it to see that), when the pool was drained: its quote side (ETH/WETH, USDG …) fell below the rug threshold ($500 by default), or the pool was emptied; after the last window also when the price fell below 5% of entry. From the rug on the price counts as 0: the windows that end after it show −100% (the returns are as recorded), Peak % shows a dash (–) and so does Latest MC.</dd></div>
         <div id="legend-perceptor"><dt>Perceptor</dt><dd>The latest on-chain check of the token by the Perceptor bot; the words link to its report. <span class="pv pv-clean">no red flags</span> = the check found none. <span class="pv pv-caution">caution</span> = it found something to look at before buying. <span class="pv pv-red">red flags</span> = it found serious warning signs. Only calls picked up live are scanned: calls imported from history were never scanned, so they show a dash (–).</dd></div>
-        <div id="legend-reports"><dt><span aria-hidden="true">▸</span> and <span class="sa-badge">sA</span></dt><dd>▸ before the date (or a click on the row) opens the token's reports under the row: the latest Perceptor report (verdict, summary and link) and the latest sAlpha report (its text and link). <span class="sa-badge">sA</span> next to the Perceptor verdict = the token has an sAlpha report. About half of sAlpha's replies are empty; an empty reply counts as no report, so the latest reply with text is shown, or "No sAlpha report".</dd></div>
+        <div id="legend-reports"><dt><span aria-hidden="true">▸</span> and <span class="sa-badge">sA</span></dt><dd>▸ before the date (or a click on the row) opens the token's reports under the row: the latest Perceptor report (verdict, summary and link) and the latest sAlpha report (its text and link). <span class="sa-badge">sA</span> next to the Perceptor verdict = the token has an sAlpha report. About half of sAlpha's replies are empty; an empty reply counts as no report, so the latest reply with text is shown, or "No sAlpha report". A reply that declines ("Not enough public signals to generate a report …", "Too little liquidity or trading activity to research yet") is not a report either: no <span class="sa-badge">sA</span>, an older real report is shown when there is one, otherwise the detail says "sAlpha did not generate a report" with the reason.</dd></div>
         <div id="legend-latest"><dt>Latest %</dt><dd>The return at the most recent price, measured from the same entry (60 seconds after the post), followed by how old the call was when that price was read, for example <span class="age">45m</span>, <span class="age">30h</span> or <span class="age">60d</span>. It is refreshed about every 15 minutes for calls under 30 days old and once a day for older ones. The window selector does not affect it. <span class="age">quiet</span> = no trade in the 7 days before the price was read, so it is the price of an older trade. Hover over the number for the exact times.</dd></div>
         <div id="legend-windows"><dt>1h, 1d, 3d, 7d, 30d</dt><dd>The return over that window, in USD, measured from the price 60 seconds after the post (not the price in the post). A dash (–) until the window has passed and been recorded. Click a column to sort by it.</dd></div>
-        <div id="legend-peak"><dt>Peak %, Worst drop %</dt><dd>The highest and the lowest price within the window chosen with the "Peak / worst drop over" selector (1h to 30d), from the same entry. Only these two columns follow the selector.</dd></div>
+        <div id="legend-peak"><dt>Peak %, Worst drop %</dt><dd>The highest and the lowest price within the window chosen with the "Peak / worst drop over" selector (1h to 30d), from the same entry. Only these two columns follow the selector. A rugged call shows no peak (–).</dd></div>
+        <div id="legend-huge"><dt>3.9×10⁴⁷</dt><dd>Very large numbers (a return of ±1,000,000% or more, an amount of $1 trillion or more) are written in powers of ten so the columns keep their width: +3.9×10⁴⁷% = +390,000,…,000%. Hover over the number for the exact value.</dd></div>
         <div id="legend-call-mc"><dt>Call MC</dt><dd>The market cap given in the call post: its "called at" figure, or its Mcap line when there is none or it is not a usable number (zero or below). Hover over the number for the exact amount.</dd></div>
         <div id="legend-latest-mc"><dt>Latest MC</dt><dd>An estimate, not a reading: the market cap in the post (its Mcap line, or the "called at" figure when there is none or it is not usable) × the latest price ÷ the price at the post. It assumes the token supply has not changed since the call. A dash (–) when the post gave no market cap or there is no latest price yet.</dd></div>
         <div><dt>no USD price</dt><dd>The token trades against an asset with no dollar price, so no performance is shown.</dd></div>
