@@ -23,10 +23,20 @@ of a token (same first-call rule as the rug scripts: address without regard to
 case, earliest post, update posts never count) that
 
 - has tracking status `tracking`, `done` or `error`,
-- has `pool_dex = 'uniswap-v4'`, and
+- has `pool_dex = 'uniswap-v4'`,
 - whose post says launchpad **or** dex Pons V2 (compared lower-case with
   everything but letters and digits removed, so "Pons V2", "pons_v2" and
-  "PONS-V2" all match; "Pons" alone does not).
+  "PONS-V2" all match; "Pons" alone does not), and
+- whose on-chain state was **not** written by the Pons-aware code.
+
+Excluded: rows whose `scout_call_tracking.onchain` is a JSON object with a
+`pons_curve` key. The Pons-aware code wrote them (tokens that had graduated
+before the call) and they are tracked right already. The same condition is in
+A, B and C's `sel`:
+
+```sql
+AND NOT COALESCE(jsonb_typeof(t.onchain) = 'object' AND t.onchain ? 'pons_curve', false)
+```
 
 Deleted: their rows in `scout_call_returns`, `scout_call_candles`,
 `scout_call_precall`. The tracking row goes back to `pending` without pool,
@@ -52,7 +62,8 @@ the WHOLE file with F5; each shows ONE result grid at the end.
 1. Deploy the Pons-aware code (Pons V2 support, graduation from indexed logs)
    and restart `-track` (and the listener).
 2. Run `A_count.sql` and paste the whole result grid to the PM.
-   Wait for the go-ahead. `new_code_state` should be 0 (see below).
+   Wait for the go-ahead. `excluded_pons_state` is the number of rows left
+   alone (see below).
 3. Stop EVERY tracking process: `-track`, and the listener too unless it runs
    with `-listen-only` (it runs the tracker inside the same process).
    Ctrl+C is safe; wait until each process has exited.
@@ -78,18 +89,19 @@ the WHOLE file with F5; each shows ONE result grid at the end.
 
 Right after a successful B, a second run finds 0 calls and stops with an
 error, changing nothing. **After the tracker has started, never run B again,
-and never change `expected_count` to make it run:** every token that had
-already graduated at its call is correctly back on `uniswap-v4` and matches
-the selection again, so a rerun would throw away correct results and track
-them all again. Only D is safe to rerun.
+and never change `expected_count` to make it run.** Re-tracked rows carry a
+`pons_curve` key and are excluded, so a rerun should find nothing; if it finds
+rows, a tracker with the old code wrote them back over the reset: run C and
+ask the PM instead. Only D is safe to rerun.
 
-## If new_code_state is not 0
+## excluded_pons_state in A
 
-`new_code_state` counts selected rows whose on-chain state already has a
-`pons_curve` key, i.e. rows the Pons-aware code wrote itself (tokens that had
-graduated before the call). They are right already; B would track them again
-anyway (harmless, only time and node load). Tell the PM the number; the
-selection could exclude them if wanted.
+`excluded_pons_state` counts rows that match every other rule but whose
+on-chain state already has a `pons_curve` key, i.e. rows the Pons-aware code
+wrote itself (tokens that had graduated before the call). They are right
+already and are **excluded**: they are not in `selected`, B does not reset
+them, and C's `not_reset` does not count them. Once the tracker saves them
+again (after `reset_at`), they may show up in C's `now_on_v4`.
 
 ## What you will see
 
