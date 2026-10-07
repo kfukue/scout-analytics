@@ -22,7 +22,8 @@ import (
 // A pool's price only changes with a trade, so the latest price is the price of
 // the last price event at or before the newest block. Each refresh reads the
 // events from where the previous one stopped (or from where the horizon scan
-// stands, whichever is further) up to the newest block.
+// stands, whichever is further) up to the newest block. A row whose horizon
+// check is due is left to the horizon scan first (latestLeftToHorizon).
 //
 // The pass has its own cursor in the persisted on-chain state (latest_block,
 // latest_price_q, latest_trade_block) and writes only that and the four
@@ -135,7 +136,8 @@ func (pc *priceConfig) loadLatestConfig() error {
 
 // latestStats is the outcome of one pass.
 type latestStats struct {
-	Due       int // rows read for this pass
+	Due       int // rows read for this pass (without the deferred ones)
+	Deferred  int // rows left to their due horizon check (see latestLeftToHorizon)
 	Refreshed int // rows that got a latest price
 	Changed   int // of those, rows with a trade since the price before
 	Failed    int
@@ -198,48 +200,91 @@ func (s *scanner) latestFailed(id int, now time.Time) {
 	s.latestRetry[id] = now.Add(latestRetryAfter)
 }
 
-// refreshLatest runs one latest-price pass: up to LatestBatch due rows, calls
-// younger than 30 days first, then the stalest, through the tracker's worker
-// pool. recentOnly leaves the older calls for a later cycle (used while horizon
-// work is still waiting). It logs one summary line when it did something.
+// refreshLatest runs one latest-price pass on its own (see trackRun.latest)
+// and returns its outcome once every row of it is finished.
 func (s *scanner) refreshLatest(ctx context.Context, recentOnly bool) latestStats {
+	r := s.newTrackRun()
+	res := r.latest(ctx, recentOnly)
+	r.close()
+	return <-res
+}
+
+// latestLeftToHorizon: the row's horizon check is due, so the horizon scan
+// is about to read the blocks the pass would read now (from its scan block on).
+// The pass leaves the row alone until that check is done and then reads only
+// what lies beyond the new scan block. Rows on schedule are read as usual: the
+// horizon scan reads their blocks again later, when the next horizon is due
+// (it must see every event for its candles and running extremes).
+func latestLeftToHorizon(t *ScoutCallTracking, now time.Time) bool {
+	return t.Status == TrackTracking && !t.NextCheckAt.After(now)
+}
+
+// latest runs one latest-price pass: up to LatestBatch due rows, calls younger
+// than 30 days first, then the stalest, handed to the run's workers as they
+// become free. recentOnly leaves the older calls for a later cycle (used while
+// horizon work is still waiting). Rows being worked on by the run, and rows
+// whose horizon check is due (latestLeftToHorizon), are left out. It returns
+// once the rows are handed out; the outcome arrives on the channel, and is
+// logged in one summary line, when the last of them is finished.
+func (r *trackRun) latest(ctx context.Context, recentOnly bool) <-chan latestStats {
+	s := r.s
+	out := make(chan latestStats, 1)
 	st := latestStats{Waiting: -1}
 	if s.db == nil || !s.pc.Enabled || !s.pc.LatestOn || s.pc.Source != "onchain" || s.onchain == nil || ctx.Err() != nil {
-		return st
+		out <- st
+		return out
 	}
 	start := time.Now()
 	limit := s.pc.LatestBatch
 	if limit < 1 {
 		limit = defaultLatestBatch
 	}
-	rows, err := s.db.DueLatest(ctx, start, s.pc.LatestRecent, s.pc.LatestOld, latestRecentAge, recentOnly, s.latestSkip(start), limit)
+	rows, _, err := r.fetch(false, func(claimed []int) ([]ScoutCallTracking, error) {
+		skip := append(append(s.latestSkip(start), r.deferredIDs(start)...), claimed...)
+		return s.db.DueLatest(ctx, start, s.pc.LatestRecent, s.pc.LatestOld, latestRecentAge, recentOnly, skip, limit)
+	})
 	if err != nil {
 		if ctx.Err() == nil {
 			log.Printf("latest prices: %v", err)
 		}
-		return st
+		out <- st
+		return out
 	}
+	var deferred []int
+	var left []ScoutCallTracking
+	keep := rows[:0]
+	for _, t := range rows {
+		if latestLeftToHorizon(&t, start) {
+			deferred = append(deferred, t.CallID)
+			left = append(left, t)
+			continue
+		}
+		keep = append(keep, t)
+	}
+	rows = keep
+	r.unclaim(left)
+	r.deferLatest(deferred, start)
+	st.Deferred = len(deferred)
 	st.Due = len(rows)
 	if len(rows) == 0 {
-		return st
+		out <- st
+		return out
 	}
 	ctx, reqs := withReqCounter(ctx)
 	o := s.onchain
 	// The newest block is read once: every row of the pass is priced as of it.
 	head, err := o.rpc.blockNumber(ctx)
 	if err != nil {
+		r.unclaim(rows)
 		if ctx.Err() == nil {
 			log.Printf("latest prices: rpc: %v — %s call(s) wait for the next pass", err, commas(len(rows)))
 		}
-		return st
+		out <- st
+		return out
 	}
 	readAt := time.Now().UTC()
 	quotes := &latestQuotes{o: o, hour: readAt.Unix() - readAt.Unix()%3600, m: map[string]*latestQuote{}}
 
-	workers := s.pc.Workers
-	if workers < 1 {
-		workers = 1
-	}
 	// Horizon tracking comes first: a pass that runs long (the first one reads
 	// weeks of blocks per token) hands out no new rows once a tracker interval
 	// has gone by. The rest stays due and is picked up after the next horizon check.
@@ -249,37 +294,11 @@ func (s *scanner) refreshLatest(ctx context.Context, recentOnly bool) latestStat
 	}
 	var refreshed, changed, failed, done atomic.Int64
 	var errMu sync.Mutex
-	var wg sync.WaitGroup
-	next := make(chan int)
-	for w := 0; w < workers; w++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for i := range next {
-				ch, err := s.latestOne(ctx, &rows[i], head, readAt, quotes)
-				done.Add(1)
-				switch {
-				case err == nil:
-					refreshed.Add(1)
-					if ch {
-						changed.Add(1)
-					}
-				case ctx.Err() != nil:
-					// Ctrl+C / shutdown: the row is as it was; not a failure
-				default:
-					failed.Add(1)
-					s.latestFailed(rows[i].CallID, time.Now())
-					errMu.Lock()
-					if st.FirstErr == "" {
-						st.FirstErr = fmt.Sprintf("call %d: %v", rows[i].CallID, err)
-					}
-					errMu.Unlock()
-				}
-			}
-		}()
-	}
+	var pass sync.WaitGroup // the rows of this pass
 	stopBeat := make(chan struct{})
+	r.aux.Add(1)
 	go func() {
+		defer r.aux.Done()
 		t := time.NewTicker(latestProgressEvery)
 		defer t.Stop()
 		for {
@@ -294,17 +313,57 @@ func (s *scanner) refreshLatest(ctx context.Context, recentOnly bool) latestStat
 			}
 		}
 	}()
-	for i := range rows {
-		if ctx.Err() != nil || time.Since(start) > budget {
+	handed := 0
+	for handed < len(rows) {
+		if time.Since(start) > budget || !r.acquire(ctx) {
 			break
 		}
-		next <- i
+		if time.Since(start) > budget { // the wait for a worker used up the budget
+			r.free <- struct{}{}
+			break
+		}
+		t := &rows[handed]
+		handed++
+		pass.Add(1)
+		r.jobs <- trackJob{id: t.CallID, run: func() {
+			defer pass.Done()
+			ch, err := s.latestOne(ctx, t, head, readAt, quotes)
+			done.Add(1)
+			switch {
+			case err == nil:
+				refreshed.Add(1)
+				if ch {
+					changed.Add(1)
+				}
+			case ctx.Err() != nil:
+				// Ctrl+C / shutdown: the row is as it was; not a failure
+			default:
+				failed.Add(1)
+				s.latestFailed(t.CallID, time.Now())
+				errMu.Lock()
+				if st.FirstErr == "" {
+					st.FirstErr = fmt.Sprintf("call %d: %v", t.CallID, err)
+				}
+				errMu.Unlock()
+			}
+		}}
 	}
-	close(next)
-	wg.Wait()
-	close(stopBeat)
+	r.unclaim(rows[handed:]) // not handed out: still due, for a later pass
 
-	st.Refreshed, st.Changed, st.Failed, st.Requests = int(refreshed.Load()), int(changed.Load()), int(failed.Load()), reqs.Load()
+	// The summary, once the last row handed out is finished.
+	r.aux.Add(1)
+	go func() {
+		defer r.aux.Done()
+		pass.Wait()
+		close(stopBeat)
+		out <- s.latestSummary(ctx, st, start, int(refreshed.Load()), int(changed.Load()), int(failed.Load()), reqs.Load())
+	}()
+	return out
+}
+
+// latestSummary completes the outcome of a finished pass and logs it.
+func (s *scanner) latestSummary(ctx context.Context, st latestStats, start time.Time, refreshed, changed, failed int, reqs int64) latestStats {
+	st.Refreshed, st.Changed, st.Failed, st.Requests = refreshed, changed, failed, reqs
 	if ctx.Err() != nil {
 		if st.Refreshed > 0 {
 			log.Printf("latest prices: interrupted after %s refreshed — the rest is picked up on the next run", commas(st.Refreshed))
@@ -318,6 +377,9 @@ func (s *scanner) refreshLatest(ctx context.Context, recentOnly bool) latestStat
 	}
 	line := fmt.Sprintf("latest prices: %s refreshed (%s changed) in %s, %s RPC requests, %s waiting",
 		commas(st.Refreshed), commas(st.Changed), time.Since(start).Round(100*time.Millisecond), commas(int(st.Requests)), waiting)
+	if st.Deferred > 0 {
+		line += fmt.Sprintf(" (%s left to their due horizon check)", commas(st.Deferred))
+	}
 	if st.Failed > 0 {
 		text := st.FirstErr
 		if len(text) > latestMaxErrTextLen {

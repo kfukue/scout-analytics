@@ -145,10 +145,21 @@ func (s *scanner) trackOneOnchain(ctx context.Context, t *ScoutCallTracking, pos
 	}
 	if t.EntryPriceUSD == nil {
 		q, ok, err := o.quoteUSD(ctx, st.Quote, st.EntryBlock)
+		noUSD := "no USD source for " + st.QuoteSym // why the call is in quote units (ok=false)
+		if noPriceYetIsFinal(err, now, deadline) {
+			// The quote's own pools still had no trade before the call block,
+			// and the call is past its last horizon + 48 h (the gave_up
+			// deadline): waiting will not bring a price at the call any more.
+			// Treated like a definitive absence: tracked in quote units (one
+			// log line: the entry is then set, so this is not asked again).
+			noUSD = fmt.Sprintf("no USD price of %s at the call block %d after the last horizon + 48 h: %v — giving up on USD",
+				st.QuoteSym, st.EntryBlock, err)
+			q, ok, err = 0, false, nil
+		}
 		if err != nil {
 			// Temporary (the node, or no trade yet in the quote's own pools):
 			// tried again later, never switched to quote units for it.
-			fail(TrackError, fmt.Errorf("USD price of %s: %w", st.QuoteSym, err), backoff(t.Attempts))
+			fail(TrackError, fmt.Errorf("USD price of %s: %w", st.QuoteSym, err), usdRetryIn(err, t.Attempts))
 			return
 		}
 		// ok=false: every USD source is definitively absent; the call is
@@ -164,7 +175,7 @@ func (s *scanner) trackOneOnchain(ctx context.Context, t *ScoutCallTracking, pos
 		if ok {
 			log.Printf("%s: entry price $%.6g (%.6g %s × $%.6g, %s)", tag, p, st.EntryPriceQ, st.QuoteSym, q, o.quoteSource(st.Quote))
 		} else {
-			log.Printf("%s: entry price %.6g %s (no USD source for %s — tracked in %s)", tag, p, st.QuoteSym, st.QuoteSym, st.QuoteSym)
+			log.Printf("%s: entry price %.6g %s (%s, tracked in %s)", tag, p, st.QuoteSym, noUSD, st.QuoteSym)
 		}
 		// The pool's quote side already under the rug threshold at entry:
 		// rugged from the start.
@@ -227,78 +238,94 @@ func (s *scanner) trackOneOnchain(ctx context.Context, t *ScoutCallTracking, pos
 			fail(TrackError, fmt.Errorf("block at +%s: %w", h.Name, err), backoff(t.Attempts))
 			return
 		}
-		// The segment up to this horizon is worked out on a copy of the state
-		// (scan cursor, extremes, rug): it replaces the state only once the
-		// segment's candles are stored. A failure before that (node, USD
-		// price, candle times, database) leaves the state as it was, so the
-		// next run reads the same segment again and nothing is lost or counted
-		// twice (candle upserts add up event counts).
-		work := st.clone()
-		// Scan the swaps up to this horizon, building candles on the way. Event
-		// times come from the block number (see timeOfBlock).
-		segFrom, segTo := work.ScanBlock, hBlock
-		tFrom, err := o.rpc.blockTime(ctx, segFrom)
-		if err != nil {
-			fail(TrackError, fmt.Errorf("time of block %d: %w", segFrom, err), backoff(t.Attempts))
-			return
-		}
-		buf := newCandleBuf(t.EntryAt.Unix())
-		var obsErr error
-		obs := func(block uint64, p float64) {
-			est := tFrom
-			if segTo > segFrom {
-				est = tFrom + int64(float64(block-segFrom)/float64(segTo-segFrom)*float64(due.Unix()-tFrom))
-			}
-			ts, err := o.timeOfBlock(ctx, block, est)
-			if err != nil {
-				if obsErr == nil {
-					obsErr = err
-				}
+		// The segment up to this horizon is scanned in pieces (segmentPieceEnd:
+		// about segmentPieceChunks log ranges each, cut at a UTC hour), each
+		// worked out on a copy of the state (scan cursor, extremes, rug) that
+		// replaces the state only once the piece's candles are stored, and
+		// then saved as a checkpoint. A failure in a piece (node, USD price,
+		// candle times, database) leaves the state at the last stored piece,
+		// so the next run goes on from there: nothing is lost or counted twice
+		// (candle upserts add up event counts; pieces end on hour boundaries,
+		// so no candle is split between two of them).
+		var tFrom int64 // time of the piece's first block (after the first piece: its hour, a guess for timeOfBlock)
+		if st.ScanBlock < hBlock {
+			if tFrom, err = o.rpc.blockTime(ctx, st.ScanBlock); err != nil {
+				fail(TrackError, fmt.Errorf("time of block %d: %w", st.ScanBlock, err), backoff(t.Attempts))
 				return
 			}
-			buf.add(ts, p, block > work.LateBlock)
 		}
-		if err := o.scan(ctx, work, hBlock, obs); err != nil {
-			fail(TrackError, fmt.Errorf("swaps to +%s: %w", h.Name, err), backoff(t.Attempts))
-			return
-		}
-		if obsErr != nil {
-			fail(TrackError, fmt.Errorf("candle times to +%s: %w", h.Name, obsErr), backoff(t.Attempts))
-			return
-		}
-		scale := func(hour int64) (float64, error) {
-			if !inUSD {
-				return 1, nil
+		for st.ScanBlock < hBlock {
+			to, toHour, err := s.segmentPieceEnd(ctx, st.ScanBlock, hBlock, tFrom, due.Unix())
+			if err != nil {
+				fail(TrackError, fmt.Errorf("swaps to +%s: piece end: %w", h.Name, err), backoff(t.Attempts))
+				return
 			}
-			return o.quoteUSDHour(ctx, work.Quote, hour)
-		}
-		candles, err := buf.list(scale)
-		if err == nil {
-			err = buf.foldExtremes(work, scale)
-		}
-		if err != nil {
-			fail(TrackError, fmt.Errorf("candles to +%s: %w", h.Name, err), backoff(t.Attempts))
-			return
+			work := st.clone()
+			// Scan the swaps of the piece, building candles on the way. Event
+			// times come from the block number (see timeOfBlock).
+			segFrom := work.ScanBlock
+			buf := newCandleBuf(t.EntryAt.Unix())
+			var obsErr error
+			obs := func(block uint64, p float64) {
+				est := tFrom // a guess for timeOfBlock: linear up to the horizon
+				if hBlock > segFrom {
+					est = tFrom + int64(float64(block-segFrom)/float64(hBlock-segFrom)*float64(due.Unix()-tFrom))
+				}
+				ts, err := o.timeOfBlock(ctx, block, est)
+				if err != nil {
+					if obsErr == nil {
+						obsErr = err
+					}
+					return
+				}
+				buf.add(ts, p, block > work.LateBlock)
+			}
+			if err := o.scan(ctx, work, to, obs); err != nil {
+				fail(TrackError, fmt.Errorf("swaps to +%s: %w", h.Name, err), backoff(t.Attempts))
+				return
+			}
+			if obsErr != nil {
+				fail(TrackError, fmt.Errorf("candle times to +%s: %w", h.Name, obsErr), backoff(t.Attempts))
+				return
+			}
+			scale := func(hour int64) (float64, error) {
+				if !inUSD {
+					return 1, nil
+				}
+				return o.quoteUSDHour(ctx, work.Quote, hour)
+			}
+			candles, err := buf.list(scale)
+			if err == nil {
+				err = buf.foldExtremes(work, scale)
+			}
+			if err != nil {
+				fail(TrackError, fmt.Errorf("candles to +%s: %w", h.Name, err), usdRetryIn(err, t.Attempts))
+				return
+			}
+			if err := s.db.UpsertCandles(ctx, t.CallID, candles); err != nil {
+				fail(TrackError, fmt.Errorf("candles to +%s: %w", h.Name, err), backoff(t.Attempts))
+				return
+			}
+			st = work // the piece is stored: it is the state from now on
+			if to < hBlock {
+				s.saveCheckpoint(t, &prev, st, tag)
+				tFrom = toHour
+			}
 		}
 		// Drained at or before this horizon's end (found by this scan, or ahead
 		// of it by the latest pass): -100%, no USD rate needed.
-		rugged := work.RugBlock > 0 && work.RugBlock <= hBlock
+		rugged := st.RugBlock > 0 && st.RugBlock <= hBlock
 		q := 1.0
 		if inUSD && !rugged {
 			var ok bool
-			if q, ok, err = o.quoteUSD(ctx, work.Quote, hBlock); err != nil || !ok {
+			if q, ok, err = o.quoteUSD(ctx, st.Quote, hBlock); err != nil || !ok {
 				if err == nil {
 					err = errNoUSDSource
 				}
-				fail(TrackError, fmt.Errorf("USD price of %s at +%s: %w", work.QuoteSym, h.Name, err), backoff(t.Attempts))
+				fail(TrackError, fmt.Errorf("USD price of %s at +%s: %w", st.QuoteSym, h.Name, err), usdRetryIn(err, t.Attempts))
 				return
 			}
 		}
-		if err := s.db.UpsertCandles(ctx, t.CallID, candles); err != nil {
-			fail(TrackError, fmt.Errorf("candles to +%s: %w", h.Name, err), backoff(t.Attempts))
-			return
-		}
-		st = work // the segment is stored: it is the state from now on
 		if inUSD && !rugged {
 			lastQ, lastQKnown = q, true
 		}
@@ -345,6 +372,68 @@ func (s *scanner) trackOneOnchain(ctx context.Context, t *ScoutCallTracking, pos
 	t.Rugged = &rug
 	t.Status = TrackDone
 	t.NextCheckAt = now
+}
+
+// segmentPieceChunks: a horizon segment is scanned and stored in pieces of
+// about this many log ranges (SCOUT_RPC_LOG_CHUNK blocks each: 32 × 200,000
+// blocks ≈ 7.4 days at 10 blocks per second), so a long segment interrupted
+// by a failure or a restart resumes from its last stored piece instead of
+// from its start. A var so tests can lower it.
+var segmentPieceChunks uint64 = 32
+
+// segmentPieceEnd: the last block of the piece of a horizon segment that
+// starts after block from (the state's scan cursor, at about time tFrom) and
+// ends at hBlock (time tEnd). A piece ends on a UTC hour boundary as
+// timeOfBlock places blocks (the block before hourBlock(H): hour H starts at
+// hourBlock(H)), so no candle (hourly or 5-minute) is split between two
+// pieces; toHour is that H. The last piece ends at hBlock (toHour 0). The
+// hour is estimated from the times given (no request); its first block is a
+// cached hour-block lookup, shared with the candle times.
+func (s *scanner) segmentPieceEnd(ctx context.Context, from, hBlock uint64, tFrom, tEnd int64) (to uint64, toHour int64, err error) {
+	o := s.onchain
+	span := segmentPieceChunks * o.rpc.maxChunk
+	if span == 0 || hBlock <= from || hBlock-from <= span {
+		return hBlock, 0, nil
+	}
+	ts := tFrom + int64(float64(span)/float64(hBlock-from)*float64(tEnd-tFrom))
+	// The hour boundary at or before the estimated end; a later one when
+	// that would leave the piece empty (an estimate that fell short).
+	for hour, i := ts-ts%3600, 0; i < 24*40; hour, i = hour+3600, i+1 {
+		b, err := o.hourBlock(ctx, hour)
+		if err != nil {
+			return 0, 0, err
+		}
+		if b >= hBlock {
+			return hBlock, 0, nil
+		}
+		if b > from+1 {
+			return b - 1, hour, nil
+		}
+	}
+	return hBlock, 0, nil
+}
+
+// saveCheckpoint stores the state after a piece of a horizon segment (see
+// segmentPieceEnd), so a run killed before it ends keeps the pieces already
+// stored. The row's status, attempts, schedule and error are written as they
+// were before this run (prev), like an interrupted run leaves them. A failed
+// save is only logged: the state is saved again at the end of the run.
+func (s *scanner) saveCheckpoint(t *ScoutCallTracking, prev *ScoutCallTracking, st *onchainState, tag string) {
+	b, err := json.Marshal(st)
+	if err != nil {
+		log.Printf("%s: checkpoint: %v", tag, err)
+		return
+	}
+	c := *t
+	c.Status, c.Attempts, c.NextCheckAt, c.LastCheckedAt, c.Error = prev.Status, prev.Attempts, prev.NextCheckAt, prev.LastCheckedAt, prev.Error
+	c.Onchain = b
+	// Its own deadline: a checkpoint is written even while the run is
+	// being stopped (the candles of the piece are already stored).
+	sctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := s.db.SaveTracking(sctx, &c); err != nil {
+		log.Printf("%s: checkpoint at block %d: save: %v", tag, st.ScanBlock, err)
+	}
 }
 
 // clone is a deep copy of the state (the horizon step works on one).
@@ -476,4 +565,26 @@ func (s *scanner) heartbeat(ctx context.Context, tag string, start time.Time, re
 		}
 	}()
 	return func() { close(done) }
+}
+
+// noPriceYetIsFinal: a "no price yet" for the entry's quote asset (its own
+// pools had no trade before the call block) is final once the call is past
+// deadline (its last horizon + 48 h, the same deadline as gave_up); before
+// that it is retried. Any other error (the node, the database) is never final.
+func noPriceYetIsFinal(err error, now, deadline time.Time) bool {
+	return errors.Is(err, errNoPriceYet) && now.After(deadline)
+}
+
+// usdSearchRetry: when a call waits for the whole-history search of its
+// quote asset's USD pools (errUSDSearchPending), it is tried again this soon:
+// every try moves that search on (bounded per try), so it ends in a price or
+// a definitive answer after a few tries instead of waiting out the back-off.
+var usdSearchRetry = 5 * time.Minute
+
+// usdRetryIn: when to try a call again after a USD-price failure (err).
+func usdRetryIn(err error, attempts int) time.Duration {
+	if errors.Is(err, errUSDSearchPending) {
+		return usdSearchRetry
+	}
+	return backoff(attempts)
 }

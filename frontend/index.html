@@ -22,6 +22,9 @@
     <div class="panel-head">
       <h2 id="progress-title">Import progress</h2>
       <div class="panel-tools">
+        <span id="live-state" class="live-state muted">Updates every 30 s</span>
+        <label class="toggle" for="sound"><input type="checkbox" id="sound" autocomplete="off"> Sound</label>
+        <button type="button" id="desktop" class="btn btn-quiet" aria-pressed="false">Desktop alerts</button>
         <span id="summary-updated" class="muted"></span>
         <button type="button" id="refresh-now" class="btn">Refresh now</button>
       </div>
@@ -66,6 +69,7 @@
       </div>
     </div>
     <p id="explain" class="muted small"></p>
+    <button type="button" id="new-calls" class="btn new-calls" hidden></button>
 
     <div class="table-wrap" tabindex="0" role="region" aria-label="Calls table">
       <table>
@@ -120,6 +124,7 @@
         <div id="legend-huge"><dt>3.9×10⁴⁷</dt><dd>Very large numbers (a return of ±1,000,000% or more, an amount of $1 trillion or more) are written in powers of ten so the columns keep their width: +3.9×10⁴⁷% = +390,000,…,000%. Hover over the number for the exact value.</dd></div>
         <div id="legend-call-mc"><dt>Call MC</dt><dd>The market cap given in the call post: its "called at" figure, or its Mcap line when there is none or it is not a usable number (zero or below). Hover over the number for the exact amount.</dd></div>
         <div id="legend-latest-mc"><dt>Latest MC</dt><dd>An estimate, not a reading: the market cap in the post (its Mcap line, or the "called at" figure when there is none or it is not usable) × the latest price ÷ the price at the post. It assumes the token supply has not changed since the call. A dash (–) when the post gave no market cap or there is no latest price yet.</dd></div>
+        <div id="legend-live"><dt>Live</dt><dd>New calls and reports appear without a refresh: a new call goes on top of the table when it shows the newest calls first on page 1 and the call matches the search and the Perceptor filter (otherwise "N new — refresh" appears), and a new Perceptor verdict or sAlpha report updates its row. Each one also shows a short notice in the corner with a GMGN link. "Sound" plays a short beep for them (off by default). "Desktop alerts" shows a system notification while the tab is in the background; browsers only allow it on a secure (HTTPS) address or on localhost, so it stays greyed out when the page is opened by plain HTTP from another machine. The whole list still refreshes every 30 seconds.</dd></div>
         <div><dt>no USD price</dt><dd>The token trades against an asset with no dollar price, so no performance is shown.</dd></div>
         <div><dt>–</dt><dd>No value yet: the window has not arrived, or the call is not tracked yet.</dd></div>
       </dl>
@@ -127,5 +132,6 @@
   </section>
   <noscript><p class="notice">This page needs JavaScript.</p></noscript>
 </main>
+<ul id="live-notices" class="live-notices" aria-live="polite" aria-label="Live updates"></ul>
 </body>
 </html>

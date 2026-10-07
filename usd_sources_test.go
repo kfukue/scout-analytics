@@ -213,7 +213,8 @@ func TestQuoteViaPoolsNodeErrorNotCached(t *testing.T) {
 			}
 			o.mu.Lock()
 			set := o.usdPools[asset]
-			cached := set != nil && (!set.noPoolUntil.IsZero() || len(set.pools) > 0 || len(set.noPrice) > 0)
+			cached := set != nil && (!set.noPoolUntil.IsZero() || len(set.pools) > 0 || len(set.noPrice) > 0 ||
+				set.histThrough > 0 || len(set.histSeen) > 0 || len(set.histPending) > 0)
 			o.mu.Unlock()
 			if cached {
 				t.Fatalf("busy node: the failure was cached: %+v", set)
@@ -226,9 +227,10 @@ func TestQuoteViaPoolsNodeErrorNotCached(t *testing.T) {
 	}
 }
 
-// "No pool" is kept for an hour, "no price yet" (pools, but no trade before the
-// block) for six hours at that block; then they are asked again. Found
-// per-hour prices are kept.
+// "No pool anywhere" is kept for an hour, then asked again of the new blocks
+// only; "no price yet" (pools, but no trade before the block) is kept for six
+// hours at that block; then they are asked again. Found per-hour prices are
+// kept.
 func TestQuoteViaPoolsNegativeCacheExpiry(t *testing.T) {
 	const (
 		noPools = "0x3333333333333333333333333333333333333333"
@@ -246,19 +248,38 @@ func TestQuoteViaPoolsNegativeCacheExpiry(t *testing.T) {
 	b := f.latest - 864000
 	requests := func() int64 { return o.rpc.requests.Load() }
 
-	// no pool: definitive, kept for an hour
+	// no pool anywhere: definitive, kept for an hour
 	if p, ok, err := o.quoteUSD(ctx, noPools, b); ok || err != nil {
 		t.Fatalf("no pool: got %v %v %v, want ok=false and no error", p, ok, err)
 	}
+	// a pool created afterwards (in blocks the search had not read)
+	noHeadCache(t) // the head moves on below
+	f.mu.Lock()
+	oldHead := f.latest
+	f.latest += 20_000
+	f.mu.Unlock()
 	pa := newUSDTestPool(f, poolA, noPools, tUSDG, 18, 6)
-	pa.trade(b-50, 4)
+	pa.trade(oldHead+100, 4)
 	before := requests()
 	if _, ok, err := o.quoteUSD(ctx, noPools, b); ok || err != nil || requests() != before {
 		t.Fatalf("no pool within the hour: got ok=%v err=%v and %d request(s), want the cached answer and none", ok, err, requests()-before)
 	}
 	clk.add(61 * time.Minute)
-	if p, ok, err := o.quoteUSD(ctx, noPools, b); err != nil || !ok || !near6(p, 4) {
-		t.Fatalf("no pool after an hour: got %v %v %v, want the new pool's $4", p, ok, err)
+	f.mu.Lock()
+	asked := len(f.queries)
+	f.mu.Unlock()
+	if _, ok, err := o.quoteUSD(ctx, noPools, b); ok || !errors.Is(err, errNoPriceYet) {
+		t.Fatalf("no pool after an hour, at block %d (before the new pool's first trade): got ok=%v %v, want errNoPriceYet", b, ok, err)
+	}
+	f.mu.Lock()
+	for _, q := range f.queries[asked:] {
+		if q.addr == noPools && q.from < oldHead-1000 {
+			t.Errorf("after the hour the asset's transfers were read from block %d, want only the blocks after %d", q.from, oldHead-1000)
+		}
+	}
+	f.mu.Unlock()
+	if p, ok, err := o.quoteUSD(ctx, noPools, oldHead+200); err != nil || !ok || !near6(p, 4) {
+		t.Fatalf("after the new pool's trade: got %v %v %v, want the new pool's $4", p, ok, err)
 	}
 
 	// no price yet: the pool's first trade is after the block
@@ -529,5 +550,345 @@ func TestResolveV2V3RevertReason(t *testing.T) {
 				t.Fatalf("discover with token0() answering %q: got %+v %v, want the pool %s", c.msg, st, err, pool)
 			}
 		})
+	}
+}
+
+// farPoolChain: a fake chain with an asset FAR whose only USD pool (FAR / USDG)
+// trades far from the blocks asked (outside the near-block search's window:
+// SCOUT_DISCOVERY_BLOCKS=1000, so 64,000 blocks either side), and wallet
+// transfers of FAR right around those blocks. b1 and b2 are two call blocks
+// 2,000,000 blocks apart; the pool traded at b1-3,000,000 ($2) and at
+// b1+1,000,000 ($3).
+type farPoolChain struct {
+	f      *fakeChain
+	b1, b2 uint64
+	env    map[string]string
+}
+
+const (
+	farAsset  = "0x8888888888888888888888888888888888888888"
+	farPool   = "0x00000000000000000000000000000000000000e1"
+	farWallet = "0x00000000000000000000000000000000000000d2"
+)
+
+func newFarPoolChain(t *testing.T) *farPoolChain {
+	t.Helper()
+	f := usdChain(t)
+	f.addToken(farAsset, 18, "FAR")
+	c := &farPoolChain{f: f, b1: f.latest - 6_000_000}
+	c.b2 = c.b1 + 2_000_000
+	p := newUSDTestPool(f, farPool, farAsset, tUSDG, 18, 6)
+	p.trade(c.b1-3_000_000, 2)
+	p.trade(c.b1+1_000_000, 3)
+	f.mu.Lock()
+	for i, b := range []uint64{c.b1 - 10, c.b1 + 10, c.b2 - 10, c.b2 + 10} {
+		f.transfer(farAsset, farWallet, uBuyer, b, fmt.Sprintf("0xw%d", i)) // a wallet near each block: no pool
+	}
+	f.mu.Unlock()
+	c.env = map[string]string{"SCOUT_CHAINLINK_FEEDS": "eth=" + uFeedETH, "SCOUT_DISCOVERY_BLOCKS": "1000"}
+	return c
+}
+
+// The bug the whole-history search fixes: two calls with the same quote asset
+// whose only USD pool trades far from the first call's block. The near-block
+// search around the first block finds only a wallet; that must not become
+// "no USD source" for the asset (the old code kept it for an hour, for every
+// block, and the call was stored in quote units for good). Both blocks are
+// priced in USD, whichever is asked first.
+func TestQuoteViaPoolsFarPool(t *testing.T) {
+	for _, order := range []string{"b1 first", "b2 first"} {
+		t.Run(order, func(t *testing.T) {
+			c := newFarPoolChain(t)
+			o := testOnchain(t, c.f, c.env)
+			ctx := context.Background()
+			asks := []struct {
+				block uint64
+				want  float64
+			}{{c.b1, 2}, {c.b2, 3}}
+			if order == "b2 first" {
+				asks[0], asks[1] = asks[1], asks[0]
+			}
+			for _, a := range asks {
+				p, ok, err := o.quoteUSD(ctx, farAsset, a.block)
+				if err != nil || !ok || !near6(p, a.want) {
+					t.Fatalf("quoteUSD(FAR, %d): got %v ok=%v err=%v, want $%v", a.block, p, ok, err, a.want)
+				}
+			}
+			if src := o.quoteSource(farAsset); src != "its USDG pool (uniswap-v3)" {
+				t.Fatalf("quoteSource(FAR): got %q, want its USDG pool", src)
+			}
+		})
+	}
+}
+
+// A quote asset with no pool against WETH / ETH / a stablecoin anywhere in its
+// history (only wallets, a v3 pool and a v4 pool against a token with no USD
+// price) is definitively without a USD source: ok=false, no error, kept for an
+// hour for every block the search covered (no more requests).
+func TestQuoteViaPoolsNoPoolAnywhere(t *testing.T) {
+	const (
+		meme  = "0x9999999999999999999999999999999999999999" // no USD price
+		mpool = "0x00000000000000000000000000000000000000e2" // NOP / MEME, v3
+	)
+	f := usdChain(t)
+	f.addToken(farAsset, 18, "NOP")
+	f.addToken(meme, 18, "MEME")
+	b := f.latest - 6_000_000
+	mp := newUSDTestPool(f, mpool, farAsset, meme, 18, 18)
+	mp.trade(b-2_000_000, 1)
+	mp.trade(b+500, 1.1)
+	id := "0x" + strings.Repeat("56", 32)
+	f.mu.Lock()
+	f.initV4(id, farAsset, meme, zeroAddr, 500, b-1_500_000)
+	f.transfer(farAsset, farWallet, uBuyer, b-10, "0xw1")
+	f.mu.Unlock()
+	clk := &fakeClock{t: time.Date(2026, 10, 1, 12, 0, 0, 0, time.UTC)}
+	o := testOnchain(t, f, map[string]string{"SCOUT_CHAINLINK_FEEDS": "eth=" + uFeedETH, "SCOUT_DISCOVERY_BLOCKS": "1000"})
+	o.now = clk.now
+	ctx := context.Background()
+	if p, ok, err := o.quoteUSD(ctx, farAsset, b); ok || err != nil {
+		t.Fatalf("quoteUSD(NOP, %d): got %v ok=%v err=%v, want ok=false and no error (definitive)", b, p, ok, err)
+	}
+	before := o.rpc.requests.Load()
+	for _, blk := range []uint64{b, b - 3_000_000, b + 2_000_000} {
+		if p, ok, err := o.quoteUSD(ctx, farAsset, blk); ok || err != nil {
+			t.Fatalf("quoteUSD(NOP, %d) again: got %v ok=%v err=%v, want the definitive answer", blk, p, ok, err)
+		}
+	}
+	if n := o.rpc.requests.Load() - before; n != 0 {
+		t.Fatalf("got %d request(s) for the cached definitive answer, want 0", n)
+	}
+}
+
+// A quote asset whose USD pool only trades after the block (far after: outside
+// the near-block window) has no price yet there: a temporary error, never the
+// definitive "no USD source".
+func TestQuoteViaPoolsPoolOnlyAfterBlock(t *testing.T) {
+	f := usdChain(t)
+	f.addToken(farAsset, 18, "LATE")
+	b := f.latest - 6_000_000
+	newUSDTestPool(f, farPool, farAsset, tUSDG, 18, 6).trade(b+2_000_000, 5)
+	o := testOnchain(t, f, map[string]string{"SCOUT_CHAINLINK_FEEDS": "eth=" + uFeedETH, "SCOUT_DISCOVERY_BLOCKS": "1000"})
+	ctx := context.Background()
+	if p, ok, err := o.quoteUSD(ctx, farAsset, b); ok || !errors.Is(err, errNoPriceYet) {
+		t.Fatalf("quoteUSD(LATE, %d): got %v ok=%v err=%v, want errNoPriceYet", b, p, ok, err)
+	}
+	if p, ok, err := o.quoteUSD(ctx, farAsset, b+2_000_100); err != nil || !ok || !near6(p, 5) {
+		t.Fatalf("quoteUSD(LATE) after the trade: got %v ok=%v err=%v, want $5", p, ok, err)
+	}
+}
+
+// A node error during the whole-history search (the wide transfer read, the
+// v4 Initialize read, a counterparty's token0()) is returned and nothing of
+// it is kept; once the node answers, the far pool prices the block.
+func TestQuoteViaPoolsHistoryNodeErrorNotCached(t *testing.T) {
+	fastRetries(t)
+	old := rpcRetryBase
+	rpcRetryBase = time.Millisecond
+	t.Cleanup(func() { rpcRetryBase = old })
+	for _, c := range []struct {
+		name string
+		busy func(f *fakeChain, on *bool)
+	}{
+		{"wide transfer read", func(f *fakeChain, on *bool) {
+			f.setLogsHook(func(addr string, from, to uint64) string {
+				if *on && addr == farAsset && to-from > 200_000 {
+					return "rate limit exceeded"
+				}
+				return ""
+			})
+		}},
+		{"v4 Initialize read", func(f *fakeChain, on *bool) {
+			f.setLogsHook(func(addr string, _, _ uint64) string {
+				if *on && addr == tPM {
+					return "rate limit exceeded"
+				}
+				return ""
+			})
+		}},
+		{"token0() of a counterparty", func(f *fakeChain, on *bool) {
+			f.callErr = func(to, sel string, _ uint64) string {
+				if *on && to == farPool && sel == selToken0 {
+					return "rate limit exceeded"
+				}
+				return ""
+			}
+		}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			fc := newFarPoolChain(t)
+			on := true
+			c.busy(fc.f, &on)
+			o := testOnchain(t, fc.f, fc.env)
+			ctx := context.Background()
+			if p, ok, err := o.quoteUSD(ctx, farAsset, fc.b1); err == nil || ok || errors.Is(err, errNoPriceYet) || errors.Is(err, errNoUSDSource) {
+				t.Fatalf("busy node: got %v ok=%v err=%v, want a node error", p, ok, err)
+			}
+			o.mu.Lock()
+			set := o.usdPools[farAsset]
+			kept := set != nil && (!set.noPoolUntil.IsZero() || len(set.pools) > 0 || len(set.noPrice) > 0 || set.histThrough > 0 || len(set.histSeen) > 0 || len(set.histPending) > 0)
+			o.mu.Unlock()
+			if kept {
+				t.Fatalf("busy node: the failed search was kept: %+v", set)
+			}
+			on = false
+			if p, ok, err := o.quoteUSD(ctx, farAsset, fc.b1); err != nil || !ok || !near6(p, 2) {
+				t.Fatalf("node back: got %v ok=%v err=%v, want $2", p, ok, err)
+			}
+		})
+	}
+}
+
+// setHistBounds lowers the whole-history sweep's bounds for one test.
+func setHistBounds(t *testing.T, maxLogs, maxChecks int) {
+	t.Helper()
+	oldLogs, oldChecks := usdHistMaxLogs, usdHistMaxChecks
+	usdHistMaxLogs, usdHistMaxChecks = maxLogs, maxChecks
+	t.Cleanup(func() { usdHistMaxLogs, usdHistMaxChecks = oldLogs, oldChecks })
+}
+
+// A sweep stopped by its bounds is never a definitive answer, and never a
+// "no price yet" that the deadline cap could make final: errUSDSearchPending
+// until a sweep has covered the whole history, each sweep going on from where
+// the last one stopped. FAR's counterparties, busiest first: the buyer (6
+// transfers), a wallet (4), the pool (2). NOP's three transfers are in three
+// blocks.
+func TestQuoteViaPoolsHistoryBounded(t *testing.T) {
+	ctx := context.Background()
+	type ask struct {
+		price    float64 // 0: no price
+		definite bool    // ok=false, no error
+	}
+	for _, c := range []struct {
+		name              string
+		maxLogs, maxCheck int
+		noPool            bool
+		want              []ask
+	}{
+		// one counterparty per sweep: the pool is the third
+		{"1 check per sweep, far pool", 100_000, 1, false, []ask{{}, {}, {price: 2}}},
+		// one transfer per sweep: the pool's first trade is the first transfer
+		{"1 log per sweep, far pool", 1, 256, false, []ask{{price: 2}}},
+		// one transfer per sweep, no USD pool: definitive only after the third
+		{"1 log per sweep, no pool", 1, 256, true, []ask{{}, {}, {definite: true}}},
+		// one counterparty per sweep, no USD pool (pool, wallet, buyer)
+		{"1 check per sweep, no pool", 100_000, 1, true, []ask{{}, {}, {definite: true}}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			setHistBounds(t, c.maxLogs, c.maxCheck)
+			var o *onchainSource
+			var asset string
+			var block uint64
+			if c.noPool {
+				const meme = "0x9999999999999999999999999999999999999999"
+				const mpool = "0x00000000000000000000000000000000000000e2"
+				f := usdChain(t)
+				f.addToken(farAsset, 18, "NOP")
+				f.addToken(meme, 18, "MEME")
+				block = f.latest - 6_000_000
+				mp := newUSDTestPool(f, mpool, farAsset, meme, 18, 18)
+				mp.trade(block-2_000_000, 1)
+				mp.trade(block+500, 1.1)
+				f.mu.Lock()
+				f.transfer(farAsset, farWallet, uBuyer, block-10, "0xw1")
+				f.mu.Unlock()
+				o = testOnchain(t, f, map[string]string{"SCOUT_CHAINLINK_FEEDS": "eth=" + uFeedETH, "SCOUT_DISCOVERY_BLOCKS": "1000"})
+				asset = farAsset
+			} else {
+				fc := newFarPoolChain(t)
+				o = testOnchain(t, fc.f, fc.env)
+				asset, block = farAsset, fc.b1
+			}
+			for i, w := range c.want {
+				p, ok, err := o.quoteUSD(ctx, asset, block)
+				switch {
+				case w.price > 0:
+					if err != nil || !ok || !near6(p, w.price) {
+						t.Fatalf("ask %d (bounds %d logs, %d checks): got %v ok=%v err=%v, want $%v", i+1, c.maxLogs, c.maxCheck, p, ok, err, w.price)
+					}
+				case w.definite:
+					if err != nil || ok {
+						t.Fatalf("ask %d (bounds %d logs, %d checks): got %v ok=%v err=%v, want the definitive ok=false, no error", i+1, c.maxLogs, c.maxCheck, p, ok, err)
+					}
+				default:
+					if ok || !errors.Is(err, errUSDSearchPending) || noPriceYetIsFinal(err, time.Now(), time.Now().Add(-time.Hour)) {
+						t.Fatalf("ask %d (bounds %d logs, %d checks): got %v ok=%v err=%v, want errUSDSearchPending, never final (the sweep is not finished)", i+1, c.maxLogs, c.maxCheck, p, ok, err)
+					}
+				}
+			}
+		})
+	}
+}
+
+// Concurrent callers on the same cold quote asset share one whole-history
+// sweep: the far pool's token0() is asked once, not once per caller.
+func TestQuoteViaPoolsHistoryOneSweepAtATime(t *testing.T) {
+	fc := newFarPoolChain(t)
+	var n int64
+	var mu sync.Mutex
+	fc.f.callErr = func(to, sel string, _ uint64) string {
+		if to == farPool && sel == selToken0 {
+			mu.Lock()
+			n++
+			mu.Unlock()
+		}
+		return ""
+	}
+	o := testOnchain(t, fc.f, fc.env)
+	ctx := context.Background()
+	const callers = 8
+	var wg sync.WaitGroup
+	errs := make([]error, callers)
+	prices := make([]float64, callers)
+	for i := range callers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			p, ok, err := o.quoteUSD(ctx, farAsset, fc.b1)
+			if err == nil && !ok {
+				err = errors.New("ok=false")
+			}
+			prices[i], errs[i] = p, err
+		}()
+	}
+	wg.Wait()
+	for i := range callers {
+		if errs[i] != nil || !near6(prices[i], 2) {
+			t.Fatalf("caller %d: got %v %v, want $2", i, prices[i], errs[i])
+		}
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if n != 1 {
+		t.Fatalf("token0() of the far pool asked %d times by %d concurrent callers, want 1 (one sweep at a time)", n, callers)
+	}
+}
+
+// A call waiting for its quote's USD pool search is tried again soon (each try
+// moves the search on), and that wait is never final; every other USD failure
+// keeps the back-off.
+func TestUSDRetryIn(t *testing.T) {
+	pending := fmt.Errorf("USD price of QT: %w", fmt.Errorf("0x22 at block 9: %w (…)", errUSDSearchPending))
+	noPrice := fmt.Errorf("USD price of QT: %w", errNoPriceYet)
+	node := errors.New("rpc error -32000: busy")
+	for _, c := range []struct {
+		name     string
+		err      error
+		attempts int
+		want     time.Duration
+	}{
+		{"search pending, attempt 1", pending, 1, usdSearchRetry},
+		{"search pending, attempt 20", pending, 20, usdSearchRetry},
+		{"no price yet, attempt 3", noPrice, 3, backoff(3)},
+		{"node error, attempt 20", node, 20, backoff(20)},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			if got := usdRetryIn(c.err, c.attempts); got != c.want {
+				t.Errorf("usdRetryIn(%v, %d) = %s, want %s", c.err, c.attempts, got, c.want)
+			}
+		})
+	}
+	if noPriceYetIsFinal(pending, time.Now(), time.Now().Add(-time.Hour)) {
+		t.Errorf("noPriceYetIsFinal(%v) after the deadline = true, want false (the search goes on)", pending)
 	}
 }

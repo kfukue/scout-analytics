@@ -1419,7 +1419,7 @@ func main() {
 	backfillMax := flag.Int("backfill-max", 0, "with -backfill: stop after this many posts (0 = no limit)")
 	trackOnly := flag.Bool("track", false, "run only the performance tracker (no Telegram), forever")
 	trackOnce := flag.Bool("track-once", false, "process the price checks that are due now, then exit (no Telegram)")
-	priceCheck := flag.String("price-check", "", "on-chain diagnostic for a CA: find its pool and print entry/current price (no DB, no Telegram), then exit")
+	priceCheck := flag.String("price-check", "", "on-chain diagnostic for a CA: find its pool and print entry/current price (no Telegram; reads the asset database's Chainlink feeds when a database is configured, SCOUT_DB=off to skip), then exit")
 	priceAt := flag.String("price-at", "", "with -price-check: the call time, RFC3339 (e.g. 2026-10-01T14:30:00Z) or a duration ago (e.g. 6h); default 1h ago")
 	exportPath := flag.String("export-dataset", "", "write the training dataset (one row per call: features + 1h/1d/3d/7d/30d outcomes) to this CSV file, then exit")
 	testNotify := flag.Bool("test-notify", false, "send one test message to SCOUT_NOTIFY_PEER and exit")
@@ -1776,6 +1776,14 @@ func (s *scanner) registerTools(ctx context.Context) error {
 // every step, to verify the RPC node, pool discovery and USD conversion.
 func runPriceCheck(ctx context.Context, cfg *config, token, at string) error {
 	o := newOnchainSource(cfg.Price.Onchain)
+	// The asset database's Chainlink feeds, as the tracker loads them (env wins
+	// on a conflict). Read-only: no migration. Without a database, or when it
+	// cannot be opened, the environment's feeds only.
+	db, _, dbErr := openScoutStore(ctx, cfg)
+	if db != nil {
+		defer db.Close()
+	}
+	feedsLine := priceCheckFeeds(ctx, o, db, dbErr)
 	// Long log scans (e.g. a month of v4 swaps, or a graduation search over the
 	// whole history) print a progress line every 5 s, so the check never looks stuck.
 	ctx = withScanProgress(ctx, "price-check "+token, 5*time.Second)
@@ -1790,6 +1798,7 @@ func runPriceCheck(ctx context.Context, cfg *config, token, at string) error {
 		}
 	}
 	fmt.Println("source:", o.describe())
+	fmt.Println(feedsLine)
 	latest, err := o.rpc.blockNumber(ctx)
 	if err != nil {
 		return fmt.Errorf("RPC %s: %w", cfg.Price.Onchain.RPCURL, err)
@@ -1869,12 +1878,75 @@ func runPriceCheck(ctx context.Context, cfg *config, token, at string) error {
 		}
 	}
 	fmt.Printf("log ranges:   up to %d blocks per eth_getLogs (SCOUT_RPC_LOG_CHUNK); %d range(s) split after the node refused them as too large or timed out\n", o.rpc.maxChunk, o.rpc.splits.Load())
-	if o.noState.Load() {
-		fmt.Println("node type:    full node (no historical state) — USD prices of the paired asset come from event logs")
-	} else {
-		fmt.Println("node type:    historical state available (archive) or not needed for this pair")
-	}
+	fmt.Println(nodeTypeLine(ctx, o, eb))
 	return nil
+}
+
+// priceCheckFeeds loads the asset database's Chainlink feeds into o exactly as
+// the tracker does (reloadFeeds: merged with the env feeds, env wins) and
+// returns the line saying how many feeds are in use and how many came from
+// the database. db nil (SCOUT_DB=off, or dbErr: it could not be opened) or a
+// database without the asset tables: the environment's feeds only.
+func priceCheckFeeds(ctx context.Context, o *onchainSource, db *ScoutStore, dbErr error) string {
+	why := "no database (SCOUT_DB=off)"
+	switch {
+	case dbErr != nil:
+		why = fmt.Sprintf("database not opened: %v", dbErr)
+	case db != nil:
+		(&scanner{db: db, onchain: o}).reloadFeeds(ctx)
+		d := &o.dbFeeds
+		d.mu.Lock()
+		loaded, prob := d.loaded, d.lastProb
+		d.mu.Unlock()
+		if loaded {
+			fm := o.feedMaps()
+			return fmt.Sprintf("feeds:        %d Robinhood Chain + %d Ethereum mainnet Chainlink feed(s) in use; %d + %d of them from the asset database (asset_chains), the rest from SCOUT_*CHAINLINK_FEEDS (env wins on a conflict)",
+				len(fm.rh), len(fm.mainnet), fm.dbRH, fm.dbMainnet)
+		}
+		why = prob
+		if why == "" {
+			why = "the asset database could not be read"
+		}
+	}
+	fm := o.feedMaps()
+	return fmt.Sprintf("feeds:        %d Robinhood Chain + %d Ethereum mainnet Chainlink feed(s) in use, from SCOUT_*CHAINLINK_FEEDS only; 0 from the asset database (%s)",
+		len(fm.rh), len(fm.mainnet), why)
+}
+
+// nodeTypeLine says whether the node keeps historical state, from a probe
+// (hasStateAt) at the call block and at a mid-history block (half the latest
+// block number: far from the genesis state and from the recent state a full
+// node may still keep), not from what this check happened to need (a pair
+// quoted in a stablecoin never asks for old state).
+func nodeTypeLine(ctx context.Context, o *onchainSource, callBlock uint64) string {
+	const p = "node type:    "
+	logs := ""
+	if o.noState.Load() {
+		logs = "; this check read USD prices from event logs"
+	}
+	atCall, err := o.hasStateAt(ctx, callBlock)
+	if err != nil {
+		return p + "unknown (state probe at the call block failed: " + err.Error() + ")" + logs
+	}
+	if !atCall {
+		return fmt.Sprintf("%sfull node (no historical state at the call block %d) — USD prices of the paired asset come from event logs%s", p, callBlock, logs)
+	}
+	latest, err := o.rpc.blockNumber(ctx)
+	if err != nil {
+		return fmt.Sprintf("%shistorical state at the call block %d; older blocks unknown (%v)%s", p, callBlock, err, logs)
+	}
+	mid := max(latest/2, 1)
+	if callBlock <= mid { // the call block is already at least half-way back
+		return fmt.Sprintf("%sarchive node (historical state at the call block %d, which is older than mid-history block %d)%s", p, callBlock, mid, logs)
+	}
+	atMid, err := o.hasStateAt(ctx, mid)
+	switch {
+	case err != nil:
+		return fmt.Sprintf("%shistorical state at the call block %d; older blocks unknown (state probe at block %d failed: %v)%s", p, callBlock, mid, err, logs)
+	case atMid:
+		return fmt.Sprintf("%sarchive node (historical state at mid-history block %d and at the call block %d)%s", p, mid, callBlock, logs)
+	}
+	return fmt.Sprintf("%sfull node that still keeps recent state (state at the call block %d, none at mid-history block %d) — older calls read USD prices from event logs%s", p, callBlock, mid, logs)
 }
 
 func printResults(s *scanner, results []*toolResult, noDeliver bool) {

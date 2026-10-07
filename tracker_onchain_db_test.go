@@ -5,7 +5,9 @@ import (
 	"context"
 	"encoding/csv"
 	"encoding/json"
+	"fmt"
 	"math"
+	"strings"
 	"testing"
 	"time"
 )
@@ -106,6 +108,13 @@ func runTrackerOnchain(t *testing.T, mode string) {
 	if n := s.trackDue(ctx, 50); n != 3 {
 		t.Fatalf("processed %d", n)
 	}
+	f.mu.Lock()
+	total := 0
+	for _, n := range f.count {
+		total += n
+	}
+	t.Logf("%s: first pass over 3 calls: %d eth_blockNumber, %d eth_getBlockByNumber, %d requests in all", mode, f.count["eth_blockNumber"], f.count["eth_getBlockByNumber"], total)
+	f.mu.Unlock()
 
 	// young: entry 1e-6 WETH × $3000 = $0.003
 	ty, _ := st.GetTracking(ctx, ids[0])
@@ -206,4 +215,89 @@ func strOrNil(p *string) string {
 		return "<nil>"
 	}
 	return *p
+}
+
+// An entry whose quote asset first traded after the call ("no price yet" at
+// the call block: its pool exists around the call, but its first trade is 10
+// minutes later) stays a retried error until the call is past its last
+// horizon + 48 h (the gave_up deadline); after that it is tracked in quote
+// units, logged once, instead of staying in error for ever.
+func TestTrackerEntryNoPriceYetCappedAfterDeadline(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+	if err := st.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	const (
+		quote = "0x2222222222222222222222222222222222222222"
+		qpool = "0x00000000000000000000000000000000000000c8" // QT / USDG
+	)
+	for i, c := range []struct {
+		name     string
+		ago      time.Duration
+		pastLast bool // past the last horizon (30d) + 48 h
+	}{
+		{"2 days old", 2 * ltDay, false},
+		{"31 days old (inside the 48 h)", 31 * ltDay, false},
+		{"33 days old", 33 * ltDay, true},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			token := fmt.Sprintf("0x%040x", 0x4444+i)
+			pool := fmt.Sprintf("0x%040x", 0xc3+i)
+			f := ltChain(t, 40*ltDay) // a new chain and tracker: no USD caches shared with the other cases
+			f.addToken(tUSDG, 6, "USDG")
+			f.addToken(quote, 18, "QT")
+			f.ltPool(token, pool, quote)
+			call := rugCall{entry: time.Now().Add(-c.ago)}
+			call.eb = f.blockAtTime(call.entry)
+			qp := newUSDTestPool(f, qpool, quote, tUSDG, 18, 6)
+			qp.trade(call.at(10*time.Minute), 3) // QT's first trade: after the call
+			f.ltTrade(token, pool, call.at(-time.Minute), 0.01)
+			f.ltTrade(token, pool, call.at(ltDay/2), 0.03)
+			logs := captureLog(t)
+			s := usdScanner(t, st, f.srv.URL, "eth="+ltFeed)
+			s.onChannelPost(postAt(100+i, call.entry, token))
+			call.id = *(<-s.queue).CallID
+			t.Cleanup(func() {
+				// Not due for the next case's tracker (another chain).
+				if _, err := st.Pool.Exec(context.Background(), `UPDATE scout_call_tracking SET next_check_at = now() + interval '1 year' WHERE call_id = $1`, call.id); err != nil {
+					t.Errorf("park call %d: %v", call.id, err)
+				}
+			})
+			for run := 1; run <= 2; run++ {
+				s.trackDue(ctx, 50)
+				tr, _ := st.GetTracking(ctx, call.id)
+				if !c.pastLast {
+					if tr.Status != TrackError || tr.PriceUnit != nil || tr.Error == nil || !strings.Contains(*tr.Error, "no price yet") {
+						t.Fatalf("run %d: got status %s unit %s error %s, want an error (no price yet) and no unit; log:\n%s",
+							run, tr.Status, strOrNil(tr.PriceUnit), strOrNil(tr.Error), logs.String())
+					}
+				} else if tr.PriceUnit == nil || *tr.PriceUnit != "QT" || tr.EntryPriceUSD == nil || !relNear(*tr.EntryPriceUSD, 0.01) ||
+					tr.Error != nil || tr.Status == TrackError || tr.Status == TrackGaveUp {
+					t.Fatalf("run %d: got status %s unit %s entry %v error %s, want tracked in QT, entry 0.01 QT, no error",
+						run, tr.Status, strOrNil(tr.PriceUnit), rugF(tr.EntryPriceUSD), strOrNil(tr.Error))
+				}
+				if _, err := st.Pool.Exec(ctx, `UPDATE scout_call_tracking SET next_check_at = now() - interval '1 minute' WHERE call_id = $1`, call.id); err != nil {
+					t.Fatal(err)
+				}
+			}
+			want := 0
+			if c.pastLast {
+				want = 1
+			}
+			if n := strings.Count(logs.String(), "giving up on USD, tracked in QT"); n != want {
+				t.Fatalf("got %d \"giving up on USD\" lines, want %d:\n%s", n, want, logs.String())
+			}
+			if !c.pastLast {
+				return
+			}
+			rets, err := st.ReturnsForCall(ctx, call.id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if r, ok := rets["1d"]; !ok || !relNear(r.ReturnPct, 200) {
+				t.Fatalf("1d return (in QT): got %+v (present %v), want +200%%", r, ok)
+			}
+		})
+	}
 }

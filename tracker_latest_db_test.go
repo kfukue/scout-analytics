@@ -16,6 +16,7 @@ import (
 	"reflect"
 	"regexp"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -215,6 +216,7 @@ func ltTime(t *testing.T, s *string) time.Time {
 // 30-day mark: the pass stores the latest price, return and times, leaves the
 // horizon side alone, costs little on the next refresh and follows a new trade.
 func TestLatestPriceOldCall(t *testing.T) {
+	noHeadCache(t) // the test moves the chain's head (advance)
 	st := testStore(t)
 	ctx := context.Background()
 	if err := st.Migrate(ctx); err != nil {
@@ -343,6 +345,7 @@ func TestLatestPriceOldCall(t *testing.T) {
 // A call that is still being tracked: the pass runs, and the horizons that
 // arrive later come out exactly as for a twin call the pass never touched.
 func TestLatestPriceTrackingCallKeepsLaterHorizons(t *testing.T) {
+	noHeadCache(t) // the test moves the chain's head (advance)
 	st := testStore(t)
 	ctx := context.Background()
 	if err := st.Migrate(ctx); err != nil {
@@ -883,13 +886,20 @@ func TestLatestPriceInterruptedLeavesRowUntouched(t *testing.T) {
 		t.Fatal(err)
 	}
 	f := ltChain(t, 20*ltDay)
-	// The node, with a switch: when armed, the first eth_getLogs cancels the run.
+	// The node, with a switch: when armed, an eth_getLogs cancels the run and
+	// gets no answer. It is counted here, before the cancel: the fake chain's
+	// own count would come after it, in the server's goroutine, possibly after
+	// the pass has already returned (the test used to fail then, about 1 run
+	// in 10).
 	var armed atomic.Bool
+	var interrupted atomic.Int64
 	var cancel context.CancelFunc
 	node := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
 		if armed.Load() && bytes.Contains(body, []byte("eth_getLogs")) {
+			interrupted.Add(1)
 			cancel()
+			return
 		}
 		r.Body = io.NopCloser(bytes.NewReader(body))
 		f.serve(w, r)
@@ -925,8 +935,8 @@ func TestLatestPriceInterruptedLeavesRowUntouched(t *testing.T) {
 	f.took("")
 	res := s.refreshLatest(cctx, false)
 	armed.Store(false)
-	if n := f.took("eth_getLogs"); n == 0 || cctx.Err() == nil {
-		t.Fatalf("the pass was not interrupted in its scan (%d eth_getLogs)", n)
+	if n := interrupted.Load(); n == 0 || cctx.Err() == nil {
+		t.Fatalf("the pass was not interrupted in its scan: got %d eth_getLogs and ctx error %v, want at least 1 and context.Canceled", n, cctx.Err())
 	}
 	if res.Due != 1 || res.Refreshed != 0 || res.Failed != 0 || res.FirstErr != "" {
 		t.Fatalf("interrupted pass: %+v", res)
@@ -938,6 +948,7 @@ func TestLatestPriceInterruptedLeavesRowUntouched(t *testing.T) {
 		t.Fatalf("the interrupted row is set aside as failed: %v", skip)
 	}
 	// a pass started after the stop does nothing at all
+	f.took("")
 	if res := s.refreshLatest(cctx, false); res.Due != 0 || f.took("eth_blockNumber") != 0 {
 		t.Fatalf("pass on a stopped run: %+v", res)
 	}
@@ -956,5 +967,138 @@ func TestLatestPriceInterruptedLeavesRowUntouched(t *testing.T) {
 	}
 	if c := ltRead(t, st, id); !ltNear(c.Price, 4e-6*ltETH) || !ltNear(c.Ret, 100) {
 		t.Fatalf("latest after the restart: %v %v", fnum(c.Price), fnum(c.Ret))
+	}
+}
+
+// ltHorizonResults is a call's horizon results and candles without the call id
+// (and the time they were written), to compare two calls.
+func ltHorizonResults(t *testing.T, st *ScoutStore, id int) (returns, candles string) {
+	t.Helper()
+	ctx := context.Background()
+	if err := st.Pool.QueryRow(ctx, `SELECT COALESCE(jsonb_agg(to_jsonb(r) - 'call_id' - 'computed_at' ORDER BY horizon_seconds)::text, '')
+		FROM scout_call_returns r WHERE call_id = $1`, id).Scan(&returns); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Pool.QueryRow(ctx, `SELECT COALESCE(jsonb_agg(to_jsonb(c) - 'call_id' ORDER BY interval_seconds, bucket_start)::text, '')
+		FROM scout_call_candles c WHERE call_id = $1`, id).Scan(&candles); err != nil {
+		t.Fatal(err)
+	}
+	return returns, candles
+}
+
+// A call refreshed by the latest-price pass (between horizons, and while a
+// horizon check is due) ends up with exactly the horizon results, candles and
+// horizon state of its twin that the pass never touched. While its horizon
+// check is due the pass leaves it alone (no node request): the horizon scan is
+// about to read those blocks. Afterwards the pass reads only past the new
+// scan block.
+func TestLatestPriceHorizonResultsUnchanged(t *testing.T) {
+	noHeadCache(t) // the test moves the chain's head (advance)
+	st := testStore(t)
+	ctx := context.Background()
+	if err := st.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	f := ltChain(t, 20*ltDay)
+	tokenA, poolA := "0x4444444444444444444444444444444444444444", "0x00000000000000000000000000000000000000c3"
+	tokenB, poolB := "0x5555555555555555555555555555555555555555", "0x00000000000000000000000000000000000000c4"
+	entry := time.Now().Add(-2 * ltDay)
+	eb := f.blockAtTime(entry)
+	at := func(d time.Duration) uint64 { return uint64(int64(eb) + int64(d/time.Second)*10) }
+	for _, p := range [][2]string{{tokenA, poolA}, {tokenB, poolB}} {
+		f.ltPool(p[0], p[1], tWETH)
+		f.ltTrade(p[0], p[1], at(-2*time.Minute), 1e-6)
+		f.ltTrade(p[0], p[1], at(30*time.Second), 2e-6)
+		f.ltTrade(p[0], p[1], at(2*time.Hour), 6e-6)
+		f.ltTrade(p[0], p[1], at(20*time.Hour), 3e-6)
+		f.ltTrade(p[0], p[1], at(30*time.Hour), 1.5e-6) // the low, between the 1d and the 3d mark
+		f.ltTrade(p[0], p[1], at(34*time.Hour), 9e-6)   // the peak, before the 3d mark (+36h below)
+		f.ltTrade(p[0], p[1], at(40*time.Hour), 8e-6)   // after the 3d mark
+	}
+	s := ltScanner(t, st, f.srv.URL)
+	s.onChannelPost(postAt(1, entry, tokenA))
+	a := *(<-s.queue).CallID
+	s.onChannelPost(postAt(2, entry, tokenB))
+	b := *(<-s.queue).CallID
+	if n := s.trackDue(ctx, 50); n != 2 {
+		t.Fatalf("got %d processed, want 2", n)
+	}
+	s.latestFailed(b, time.Now()) // B never gets a latest price
+	var mu sync.Mutex
+	var froms []uint64
+	f.setLogsHook(func(addr string, from, to uint64) string {
+		if addr == poolA {
+			mu.Lock()
+			froms = append(froms, from)
+			mu.Unlock()
+		}
+		return ""
+	})
+	logsFrom := func() []uint64 {
+		mu.Lock()
+		defer mu.Unlock()
+		out := froms
+		froms = nil
+		return out
+	}
+
+	// Between horizons: the pass reads A from the 1d scan block to the head.
+	if res := s.refreshLatest(ctx, false); res.Refreshed != 1 || res.Deferred != 0 {
+		t.Fatalf("pass between horizons: got %+v, want 1 refreshed", res)
+	}
+	logsFrom()
+	f.advance(9000)
+
+	// The 3d horizon becomes due (the calls are made 36 hours older).
+	if _, err := st.Pool.Exec(ctx, `UPDATE scout_calls SET message_date = message_date - interval '36 hours';
+		UPDATE scout_call_tracking SET entry_at = entry_at - interval '36 hours', next_check_at = now() - interval '1 second',
+		latest_checked_at = latest_checked_at - interval '1 hour'`); err != nil {
+		t.Fatal(err)
+	}
+	f.took("")
+	res := s.refreshLatest(ctx, false)
+	if res.Due != 0 || res.Deferred != 1 || res.Refreshed != 0 {
+		t.Fatalf("pass with the horizon check due: got %+v, want A deferred and nothing refreshed", res)
+	}
+	if n := f.took("eth_getLogs") + f.took("eth_blockNumber"); n != 0 {
+		t.Fatalf("pass with the horizon check due: got %d node requests, want 0", n)
+	}
+	if n := s.trackDue(ctx, 50); n != 2 {
+		t.Fatalf("3d: got %d processed, want 2", n)
+	}
+	scanA := ltState(t, st, a).ScanBlock
+	logsFrom()
+	if res := s.refreshLatest(ctx, false); res.Refreshed != 1 || res.Deferred != 0 {
+		t.Fatalf("pass after the 3d check: got %+v, want 1 refreshed", res)
+	}
+	for _, from := range logsFrom() {
+		if from <= scanA {
+			t.Fatalf("pass after the 3d check read from block %d, want only blocks after the scan block %d", from, scanA)
+		}
+	}
+	if c := ltRead(t, st, a); !ltNear(c.Price, 8e-6*ltETH) {
+		t.Fatalf("latest of A: got %v, want %v", fnum(c.Price), 8e-6*ltETH)
+	}
+
+	// The horizons of A and B are the same in every detail.
+	retA, candA := ltHorizonResults(t, st, a)
+	retB, candB := ltHorizonResults(t, st, b)
+	if retA == "" || retA != retB {
+		t.Fatalf("returns differ between the refreshed call and its twin:\n A %s\n B %s", retA, retB)
+	}
+	if candA == "" || candA != candB {
+		t.Fatalf("candles differ between the refreshed call and its twin:\n A %s\n B %s", candA, candB)
+	}
+	sa, sb := ltState(t, st, a), ltState(t, st, b)
+	if sa.LatestBlock == 0 || sb.LatestBlock != 0 {
+		t.Fatalf("latest cursors: got A %d, B %d; want A set, B 0", sa.LatestBlock, sb.LatestBlock)
+	}
+	sa.LatestBlock, sa.LatestPriceQ, sa.LatestTradeBlock = 0, 0, 0
+	sa.Pool, sb.Pool = "", ""
+	if !reflect.DeepEqual(sa, sb) {
+		t.Fatalf("horizon state differs:\n A %+v\n B %+v", sa, sb)
+	}
+	if rs, _ := st.ReturnsForCall(ctx, a); len(rs) != 3 {
+		t.Fatalf("got horizons %v, want 1h, 1d and 3d", sortedKeys(rs))
 	}
 }

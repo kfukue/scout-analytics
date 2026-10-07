@@ -192,6 +192,7 @@ func TestTrackerPonsGraduationAfterLastHorizon(t *testing.T) {
 }
 
 func testTrackerPonsGraduationAfterLastHorizon(t *testing.T, fullNode bool) {
+	noHeadCache(t) // the test moves the chain's head (advance)
 	st := testStore(t)
 	ctx := context.Background()
 	if err := st.Migrate(ctx); err != nil {

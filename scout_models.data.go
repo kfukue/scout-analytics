@@ -171,6 +171,12 @@ func (st *ScoutStore) UpsertScoutCall(ctx context.Context, c *ScoutCall) (*int, 
 		return nil, false, err
 	}
 	c.ID = &id
+	if created && c.PostKind == PostKindCall && c.Status != CallStatusBackfill {
+		// tells an open website (-web) at once; never fails the insert. Posts
+		// imported from channel history (-backfill) are old news: they reach
+		// the page with its next regular refresh, without a refresh per row.
+		st.notifyScoutEvent(ctx, scoutEvent{Kind: scoutEventCall, CallID: id})
+	}
 	return &id, created, nil
 }
 
@@ -431,22 +437,29 @@ func (st *ScoutStore) InsertScoutInvestigation(ctx context.Context, r *ScoutInve
 		r.Details = []byte("{}")
 	}
 	var id int
-	err := st.Pool.QueryRow(ctx, `INSERT INTO scout_investigations (
+	var toolCode *string // the code of the tool, for the website's notice
+	err := st.Pool.QueryRow(ctx, `WITH ins AS (
+	INSERT INTO scout_investigations (
 		uuid, call_id, tool_id, contract_address, request_text, requested_at, completed_at, status,
 		bot_message_ids, report_text, report_urls, report_url, external_id, verdict_level,
 		verdict_label, ticker, verdict_summary, verdict_source, details, error,
 		created_by, created_at, updated_by, updated_at
 	) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19::jsonb,$20,$21,$22,$23,$24)
-	RETURNING id`,
+	RETURNING id, tool_id)
+	SELECT ins.id, t.code FROM ins LEFT JOIN scout_investigation_tools t ON t.id = ins.tool_id`,
 		r.UUID, r.CallID, r.ToolID, r.ContractAddress, r.RequestText, r.RequestedAt, r.CompletedAt, r.Status,
 		r.BotMessageIDs, r.ReportText, r.ReportURLs, r.ReportURL, r.ExternalID, r.VerdictLevel,
 		r.VerdictLabel, r.Ticker, r.VerdictSummary, r.VerdictSource, string(r.Details), r.Error,
 		r.CreatedBy, now, r.UpdatedBy, now,
-	).Scan(&id)
+	).Scan(&id, &toolCode)
 	if err != nil {
 		return nil, err
 	}
 	r.ID = &id
+	if ev, ok := scoutReportEvent(r, toolCode); ok {
+		// tells an open website (-web) at once; never fails the insert
+		st.notifyScoutEvent(ctx, ev)
+	}
 	return &id, nil
 }
 
