@@ -33,15 +33,15 @@ def render(res: dict) -> str:
            "## Data and exclusions\n",
            f"- rows read: {d['rows']} ({d['first_date']} to {d['last_date']})",
            f"- excluded, update post (not a call): {d.get('update', 0)}",
+           f"- excluded, repeat call (not the token's first call; only first calls are tracked): {d.get('repeat', 0)}",
            f"- excluded, no pool (never tradable; out of training and simulation): {d['no_pool']}",
-           f"- excluded, repeat call not tracked (only the first call of each token is tracked): {d.get('repeat', 0)}",
            f"- excluded, price_unit not 'usd': {d['not_usd']}",
            f"- excluded, extreme outcome (a label/simulation outcome above {MAX_OUTCOME_PCT:,.0f} %; "
            f"bogus pool data): {d.get('extreme', 0)}",
            f"- rows left before per-bucket outcome availability: {d['eligible']}\n",
-           table(["bucket", "outcome not available yet", "usable rows"],
+           table(["bucket", "not labelled yet (horizon not due or no data; not a negative)", "usable rows"],
                  [[b, d["eligible"] - r["usable"], r["usable"]] for b, r in res["buckets"].items()]),
-           "## Feature coverage (share of non-null values, all rows)\n",
+           "## Feature coverage (share of non-null values, rows left after the exclusions above)\n",
            table(["column", "non-null"], [[c, v] for c, v in d["coverage"].items()])]
     for b, r in res["buckets"].items():
         cfg = BUCKETS[b]

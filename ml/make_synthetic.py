@@ -2,14 +2,14 @@
 end to end without a database.  The numbers are invented; only the column
 layout, missingness pattern and CSV conventions mimic the real export.
 
-    python make_synthetic.py --out calls.csv [--calls 6000 --days 70 --seed 7]
+    python make_synthetic.py --out calls.csv [--calls 6000 --days 70 --seed 7 --end 2026-10-01T00:00:00Z]
 """
 import argparse
 
 import numpy as np
 import pandas as pd
 
-from scout_ml.config import HORIZONS, VIEW_COLUMNS
+from scout_ml.config import HORIZONS, LATEST_VIEW, VIEW_COLUMNS
 
 HORIZON_DAYS = {"1h": 1 / 24, "1d": 1, "3d": 3, "7d": 7, "30d": 30}
 STEP_SIGMA = {"1h": 0.30, "1d": 0.75, "3d": 0.55, "7d": 0.55, "30d": 0.80}  # log-price steps
@@ -31,9 +31,17 @@ def make(n: int = 6000, days: float = 70, seed: int = 7, end: str = "2026-10-01T
     tok = np.zeros(n, dtype=int)
     for i in range(1, n):
         tok[i] = tok[rng.integers(max(0, i - 200), i)] if rng.random() < 0.30 else tok[:i].max() + 1
-    d["contract_address"] = [f"Tok{t:06d}pump" for t in tok]
-    d["call_status"] = "posted"
+    # Addresses in mixed case: the same token can be posted in different case.
+    d["contract_address"] = [f"0xAb{t:06d}C0" if rng.random() < 0.5 else f"0xab{t:06d}c0" for t in tok]
+    later = pd.Series(tok).duplicated().to_numpy()      # not the token's first post
+    # Update posts ("$TOKEN hit 3X ..."): about an earlier call, never a first post.
+    update = later & (rng.random(n) < 0.15)
+    d["call_status"] = np.where(update, "update", np.where(later, "duplicate", "scanned"))
+    d["post_kind"] = pd.Series(np.where(update, "update", "call"), dtype=object)
+    d.loc[rng.random(n) < 0.01, "post_kind"] = None      # not classified yet: read as a call
     d["token_symbol"] = [f"SYM{t % 997}" for t in tok]
+    d["token_name"] = pd.Series([f"Token {t}" for t in tok], dtype=object).mask(
+        pd.Series(rng.random(n) < 0.2))
     d["dex"] = rng.choice(["raydium", "pumpswap", "meteora", "uniswap_v2", "rare_dex"], n,
                           p=[0.35, 0.35, 0.15, 0.149, 0.001])
     d["launchpad"] = rng.choice(["pumpfun", "bonk", None], n, p=[0.40, 0.10, 0.50])
@@ -106,14 +114,21 @@ def make(n: int = 6000, days: float = 70, seed: int = 7, end: str = "2026-10-01T
     done = age_days >= 30
     d["tracking_status"] = np.where(done, "done", "tracking")
     d["pool_address"] = [f"Pool{i:07d}" for i in range(n)]
-    d["pool_dex"] = d["dex"]
+    kind = rng.choice(["v2", "v3", "v4", "pons"], n, p=[0.45, 0.15, 0.25, 0.15])
+    d["pool_dex"] = np.where(kind == "pons", "pons-curve", np.char.add("uniswap-", kind))
     d["entry_price_usd"] = rng.lognormal(np.log(1e-4), 2.0, n)
-    d["entry_price_source"] = rng.choice(["swap", "ohlcv"], n, p=[0.8, 0.2])
-    d["price_unit"] = rng.choice(["usd", "native"], n, p=[0.94, 0.06])
-    d["quote_asset"] = rng.choice(["SOL", "WETH", "USDC"], n, p=[0.75, 0.15, 0.10])
+    d["entry_price_source"] = np.char.add("onchain-", kind)
+    d["price_unit"] = rng.choice(["usd", "VIRTUAL"], n, p=[0.94, 0.06])
+    d["quote_asset"] = rng.choice(["WETH", "USDG", "VIRTUAL"], n, p=[0.75, 0.15, 0.10])
     d["entry_late_price_usd"] = d["entry_price_usd"] * late
     d["current_liquidity_usd"] = d["liq_usd"] * np.where(rug_at < 99, 0.001, np.exp(log_p / 2))
-    d["rugged"] = pd.Series(np.where(done, rug_at < 99, None), dtype=object)
+    # The tracker flags a rug at once, before the last horizon is due.
+    rug_seen = (rug_at < 99) & (age_days >= rug_at)
+    d["rugged"] = pd.Series(np.where(done | rug_seen, rug_at < 99, None), dtype=object)
+    latest_ret = np.where(rug_at < 99, -100.0, np.exp(log_p) / late * 100 - 100)
+    d["latest_price_usd"] = d["entry_price_usd"] * late * (1 + latest_ret / 100)
+    d["latest_return_pct"] = latest_ret
+    d["latest_checked_at"] = end - pd.Timedelta(minutes=7)
 
     # Missingness. No pool => nothing about the pool is known, incl. pre-call trading.
     def blank(mask, cols):
@@ -128,6 +143,17 @@ def make(n: int = 6000, days: float = 70, seed: int = 7, end: str = "2026-10-01T
     d.loc[no_pool, "tracking_status"] = rng.choice(["no_pool", "gave_up"], int(no_pool.sum()))
     blank(rng.random(n) < 0.25, pre_cols)
     blank(rng.random(n) < 0.40, live_cols)
+    # Later posts of a token are not tracked (status repeat, no pool or outcomes)
+    # and update posts have no tracking row; a few older ones kept the results
+    # of an earlier tracker version (they must still be left out of training).
+    tracked = ["tracking_status", "pool_address", "pool_dex", "entry_price_usd",
+               "entry_price_source", "price_unit", "quote_asset", "entry_late_price_usd",
+               "current_liquidity_usd", "rugged"] + LATEST_VIEW
+    stale = later & ~no_pool & (rng.random(n) < 0.15)
+    blank(later & ~stale, pre_cols + outcome_cols + tracked)
+    d.loc[later & ~update & ~stale, "tracking_status"] = "repeat"
+    # set aside while still tracking: status repeat, partial results kept
+    d.loc[later & ~update & stale & (d["tracking_status"] == "tracking").to_numpy(), "tracking_status"] = "repeat"
     blank(rng.random(n) < 0.20, ["tax_buy_pct", "tax_sell_pct"])
     blank(rng.random(n) < 0.30, ["holders"])
     blank(rng.random(n) < 0.10, ["liq_usd", "liq_pct"])
@@ -137,7 +163,8 @@ def make(n: int = 6000, days: float = 70, seed: int = 7, end: str = "2026-10-01T
 def write_csv(d: pd.DataFrame, path) -> None:
     """Same conventions as the Go exporter: '' for NULL, true/false, RFC3339."""
     d = d.copy()
-    d["message_date"] = pd.to_datetime(d["message_date"], utc=True).dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+    for c in ("message_date", "latest_checked_at"):
+        d[c] = pd.to_datetime(d[c], utc=True).dt.strftime("%Y-%m-%dT%H:%M:%SZ").where(d[c].notna(), None)
     for c in INT_COLUMNS:
         d[c] = pd.to_numeric(d[c]).astype("Int64")
     d["rugged"] = d["rugged"].map({True: "true", False: "false"})
@@ -150,6 +177,7 @@ if __name__ == "__main__":
     ap.add_argument("--calls", type=int, default=6000)
     ap.add_argument("--days", type=float, default=70)
     ap.add_argument("--seed", type=int, default=7)
+    ap.add_argument("--end", default="2026-10-01T00:00:00Z", help="time of the newest call (UTC)")
     a = ap.parse_args()
-    write_csv(make(a.calls, a.days, a.seed), a.out)
+    write_csv(make(a.calls, a.days, a.seed, a.end), a.out)
     print(f"wrote {a.out}: {a.calls} synthetic calls over {a.days:g} days")

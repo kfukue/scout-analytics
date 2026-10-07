@@ -49,8 +49,13 @@ OUTCOMES = [f"{m}{late}_{h}" for h in HORIZONS for late in ("", "_late")
 BOOKKEEPING = ["tracking_status", "pool_address", "pool_dex", "entry_price_usd",
                "entry_price_source", "price_unit", "quote_asset",
                "entry_late_price_usd", "current_liquidity_usd", "rugged"]
-VIEW_COLUMNS = (IDENTITY + ["dex", "launchpad"] + NUMERIC_RAW
-                + ["pre_vol_unit", "perceptor_verdict"] + BOOKKEEPING + OUTCOMES)
+# latest_* columns the view exports (latest_trade_at is not exported).
+LATEST_VIEW = ["latest_price_usd", "latest_return_pct", "latest_checked_at"]
+# Exactly the columns of scout_call_dataset_v (scoutanalytics.sql), in order;
+# tests/test_view_columns.py compares this list with the SQL.
+VIEW_COLUMNS = (["call_id", "message_id", "message_date", "contract_address", "call_status",
+                 "post_kind", "token_symbol", "token_name", "dex", "launchpad"] + NUMERIC_RAW
+                + ["pre_vol_unit", "perceptor_verdict"] + BOOKKEEPING + OUTCOMES + LATEST_VIEW)
 
 # --- Leakage guard ---------------------------------------------------------
 # Outcomes and bookkeeping are only known after the post; ids are not signal.
