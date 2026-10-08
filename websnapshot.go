@@ -41,6 +41,31 @@ var webVerdictBuckets = map[string]uint8{
 	"not_scanned": webBucketNotScanned,
 }
 
+// webVerdictNames: the verdict filter values in bucket order (index = bucket).
+var webVerdictNames = [webBuckets]string{"clean", "caution", "red_flags", "not_scanned"}
+
+// webVerdictAll: the set of every bucket (bit b = bucket b).
+const webVerdictAll uint8 = 1<<webBuckets - 1
+
+// webVerdictSet reads the verdict list of a filter ("" = all, else names of
+// buckets separated by commas, in any order) as a set of buckets.
+func webVerdictSet(list string) (uint8, error) {
+	if list == "" {
+		return webVerdictAll, nil
+	}
+	var set uint8
+	for list != "" {
+		var item string
+		item, list, _ = strings.Cut(list, ",")
+		b, ok := webVerdictBuckets[item]
+		if !ok {
+			return 0, fmt.Errorf("unknown verdict %q", item)
+		}
+		set |= 1 << b
+	}
+	return set, nil
+}
+
 // Sort keys: 0 = date, then return and peak of each window, then the return
 // as of the latest price, the market cap at the call and the estimated market
 // cap at the latest price.
@@ -812,13 +837,9 @@ func (s *webSnapshot) page(f ScoutWebCallsFilter, dst []int32) ([]int32, int, er
 	if f.Page < 1 || f.Per < 1 {
 		return dst, 0, errors.New("page and per must be at least 1")
 	}
-	bucket := webBuckets // all
-	if f.Verdict != "" {
-		b, ok := webVerdictBuckets[f.Verdict]
-		if !ok {
-			return dst, 0, fmt.Errorf("unknown verdict %q", f.Verdict)
-		}
-		bucket = b
+	set, err := webVerdictSet(f.Verdict)
+	if err != nil {
+		return dst, 0, err
 	}
 	q := strings.ToLower(f.Q)
 	if strings.IndexByte(q, 0) >= 0 {
@@ -829,14 +850,12 @@ func (s *webSnapshot) page(f ScoutWebCallsFilter, dst []int32) ([]int32, int, er
 	asc := f.Dir == "asc"
 	skip := (f.Page - 1) * f.Per
 	base := len(dst)
-	// which flags a row must have: mask picks the bits that count, want their values
-	var mask, want uint8
+	// which rows count: with the USD flag if asked for, and a bucket in the set
+	var usd uint8
 	if f.USDOnly {
-		mask, want = webFlagUSD, webFlagUSD
+		usd = webFlagUSD
 	}
-	if bucket != webBuckets {
-		mask, want = mask|^uint8(webFlagUSD), want|bucket
-	}
+	every := set == webVerdictAll // no Perceptor filter
 
 	total, known := 0, false
 	var bits []uint64
@@ -846,7 +865,16 @@ func (s *webSnapshot) page(f ScoutWebCallsFilter, dst []int32) ([]int32, int, er
 		if f.USDOnly {
 			u = 1
 		}
-		total, known = s.counts[u][bucket], true
+		if every {
+			total = s.counts[u][webBuckets]
+		} else {
+			for b := range uint8(webBuckets) {
+				if set&(1<<b) != 0 {
+					total += s.counts[u][b]
+				}
+			}
+		}
+		known = true
 		if skip >= total {
 			return dst, total, nil
 		}
@@ -862,7 +890,7 @@ func (s *webSnapshot) page(f ScoutWebCallsFilter, dst []int32) ([]int32, int, er
 		s.markMatches(q, bits)
 	}
 	start, matched := 0, 0
-	if known && mask == 0 { // every row matches: jump to the page
+	if known && every && usd == 0 { // every row matches: jump to the page
 		start, matched = skip, skip
 	}
 	for i := start; i < n; i++ {
@@ -874,7 +902,7 @@ func (s *webSnapshot) page(f ScoutWebCallsFilter, dst []int32) ([]int32, int, er
 				pos = order[n-1-(i-nn)]
 			}
 		}
-		if s.flags[pos]&mask != want {
+		if fl := s.flags[pos]; fl&usd != usd || set&(1<<(fl&^webFlagUSD)) == 0 {
 			continue
 		}
 		if bits != nil && bits[pos>>6]&(1<<(pos&63)) == 0 {

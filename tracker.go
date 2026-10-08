@@ -731,13 +731,13 @@ func (s *scanner) backfillMessage(m *tg.Message, st *backfillStats) {
 	if postKind(m.Message) == PostKindUpdate {
 		st.Updates++
 		for _, ca := range cas {
-			s.recordCallInfo(m, ca, urls, CallStatusUpdate)
+			s.recordCallInfo(context.Background(), m, ca, urls, CallStatusUpdate)
 		}
 		return
 	}
 	st.Calls++
 	for _, ca := range cas {
-		id, created := s.recordCallInfo(m, ca, urls, CallStatusBackfill)
+		id, created := s.recordCallInfo(context.Background(), m, ca, urls, CallStatusBackfill)
 		if id == nil {
 			continue
 		}

@@ -40,12 +40,59 @@ go run ./telegrambot/scoutanalytics
 First run asks for the Telegram login code (and uses `TG_PASSWORD` if you have 2FA).
 Make sure you've pressed **Start** on **@perceptor0xBot and @salpha_research_bot** once from this account.
 
+Deploying, restarts, health checks and draft systemd units: see [DEPLOY.md](DEPLOY.md).
+
 ## How calls are picked up
 
 - **Live updates** for new posts, plus **edited posts** (a call posted first and the CA added later).
 - **Polling backup** every `SCOUT_POLL_INTERVAL` (default `20s`, `0` = off): Telegram doesn't
   always push every post of a big channel to user accounts, so the scanner also asks for
   posts newer than the last one it polled. Each (post, CA) is handled once.
+- **Catch-up after a restart** (or a reconnect): the posts that arrived while the listener was
+  down are handled on start. Polling resumes from a saved cursor, the lower of the newest post
+  recorded in `scout_calls` for the channel and `scoutanalytics_data/poll_cursor.json` (written
+  whenever polling moves on; the only cursor when `SCOUT_DB=off`). The missed posts are then
+  read (oldest first) and split:
+  - the newest `SCOUT_CATCHUP_MAX` posts (default `100`, `0` to `250`) that are at most
+    `SCOUT_CATCHUP_MAX_AGE` old (default `24h`, `0` = no age limit; an invalid value stops the
+    start) are **handled live**: investigated and delivered as usual, update posts recorded
+    only, tokens already investigated recorded as `duplicate`;
+  - the older ones are **stored only**, the way `-backfill` stores them (status `backfill`,
+    tracked, no bot scans, no delivery, the token's investigation is not used up). With
+    `SCOUT_DB=off` they are skipped (nothing is recorded).
+
+  Posts already in `scout_calls` are skipped, so nothing is handled twice. One log line:
+  `catch-up: 12 post(s) since post 10420 (12 handled live, 0 stored only)`, then
+  `polling @… (starting after post N, from …)`. With no saved cursor at all (first run, empty
+  database) it starts at the channel's newest post as before.
+- **Calls still waiting at a restart are queued again.** The job queue lives in memory: calls
+  that were `queued` (or `dropped` because the queue was full) and have no completed
+  investigation are put back in it at the start, before the catch-up's posts (oldest first),
+  with the same rules: the newest `SCOUT_CATCHUP_MAX` of them no older than
+  `SCOUT_CATCHUP_MAX_AGE` are scanned, the others are stored only (status `backfill`, the
+  token freed in `seen_cas.json`), and a call whose token another call already investigated
+  becomes `duplicate`. One log line when there are any:
+  `requeue: 3 queued call(s) from before the restart (2 scanned now, 1 stored only)`. A call
+  being scanned when the listener stops can end as `failed` (its bot requests are cut off);
+  `failed` calls are not requeued. Needs the database (nothing to requeue with `SCOUT_DB=off`).
+  Several waiting calls of one token are scanned once (the newest; the older ones become
+  `duplicate`, or `backfill` with it); a call whose token is already queued in this process
+  becomes `duplicate`.
+- **The requeue only looks back `SCOUT_CATCHUP_MAX_AGE` + 48h** (72h with the defaults; 24h
+  + 48h when `SCOUT_CATCHUP_MAX_AGE=0`). Older `queued`/`dropped` rows are never rewritten,
+  also on the first deploy of this feature; when there are any, one line per process counts
+  them: `requeue: N queued or dropped call(s) posted before … left as they are; DEPLOY.md 3.3
+  has the SQL to fix them by hand`.
+- The requeue and the catch-up run when the listener (re)connects, also with
+  `SCOUT_POLL_INTERVAL=0` (then only once: a failure is logged and not retried until the next
+  start). With polling on, a failure (Telegram or the database unreachable) handles nothing and
+  is retried at every poll interval; the outage is never skipped. A stored-only post that cannot
+  be written stops the catch-up there (the cursor stays before it) until the next try. When only
+  the second requeue (after the catch-up) fails, polling runs and each poll retries it. More than 50 new posts in one
+  interval are read page by page, so polling skips none either. Worst case after a long
+  outage: Perceptor scans one CA every 2m5s, so 100 calls take about 3.5 hours, and newer calls
+  wait behind them; the requeue and the catch-up each allow up to `SCOUT_CATCHUP_MAX`, so up to
+  twice that can be waiting. Lower `SCOUT_CATCHUP_MAX` if that is too long.
 - The CA is read from the post text, text links, link previews **and inline buttons**
   (Chart/Buy/"Copy CA"). Links to **wallet or transaction pages** (`/address/`, `/tx/`,
   `/profile/`, …, e.g. the "Live buys" wallets) are ignored, so wallets aren't scanned.
@@ -779,6 +826,8 @@ SCOUT_RED_FLAG_MARKERS=🚩,⚠️,red flag,warning,honeypot,...   # comma list,
 SCOUT_SAFE_PHRASES=no red flags,honeypot: no,...            # stripped before matching
 SCOUT_SCAN_GAP=3s        # pause between CAs
 SCOUT_STATE_DIR=scoutanalytics_data
+SCOUT_CATCHUP_MAX=100    # after a restart: missed posts (and calls still queued) handled live, newest first, 0-250; older ones stored only
+SCOUT_CATCHUP_MAX_AGE=24h # missed posts / queued calls older than this are stored only (0 = no age limit; invalid = startup error)
 ```
 
 ## Investigation tools
@@ -1191,8 +1240,13 @@ other sites):
   after the rug).
 - **Perceptor** — the column shows the verdict of the token's Perceptor report as words:
   "no red flags", "caution", "red flags" (linked to the report, in a new tab), or "–" when
-  there is none. The "Perceptor" select next to the search box filters the list: All reports,
-  No red flags found, Caution, Red flags, Not scanned.
+  there is none. The "Perceptor" button next to the search box filters the list: it opens a
+  small panel of checkboxes (No red flags, Caution, Red flags, Not scanned), and the list shows
+  the tokens whose verdict is any of those ticked, e.g. No red flags **and** Caution. None
+  ticked (or all four) = all; "All (clear)" unticks them. The button names the choice
+  ("Perceptor: No red flags + Caution", "Perceptor: all"). It opens with Enter or Space, Esc
+  or a click elsewhere closes it, and the choice is kept in the browser (localStorage) across
+  reloads.
   **The verdict belongs to the token, not to the listed call:** it is the latest completed
   Perceptor report for that contract address (upper/lower case ignored), whichever post of
   the token it was made for. So a token whose first call was imported from history still
@@ -1280,14 +1334,14 @@ returned and cannot be found by its own name or symbol:
 | `dir` | `desc`, `asc` | `desc` | |
 | `horizon` | `1h`, `1d`, `3d`, `7d`, `30d` | `1d` | which window `return_pct` / `peak_pct` / `drawdown_pct` (and `sort=return` / `peak`) are for; the page sets it with its Peak / worst drop selector |
 | `usd_only` | `1`, `0` | `1` for every `sort` but `date`, else `0` | `1` = only tokens whose first call has `price_unit = usd` |
-| `verdict` | `clean`, `caution`, `red_flags`, `not_scanned` | *(none = all)* | the token's Perceptor verdict (see below). `clean` = no red flags found; `not_scanned` = no completed Perceptor report, or one whose verdict is `unknown` |
+| `verdict` | `clean`, `caution`, `red_flags`, `not_scanned`, or several separated by commas (`verdict=clean,caution`) | *(none = all)* | the token's Perceptor verdict (see below); with several, a token with any of them. The parameter may also be repeated (`verdict=clean&verdict=caution`); all values add up, repeats and empty items are ignored, so `verdict=` = all, and so do all four. `clean` = no red flags found; `not_scanned` = no completed Perceptor report, or one whose verdict is `unknown`. The order does not matter: `caution,clean` is the same question, with the same `ETag`, as `clean,caution` |
 | `page` | 1 … | `1` | |
 | `per` | 1 – 200 | `50` | |
 
-Any other value or parameter → HTTP 400 with `{"error": "…"}`.
+Any other value or parameter, or any parameter but `verdict` given twice → HTTP 400 with `{"error": "…"}`.
 
 ```json
-{"total": 3105, "page": 1, "per": 50, "horizon": "1d", "sort": "date", "dir": "desc", "usd_only": false, "verdict": "",
+{"total": 3105, "page": 1, "per": 50, "horizon": "1d", "sort": "date", "dir": "desc", "usd_only": false, "verdict": "", "verdicts": [],
  "snapshot_at": "2026-10-02T14:30:00.123Z",
  "calls": [{"call_id": 812, "message_id": 10002, "message_date": "2026-10-01T14:30:00Z",
    "post_url": "https://t.me/scoutrobinhood/10002",
@@ -1346,7 +1400,9 @@ finite, or when the result is not finite. `latest_mcap_usd` is also `null` whene
 `horizon`, and a change to either value changes the `ETag` of `/api/calls`.
 
 `snapshot_at` = when the website last read the database (the same moment as `updated_at` of
-`/api/summary`). `verdict` in the response repeats the filter that was applied (`""` when none).
+`/api/summary`). `verdict` in the response repeats the filter that was applied, in the order `clean`, `caution`,
+`red_flags`, `not_scanned`, separated by commas (`"clean,caution"`; a single value as asked,
+`"clean"`; `""` when none or all four), and `verdicts` is the same list as an array (`[]` = all).
 `perceptor_verdict` and `perceptor_url` are **per token**: the verdict (`clean`, `caution`,
 `red_flags` or `unknown`) and report link of the latest completed Perceptor investigation
 (`scout_investigations`, tool `perceptor`, `status = completed`, newest `requested_at`) with
@@ -1491,6 +1547,8 @@ of the limit below, and `snapshot_at` is the snapshot as it already was. Afterwa
 
 - `scoutanalytics_data/seen_cas.json` — CAs already investigated (never re-run; delete an entry to rerun)
 - `scoutanalytics_data/scans.jsonl` — every CA: each tool's status, verdict and report text, delivered?
+- `scoutanalytics_data/poll_cursor.json` — the last post polling has handled, per channel; a
+  restart catches up from it (see "How calls are picked up")
 
 CAs are processed one at a time; within a CA all tools run in parallel (replies are
 matched to each bot, so they can't get mixed up). The client reconnects with

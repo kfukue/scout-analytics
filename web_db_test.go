@@ -223,16 +223,17 @@ type webCallJSON struct {
 }
 
 type webCallsJSON struct {
-	Total   int           `json:"total"`
-	Page    int           `json:"page"`
-	Per     int           `json:"per"`
-	Horizon string        `json:"horizon"`
-	Sort    string        `json:"sort"`
-	Dir     string        `json:"dir"`
-	USDOnly bool          `json:"usd_only"`
-	Verdict string        `json:"verdict"`
-	At      string        `json:"snapshot_at"`
-	Calls   []webCallJSON `json:"calls"`
+	Total    int           `json:"total"`
+	Page     int           `json:"page"`
+	Per      int           `json:"per"`
+	Horizon  string        `json:"horizon"`
+	Sort     string        `json:"sort"`
+	Dir      string        `json:"dir"`
+	USDOnly  bool          `json:"usd_only"`
+	Verdict  string        `json:"verdict"`
+	Verdicts []string      `json:"verdicts"`
+	At       string        `json:"snapshot_at"`
+	Calls    []webCallJSON `json:"calls"`
 }
 
 // get asks the website for path after bringing its snapshot up to date with
@@ -1074,9 +1075,44 @@ func TestWebPerceptorVerdict(t *testing.T) {
 		"red_flags":   {"gamma"},
 		"not_scanned": {"gave", "pct", "xss", "virt"},
 	} {
-		if res := check("verdict="+v, len(keys), keys...); res.Verdict != v {
-			t.Errorf("verdict=%s echoed as %q", v, res.Verdict)
+		if res := check("verdict="+v, len(keys), keys...); res.Verdict != v || !reflect.DeepEqual(res.Verdicts, []string{v}) {
+			t.Errorf("verdict=%s echoed as %q %q", v, res.Verdict, res.Verdicts)
 		}
+	}
+	// Several values: a list separated by commas, the parameter repeated, or
+	// both; the union of the buckets, echoed in one order.
+	for _, tc := range []struct {
+		query, echo string
+		keys        []string
+	}{
+		{"verdict=clean,caution", "clean,caution", []string{"delta", "err", "sol", "beta", "alpha"}},
+		{"verdict=caution,clean", "clean,caution", []string{"delta", "err", "sol", "beta", "alpha"}},
+		{"verdict=caution&verdict=clean", "clean,caution", []string{"delta", "err", "sol", "beta", "alpha"}},
+		{"verdict=clean,clean", "clean", []string{"delta", "sol", "alpha"}},
+		{"verdict=not_scanned,red_flags", "red_flags,not_scanned", []string{"gave", "pct", "xss", "virt", "gamma"}},
+		{"verdict=red_flags&verdict=clean,red_flags&verdict=", "clean,red_flags", []string{"delta", "sol", "gamma", "alpha"}},
+		{"verdict=clean,,caution,", "clean,caution", []string{"delta", "err", "sol", "beta", "alpha"}},
+		{"verdict=", "", fx.keys(all.Calls)},
+		{"verdict=not_scanned,red_flags,caution,clean", "", fx.keys(all.Calls)},
+	} {
+		res := check(tc.query, len(tc.keys), tc.keys...)
+		wantArr := []string{}
+		if tc.echo != "" {
+			wantArr = strings.Split(tc.echo, ",")
+		}
+		if res.Verdict != tc.echo || !reflect.DeepEqual(res.Verdicts, wantArr) {
+			t.Errorf("?%s: echoed %q %q, want %q %q", tc.query, res.Verdict, res.Verdicts, tc.echo, wantArr)
+		}
+	}
+	check("verdict=clean,caution&q=Beta", 1, "beta")
+	check("verdict=clean,caution&sort=return", 3, "delta", "alpha", "beta")
+	check("verdict=clean,caution&per=2&page=2", 5, "sol", "beta")
+	// … the same set in another order is the same ETag
+	_, h1, _ := fx.get(t, "/api/calls?verdict=clean,caution")
+	_, h2, _ := fx.get(t, "/api/calls?verdict=caution&verdict=clean")
+	_, h3, _ := fx.get(t, "/api/calls?verdict=clean")
+	if h1.Get("ETag") == "" || h1.Get("ETag") != h2.Get("ETag") || h1.Get("ETag") == h3.Get("ETag") {
+		t.Errorf("ETags: clean,caution %q, caution&clean %q, clean %q", h1.Get("ETag"), h2.Get("ETag"), h3.Get("ETag"))
 	}
 	// … combined with the search
 	check("verdict=clean&q=alpha", 2, "delta", "alpha") // "Delta Alpha", "Alpha Token"
@@ -1112,8 +1148,9 @@ func TestWebPerceptorVerdict(t *testing.T) {
 		}
 	}
 
-	for _, bad := range []string{"verdict=bad", "verdict=", "verdict=CLEAN", "verdict=unknown", "verdict=red%20flags", "verdict=all",
-		"verdict=clean&verdict=caution", "verdict=clean%27%20OR%201=1", "verdict=not_scanned;--"} {
+	for _, bad := range []string{"verdict=bad", "verdict=CLEAN", "verdict=unknown", "verdict=red%20flags", "verdict=all",
+		"verdict=clean,bad", "verdict=clean&verdict=bad", "verdict=CLEAN,caution", "verdict=clean,%20caution", "verdict=clean;caution",
+		"verdict=clean%27%20OR%201=1", "verdict=not_scanned;--", "sort=date&sort=date"} {
 		code, _, body := fx.get(t, "/api/calls?"+bad)
 		var e map[string]string
 		if code != 400 || json.Unmarshal(body, &e) != nil || e["error"] == "" {
