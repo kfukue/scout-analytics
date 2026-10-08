@@ -45,7 +45,7 @@ step.
 
 Time: about 10 minutes the first time (mostly `pip install`), then about
 2 minutes per run. Memory: the export and training each need under 0.5 GB
-(training took about 10 s and peaked at about 200 MB on synthetic data of the
+(training took about 20 s on a desktop PC and peaked at about 200 MB on synthetic data of the
 same size, and about 300 MB at 30,000 rows). `go run` compiles first, which
 takes about 1 GB and 1 to 2 minutes. Disk: about 400 MB for the venv, about
 10 MB for the CSV, about 1 MB per model version.
@@ -68,7 +68,9 @@ ignores `*.csv`, but do not rely on that).
 ## 1. Get the ml/ code with the fixes (once per change to ml/)
 
 The fixes from 7 October 2026 (repeat calls excluded, columns checked against
-the view) are on `main`. Train from a separate worktree of `origin/main`, so
+the view) and from 9 October 2026 (`long` skipped until its 30d data has
+matured, forward test split for `medium`/`long`, category levels from the
+train part only) must be on `main`. Train from a separate worktree of `origin/main`, so
 the deployed checkout is not touched:
 
 ```bash
@@ -76,8 +78,8 @@ git -C "$REPO" fetch origin main
 git -C "$REPO" worktree add --detach "$ML/src" origin/main
 # later, to update it:  git -C "$ML/src" checkout --detach origin/main  (after the fetch above)
 
-# refuse the old ml/ (it would train on repeat calls): this file comes with the fixes
-test -f "$ML/src/ml/tests/test_view_columns.py" && echo "ml/ is up to date" || echo "OLD ml/: stop; the fixes are not pushed yet"
+# refuse an old ml/ (it would train `long` and use the old medium split): MIN_MATURED comes with the fixes
+grep -q '^MIN_MATURED' "$ML/src/ml/scout_ml/config.py" && echo "ml/ is up to date" || echo "OLD ml/: stop; the fixes are not pushed yet"
 ```
 
 If `$REPO` is up to date with `origin/main`, `$REPO/ml` works as well; then
@@ -98,7 +100,7 @@ python3 -m venv "$ML/venv"
 If the server only has Python 3.10, stop here and tell the product manager
 (not tested on 3.10).
 
-Check the install with the test suite (synthetic data only, about 30 s;
+Check the install with the test suite (synthetic data only, about 45 s;
 `-p no:cacheprovider` keeps it from writing a cache into the worktree):
 
 ```bash
@@ -106,7 +108,7 @@ cd "$ML/src/ml"
 "$ML/venv/bin/python" -m pytest tests -q -p no:cacheprovider
 ```
 
-Expected: `53 passed` (one deprecation warning from fastapi is fine).
+Expected: `72 passed` (one deprecation warning from fastapi is fine).
 
 ## 3. Read-only checks before the export (optional, psql or pgAdmin)
 
@@ -243,9 +245,12 @@ cat "$ML/models/$(cat "$ML/models/LATEST")/report.md"
 From the top:
 
 1. **Verdict**: one line per bucket. A bucket PASSes only if all three hold
-   on the test part (the latest ~15% of calls):
+   on the test part (`short`, `3day`: the latest ~15% of calls; `medium`,
+   `long`: the calls of the last 14 days with an outcome):
    - top-10% lift >= 2: calls in the top 10% by runner score are at least
-     twice as often runners as calls overall;
+     twice as often runners as calls overall (the report adds an approximate
+     95% interval and the runner counts; with ~70 calls in the top 10% the
+     interval is wide, so read a lift near 2 with care);
    - collapses removed >= 40%: skipping the 30% with the highest collapse
      score avoids at least 40% of the collapses;
    - beats buy-all in every week: in every evaluated walk-forward week, the
@@ -255,19 +260,22 @@ From the top:
    how many calls are not labelled yet. Not labelled yet means the horizon is
    not due or the tracker could not compute it; these calls are left out of
    that bucket, never counted as losses.
-3. Per bucket: the split, class balance, test metrics (LightGBM vs the
-   logistic baseline), the gate table, the money simulation, the walk-forward
-   table, calibration and top features.
+3. Per bucket: the split (rows dropped by the embargo), class balance, for
+   `medium` and `long` the purged k-fold inside train (rounds, calibration),
+   test metrics (LightGBM vs the logistic baseline), the gate table, the
+   money simulation, the walk-forward table, calibration and top features.
 
-What to expect from this first dataset (calls from late July to 7 October
-2026):
+What to expect from the October 2026 data (calls from late July 2026):
 
 | bucket | horizon | walk-forward weeks | weeks with training data | expected |
 |---|---|---|---|---|
-| short | 1d | ~10 | ~10 | evaluated |
-| 3day | 3d | ~10 | ~10 | evaluated |
-| medium | 7d | ~9 | ~8 | evaluated; validation part small (~150-200 calls) |
-| long | 30d | ~6 | ~2 | **skipped** (too little history after the 30-day embargo) |
+| short | 1d | ~10 | ~10 | evaluated; 70/15/15 split |
+| 3day | 3d | ~10 | ~10 | evaluated; 70/15/15 split |
+| medium | 7d | ~9 | ~8 | evaluated; no validation part: test = last 14 days (~900 calls), train = everything before that date minus 7 days, rounds and calibration from a purged 5-fold inside train |
+| long | 30d | - | - | **skipped**: "not enough matured 30d data (...)" until at least 2,000 calls with a 30d outcome span 120 days, i.e. an export from about 25 December 2026 |
+
+`prior_calls` and `secs_since_prev_call` are no longer model inputs (always
+0 / empty for a first call); the coverage table no longer lists them.
 
 Ceilings: two gates cannot be met at all when a label is too common. Compare
 with the "positive rate (usable)" column of each bucket's Class balance table

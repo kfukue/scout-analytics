@@ -12,9 +12,10 @@ import pandas as pd  # noqa: E402
 
 @pytest.fixture(scope="session")
 def synthetic_csv(tmp_path_factory):
-    """130 days so that the 30d bucket also has training rows after its embargo."""
+    """170 days: the 30d bucket then has 140 days of matured calls, above its
+    MIN_MATURED span (120), so every bucket trains."""
     path = tmp_path_factory.mktemp("data") / "calls.csv"
-    make_synthetic.write_csv(make_synthetic.make(n=6000, days=130, seed=11), path)
+    make_synthetic.write_csv(make_synthetic.make(n=6000, days=170, seed=11), path)
     return path
 
 

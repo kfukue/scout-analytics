@@ -78,3 +78,42 @@ def test_post_fields_known_at_the_call_stay_allowed():
     for col in ("launchpad", "dex", "quote_asset", "liq_usd", "mcap_usd"):
         assert not C.is_forbidden(col), col
     assert "launchpad" in C.FEATURES and "dex" in C.FEATURES
+
+
+def test_feature_list_excludes_columns_constant_for_first_calls(synthetic_df):
+    X = build_features(synthetic_df, {})
+    for c in ("prior_calls", "secs_since_prev_call"):
+        assert c not in C.FEATURES and c not in X.columns, c
+    assert list(X.columns) == C.FEATURES
+    # no derived feature reads them: changing them changes nothing
+    changed = synthetic_df.assign(prior_calls=99, secs_since_prev_call=1.0)
+    pd.testing.assert_frame_equal(X, build_features(changed, {}))
+
+
+def test_categories_match_without_regard_to_case_and_whitespace():
+    rows = [{"dex": "Raydium"}, {"dex": " raydium "}, {"dex": "RAYDIUM"}, {"dex": "raydium"},
+            {"dex": "PumpSwap"}, {"dex": "never_seen"}, {"dex": "  "}, {"dex": None}]
+    levels = learn_cat_levels(pd.DataFrame([{"dex": "RayDium "}] * 20 + [{"dex": "pumpswap"}] * 20))
+    assert levels["dex"] == ["pumpswap", "raydium"]           # stored normalised
+    X = build_features(rows, levels)
+    assert X["dex"].tolist()[:5] == [1.0, 1.0, 1.0, 1.0, 0.0]
+    assert X["dex"][5:].isna().all()                          # unseen / empty -> missing
+    # an old flat meta.json (exact_levels) keeps its case-sensitive matching: no skew
+    old = build_features(rows, {"dex": ["PumpSwap", "Raydium", "raydium"]}, exact_levels=True)
+    assert old["dex"][[0, 1, 3, 4]].tolist() == [1.0, 2.0, 2.0, 0.0]
+    assert old["dex"][[2, 5, 6, 7]].isna().all()                # 'RAYDIUM' is no old level
+
+
+def test_levels_counted_case_insensitively_against_the_minimum():
+    """10 'Meteora' + 10 'meteora' are one level with 20 rows (MIN_CATEGORY_COUNT)."""
+    df = pd.DataFrame({"dex": ["Meteora"] * 10 + ["meteora "] * 10 + ["x"] * 19})
+    assert C.MIN_CATEGORY_COUNT == 20
+    assert learn_cat_levels(df)["dex"] == ["meteora"]
+
+
+def test_old_model_feature_list_with_removed_columns_still_builds():
+    """A meta.json from before the change lists prior_calls: serving must not crash."""
+    cols = C.FEATURES[:3] + ["prior_calls", "secs_since_prev_call"]
+    X = build_features({"prior_calls": 0, "mcap_usd": 1.0}, {}, columns=cols)
+    assert list(X.columns) == cols and X["prior_calls"][0] == 0.0
+    assert np.isnan(X["secs_since_prev_call"][0])

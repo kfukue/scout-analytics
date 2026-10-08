@@ -80,9 +80,12 @@ def test_fold_counts_for_the_first_real_dataset(bucket, windows, with_train):
     ws = list(V.walk_forward_windows(dates, tokens, h))
     assert len(ws) == windows
     assert sum(bool(w["train"].any()) for w in ws) == with_train
-    if bucket == "long":                                 # 30-day embargo: next to nothing to train on
-        s = V.time_split(dates, tokens, h)
-        assert s["val"].sum() == 0 and s["train"].sum() < 0.1 * n
+    if bucket == "long":                 # 44 days of matured 30d calls: skipped until 120
+        import train
+        assert train.maturity_skip(bucket, dates).startswith("not enough matured 30d data (")
+    if bucket == "medium":               # forward split: test = last 14 days, 7-day embargo
+        s = V.forward_split(dates, tokens, h)
+        assert 0.15 * n < s["test"].sum() < 0.30 * n and s["train"].sum() > 0.6 * n
 
 
 def test_trading_metrics_and_gates():
@@ -129,3 +132,115 @@ def test_one_huge_winner_cannot_decide_the_simulation(monkeypatch):
     # the cap never touches losses: -100% stays -100%
     all_lost = V.trading_metrics(y, score, y, None, np.full(n, -100.0))
     assert all_lost["sim_top_mean"] == -100.0 and all_lost["sim_all_mean"] == -100.0
+
+
+@pytest.mark.parametrize("horizon", [7, 30])
+def test_forward_split_test_strictly_after_train_plus_embargo(calls, horizon):
+    dates, tokens = calls
+    s = V.forward_split(dates, tokens, horizon)
+    tr, te = s["train"], s["test"]
+    assert "val" not in s and tr.sum() > 0 and te.sum() > 0 and not (tr & te).any()
+    assert not set(tokens[tr]) & set(tokens[te])
+    gap = pd.Timedelta(days=horizon)
+    # time-based boundary: a midnight UTC date, test_days before the newest call
+    assert s["t_test"] == s["t_test"].floor("D")
+    assert s["t_test"] == (dates.max() - pd.Timedelta(days=V.FORWARD_TEST_DAYS)).floor("D")
+    assert s["t_train_end"] == s["t_test"] - gap
+    assert dates[tr].max() < s["t_test"] - gap                   # every train outcome window ends
+    assert dates[tr].max() + gap < dates[te].min()               # before the first test call
+    assert dates[te].min() >= s["t_test"]
+    # everything after the test date that is not test was dropped by token grouping,
+    # everything between train and test by the embargo
+    in_gap = ((dates >= s["t_test"] - gap) & (dates < s["t_test"])).to_numpy()
+    assert s["n_dropped_embargo"] == int(in_gap.sum())
+    assert s["n_dropped_embargo"] + s["n_dropped_token"] + tr.sum() + te.sum() == len(dates)
+
+
+def test_forward_split_boundary_is_a_date_not_a_row_quantile():
+    """Adding many calls early in the period moves a row quantile, not the test date."""
+    base = pd.Timestamp("2026-08-01", tz="UTC")
+    dates = pd.Series(base + pd.to_timedelta(np.arange(0, 60, 0.25), unit="D"))
+    crowded = pd.concat([pd.Series(base + pd.to_timedelta(np.linspace(0, 5, 2000), unit="D")),
+                         dates], ignore_index=True)
+    a = V.forward_split(dates, pd.Series(np.arange(len(dates))).astype(str), 7)
+    b = V.forward_split(crowded, pd.Series(np.arange(len(crowded))).astype(str), 7)
+    assert a["t_test"] == b["t_test"] == pd.Timestamp("2026-09-15", tz="UTC")
+    assert a["test"].sum() == b["test"].sum()
+
+
+@pytest.mark.parametrize("horizon", [7, 30])
+def test_purged_kfold_purges_both_sides_and_stays_inside_train(calls, horizon):
+    dates, tokens = calls
+    s = V.forward_split(dates, tokens, horizon)
+    d_tr, t_tr = dates[s["train"]].reset_index(drop=True), tokens[s["train"]].reset_index(drop=True)
+    folds = list(V.purged_kfold(d_tr, t_tr, horizon, 5))
+    assert len(folds) == 5
+    gap = pd.Timedelta(days=horizon)
+    held_all = np.zeros(len(d_tr), dtype=bool)
+    for f in folds:
+        fit, held = f["fit"], f["held"]
+        assert len(fit) == len(held) == len(d_tr)                 # train rows only: no test row
+        assert held.any() and not (fit & held).any() and not (held_all & held).any()
+        held_all |= held
+        lo, hi = d_tr[held].min(), d_tr[held].max()
+        assert (d_tr[held] >= lo).all() and (d_tr[held] <= hi).all()
+        # contiguous in time: no other row lies inside the fold's span
+        assert not ((d_tr >= lo) & (d_tr <= hi) & ~pd.Series(held)).any()
+        # purge: no fit row's outcome window [t, t + h] overlaps a held-out window
+        f_d = d_tr[fit]
+        assert not ((f_d + gap >= lo) & (f_d <= hi + gap)).any()
+        assert not set(t_tr[fit]) & set(t_tr[held])
+    assert held_all.all()                                        # every train row held out once
+    assert d_tr.max() < s["t_test"]                              # folds never reach the test
+
+
+def test_skip_threshold_leaves_enough_purged_folds():
+    """A long bucket exactly at its MIN_MATURED threshold (rows spread evenly
+    over span_days, a 15% minority class) gets at least KFOLD_MIN_FOLDS usable
+    folds: the skip rule and the k-fold agree."""
+    from scout_ml import config as C
+    need, h = C.MIN_MATURED["long"], C.BUCKETS["long"]["horizon_days"]
+    n = need["rows"]
+    start = pd.Timestamp("2026-07-28", tz="UTC")
+    dates = pd.Series(start + pd.to_timedelta(np.linspace(0, need["span_days"], n), unit="D"))
+    tokens = pd.Series(np.arange(n)).astype(str)
+    y = (np.arange(n) % 20 < 3).astype(float)                    # 15% positives, spread evenly
+    s = V.forward_split(dates, tokens, h)
+    d_tr, y_tr = dates[s["train"]].reset_index(drop=True), y[s["train"]]
+    usable = 0
+    for f in V.purged_kfold(d_tr, tokens[s["train"]], h, C.KFOLD_K):
+        fit, held = y_tr[f["fit"]], y_tr[f["held"]]
+        usable += (min(fit.sum(), len(fit) - fit.sum()) >= C.MIN_CLASS_ROWS
+                   and min(held.sum(), len(held) - held.sum()) >= C.MIN_CLASS_ROWS // 3)
+    assert usable >= C.KFOLD_MIN_FOLDS, usable
+
+
+def test_lift_interval_wilson():
+    lo, hi = V.wilson(8, 31)
+    assert lo == pytest.approx(0.1365, abs=1e-3) and hi == pytest.approx(0.4316, abs=1e-3)
+    assert V.wilson(0, 10)[0] == 0.0 and V.wilson(10, 10)[1] == 1.0
+    assert np.isnan(V.wilson(0, 0)[0])
+    lo_l, hi_l = V.lift_interval(8, 31, 43, 307)
+    base = 43 / 307
+    assert (lo_l, hi_l) == pytest.approx((lo / base, hi / base))
+    assert lo_l < (8 / 31) / base < hi_l
+    assert all(np.isnan(V.lift_interval(0, 10, 0, 100)))           # no runners: undefined
+
+
+def test_trading_metrics_report_lift_counts_and_interval():
+    y = np.array([1, 1, 0, 0, 0, 0, 0, 0, 0, 0] * 2)
+    t = V.trading_metrics(y, np.where(y == 1, 0.9, 0.1), y, None, np.zeros(20))
+    assert (t["top_pos"], t["top_n"], t["all_pos"], t["all_n"]) == (2, 2, 4, 20)
+    assert t["top_lift_lo"] < t["top_lift"] == pytest.approx(5.0) and t["top_lift_hi"] <= 5.0
+    assert (t["top_lift_lo"], t["top_lift_hi"]) == pytest.approx(V.lift_interval(2, 2, 4, 20))
+
+
+def test_time_split_counts_embargo_and_token_drops_apart():
+    dates = pd.Series(pd.Timestamp("2026-08-01", tz="UTC") + pd.to_timedelta(np.arange(100), unit="D"))
+    tokens = pd.Series([f"0xT{i}" for i in range(100)])
+    s = V.time_split(dates, tokens, 3)
+    assert s["n_dropped_token"] == 0
+    assert s["n_dropped_embargo"] == 100 - s["train"].sum() - s["val"].sum() - s["test"].sum() == 6
+    tokens[95] = "0xt5"                                            # a later call of a train token
+    s = V.time_split(dates, tokens, 3)
+    assert s["n_dropped_token"] == 1 and s["n_dropped_embargo"] == 6

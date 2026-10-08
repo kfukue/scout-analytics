@@ -17,7 +17,8 @@ import pandas as pd
 from scout_ml import config as C
 from scout_ml.features import build_features, learn_cat_levels
 from scout_ml.labels import build_labels
-from scout_ml.model import fit_baseline, fit_lgbm, predict
+from scout_ml.model import (best_rounds, fit_baseline, fit_lgbm, fit_platt, predict,
+                            usable_holdout)
 from scout_ml.report import render
 from scout_ml import validate as V
 
@@ -49,19 +50,23 @@ def _json_safe(o):
     return o
 
 
-def _train_label(X, y, split, label, out_dir, bucket):
-    """Fit baseline + LightGBM for one label; returns (info, fitted, test scores)."""
-    tr, va, te = split["train"], split["val"], split["test"]
-    pos, neg = int(y[tr].sum()), int((1 - y[tr]).sum())
-    info = {"positive_rate": float(y.mean()), "train_pos": pos, "train_neg": neg, "messages": []}
+def _class_check(y, mask, part_desc):
+    """Class balance info for one label; info["skipped"] is set when the
+    training part has too few rows of a class."""
+    pos, neg = int(y[mask].sum()), int((1 - y[mask]).sum())
+    info = {"positive_rate": float(np.nanmean(y)), "train_pos": pos, "train_neg": neg,
+            "messages": []}
     if not 0.10 <= info["positive_rate"] <= 0.90:
         info["messages"].append(f"WARNING: positive rate {info['positive_rate']:.1%} is outside 10-90%")
     if min(pos, neg) < C.MIN_CLASS_ROWS:
-        info["skipped"] = (f"model skipped: training part (earliest 70% minus the embargo) has "
-                           f"{pos} positives / {neg} negatives (need {C.MIN_CLASS_ROWS} of each)")
+        info["skipped"] = (f"model skipped: training part ({part_desc}) has {pos} positives / "
+                           f"{neg} negatives (need {C.MIN_CLASS_ROWS} of each)")
         info["messages"].append(info["skipped"])
-        return info, None, None
-    fitted = fit_lgbm(X[tr], y[tr], X[va], y[va])
+    return info
+
+
+def _finish_label(info, fitted, X, y, tr, te, out_dir, bucket, label):
+    """Test metrics, importance and the saved model for a fitted label."""
     if fitted["note"]:
         info["messages"].append(fitted["note"])
     p_test = predict(fitted, X[te])
@@ -72,24 +77,87 @@ def _train_label(X, y, split, label, out_dir, bucket):
         logistic=V.model_metrics(y[te], fit_baseline(X[tr], y[tr]).predict_proba(
             X[te][C.NUMERIC_FEATURES])[:, 1]),
         calibration=V.calibration_table(y[te], p_test),
-        rounds=int(fitted["model"].best_iteration_ or fitted["model"].n_estimators),
+        rounds=best_rounds(fitted),
         importance=[[X.columns[i], float(gain[i] / max(gain.sum(), 1e-12))] for i in order])
     joblib.dump({"model": fitted["model"], "calibrator": fitted["calibrator"]},
                 out_dir / f"{bucket}_{label}.joblib")
     return info, fitted, p_test
 
 
-def _walk_forward(X, Y, net_ret, dates, tokens, horizon_days, rounds):
-    """Refit per week with the main model's round count; ranking metrics only."""
-    rows = []
+def _train_label(X, y, split, label, out_dir, bucket):
+    """short/3day: early stopping + Platt calibration on the validation part."""
+    tr, va, te = split["train"], split["val"], split["test"]
+    info = _class_check(y, tr, "earliest 70% minus the embargo")
+    if info.get("skipped"):
+        return info, None, None
+    fitted = fit_lgbm(X[tr], y[tr], X[va], y[va])
+    return _finish_label(info, fitted, X, y, tr, te, out_dir, bucket, label)
+
+
+def _kfold_matrices(rows, dates, tokens, tr, horizon_days):
+    """Purged k-fold inside the train part: per fold the row masks (over all
+    rows of the bucket) and a feature matrix whose category levels come from
+    that fold's fit rows only. Test rows are never in a fold."""
+    idx = np.flatnonzero(tr)
+    folds = []
+    for f in V.purged_kfold(dates[tr], tokens[tr], horizon_days, C.KFOLD_K):
+        fit, held = np.zeros(len(tr), bool), np.zeros(len(tr), bool)
+        fit[idx[f["fit"]]], held[idx[f["held"]]] = True, True
+        X = build_features(rows, learn_cat_levels(rows[fit]))
+        folds.append({**f, "fit": fit, "held": held, "X": X})
+    return folds
+
+
+def _train_label_kfold(X, y, split, folds, label, out_dir, bucket):
+    """medium/long: rounds = median best iteration over the usable purged
+    folds; Platt calibration fitted on the out-of-fold margins of fold models
+    refitted with those rounds; final model on the whole train part."""
+    tr, te = split["train"], split["test"]
+    info = _class_check(y, tr, "calls before the test date minus the embargo")
+    if info.get("skipped"):
+        return info, None, None
+    usable = [f for f in folds if min(y[f["fit"]].sum(), (1 - y[f["fit"]]).sum()) >= C.MIN_CLASS_ROWS
+              and usable_holdout(y[f["held"]])]
+    cv = {"folds": len(folds), "folds_used": len(usable), "fold_rounds": [], "oof_rows": 0}
+    info["cv"] = cv
+    if len(usable) < C.KFOLD_MIN_FOLDS:
+        fitted = fit_lgbm(X[tr], y[tr], n_estimators=C.FALLBACK_ROUNDS)
+        fitted["note"] = (f"only {len(usable)} of {len(folds)} purged folds usable (need "
+                          f"{C.KFOLD_MIN_FOLDS}): fixed {C.FALLBACK_ROUNDS} rounds, "
+                          "probabilities uncalibrated")
+        return _finish_label(info, fitted, X, y, tr, te, out_dir, bucket, label)
+    for f in usable:
+        Xf = f["X"]
+        cv["fold_rounds"].append(best_rounds(fit_lgbm(Xf[f["fit"]], y[f["fit"]],
+                                                       Xf[f["held"]], y[f["held"]])))
+    rounds = int(np.median(cv["fold_rounds"]))
+    raw, obs = [], []
+    for f in usable:
+        Xf = f["X"]
+        m = fit_lgbm(Xf[f["fit"]], y[f["fit"]], n_estimators=rounds)["model"]
+        raw.append(m.predict(Xf[f["held"]], raw_score=True))
+        obs.append(y[f["held"]])
+    raw, obs = np.concatenate(raw), np.concatenate(obs)
+    cv["oof_rows"] = int(len(obs))
+    fitted = fit_lgbm(X[tr], y[tr], n_estimators=rounds)
+    fitted["calibrator"] = fit_platt(raw, obs)
+    return _finish_label(info, fitted, X, y, tr, te, out_dir, bucket, label)
+
+
+def _walk_forward(rows, Y, net_ret, dates, tokens, horizon_days, rounds):
+    """Refit per week with the main model's round count; ranking metrics only.
+    Category levels are learned from each window's training rows."""
+    out = []
     for w in V.walk_forward_windows(dates, tokens, horizon_days):
         tr, te = w["train"], w["test"]
         row = {"week": w["week"], "start": w["start"].strftime("%Y-%m-%d"),
                "n_train": int(tr.sum()), "n_test": int(te.sum())}
-        scores = {}
+        scores, X = {}, None
         for label, n_rounds in rounds.items():
             y = Y[label]
             if min(y[tr].sum(), (1 - y[tr]).sum()) >= C.MIN_CLASS_ROWS and V.window_ok(te.sum()):
+                if X is None:
+                    X = build_features(rows, learn_cat_levels(rows[tr]))
                 scores[label] = predict(fit_lgbm(X[tr], y[tr], n_estimators=n_rounds), X[te])
         if "runner" not in scores:
             row["skipped"] = "too few training rows per class or test rows"
@@ -97,46 +165,82 @@ def _walk_forward(X, Y, net_ret, dates, tokens, horizon_days, rounds):
             row.update(V.trading_metrics(Y["runner"][te], scores["runner"], Y["collapse"][te],
                                          scores.get("collapse"), net_ret[te]))
             row["runner_auc"] = V.model_metrics(Y["runner"][te], scores["runner"])["roc_auc"]
-        rows.append(row)
-    return rows
+        out.append(row)
+    return out
 
 
-def _train_bucket(b, df, X_all, L, out_dir):
+def maturity_skip(b, dates):
+    """Reason to skip bucket `b` while too few calls have a matured outcome
+    (C.MIN_MATURED), else None."""
+    need = C.MIN_MATURED.get(b)
+    if not need:
+        return None
+    n = len(dates)
+    span = (dates.max() - dates.min()).total_seconds() / 86400 if n else 0.0
+    if n >= need["rows"] and span >= need["span_days"]:
+        return None
+    h = C.BUCKETS[b]["horizon_days"]
+    return (f"not enough matured {h:g}d data ({n} rows over {span:.0f} days, need "
+            f"{need['rows']} rows over at least {need['span_days']} days)")
+
+
+def _train_bucket(b, df, L, out_dir):
+    """Returns (results, runner reference quantiles or None, category levels or None)."""
     cfg = C.BUCKETS[b]
     use = L[f"usable_{b}"].to_numpy()
     res = {"usable": int(use.sum())}
     if res["usable"] < C.MIN_BUCKET_ROWS:
         res["skipped"] = f"only {res['usable']} usable rows (need {C.MIN_BUCKET_ROWS})"
-        return res, None
-    X = X_all[use].reset_index(drop=True)
-    dates = df["message_date"][use].reset_index(drop=True)
-    tokens = df["contract_address"][use].reset_index(drop=True)
+        return res, None, None
+    rows = df[use].reset_index(drop=True)
+    dates = rows["message_date"]
+    tokens = rows["contract_address"]
+    reason = maturity_skip(b, dates)
+    if reason:
+        res["skipped"] = reason
+        return res, None, None
     net_ret = L[f"net_ret_{b}"][use].to_numpy()
     Y = {lab: L[f"{lab}_{b}"][use].to_numpy() for lab in C.LABELS}
-    split = V.time_split(dates, tokens, cfg["horizon_days"])
-    kept = sum(int(split[k].sum()) for k in ("train", "val", "test"))
-    res["split"] = {"n_train": int(split["train"].sum()), "n_val": int(split["val"].sum()),
-                    "n_test": int(split["test"].sum()), "n_dropped": res["usable"] - kept,
-                    "t1": split["t1"].strftime("%Y-%m-%d %H:%M"),
-                    "t2": split["t2"].strftime("%Y-%m-%d %H:%M")}
-    if split["test"].sum() < C.MIN_CLASS_ROWS:
-        res["skipped"] = f"only {int(split['test'].sum())} test rows after the time split"
-        return res, None
+    h = cfg["horizon_days"]
+    forward = b in C.FORWARD_SPLIT_BUCKETS
+    split = V.forward_split(dates, tokens, h) if forward else V.time_split(dates, tokens, h)
+    tr, te = split["train"], split["test"]
+    res["split"] = {"kind": "forward" if forward else "70/15/15", "n_train": int(tr.sum()),
+                    "n_test": int(te.sum()), "n_dropped_embargo": split["n_dropped_embargo"],
+                    "n_dropped_token": split["n_dropped_token"]}
+    if forward:
+        res["split"].update(t_train_end=split["t_train_end"].strftime("%Y-%m-%d %H:%M"),
+                            t_test=split["t_test"].strftime("%Y-%m-%d %H:%M"),
+                            test_days=C.FORWARD_TEST_DAYS, k=C.KFOLD_K)
+    else:
+        res["split"].update(n_val=int(split["val"].sum()),
+                            t1=split["t1"].strftime("%Y-%m-%d %H:%M"),
+                            t2=split["t2"].strftime("%Y-%m-%d %H:%M"))
+    if te.sum() < C.MIN_CLASS_ROWS:
+        res["skipped"] = f"only {int(te.sum())} test rows after the time split"
+        return res, None, None
+    # Category levels: from the train part only (never validation or test rows).
+    levels = learn_cat_levels(rows[tr])
+    X = build_features(rows, levels)
+    folds = _kfold_matrices(rows, dates, tokens, tr, h) if forward else None
     res["labels"], scores, rounds = {}, {}, {}
     for lab in C.LABELS:
-        res["labels"][lab], fitted, scores[lab] = _train_label(X, Y[lab], split, lab, out_dir, b)
+        if forward:
+            out = _train_label_kfold(X, Y[lab], split, folds, lab, out_dir, b)
+        else:
+            out = _train_label(X, Y[lab], split, lab, out_dir, b)
+        res["labels"][lab], fitted, scores[lab] = out
         if fitted is not None:
             rounds[lab] = res["labels"][lab]["rounds"]
     if "runner" not in rounds:
         res["skipped"] = res["labels"]["runner"]["skipped"]
-        return res, None
-    te = split["test"]
+        return res, None, None
     res["trading"] = V.trading_metrics(Y["runner"][te], scores["runner"], Y["collapse"][te],
                                        scores["collapse"], net_ret[te])
-    res["walk_forward"] = _walk_forward(X, Y, net_ret, dates, tokens, cfg["horizon_days"], rounds)
+    res["walk_forward"] = _walk_forward(rows, Y, net_ret, dates, tokens, h, rounds)
     res["gates"] = V.gates(res["trading"], res["walk_forward"])
     reference = np.quantile(scores["runner"], np.linspace(0, 1, C.N_REF_QUANTILES))
-    return res, reference.tolist()
+    return res, reference.tolist(), levels
 
 
 def train(df: pd.DataFrame, out_root, version: str | None = None) -> Path:
@@ -152,8 +256,6 @@ def train(df: pd.DataFrame, out_root, version: str | None = None) -> Path:
     first = call & ~L["repeat"]  # later calls of a token: out of training, counted on their own
     extreme = first & ~L["no_pool"] & ~L["not_usd"] & L["extreme"]
     eligible = first & ~L["no_pool"] & ~L["not_usd"] & ~L["extreme"]
-    cat_levels = learn_cat_levels(df[eligible])
-    X_all = build_features(df, cat_levels)
 
     raw_cols = C.NUMERIC_RAW + C.CATEGORICAL + ["pre_vol_unit", "message_date"]
     blank = df.reindex(columns=raw_cols).replace("", np.nan)
@@ -168,11 +270,11 @@ def train(df: pd.DataFrame, out_root, version: str | None = None) -> Path:
         # over the rows training can use (repeat calls and update posts have no pool data)
         "coverage": {c: float(blank[c][eligible].notna().mean()) if eligible.any() else 0.0
                      for c in raw_cols}}}
-    reference = {}
+    reference, cat_levels = {}, {}  # per trained bucket: learned from its training rows
     for b in C.BUCKETS:
-        res["buckets"][b], ref = _train_bucket(b, df, X_all, L, out_dir)
+        res["buckets"][b], ref, levels = _train_bucket(b, df, L, out_dir)
         if ref is not None:
-            reference[b] = ref
+            reference[b], cat_levels[b] = ref, levels
         status = res["buckets"][b]
         print(f"[{b}] " + (f"skipped: {status['skipped']}" if status.get("skipped") else
                            "PASS" if status["gates"]["passed"] else "FAIL (see report.md)"))
@@ -182,7 +284,7 @@ def train(df: pd.DataFrame, out_root, version: str | None = None) -> Path:
         if p.stem not in models:
             p.unlink()
     meta = {"version": version, "trained_at": datetime.now(timezone.utc).isoformat(),
-            "features": list(X_all.columns), "categorical": C.CATEGORICAL,
+            "features": list(C.FEATURES), "categorical": C.CATEGORICAL,
             "category_levels": cat_levels, "thresholds": {"buckets": C.BUCKETS, "gates": C.GATES},
             "models": models, "runner_reference": reference,
             "data": res["data"], "metrics": res["buckets"]}
