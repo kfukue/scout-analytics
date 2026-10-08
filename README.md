@@ -515,7 +515,7 @@ Only use the feature columns as model inputs; everything about the future is an 
 | `SCOUT_PONS_HOOK` | `0xE5e70264…6Be044` | hook of graduated Pons v4 pools (`off` = any hook) |
 | `SCOUT_RUG_LIQ_USD` | `500` | rugged when the USD value of the pool's **quote side** (ETH/WETH, USDG, stock token …) is below this; settable in `.env`. `0` = USD check off, but an empty pool still counts. Negative values are rejected |
 | `SCOUT_TRACK_INTERVAL` | `1m` | how often due checks are processed |
-| `SCOUT_TRACK_WORKERS` | `8` | calls tracked at the same time (on-chain source); a free worker takes the next due call at once (see "What the tracker logs") |
+| `SCOUT_TRACK_WORKERS` | `8` | calls tracked at the same time (on-chain source); a free worker takes the next due call at once (see "What the tracker logs"); also sizes the database pool (the tracker's worker count + 4, between 4 and 32; see "Recording to a SQL database (Postgres)") |
 | `SCOUT_RPC_PARALLEL` | `8` | block ranges of one scan fetched from the node at the same time |
 | `SCOUT_RPC_MAX_INFLIGHT` | `64` | most requests in flight to the node at once (workers × ranges, capped here) |
 | `SCOUT_RPC_LOG_CACHE` | `300000` | swap logs kept in memory so repeat calls of a token are not scanned twice (`0` = off) |
@@ -831,6 +831,7 @@ SCOUT_SCAN_GAP=3s        # pause between CAs
 SCOUT_STATE_DIR=scoutanalytics_data
 SCOUT_CATCHUP_MAX=100    # after a restart: missed posts (and calls still queued) handled live, newest first, 0-250; older ones stored only
 SCOUT_CATCHUP_MAX_AGE=24h # missed posts / queued calls older than this are stored only (0 = no age limit; invalid = startup error)
+SCOUT_RESCAN=off         # Perceptor re-scans of first calls without a report; SCOUT_RESCAN_* in "Re-scanning calls without a Perceptor report"
 ```
 
 ## Investigation tools
@@ -899,6 +900,96 @@ non-gate tool that fails or times out doesn't block delivery; the header says
 "no report (timeout)". With no gate tool at all, every CA with a report is delivered.
 (Old `SCOUT_SCAN_BOT`/`SCOUT_SCAN_COMMAND`/`SCOUT_SCAN_TIMEOUT`/`SCOUT_SETTLE`/`SCOUT_MAX_WAIT` still work for perceptor.)
 
+### Re-scanning calls without a Perceptor report
+
+> **Do not set `SCOUT_RESCAN=on` in prod before the website's "Perceptor today" label is
+> deployed.** Until then the page has no place for the re-scan verdict (the API already
+> serves it as `perceptor_today_*`, see "API").
+
+Most first calls imported from history, and live calls whose scan failed, have no Perceptor
+report. The **rescan lane** asks Perceptor about them later, one at a time, inside the
+listener (`-listen-only` or the full listener): the same Telegram session, never a second
+process. It is **off by default**.
+
+```
+SCOUT_RESCAN=off                  # on = run the lane in the listener
+SCOUT_RESCAN_MAX_AGE=720h         # only first calls posted within this (at least 1h)
+SCOUT_RESCAN_MAX_PER_DAY=100      # re-scans requested in any rolling 24 hours (1-10000)
+SCOUT_RESCAN_GAP=10m              # at least this between two re-scan requests
+SCOUT_RESCAN_IDLE=5m              # only after the live queue has been idle this long
+SCOUT_RESCAN_STATUSES=backfill,duplicate,failed,scanned   # scout_calls.status of the first call (queued/dropped belong to the requeue)
+```
+
+An invalid value stops every mode at startup (the settings are read by all of them, so
+also `-track` and `-web` sharing the same `.env`) with an error naming the setting.
+
+**Which calls (candidates).** All of these, newest first (ties: the higher call id):
+
+- the token's **first call** (the tracker's and the website's rule: lowest `message_date`,
+  then lowest id, per contract address with upper/lower case ignored; update posts are never
+  a first call), posted within `SCOUT_RESCAN_MAX_AGE`, with a status in
+  `SCOUT_RESCAN_STATUSES`;
+- the token has **no completed Perceptor report of either kind** (live or re-scan, any post
+  of the token);
+- **not rugged** (`scout_call_tracking.rugged`), and `latest_return_pct` is `NULL` (no latest
+  price yet) or above −99;
+- **fewer than 2 failed re-scans** of the token (`failed` or `timeout`; a `rate_limited` one
+  does not count). After the second failure the token is not tried again.
+
+**How it runs.** Live calls always come first. The scan worker looks at the lane only when
+the live queue is empty, the last live call finished at least `SCOUT_RESCAN_IDLE` ago (a
+start or reconnect counts as a live call), the newest re-scan was requested at least
+`SCOUT_RESCAN_GAP` ago and fewer than `SCOUT_RESCAN_MAX_PER_DAY` re-scans were requested in
+the last 24 hours. The cap and the gap are read from the database, so they hold across
+restarts. A re-scan uses the same Perceptor runner as live calls, so the account's pacing
+(`SCOUT_TOOL_PERCEPTOR_MIN_INTERVAL`, 2m5s) is shared. It runs synchronously in the worker: a
+live call that arrives meanwhile waits for it, at most about 5 minutes (Perceptor's 180 s
+`_MAX_WAIT`, the report page, then the pacing). A re-scan is not retried on a rate-limit
+reply: it is stored as `rate_limited` and the lane pauses for an hour; a Telegram
+`FLOOD_WAIT` stores nothing and pauses the lane for an hour or the wait Telegram asks for,
+whichever is longer. A stop during a re-scan stores nothing. With no candidate left, the lane
+looks again every 10 minutes.
+
+**What a re-scan writes.** One `scout_investigations` row (tool `perceptor`, `scan_kind =
+'rescan'`, `call_id` = the first call, `details` with `"rescan": true` and `call_age_s`), and
+nothing else: no delivery, no change to `scout_calls.status`, `seen_cas.json`, tracking or
+model scores. sAlpha is never asked. `-scan`/`-post` are not used for this: they deliver,
+overwrite the status and would make today's verdict look like one from the time of the call.
+
+**No leakage into the model.** A re-scan's verdict is today's, not one known when the call
+was made. `scout_call_dataset_v` (and so `-export-dataset`, the training data and the model's
+scoring row), the requeue's "already investigated" check, the website's `perceptor_verdict`
+/ Perceptor filter / `GET /api/call`, and the sAlpha lookup all read `scan_kind = 'live'` rows
+only. The website shows a re-scan only as `perceptor_today_*`.
+
+**Dry run** (database only: no Telegram login, no node; nothing is scanned, and no call,
+investigation or delivery is written):
+
+```
+go run . -rescan-missing -dry-run
+```
+
+It prints the settings, how many first calls without a Perceptor report have an allowed
+status, how many of those each rule excludes (too old, rugged, latest return ≤ −99%, failed
+twice; each counted once, in that order), the number of candidates by status and by age, an
+estimate of the days needed at the current cap and gap, and then every candidate in the order
+the lane takes them (call id, posted, age, status, contract address). It reads
+`SCOUT_RESCAN_*` from the environment / `.env` like the listener, so a setting can be tried
+first, e.g. `SCOUT_RESCAN_MAX_AGE=168h go run . -rescan-missing -dry-run`. Like every mode, it
+applies `scoutanalytics.sql` first unless `SCOUT_DB_AUTO_MIGRATE=false` (which adds the
+`scan_kind` column if it is missing and recreates the views, the same as the next listener
+start would), so on prod run it only as part of a deploy (DEPLOY.md 3.4), never while
+processes of an older version are running.
+`-rescan-missing` without `-dry-run` scans nothing; it prints a pointer to this section.
+
+The lane logs one line when it starts (`rescan: on — …`), one per re-scan (`rescan: call
+<id> (<CA>, 12d old): clean (3 of 100 today)`), and once each when it reaches the cap or runs
+out of candidates. Count failures with:
+
+```sql
+SELECT status, count(*) FROM scout_investigations WHERE scan_kind = 'rescan' GROUP BY 1;
+```
+
 ## How it decides "warning / red flag"
 
 Perceptor gives every report one of three verdicts (shown in the report page title):
@@ -924,19 +1015,26 @@ stored in the DB for reference; it doesn't affect delivery unless you make it a 
 ## Recording to a SQL database (Postgres)
 
 Every call, report and delivery is recorded **in the same database your API uses**. The
-scanner calls `database.SetupDatabase()` (in `internal/database`, copied unchanged from
-the API repo), so it uses the same settings from
+scanner calls `database.SetupDatabase()` (in `internal/database`, copied from the API repo;
+the only addition is the pool size, see below), so it uses the same settings from
 `.env`: `DB_USER`, `DB_PASS`, `DB_NAME_DEV`, `APP_ENV`, and `GETH_HOST_PATH` (LOCAL_GETH) or
 `HOST_SECRET_PATH` + `SSL_CERT_FILE_PATH` (Cloud SQL). Nothing extra to configure.
 
 The startup log confirms where it writes, e.g.
-`recording to SQL via database.SetupDatabase (DB_USER, APP_ENV=…) → database "assetdb", schema "public", user "…"`.
+`recording to SQL via database.SetupDatabase (DB_USER, APP_ENV=…) → database "assetdb", schema "public", user "…", pool of at most 16 connections (default for 12 tracker worker(s))`.
 The tables are created in that database's `public` schema on first start.
+
+Pool size: each process opens at most the tracker's worker count (`SCOUT_TRACK_WORKERS` with
+the on-chain source, 1 with GeckoTerminal) + 4 connections, between 4 and 32 (on-chain: 12
+with the default 8 workers, 16 with 12; GeckoTerminal: 5). Connections are opened only when
+needed, so the listener and the website use far fewer than that. With `SCOUT_DATABASE_URL`,
+`pool_max_conns` in the DSN (e.g. `…?pool_max_conns=10` or `… pool_max_conns=10`) overrides
+it. The website's live-update `LISTEN` uses one more connection outside the pool.
 
 ```
 SCOUT_DB=repo                # default: the repo's database package
 # SCOUT_DB=off               # run without recording
-# SCOUT_DATABASE_URL="host=… port=5432 user=… password=… dbname=… sslmode=disable"   # optional override
+# SCOUT_DATABASE_URL="host=… port=5432 user=… password=… dbname=… sslmode=disable"   # optional override; add pool_max_conns=N to set the pool size
 SCOUT_DB_AUTO_MIGRATE=true   # creates/upgrades the tables on startup; false = run scoutanalytics.sql yourself
 ```
 
@@ -956,7 +1054,7 @@ scout_calls ──< scout_investigations >── scout_investigation_tools
 | `scout_call_returns` | call × horizon | `horizon`, `price_usd`, `return_pct`, `max_gain_pct`, `max_drawdown_pct`, `last_trade_at` |
 | `scout_call_dataset_v` (view) | call | features + pivoted outcomes; what `-export-dataset` writes |
 | `scout_calls` | CA found in a @scoutrobinhood post | `message_id`, `message_date`, `message_text`, `urls`, `contract_address`, `chain`, `status` (`queued` → `scanned`/`failed`, or `duplicate`/`dropped`; `backfill` = imported from history; `update` = an update post, recorded only), `post_kind` (`call` / `update`; NULL = stored before the column existed, not classified yet) |
-| `scout_investigations` | (CA, tool) request | `call_id`, `tool_id`, `request_text`, `requested_at`, `completed_at`, `status` (`completed`/`failed`/`timeout`/`rate_limited`), `bot_message_ids`, `report_text`, `report_urls`, `report_url`, `external_id`, `verdict_level`, `verdict_label`, `ticker`, `verdict_summary`, `details` (JSONB: attempts, rate-limit waits, files, photos, buttons), `error` |
+| `scout_investigations` | (CA, tool) request | `call_id`, `tool_id`, `request_text`, `requested_at`, `completed_at`, `status` (`completed`/`failed`/`timeout`/`rate_limited`), `bot_message_ids`, `report_text`, `report_urls`, `report_url`, `external_id`, `verdict_level`, `verdict_label`, `ticker`, `verdict_summary`, `details` (JSONB: attempts, rate-limit waits, files, photos, buttons), `error`, `scan_kind` (`live` = scanned when the call came in or by `-scan`/`-post`; `rescan` = a late Perceptor re-scan by the rescan lane, today's verdict: never a call-time feature, so the dataset view, the requeue and the website's verdict read `live` rows only) |
 | `scout_deliveries` | bundle sent to you (or failed attempt) | `call_id`, `target`, `status` (`sent`/`failed`), `header_text`, `delivered_at`, `error` |
 | `scout_delivery_investigations` | report attached to a delivery | `delivery_id`, `investigation_id` |
 | `scout_investigations_v` (view) | investigation + tool + source post + `delivered` flag | handy for ad-hoc queries |
@@ -985,18 +1083,20 @@ SELECT c.message_date, c.contract_address,
        max(v.verdict_level) FILTER (WHERE v.tool = 'perceptor') AS perceptor,
        max(v.status)        FILTER (WHERE v.tool = 'salpha')    AS salpha,
        bool_or(v.delivered) AS delivered
-FROM scout_calls c JOIN scout_investigations_v v ON v.call_id = c.id
+FROM scout_calls c JOIN scout_investigations_v v ON v.call_id = c.id AND v.scan_kind = 'live'
 GROUP BY c.id ORDER BY c.message_date DESC LIMIT 50;
 
 -- sAlpha reports for CAs Perceptor passed
 SELECT s.contract_address, s.report_text
 FROM scout_investigations_v s JOIN scout_investigations_v p ON p.call_id = s.call_id
-WHERE s.tool = 'salpha' AND p.tool = 'perceptor' AND p.verdict_level IN ('clean','caution');
+WHERE s.tool = 'salpha' AND p.tool = 'perceptor' AND p.scan_kind = 'live'
+  AND p.verdict_level IN ('clean','caution');
 
 -- calls with their post data and Perceptor verdict
 SELECT c.message_date, c.token_symbol, c.mcap_usd, c.liq_usd, c.holders, c.proof_elite, c.proof_good,
        v.verdict_level AS perceptor
 FROM scout_calls_v c LEFT JOIN scout_investigations_v v ON v.call_id = c.call_id AND v.tool = 'perceptor'
+                                                        AND v.scan_kind = 'live'  -- 'rescan' = today's verdict
 ORDER BY c.message_date DESC LIMIT 50;
 
 -- elite vs good live-buy volume per call
@@ -1043,8 +1143,9 @@ other mode it applies the schema at startup (`SCOUT_DB_AUTO_MIGRATE`), and it re
 records calls) runs `SELECT pg_notify('scout_events', '{"kind":"call","call_id":812}')` after
 storing a new real call (not an update post, not a post stored again, not a call imported by
 `-backfill`), and
-`{"kind":"report","call_id":812,"tool":"perceptor","id":5120}` after storing a completed
-Perceptor or sAlpha report. A failed `NOTIFY` never fails the insert; it is logged (at most
+`{"kind":"report","call_id":812,"tool":"perceptor","id":5120,"scan_kind":"live"}` after storing
+a completed Perceptor or sAlpha report (`"scan_kind":"rescan"` for a re-scan by the rescan
+lane). A failed `NOTIFY` never fails the insert; it is logged (at most
 one line a minute) and the page then shows the row with the next regular refresh. You can
 watch them with `LISTEN scout_events;` in psql. `-web` opens **one extra database connection**
 for `LISTEN`, outside its pool (so it holds one more connection than before). If that
@@ -1108,7 +1209,8 @@ read on demand (see below).
   and the page leaves the table as it is. A refresh that finds the same data in the database
   keeps the same `ETag`, so an idle site costs a few hundred bytes per open tab per refresh.
   The `ETag` of `/api/summary` follows the counts only, so it stays "not modified" while rows
-  change but the counts do not.
+  change but the counts do not. With `days` (the age filter) the `ETag` of `/api/calls` also
+  changes when a call drops out of the window as time goes on, even if the data did not.
 - JSON and the page's text files are sent gzip-compressed to clients that ask for it
   (`Accept-Encoding: gzip`; every browser does) when the answer is 1 KB or larger — a page of
   50 rows goes from about 30 KB to about 5 KB.
@@ -1157,8 +1259,8 @@ other sites):
   is not). Nothing to set up; the 30-second refresh keeps running in any case, so a page
   without the stream (refused, blocked by a proxy, an old browser) is at most 30 seconds behind.
   - **A new call** goes on top of the table, briefly highlighted, when the table shows the
-    newest calls first (Date ▼) on page 1 and the token matches the search and the Perceptor
-    filter. Otherwise a **"N new — refresh"** button appears above the table; it switches to
+    newest calls first (Date ▼) on page 1 and the token matches the search, the Perceptor
+    filter and the "Calls from the last" choice. Otherwise a **"N new — refresh"** button appears above the table; it switches to
     the newest calls, page 1, and reloads.
   - **A new Perceptor verdict, or a new sAlpha report or decline**, updates that token's row
     in place (verdict, "sA" badge, an open detail panel).
@@ -1186,10 +1288,34 @@ other sites):
     all its tabs; every open tab of this page holds one for its stream. With many tabs of the
     page open in one browser, the other requests of those tabs can wait. HTTPS with HTTP/2
     (a reverse proxy) does not have this limit.
-- **Calls** — the columns, in this order:
-  Date (links to the post) | Token | Symbol (both link to GMGN) | Calls (`×N` when the token was
-  called N > 1 times, empty otherwise; hover for "Called N times, last on …") | Perceptor |
-  Status | Entry $ | Call MC | Latest MC | Latest % | Peak % | Worst drop % | 1h | 1d | 3d | 7d | 30d.
+- **Reading the list.** Each row starts with what matters now: the token, **Latest %** (the
+  return at the most recent price, as a badge coloured by size: rugged/−100%, down by half or
+  more, down, flat, up to 2×, 2×–11×, 11× and more; every value but a flat `0.0%` carries its
+  sign, so colour is never the only cue) and, under it, how long ago that price was read
+  ("12m ago", "2d ago"; "just now" under a minute), counted to the time the website last read
+  the database. **stale** = older than twice the tracker's prod schedule (30 min for calls
+  under 30 days old, 2 h for older or rugged ones, which prod refreshes every hour with
+  `SCOUT_LATEST_REFRESH_OLD=1h`; a drained pool is re-stamped at that same pace; fixed in
+  `app.js` as `STALE_OLD_MS`, not read from `SCOUT_LATEST_REFRESH_*`; a tracker left on the
+  24 h default makes most older and rugged calls show stale; raise `STALE_OLD_MS` to 2× the
+  setting in that case), so the tracker may be stopped or behind; **quiet** = no trade in the
+  7 days before the reading. The header row and the Token column stay in view while
+  scrolling. ▸ (or a click on the row) opens the call's performance (entry and latest price,
+  when the price was read and the last trade, the call's age, Call MC → Latest MC, peak and
+  worst drop for the chosen window) and its Perceptor/sAlpha reports.
+- **Calls from the last 1d / 7d / 30d / All.** Shows only calls posted within that many days
+  (× 24 hours) of the snapshot time. It goes by the date of the row's (first) call: a token
+  first called 60 days ago and again yesterday is not under 7d. Import progress is not
+  filtered. Kept in the address (`?days=7`; the page takes only 1, 7
+  and 30 from it, anything else shows All). The API takes `GET /api/calls?days=N` (whole days,
+  1–3650; anything else is a 400; leave it out for all); the answer carries `"days"` (0 = all),
+  and the total counts only the matching calls ("N calls from the last 7 days" under the
+  table).
+- **Calls** — 16 columns, in this order:
+  Token (the name links to GMGN; the symbol follows in grey when it differs from the name) |
+  Latest % | Latest MC | Call MC | Date (links to the post) | Perceptor | Status | Calls (`×N`
+  when the token was called N > 1 times, empty otherwise; hover for "Called N times, last on
+  …") | Entry $ | Peak % | Worst drop % | 1h | 1d | 3d | 7d | 30d.
   - **1h, 1d, 3d, 7d, 30d** are the return over each window (the number the old single
     "Return %" column showed for that window), all five side by side. A dash until the window
     has passed and been recorded.
@@ -1200,13 +1326,18 @@ other sites):
     any of 1h … 30d; click again to reverse. ▲/▼ shows the column and direction (also as
     `aria-sort`). Rows without a value are always last; ties by call id. Worst drop % is not
     sortable.
-  - Search by token name, symbol or address. 50 per page. On a narrow screen the table scrolls
-    sideways inside its box; the page itself does not.
-- **Row detail (the token's reports)** — the **▸** button before the date of every row opens a
-  panel under the row with the token's reports; a click anywhere else on the row does the same,
+  - Search by token name, symbol or address. 50 per page. The table scrolls inside its box: sideways
+    on a narrow screen (the page itself does not), and down when it is taller than the window.
+- **Row detail (performance and the token's reports)** — the **▸** button in the Token cell of
+  every row opens a panel under the row; a click anywhere else on the row does the same,
   except on a link (the post, GMGN, the Perceptor report) or while selecting text. The button
   is a real button: Tab to it and press Enter or Space; it says whether the row is open
   (`aria-expanded`). The panel shows:
+  - **Performance**, drawn from the row at once (the reports below load separately): when it
+    was called (and how long ago), Latest % as a badge, entry price (60 s after the post),
+    latest price, when that price was read (how long ago, "stale"/"quiet" as in the list, and
+    how old the call was then), the last trade, Call MC → Latest MC, and Peak % and Worst drop
+    % for the window chosen. A call not priced in USD shows only that it has no dollar price.
   - **Perceptor**: the verdict once (the report's own verdict line, e.g. "No red flags found",
     or the words "no red flags" / "caution" / "red flags" when it has none) and its time, the
     summary, and "Open the Perceptor report" (https links only);
@@ -1226,8 +1357,9 @@ other sites):
   - A text longer than 32 KB is cut there and marked "Cut at 32 KB."; a long one scrolls
     inside the panel. The panel is never wider than the visible part of the table box, also on
     a phone while the table is scrolled sideways.
-  The panel is loaded when it is opened ("Loading…" until then; an error notice if it cannot
-  be loaded, tried again with the next refresh). Open rows **stay open**, with their content,
+  The reports are loaded when the panel is opened ("Loading…" until then; an error notice if
+  they cannot be loaded, tried again with the next refresh); the performance block is redrawn
+  from the row with every refresh. Open rows **stay open**, with their content,
   through the 30-second refresh, **Refresh now**, sorting, the window selector, searching and
   paging (a row that is on another page is open again when you come back to it). When a newer
   report arrives the panel is updated with the next refresh. If the row's call is no longer in
@@ -1260,20 +1392,23 @@ other sites):
   A scan that failed, timed out or was rate-limited does not count, and a report whose
   verdict could not be read counts as not scanned.
 - Every number is **in USD and measured from the entry 60 seconds after the post** (the
-  `*_late_*` columns). A call tracked in another asset (no USD source for its pair) shows a
-  dash for Entry $, Call MC and Latest MC and one "no USD price" cell across Latest % … 30d.
+  `*_late_*` columns). A call tracked in another asset (no USD source for its pair) shows
+  "no USD price" in Latest %, a dash for Latest MC, Call MC and Entry $, and one dash across
+  Peak % … 30d.
   Sorting by anything but Date lists the USD-priced calls only.
-- **Latest %** (the column after "Latest MC") is the return at the most recent price,
-  from the same entry, followed by how old the call was when that price was read:
-  `+35.2% · 60d` (`45m` under an hour, `30h` under two days, otherwise days). It comes from
-  the tracker's latest-price pass (about every 15 minutes for calls under 30 days old, once
-  a day for older ones) and does not change with the window selector. `· quiet` is added
-  when the last trade is more than 7 days older than the reading (the price is then that of
-  an old trade); the tooltip gives both times. A dash means no latest price has been read yet.
-- **Call MC** (after "Entry $") is the market cap given in the call post: its "called at"
+- **Latest %** (the column after "Token") is the return at the most recent price, from the
+  same entry, as a coloured badge (see "Reading the list"), with how long ago that price was
+  read under it: `+35.2%` / `12m ago` (`45m` under an hour, `30h` under two days, otherwise days), plus
+  `· stale` and `· quiet` when they apply (`12m ago · quiet`). It comes from the tracker's
+  latest-price pass (about every 15 minutes for calls under 30 days old, once a day for older
+  ones) and does not change with the window selector. Quiet = the last trade is more than 7
+  days older than the reading (the price is then that of an old trade). The tooltip gives the
+  time of the reading, of the last trade and how old the call was then. A dash means no
+  latest price has been read yet.
+- **Call MC** (after "Latest MC") is the market cap given in the call post: its "called at"
   figure, or its "📈 Mcap" line when the post has no usable "called at" (missing, zero or
   below, or not a finite number) (`scout_call_metrics`).
-  **Latest MC** (after "Call MC") is an **estimate**, since the latest market cap is not
+  **Latest MC** (after "Latest %") is an **estimate**, since the latest market cap is not
   stored: the post's market cap (the Mcap line first, else "called at", by the same rule) ×
   the latest price ÷ the price at the post. It assumes the token supply has not changed. Both are written
   compactly (`$850`, `$45.2k`, `$1.3M`, `$2.1B`, and from $1 trillion on in powers of ten:
@@ -1328,7 +1463,7 @@ not `usd`. `total_calls` = every real call in `scout_calls`, repeats included; `
 in `scout_calls` (not calls: they are in none of the other numbers and are not listed).
 
 `GET /api/calls` — one page of first calls, one row per token (from the snapshot);
-`q`, `sort`, `usd_only`, `verdict`, paging and `total` all apply to that list, so a repeat call is never
+`q`, `sort`, `usd_only`, `verdict`, `days`, paging and `total` all apply to that list, so a repeat call is never
 returned and cannot be found by its own name or symbol:
 
 | Parameter | Values | Default | |
@@ -1339,6 +1474,7 @@ returned and cannot be found by its own name or symbol:
 | `horizon` | `1h`, `1d`, `3d`, `7d`, `30d` | `1d` | which window `return_pct` / `peak_pct` / `drawdown_pct` (and `sort=return` / `peak`) are for; the page sets it with its Peak / worst drop selector |
 | `usd_only` | `1`, `0` | `1` for every `sort` but `date`, else `0` | `1` = only tokens whose first call has `price_unit = usd` |
 | `verdict` | `clean`, `caution`, `red_flags`, `not_scanned`, or several separated by commas (`verdict=clean,caution`) | *(none = all)* | the token's Perceptor verdict (see below); with several, a token with any of them. The parameter may also be repeated (`verdict=clean&verdict=caution`); all values add up, repeats and empty items are ignored, so `verdict=` = all, and so do all four. `clean` = no red flags found; `not_scanned` = no completed Perceptor report, or one whose verdict is `unknown`. The order does not matter: `caution,clean` is the same question, with the same `ETag`, as `clean,caution` |
+| `days` | 1 – 3650 (whole days) | *(none = all)* | only tokens whose first call was posted within the last `days` × 24 hours, counted back from the snapshot time (`snapshot_at`), not the time of the request; `days=0` is a 400 (leave it out for all) |
 | `page` | 1 … | `1` | |
 | `per` | 1 – 200 | `50` | |
 
@@ -1346,7 +1482,7 @@ Any other value or parameter, or any parameter but `verdict` given twice → HTT
 
 ```json
 {"total": 3105, "page": 1, "per": 50, "horizon": "1d", "sort": "date", "dir": "desc", "usd_only": false, "verdict": "", "verdicts": [],
- "snapshot_at": "2026-10-02T14:30:00.123Z",
+ "days": 0, "snapshot_at": "2026-10-02T14:30:00.123Z",
  "calls": [{"call_id": 812, "message_id": 10002, "message_date": "2026-10-01T14:30:00Z",
    "post_url": "https://t.me/scoutrobinhood/10002",
    "contract_address": "0x…", "token_name": "Malfoid", "token_symbol": "MALFOID",
@@ -1359,7 +1495,8 @@ Any other value or parameter, or any parameter but `verdict` given twice → HTT
    "latest_return_pct": 35.2, "latest_price_usd": 0.006084,
    "latest_at": "2026-11-30T14:31:10.52Z", "latest_trade_at": "2026-11-30T13:02:44Z",
    "latest_age_seconds": 5184070, "call_mcap_usd": 45200, "latest_mcap_usd": 61110.4,
-   "has_salpha_report": true, "perceptor_report_id": 5120, "salpha_report_id": 5121}]}
+   "has_salpha_report": true, "perceptor_report_id": 5120, "salpha_report_id": 5121,
+   "perceptor_today_verdict": null, "perceptor_today_url": null, "perceptor_today_at": null}]}
 ```
 `call_count` = how many real calls of that token exist in total (1 or more; update posts are
 not counted); `last_call_date` = the date of the most recent one (equal to `message_date` when there is only one). Everything else
@@ -1407,17 +1544,30 @@ finite, or when the result is not finite. `latest_mcap_usd` is also `null` whene
 `/api/summary`). `verdict` in the response repeats the filter that was applied, in the order `clean`, `caution`,
 `red_flags`, `not_scanned`, separated by commas (`"clean,caution"`; a single value as asked,
 `"clean"`; `""` when none or all four), and `verdicts` is the same list as an array (`[]` = all).
+`days` repeats the age filter (`0` = all); `total` then counts only the calls within it.
 `perceptor_verdict` and `perceptor_url` are **per token**: the verdict (`clean`, `caution`,
-`red_flags` or `unknown`) and report link of the latest completed Perceptor investigation
-(`scout_investigations`, tool `perceptor`, `status = completed`, newest `requested_at`) with
-that contract address, upper/lower case ignored — not only the listed call's own. Both are
-`null` when the token was never scanned, which is the normal case for calls imported from
-history (only live calls are scanned). `perceptor_url` is also `null` when the stored link
-does not start with `https://`. This is a rule of the website only:
-`scout_call_dataset_v.perceptor_verdict` is unchanged and still belongs to the single call.
+`red_flags` or `unknown`) and report link of the latest completed live Perceptor investigation
+(`scout_investigations`, tool `perceptor`, `status = completed`, `scan_kind = 'live'`, newest
+`requested_at`) with that contract address, upper/lower case ignored — not only the listed
+call's own. Both are `null` when the token was never scanned at the time of a call, which is
+the normal case for calls imported from history (only live calls are scanned).
+`perceptor_url` is also `null` when the stored link does not start with `https://`. This is a
+rule of the website only: `scout_call_dataset_v.perceptor_verdict` is unchanged and still
+belongs to the single call. The Perceptor filter (`verdict=`) and its counts use the same
+live verdict.
 
-`has_salpha_report`, `perceptor_report_id` and `salpha_report_id` are the last three fields of
-a call and say which reports `GET /api/call` returns for it (per token, like the verdict):
+`perceptor_today_verdict`, `perceptor_today_url` and `perceptor_today_at` are **"Perceptor
+today"**: the token's latest completed Perceptor re-scan by the rescan lane (`scan_kind =
+'rescan'`, see "Re-scanning calls without a Perceptor report"), run long after the call, so
+its verdict is today's, not the one at the time of the call. Same verdict values and link rule
+as above; `perceptor_today_at` = when it ran (`completed_at`, else `requested_at`). All three
+are `null` without a completed re-scan. A re-scan never fills `perceptor_verdict`,
+`perceptor_url` or `perceptor_report_id`, never moves a row in the Perceptor filter, and is
+not shown by `GET /api/call`. A new re-scan changes the `ETag` of `/api/calls`; it sends no
+live `report` event (an open page sees it with its next list refresh, every 30 s).
+
+`has_salpha_report`, `perceptor_report_id` and `salpha_report_id` are three fields of
+a call that say which reports `GET /api/call` returns for it (per token, like the verdict):
 `perceptor_report_id` = the id (`scout_investigations.id`) of the Perceptor investigation the
 verdict comes from; `salpha_report_id` = the id of the token's latest completed sAlpha
 investigation (tool `salpha`, `status = completed`, newest `requested_at`, contract address

@@ -135,6 +135,14 @@ CREATE INDEX IF NOT EXISTS scout_investigations_call_idx  ON scout_investigation
 CREATE INDEX IF NOT EXISTS scout_investigations_tool_idx  ON scout_investigations (tool_id, requested_at DESC);
 CREATE INDEX IF NOT EXISTS scout_investigations_ca_idx    ON scout_investigations (contract_address);
 CREATE INDEX IF NOT EXISTS scout_investigations_level_idx ON scout_investigations (verdict_level, requested_at DESC);
+-- scan_kind: 'live' = run when the call came in (or by -scan/-post);
+-- 'rescan' = Perceptor re-scan of a first call that had no report, run long
+-- after the call by the listener's rescan lane (SCOUT_RESCAN). A rescan's
+-- verdict is today's, never a call-time feature: the dataset view and the
+-- requeue read 'live' rows only.
+ALTER TABLE scout_investigations ADD COLUMN IF NOT EXISTS scan_kind TEXT NOT NULL DEFAULT 'live';  -- live | rescan
+-- the rescan lane's daily cap and gap (rows of the last 24 hours, the newest)
+CREATE INDEX IF NOT EXISTS scout_investigations_rescan_idx ON scout_investigations (requested_at DESC) WHERE scan_kind = 'rescan';
 
 -- One row per message bundle sent to you (or a failed attempt).
 CREATE TABLE IF NOT EXISTS scout_deliveries (
@@ -178,7 +186,8 @@ SELECT i.id, i.call_id, t.code AS tool, t.bot_username, i.contract_address, i.re
        c.channel_username, c.message_id AS source_message_id, c.message_date AS source_message_date,
        EXISTS (SELECT 1 FROM scout_delivery_investigations di
                JOIN scout_deliveries d ON d.id = di.delivery_id AND d.status = 'sent'
-               WHERE di.investigation_id = i.id) AS delivered
+               WHERE di.investigation_id = i.id) AS delivered,
+       i.scan_kind  -- live | rescan (a late Perceptor re-scan, see the column)
 FROM scout_investigations i
 JOIN scout_investigation_tools t ON t.id = i.tool_id
 LEFT JOIN scout_calls c ON c.id = i.call_id;
@@ -389,10 +398,11 @@ LEFT JOIN LATERAL (
     WHERE c3.message_date < cv.message_date AND c3.message_date >= cv.message_date - interval '24 hours'
 ) bz ON true
 -- Perceptor verdict: this call's own scan, else the latest earlier scan of the same token.
+-- Live scans only: a rescan (scan_kind 'rescan') is today's verdict, not one known at call time.
 LEFT JOIN LATERAL (
     SELECT i.verdict_level FROM scout_investigations i
     JOIN scout_investigation_tools tt ON tt.id = i.tool_id
-    WHERE tt.code = 'perceptor' AND i.status = 'completed'
+    WHERE tt.code = 'perceptor' AND i.status = 'completed' AND i.scan_kind = 'live'
       AND (i.call_id = cv.call_id OR (i.contract_address = cv.contract_address AND i.requested_at <= cv.message_date))
     ORDER BY (i.call_id = cv.call_id) DESC, i.requested_at DESC LIMIT 1
 ) p ON true

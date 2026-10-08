@@ -26,6 +26,10 @@ var scoutSchemaSQL string
 type ScoutStore struct {
 	Pool  *pgxpool.Pool
 	owned bool // true when this store opened the pool (and must close it)
+
+	// MaxConnsFrom says where the pool's MaxConns came from, for the startup
+	// log ("pool_max_conns in the DSN" or "default for N tracker workers").
+	MaxConnsFrom string
 }
 
 // NewScoutStoreFromPool wraps an existing pool, e.g. database.DbConnPgx from
@@ -34,14 +38,68 @@ func NewScoutStoreFromPool(pool *pgxpool.Pool) *ScoutStore {
 	return &ScoutStore{Pool: pool}
 }
 
+// Pool size. pgxpool opens connections only when they are needed (MinConns
+// is 0), so MaxConns is a ceiling: a process holds about as many connections
+// as it uses at the same time, and a listener or website process with a high
+// ceiling still opens only a few.
+//
+// A tracker worker holds a connection for one query at a time, never across
+// node requests (no transaction in the tracker or latest-price path); the
+// latest-price pass runs on the same workers. On top of the workers come the
+// dispatcher's reads and the cycle's own queries (status, token names,
+// Chainlink feeds), which run one at a time, and in the default mode (no
+// -listen-only) the listener's scans and tool results in the same process.
+// The website's LISTEN connection is dialled separately, outside the pool.
+const (
+	poolConnsHeadroom = 4  // dispatcher and cycle queries, listener in the same process, slack
+	poolConnsMin      = 4  // the old fixed size
+	poolConnsCap      = 32 // keeps one process well below Postgres' default max_connections (100)
+)
+
+// defaultPoolMaxConns is the pool size used when the DSN does not set
+// pool_max_conns: the tracker workers plus headroom, at least poolConnsMin
+// and at most poolConnsCap.
+func defaultPoolMaxConns(workers int) int32 {
+	return int32(min(max(workers+poolConnsHeadroom, poolConnsMin), poolConnsCap))
+}
+
+// applyPoolMaxConns sets cfg.MaxConns to defaultPoolMaxConns(workers) unless
+// dsn sets pool_max_conns itself (pgxpool has already applied it to cfg), and
+// returns where the value came from.
+func applyPoolMaxConns(dsn string, cfg *pgxpool.Config, workers int) (string, error) {
+	// pgxpool.ParseConfig removes pool_max_conns from the runtime parameters,
+	// so parse once more to see whether the DSN sets it. Comparing cfg.MaxConns
+	// with pgxpool's default would miss an explicit value equal to it.
+	cc, err := pgx.ParseConfig(dsn)
+	if err != nil {
+		return "", fmt.Errorf("parse SCOUT_DATABASE_URL: %w", err)
+	}
+	if _, ok := cc.RuntimeParams["pool_max_conns"]; ok {
+		return "pool_max_conns in SCOUT_DATABASE_URL", nil
+	}
+	cfg.MaxConns = defaultPoolMaxConns(workers)
+	return defaultPoolSource(workers), nil
+}
+
+// defaultPoolSource is the startup log's note for a pool sized by
+// defaultPoolMaxConns(workers).
+func defaultPoolSource(workers int) string {
+	return fmt.Sprintf("default for %d tracker worker(s)", workers)
+}
+
 // NewScoutStore connects to Postgres using a pgx DSN / URL, e.g.
-// postgres://user:pass@host:5432/dbname?sslmode=disable
-func NewScoutStore(ctx context.Context, dsn string) (*ScoutStore, error) {
+// postgres://user:pass@host:5432/dbname?sslmode=disable. workers is the
+// tracker's effective worker count (priceConfig.trackWorkers); it sizes the
+// pool unless the DSN sets pool_max_conns.
+func NewScoutStore(ctx context.Context, dsn string, workers int) (*ScoutStore, error) {
 	cfg, err := pgxpool.ParseConfig(dsn)
 	if err != nil {
 		return nil, fmt.Errorf("parse SCOUT_DATABASE_URL: %w", err)
 	}
-	cfg.MaxConns = 4
+	from, err := applyPoolMaxConns(dsn, cfg, workers)
+	if err != nil {
+		return nil, err
+	}
 	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {
 		return nil, err
@@ -52,7 +110,7 @@ func NewScoutStore(ctx context.Context, dsn string) (*ScoutStore, error) {
 		pool.Close()
 		return nil, fmt.Errorf("ping db: %w", err)
 	}
-	return &ScoutStore{Pool: pool, owned: true}, nil
+	return &ScoutStore{Pool: pool, owned: true, MaxConnsFrom: from}, nil
 }
 
 func (st *ScoutStore) Close() {
@@ -318,16 +376,17 @@ func (st *ScoutStore) SelectScoutCallPostCAs(ctx context.Context, channelID int6
 
 // SelectScoutCallsToRequeue returns a channel's calls with status queued or
 // dropped (the job queue was full) that have no completed investigation and
-// were posted at or after since, oldest first. A restarted listener queues
+// were posted at or after since, oldest first. Only live investigations count
+// (scan_kind 'live'): a late rescan never makes a call a duplicate. A restarted listener queues
 // them again (see requeue in catchup.go). older is the number of such calls
 // posted before since: they are left as they are (fixed by hand if needed).
 func (st *ScoutStore) SelectScoutCallsToRequeue(ctx context.Context, channelID int64, since time.Time) (calls []ScoutCallToRequeue, older int, err error) {
 	// the same predicates in both queries; only the date test differs
 	const stuck = `c.channel_id = $1 AND c.status IN ($2, $3)
-		  AND NOT EXISTS (SELECT 1 FROM scout_investigations i WHERE i.call_id = c.id AND i.status = $4)`
+		  AND NOT EXISTS (SELECT 1 FROM scout_investigations i WHERE i.call_id = c.id AND i.status = $4 AND i.scan_kind = 'live')`
 	rows, err := st.Pool.Query(ctx, `SELECT c.id, c.message_id, c.message_date, c.message_text, c.contract_address, c.status,
 			EXISTS (SELECT 1 FROM scout_investigations o
-				WHERE o.status = $4 AND (o.contract_address = c.contract_address
+				WHERE o.status = $4 AND o.scan_kind = 'live' AND (o.contract_address = c.contract_address
 					OR (c.contract_address LIKE '0x%' AND lower(o.contract_address) = lower(c.contract_address))))
 		FROM scout_calls c
 		WHERE `+stuck+` AND c.message_date >= $5
@@ -465,6 +524,7 @@ const scoutInvestigationColumns = `
 	i.created_at,       -- 23
 	i.updated_by,       -- 24
 	i.updated_at,       -- 25
+	i.scan_kind,        -- 26
 	t.code              -- tool code (join)
 `
 
@@ -477,7 +537,7 @@ func scanScoutInvestigation(row pgx.Row) (*ScoutInvestigation, error) {
 		&r.RequestedAt, &r.CompletedAt, &r.Status, &r.BotMessageIDs, &r.ReportText, &r.ReportURLs,
 		&r.ReportURL, &r.ExternalID, &r.VerdictLevel, &r.VerdictLabel, &r.Ticker,
 		&r.VerdictSummary, &r.VerdictSource, &details, &r.Error,
-		&r.CreatedBy, &r.CreatedAt, &r.UpdatedBy, &r.UpdatedAt, &r.ToolCode)
+		&r.CreatedBy, &r.CreatedAt, &r.UpdatedBy, &r.UpdatedAt, &r.ScanKind, &r.ToolCode)
 	if err != nil {
 		return nil, err
 	}
@@ -509,6 +569,9 @@ func (st *ScoutStore) InsertScoutInvestigation(ctx context.Context, r *ScoutInve
 	if len(r.Details) == 0 {
 		r.Details = []byte("{}")
 	}
+	if r.ScanKind == "" {
+		r.ScanKind = ScanKindLive
+	}
 	var id int
 	var toolCode *string // the code of the tool, for the website's notice
 	err := st.Pool.QueryRow(ctx, `WITH ins AS (
@@ -516,14 +579,14 @@ func (st *ScoutStore) InsertScoutInvestigation(ctx context.Context, r *ScoutInve
 		uuid, call_id, tool_id, contract_address, request_text, requested_at, completed_at, status,
 		bot_message_ids, report_text, report_urls, report_url, external_id, verdict_level,
 		verdict_label, ticker, verdict_summary, verdict_source, details, error,
-		created_by, created_at, updated_by, updated_at
-	) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19::jsonb,$20,$21,$22,$23,$24)
+		created_by, created_at, updated_by, updated_at, scan_kind
+	) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19::jsonb,$20,$21,$22,$23,$24,$25)
 	RETURNING id, tool_id)
 	SELECT ins.id, t.code FROM ins LEFT JOIN scout_investigation_tools t ON t.id = ins.tool_id`,
 		r.UUID, r.CallID, r.ToolID, r.ContractAddress, r.RequestText, r.RequestedAt, r.CompletedAt, r.Status,
 		r.BotMessageIDs, r.ReportText, r.ReportURLs, r.ReportURL, r.ExternalID, r.VerdictLevel,
 		r.VerdictLabel, r.Ticker, r.VerdictSummary, r.VerdictSource, string(r.Details), r.Error,
-		r.CreatedBy, now, r.UpdatedBy, now,
+		r.CreatedBy, now, r.UpdatedBy, now, r.ScanKind,
 	).Scan(&id, &toolCode)
 	if err != nil {
 		return nil, err
@@ -609,6 +672,113 @@ func (st *ScoutStore) SelectScoutInvestigations(ctx context.Context, f ScoutInve
 		out = append(out, *r)
 	}
 	return out, rows.Err()
+}
+
+// ---------------------------------------------------------------------------
+// Rescan lane (scan_kind 'rescan'): Perceptor re-scans of first calls that
+// have no Perceptor report. See rescan.go.
+// ---------------------------------------------------------------------------
+
+// RescanCandidate is a first call the rescan lane may re-scan.
+type RescanCandidate struct {
+	CallID          int
+	ContractAddress string
+	MessageDate     time.Time
+	Status          string
+}
+
+// RescanPoolRow is one first call without a completed Perceptor report (any
+// scan kind) whose status is one the lane may re-scan, with what decides
+// whether it is a candidate (the dry run's summary).
+type RescanPoolRow struct {
+	CallID          int
+	ContractAddress string
+	MessageDate     time.Time
+	Status          string
+	Rugged          bool // scout_call_tracking.rugged
+	Wiped           bool // latest_return_pct ≤ −99 (NULL = not wiped)
+	FailedRescans   int  // rescans of the token that ended failed or timeout
+}
+
+// rescanWipedPct: a first call whose latest return is at or below this
+// (percent) is not re-scanned. No latest price yet does not exclude it.
+const rescanWipedPct = -99
+
+// rescanPoolSQL lists the first calls (the website's rule, webFirstCallsSQL:
+// lowest message_date, then lowest id, per lower(contract_address); update
+// posts left out) whose status is in $1 and whose token has no completed
+// Perceptor investigation of any scan kind, with the columns of RescanPoolRow
+// (and the contract address). A failed rescan is one that ended failed or
+// timeout: rate_limited says nothing about the token (the lane pauses). $2 =
+// rescanWipedPct.
+const rescanPoolSQL = `SELECT c.id, c.contract_address, c.message_date, c.status,
+		COALESCE(t.rugged, false) AS rugged,
+		COALESCE(t.latest_return_pct <= $2, false) AS wiped,
+		(SELECT count(*) FROM scout_investigations i
+			JOIN scout_investigation_tools pt ON pt.id = i.tool_id AND pt.code = 'perceptor'
+			WHERE lower(i.contract_address) = fc.ca AND i.scan_kind = 'rescan'
+			  AND i.status IN ('failed', 'timeout'))::int AS failed_rescans
+	FROM ` + webFirstCallsSQL + ` fc
+	JOIN scout_calls c ON c.id = fc.id
+	LEFT JOIN scout_call_tracking t ON t.call_id = fc.id
+	WHERE c.status = ANY($1)
+	  AND NOT EXISTS (SELECT 1 FROM scout_investigations i
+			JOIN scout_investigation_tools pt ON pt.id = i.tool_id AND pt.code = 'perceptor'
+			WHERE lower(i.contract_address) = fc.ca AND i.status = 'completed')`
+
+// NextRescanCandidate returns the newest first call the rescan lane may
+// re-scan (nil when there is none): from rescanPoolSQL, posted at or after
+// since, not rugged, latest return above rescanWipedPct (or none yet), and
+// fewer than maxFailed failed rescans. Ties on the time go to the higher id.
+func (st *ScoutStore) NextRescanCandidate(ctx context.Context, statuses []string, since time.Time, maxFailed int) (*RescanCandidate, error) {
+	var c RescanCandidate
+	err := st.Pool.QueryRow(ctx, `SELECT id, contract_address, message_date, status FROM (`+rescanPoolSQL+`) p
+		WHERE message_date >= $3 AND NOT rugged AND NOT wiped AND failed_rescans < $4
+		ORDER BY message_date DESC, id DESC LIMIT 1`, statuses, rescanWipedPct, since, maxFailed).
+		Scan(&c.CallID, &c.ContractAddress, &c.MessageDate, &c.Status)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("selecting the next rescan candidate: %w", err)
+	}
+	return &c, nil
+}
+
+// SelectRescanPool returns every row of rescanPoolSQL (any age), for the dry
+// run's summary.
+func (st *ScoutStore) SelectRescanPool(ctx context.Context, statuses []string) ([]RescanPoolRow, error) {
+	rows, err := st.Pool.Query(ctx, `SELECT id, contract_address, message_date, status, rugged, wiped, failed_rescans FROM (`+rescanPoolSQL+`) p
+		ORDER BY message_date DESC, id DESC`, statuses, rescanWipedPct)
+	if err != nil {
+		return nil, fmt.Errorf("reading the first calls without a Perceptor report: %w", err)
+	}
+	defer rows.Close()
+	var out []RescanPoolRow
+	for rows.Next() {
+		var r RescanPoolRow
+		if err := rows.Scan(&r.CallID, &r.ContractAddress, &r.MessageDate, &r.Status, &r.Rugged, &r.Wiped, &r.FailedRescans); err != nil {
+			return nil, fmt.Errorf("scanning a first call without a Perceptor report: %w", err)
+		}
+		out = append(out, r)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("reading the first calls without a Perceptor report: %w", err)
+	}
+	return out, nil
+}
+
+// RescanStats returns how many rescans (scan_kind 'rescan', any status) were
+// requested after since, and when the newest one was requested (nil = none
+// yet). The lane's daily cap and gap come from it, so they survive restarts.
+func (st *ScoutStore) RescanStats(ctx context.Context, since time.Time) (int, *time.Time, error) {
+	var n int
+	var last *time.Time
+	if err := st.Pool.QueryRow(ctx, `SELECT count(*) FILTER (WHERE requested_at > $1), max(requested_at)
+		FROM scout_investigations WHERE scan_kind = 'rescan'`, since).Scan(&n, &last); err != nil {
+		return 0, nil, fmt.Errorf("reading the rescan count: %w", err)
+	}
+	return n, last, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -1340,13 +1510,25 @@ const (
 	// webPerceptorSQL: each token's latest completed Perceptor investigation
 	// (by contract address without regard to letter case, whichever post of the
 	// token it was run for). verdict is one of clean | caution | red_flags | unknown.
+	// Live scans only (scan_kind 'live'): a late re-scan is today's verdict,
+	// not the one at the time of the call (webPerceptorTodaySQL has those).
 	webPerceptorSQL = `(SELECT DISTINCT ON (lower(i.contract_address)) lower(i.contract_address) AS ca,
 		CASE WHEN i.verdict_level IN ('clean', 'caution', 'red_flags') THEN i.verdict_level ELSE 'unknown' END AS verdict,
 		i.report_url, i.id
 		FROM scout_investigations i JOIN scout_investigation_tools pt ON pt.id = i.tool_id AND pt.code = 'perceptor'
-		WHERE i.status = 'completed'
+		WHERE i.status = 'completed' AND i.scan_kind = 'live'
 		ORDER BY lower(i.contract_address), i.requested_at DESC, i.id DESC)`
 	webPerceptorJoinSQL = ` LEFT JOIN ` + webPerceptorSQL + ` p ON p.ca = fc.ca`
+	// webPerceptorTodaySQL: each token's latest completed Perceptor re-scan
+	// (scan_kind 'rescan', by the rescan lane), by the same rule: "Perceptor
+	// today". at is completed_at, else requested_at.
+	webPerceptorTodaySQL = `(SELECT DISTINCT ON (lower(i.contract_address)) lower(i.contract_address) AS ca,
+		CASE WHEN i.verdict_level IN ('clean', 'caution', 'red_flags') THEN i.verdict_level ELSE 'unknown' END AS verdict,
+		i.report_url, COALESCE(i.completed_at, i.requested_at) AS at
+		FROM scout_investigations i JOIN scout_investigation_tools pt ON pt.id = i.tool_id AND pt.code = 'perceptor'
+		WHERE i.status = 'completed' AND i.scan_kind = 'rescan'
+		ORDER BY lower(i.contract_address), i.requested_at DESC, i.id DESC)`
+	webPerceptorTodayJoinSQL = ` LEFT JOIN ` + webPerceptorTodaySQL + ` ptd ON ptd.ca = fc.ca`
 	// webSAlphaSQL: each token's latest completed sAlpha investigation by the
 	// same rule, among those whose report_text has something other than white
 	// space (about half of sAlpha's replies are empty: they count as no report,
@@ -1356,7 +1538,7 @@ const (
 	// has no real report: any real report, however old, comes first.
 	webSAlphaSQL = `(SELECT DISTINCT ON (lower(i.contract_address)) lower(i.contract_address) AS ca, i.id
 		FROM scout_investigations i JOIN scout_investigation_tools sat ON sat.id = i.tool_id AND sat.code = 'salpha'
-		WHERE i.status = 'completed' AND i.report_text ~ '[^[:space:]]'
+		WHERE i.status = 'completed' AND i.scan_kind = 'live' AND i.report_text ~ '[^[:space:]]'
 		ORDER BY lower(i.contract_address),
 			EXISTS (SELECT 1 FROM unnest($1::text[]) AS d(phrase) WHERE strpos(lower(i.report_text), d.phrase) > 0),
 			i.requested_at DESC, i.id DESC)`
@@ -1366,7 +1548,7 @@ const (
 // webRowsSQL loads the website's whole list in one statement: each token's
 // first call with its tracking row (and its latest price), the late-entry
 // results of the five windows, how often the token was called, its latest
-// Perceptor report, the id of its latest sAlpha report with text (a real
+// live Perceptor report and its latest Perceptor re-scan ("Perceptor today"), the id of its latest sAlpha report with text (a real
 // report before a decline; $1 = salphaDeclinePhrases) and the
 // market caps of the post. It reads the
 // tables directly (not scout_call_dataset_v, whose per-row lookups the website
@@ -1378,14 +1560,15 @@ var webRowsSQL = `SELECT c.id, c.message_id, c.message_date, c.channel_username,
 	` + webReturnsPivotSQL("r.") + `,
 	p.verdict, p.report_url, p.id, sa.id, n.call_count, n.last_call_date,
 	t.latest_return_pct::float8, t.latest_price_usd::float8, t.latest_checked_at, t.latest_trade_at,
-	m.called_at_mcap_usd::float8, m.mcap_usd::float8, t.entry_price_usd::float8
+	m.called_at_mcap_usd::float8, m.mcap_usd::float8, t.entry_price_usd::float8,
+	ptd.verdict, ptd.report_url, ptd.at
 	FROM ` + webFirstCallsSQL + ` fc
 	JOIN scout_calls c ON c.id = fc.id
 	JOIN ` + webCallCountsSQL + ` n ON n.ca = fc.ca
 	LEFT JOIN scout_call_metrics m ON m.call_id = fc.id
 	LEFT JOIN scout_call_tracking t ON t.call_id = fc.id
 	LEFT JOIN (SELECT call_id, ` + webReturnsPivotSQL("") + `
-		FROM scout_call_returns WHERE status = 'done' GROUP BY call_id) r ON r.call_id = fc.id` + webPerceptorJoinSQL + webSAlphaJoinSQL + `
+		FROM scout_call_returns WHERE status = 'done' GROUP BY call_id) r ON r.call_id = fc.id` + webPerceptorJoinSQL + webPerceptorTodayJoinSQL + webSAlphaJoinSQL + `
 	ORDER BY c.id`
 
 // webReturnsPivotSQL lists the 15 result columns (window × return, peak,
@@ -1435,7 +1618,7 @@ func (st *ScoutStore) SelectWebRows(ctx context.Context) ([]ScoutWebRow, int, er
 		}
 		dest = append(dest, &r.PerceptorVerd, &r.PerceptorURL, &r.PerceptorID, &r.SAlphaID, &r.CallCount, &r.LastCallDate,
 			&r.LatestReturn, &r.LatestPrice, &r.LatestAt, &r.LatestTradeAt,
-			&r.CalledAtMcap, &r.PostMcap, &r.PostPrice)
+			&r.CalledAtMcap, &r.PostMcap, &r.PostPrice, &r.PerceptorTodayVerd, &r.PerceptorTodayURL, &r.PerceptorTodayAt)
 		if err := rows.Scan(dest...); err != nil {
 			return nil, 0, err
 		}

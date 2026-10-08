@@ -319,6 +319,13 @@ func (r *toolRunner) rateLimitWait(res *toolResult) (time.Duration, bool) {
 // with a rate-limit notice, waits the requested time and asks again
 // (up to MaxRetries times).
 func (r *toolRunner) investigateWithRetry(ctx context.Context, send sendFunc, ca string) *toolResult {
+	return r.investigateWithRetryN(ctx, send, ca, r.spec.MaxRetries)
+}
+
+// investigateWithRetryN is investigateWithRetry with maxRetries in place of
+// the tool's MaxRetries (the rescan lane uses 0: a rate-limit notice ends the
+// attempt as rate_limited at once).
+func (r *toolRunner) investigateWithRetryN(ctx context.Context, send sendFunc, ca string, maxRetries int) *toolResult {
 	var waits []int
 	first := time.Time{}
 	for attempt := 1; ; attempt++ {
@@ -340,13 +347,13 @@ func (r *toolRunner) investigateWithRetry(ctx context.Context, send sendFunc, ca
 		if !limited {
 			return res
 		}
-		if attempt > r.spec.MaxRetries {
+		if attempt > maxRetries {
 			res.Status = investigationRateLimited
 			res.Err = fmt.Errorf("@%s still rate-limited after %d attempt(s): %s", r.spec.Bot, attempt, strings.TrimSpace(res.ReportText()))
 			return res
 		}
 		log.Printf("[%s] rate-limited by @%s (%q) — retrying in %s (retry %d/%d)",
-			r.spec.Code, r.spec.Bot, strings.TrimSpace(res.ReportText()), wait.Round(time.Second), attempt, r.spec.MaxRetries)
+			r.spec.Code, r.spec.Bot, strings.TrimSpace(res.ReportText()), wait.Round(time.Second), attempt, maxRetries)
 		waits = append(waits, int(wait.Round(time.Second)/time.Second))
 		if err := sleepCtx(ctx, wait); err != nil {
 			res.Status, res.Err = investigationFailed, err

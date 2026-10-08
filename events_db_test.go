@@ -96,20 +96,23 @@ func TestScoutNotifyOnInsert(t *testing.T) {
 
 	done := at.Add(time.Minute)
 	for _, tc := range []struct {
-		name   string
-		tool   int
-		status string
-		want   string // "" = no notification; %d = the investigation id
+		name     string
+		tool     int
+		status   string
+		scanKind string // "" = the insert's default, live
+		want     string // "" = no notification; %d = the investigation id
 	}{
-		{"perceptor completed", perc, investigationCompleted, `{"kind":"report","call_id":%d,"tool":"perceptor","id":%d}`},
-		{"perceptor failed", perc, "failed", ""},
-		{"salpha completed", salpha, investigationCompleted, `{"kind":"report","call_id":%d,"tool":"salpha","id":%d}`},
-		{"salpha timeout", salpha, "timeout", ""},
-		{"another tool", other, investigationCompleted, ""},
+		{"perceptor completed", perc, investigationCompleted, "", `{"kind":"report","call_id":%d,"tool":"perceptor","id":%d,"scan_kind":"live"}`},
+		{"perceptor failed", perc, "failed", "", ""},
+		{"perceptor rescan completed", perc, investigationCompleted, ScanKindRescan, `{"kind":"report","call_id":%d,"tool":"perceptor","id":%d,"scan_kind":"rescan"}`},
+		{"perceptor rescan failed", perc, "failed", ScanKindRescan, ""},
+		{"salpha completed", salpha, investigationCompleted, "", `{"kind":"report","call_id":%d,"tool":"salpha","id":%d,"scan_kind":"live"}`},
+		{"salpha timeout", salpha, "timeout", "", ""},
+		{"another tool", other, investigationCompleted, "", ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			inv := &ScoutInvestigation{CallID: id, ToolID: tc.tool, ContractAddress: ca, RequestText: "x",
-				RequestedAt: at, CompletedAt: &done, Status: tc.status}
+				RequestedAt: at, CompletedAt: &done, Status: tc.status, ScanKind: tc.scanKind}
 			iid, err := st.InsertScoutInvestigation(ctx, inv)
 			if err != nil {
 				t.Fatal(err)
