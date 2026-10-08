@@ -10,7 +10,7 @@ First message to give it:
 > "Prod state and pending owner actions" with me before starting "Next work".
 
 **Moved from `kfukue/geth-analytics` (history kept).** This repo,
-`kfukue/scoutanalytics`, is `telegrambot/scoutanalytics` of
+`kfukue/scout-analytics`, is `telegrambot/scoutanalytics` of
 `kfukue/geth-analytics` extracted with `git filter-repo --subdirectory-filter`
 from that repo's `main` at 4369a1d (PR #20), plus one standalone commit (own
 `go.mod`, `internal/database`, paths). Every commit hash in this file before
@@ -19,7 +19,7 @@ matter are in section 5. Package `main` is at the repo root: `go run .`.
 
 ## What the system is
 
-Repo `kfukue/scoutanalytics`, branch `main` (the only branch carried over).
+Repo `kfukue/scout-analytics`, branch `main` (the only branch carried over).
 Production runs `main` of the old repo at 4369a1d (the owner confirmed the
 server has the latest); it moves to this repo with the cut-over in section 5.
 
@@ -130,7 +130,7 @@ State on 7 October:
 
 Pending owner actions:
 
-1. Create the empty private repo `kfukue/scoutanalytics` and push this repo's
+1. Create the empty private repo `kfukue/scout-analytics` and push this repo's
    `main` (section 5).
 2. The prod cut-over to the new checkout (section 5, checklist).
 3. **Prod settings** (for reference):
@@ -147,7 +147,7 @@ Pending owner actions:
    it did not move here. (`stash@{1..3}` are old GitHub Desktop stashes from
    other branches.)
 2. Done, pending the owner's push and the prod cut-over: **the repo migration
-   to `kfukue/scoutanalytics`** (section 5), BEFORE ML training.
+   to `kfukue/scout-analytics`** (section 5), BEFORE ML training.
 3. **The first ML training** via `ml/RUNBOOK.md`, run from this repo after the
    cut-over (the runbook paths are for this layout). No GPU needed: CPU
    only, it takes seconds. The long (30d) horizon is skipped until about
@@ -184,7 +184,7 @@ Later:
   (no `.env`, `*session.json`, `calls.csv`, `scoutanalytics_data/` or `.exe`
   object). Only `main` was carried over; the old stash stayed behind.
 - Then one standalone commit, no functional changes: module
-  `github.com/kfukue/scoutanalytics` (`go.mod`/`go.sum` from the old repo,
+  `github.com/kfukue/scout-analytics` (`go.mod`/`go.sum` from the old repo,
   `go mod tidy`, same versions for every module still required);
   `internal/database/database.go` copied unchanged from the old
   `database/database.go` (same `.env` variables); new `.gitignore`; `.claude/`
@@ -196,14 +196,14 @@ Later:
   old-repo hashes; `git log --grep` or the subject line finds them here.
 
 Owner's push (from the extracted repo on the PC): create the empty private
-repo `kfukue/scoutanalytics` on GitHub (no README, licence or .gitignore), then
-`git remote add origin https://github.com/kfukue/scoutanalytics.git` and
+repo `kfukue/scout-analytics` on GitHub (no README, licence or .gitignore), then
+`git remote add origin https://github.com/kfukue/scout-analytics.git` and
 `git push -u origin main`.
 
 **Prod cut-over checklist** (the old checkout stays untouched for rollback):
 
 1. On the server, clone the new repo next to the old checkout, e.g.
-   `git clone https://github.com/kfukue/scoutanalytics.git /srv/scoutanalytics`
+   `git clone https://github.com/kfukue/scout-analytics.git /srv/scout-analytics`
    (EDIT the path; a private repo needs a deploy key or token on the server).
    `go build -o /tmp/scout-new .` in it compiles everything before any
    downtime.
@@ -234,7 +234,7 @@ repo `kfukue/scoutanalytics` on GitHub (no README, licence or .gitignore), then
 8. After the cut-over: record `git rev-parse HEAD` in the new checkout for
    DEPLOY.md 3.0 (the old `/tmp/scout-prev-commit` hash is not in this
    history). The systemd drafts in DEPLOY.md use
-   `WorkingDirectory=/srv/scoutanalytics` (EDIT).
+   `WorkingDirectory=/srv/scout-analytics` (EDIT).
 9. Removing `telegrambot/scoutanalytics` from the old repo is a separate,
    later decision; nothing in the old repo was changed.
 

@@ -44,7 +44,7 @@ import (
 	"github.com/gotd/td/tgerr"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/joho/godotenv"
-	"github.com/kfukue/scoutanalytics/internal/database"
+	"github.com/kfukue/scout-analytics/internal/database"
 )
 
 // ---------------------------------------------------------------------------

@@ -19,12 +19,12 @@ takes about 1 GB and 1 to 2 minutes. Disk: about 400 MB for the venv, about
 ## 0. Paths
 
 ```bash
-REPO=/path/to/scoutanalytics      # the deployed checkout of kfukue/scoutanalytics (runs main); .env is where you start the listener
+REPO=/path/to/scout-analytics      # the deployed checkout of kfukue/scout-analytics (runs main); .env is where you start the listener
 ML=~/scout-ml                      # everything this runbook creates; outside the repo
 mkdir -p "$ML"
 ```
 
-This runbook assumes prod already runs from the new `kfukue/scoutanalytics`
+This runbook assumes prod already runs from the new `kfukue/scout-analytics`
 checkout (HANDOFF.md, section 5, cut-over checklist).
 
 The CSV contains every call (addresses, symbols, outcomes). It never goes

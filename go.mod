@@ -1,4 +1,4 @@
-module github.com/kfukue/scoutanalytics
+module github.com/kfukue/scout-analytics
 
 go 1.24.0
 

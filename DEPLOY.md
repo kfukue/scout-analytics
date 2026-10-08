@@ -32,7 +32,7 @@ the `ops/*/README.md` files (pgAdmin scripts).
 ```
 
 - Production runs the `main` branch; development is on a work branch merged
-  with a PR. The repo is `kfukue/scoutanalytics` (moved from
+  with a PR. The repo is `kfukue/scout-analytics` (moved from
   `kfukue/geth-analytics`, `telegrambot/scoutanalytics`, history kept).
 - Nitro must keep `--execution.rpc.log-history=0`. Without the full log index,
   old block ranges are read one block at a time and the tracker slows to a crawl.
@@ -190,7 +190,7 @@ On the PC: commit and push the work branch, merge to `main` with a PR (the
 owner does this). On the server:
 
 ```bash
-cd /srv/scoutanalytics                     # EDIT: the server's repo root
+cd /srv/scout-analytics                     # EDIT: the server's repo root
 git rev-parse HEAD > /tmp/scout-prev-commit   # note what runs now
 git checkout main && git pull
 git log --oneline "$(cat /tmp/scout-prev-commit)"..HEAD   # what changed
@@ -412,7 +412,7 @@ StartLimitBurst=3
 Type=simple
 User=scout
 Group=scout
-WorkingDirectory=/srv/scoutanalytics
+WorkingDirectory=/srv/scout-analytics
 # flock: a second copy (e.g. a manual run with the same wrapper) refuses to start.
 ExecStart=/usr/bin/flock -n /run/lock/scout-listener.lock /opt/scoutanalytics/scoutanalytics -listen-only
 Restart=on-failure
@@ -455,7 +455,7 @@ StartLimitBurst=5
 Type=simple
 User=scout
 Group=scout
-WorkingDirectory=/srv/scoutanalytics
+WorkingDirectory=/srv/scout-analytics
 EnvironmentFile=/etc/scoutanalytics/track.env
 ExecStart=/opt/scoutanalytics/scoutanalytics -track
 Restart=on-failure
@@ -484,7 +484,7 @@ StartLimitBurst=10
 Type=simple
 User=scout
 Group=scout
-WorkingDirectory=/srv/scoutanalytics
+WorkingDirectory=/srv/scout-analytics
 # Enable ONLY once nginx (section 5) is in front: binds to this machine only and
 # wins over SCOUT_WEB_ADDR in .env. Enabled now, it would cut off http://<server IP>:8090.
 #Environment=SCOUT_WEB_ADDR=127.0.0.1:8090
@@ -638,7 +638,7 @@ the owner plans **GCP Pub/Sub** (already used by the main API):
   equivalents if the cloud choice changes. Cost at this volume is near zero
   ([Pub/Sub pricing](https://cloud.google.com/pubsub/pricing)).
 
-### 7.3 Repo move to `kfukue/scoutanalytics`
+### 7.3 Repo move to `kfukue/scout-analytics`
 
 Done in this repo (history kept); pending the owner's push and the prod
 cut-over. The checklist is in [HANDOFF.md, section 5](HANDOFF.md#5-repo-migration-done-pending-push-and-prod-cut-over).
