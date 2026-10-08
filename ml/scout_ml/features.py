@@ -32,11 +32,20 @@ def assert_no_leakage(columns) -> None:
         raise ValueError(f"forbidden columns in feature matrix: {bad}")
 
 
+def category(df: pd.DataFrame, col: str) -> pd.Series:
+    """Categorical column normalised for matching: stripped, lower case; absent/empty -> None."""
+    return text(df, col).str.lower()
+
+
 def learn_cat_levels(df: pd.DataFrame) -> dict:
-    """Category levels seen often enough in training data (stored in meta.json)."""
+    """Category levels seen often enough in `df` (stored in meta.json).
+
+    Pass the TRAINING rows of a split only: levels learned on validation or
+    test rows would let the later period shape the model. Levels are stored
+    normalised (see `category`)."""
     out = {}
     for c in CATEGORICAL:
-        counts = text(df, c).value_counts()
+        counts = category(df, c).value_counts()
         out[c] = sorted(counts[counts >= MIN_CATEGORY_COUNT].index.tolist())
     return out
 
@@ -46,12 +55,15 @@ def _ratio(a: pd.Series, b: pd.Series) -> pd.Series:
     return (a / b.where(b > 0)).replace([np.inf, -np.inf], np.nan)
 
 
-def build_features(rows, cat_levels: dict, columns=None) -> pd.DataFrame:
+def build_features(rows, cat_levels: dict, columns=None, exact_levels: bool = False) -> pd.DataFrame:
     """Raw view rows (DataFrame, dict or list of dicts) -> float feature matrix.
 
     Only whitelisted input columns are read, so unknown keys are ignored and
-    missing ones become NaN. Categoricals become integer codes into
-    `cat_levels` (unknown level -> NaN), which LightGBM treats as missing.
+    missing ones become NaN. Categoricals are matched without regard to case
+    and surrounding whitespace and become integer codes into `cat_levels`
+    (unknown level -> NaN), which LightGBM treats as missing.
+    `exact_levels=True` (serving an old meta.json with one flat set of levels
+    only) matches stripped values case-sensitively, as those models were trained.
     `columns` (serving: the list stored in meta.json) fixes the column order.
     """
     if isinstance(rows, dict):
@@ -82,9 +94,18 @@ def build_features(rows, cat_levels: dict, columns=None) -> pd.DataFrame:
     X["weekday_utc"] = when.dt.weekday.astype(float)
 
     for c in CATEGORICAL:
-        codes = {level: i for i, level in enumerate(cat_levels.get(c, []))}
-        X[c] = text(df, c).map(codes).astype(float)
+        if exact_levels:
+            # old flat meta.json: levels were learned stripped but case-sensitive, and
+            # 'Raydium' / 'raydium' may be two levels; match exactly as they were trained
+            codes = {level: i for i, level in enumerate(cat_levels.get(c, []))}
+            X[c] = text(df, c).map(codes).astype(float)
+        else:
+            codes = {str(level).strip().lower(): i for i, level in enumerate(cat_levels.get(c, []))}
+            X[c] = category(df, c).map(codes).astype(float)
 
     columns = list(columns) if columns is not None else FEATURES
     assert_no_leakage(columns)
+    for c in columns:  # e.g. a raw column an older model version still lists (prior_calls)
+        if c not in X.columns:
+            X[c] = num(df, c)
     return X[columns]
