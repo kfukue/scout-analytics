@@ -903,8 +903,9 @@ non-gate tool that fails or times out doesn't block delivery; the header says
 ### Re-scanning calls without a Perceptor report
 
 > **Do not set `SCOUT_RESCAN=on` in prod before the website's "Perceptor today" label is
-> deployed.** Until then the page has no place for the re-scan verdict (the API already
-> serves it as `perceptor_today_*`, see "API").
+> deployed.** A website older than the label has no place for the re-scan verdict (the API
+> serves it as `perceptor_today_*`, see "API"); the label is described under "Website",
+> "Perceptor today".
 
 Most first calls imported from history, and live calls whose scan failed, have no Perceptor
 report. The **rescan lane** asks Perceptor about them later, one at a time, inside the
@@ -1263,10 +1264,13 @@ other sites):
     filter and the "Calls from the last" choice. Otherwise a **"N new — refresh"** button appears above the table; it switches to
     the newest calls, page 1, and reloads.
   - **A new Perceptor verdict, or a new sAlpha report or decline**, updates that token's row
-    in place (verdict, "sA" badge, an open detail panel).
-  - Each one also shows a **notice in the bottom-right corner**: token, verdict (or "sAlpha:
-    report available" / "did not generate a report") and a GMGN link. At most 4 are kept (2
-    on a narrow screen); each goes after a minute or with its × button.
+    in place (verdict, "sA" badge, an open detail panel). So does a **new or changed
+    "Perceptor today"** (a re-scan; a `report` event with `"tool":"perceptor_today"`), but
+    quietly: no notice, no beep and no desktop alert, since re-scans are about old calls
+    (up to 100 a day) and would push the call-time notices out of the corner.
+  - Each of the others also shows a **notice in the bottom-right corner**: token, verdict
+    (or "sAlpha: report available" / "did not generate a report") and a GMGN link. At most
+    4 are kept (2 on a narrow screen); each goes after a minute or with its × button.
   - **Sound** (a checkbox next to "Updated"): a short beep for each notice, made by the browser
     (Web Audio, no sound file). **Off by default**; the choice is kept in this browser
     (`localStorage`). Browsers only play sound after a click or key press on the page.
@@ -1343,6 +1347,11 @@ other sites):
     summary, and "Open the Perceptor report" (https links only);
     "No Perceptor report" when the token was never scanned. It is the same report the
     Perceptor column shows.
+  - **Perceptor today (re-scan)**, only when the token has one: the re-scan's verdict in the
+    same outlined label as the list ("today: caution"), its date, a line saying it is a
+    re-scan made long after the call and not the verdict at call time, and "Open the re-scan
+    report" (https links only). It comes from the row (`perceptor_today_*`), not from
+    `GET /api/call`, and is redrawn with every refresh, like the performance block.
   - **sAlpha**: the text of the token's latest completed sAlpha report, as plain text with its
     line breaks, its time and "Open the sAlpha report" (https links only). **About half of
     sAlpha's replies are empty; an empty reply (or one of white space only) counts as no
@@ -1391,6 +1400,17 @@ other sites):
   sent to Perceptor, so most imported tokens show "–" and are found under "Not scanned".
   A scan that failed, timed out or was rate-limited does not count, and a report whose
   verdict could not be read counts as not scanned.
+- **Perceptor today** — a token that had no Perceptor report at call time but was re-scanned
+  later by the rescan lane (see "Re-scanning calls without a Perceptor report") shows, on a
+  line of its own in its Perceptor cell (under the dash, or under the call-time verdict when
+  there is one, and the "sA" badge), a small label:
+  "today: no red flags", "today: caution", "today: red flags", or "today: no readable
+  verdict". It is **not the verdict at call time**, so it looks different from the verdict
+  pills: smaller, outlined with a dashed line, square corners, no fill, and always with
+  "today:" in front. It links to the re-scan report (in a new tab, https only; plain text
+  otherwise), and its tooltip says "Perceptor re-scan on <date>, not the verdict at call
+  time". **The Perceptor filter and its counts ignore it**: such a token stays under "Not
+  scanned". The legend under the table has an entry for it ("today: caution").
 - Every number is **in USD and measured from the entry 60 seconds after the post** (the
   `*_late_*` columns). A call tracked in another asset (no USD source for its pair) shows
   "no USD price" in Latest %, a dash for Latest MC, Call MC and Entry $, and one dash across
@@ -1563,8 +1583,9 @@ its verdict is today's, not the one at the time of the call. Same verdict values
 as above; `perceptor_today_at` = when it ran (`completed_at`, else `requested_at`). All three
 are `null` without a completed re-scan. A re-scan never fills `perceptor_verdict`,
 `perceptor_url` or `perceptor_report_id`, never moves a row in the Perceptor filter, and is
-not shown by `GET /api/call`. A new re-scan changes the `ETag` of `/api/calls`; it sends no
-live `report` event (an open page sees it with its next list refresh, every 30 s).
+not shown by `GET /api/call`. A new re-scan changes the `ETag` of `/api/calls` and sends a
+live `report` event with `"tool":"perceptor_today"` (also when a newer re-scan has the same
+verdict); the page shows it as the "Perceptor today" label (see "Website").
 
 `has_salpha_report`, `perceptor_report_id` and `salpha_report_id` are three fields of
 a call that say which reports `GET /api/call` returns for it (per token, like the verdict):
@@ -1638,10 +1659,12 @@ data: {"call_id":812,"tool":"perceptor","horizon":"1d","row":{…}}
 
 - `call` = a token row that was not in the snapshot before (a new token; a repeat call of a
   listed token is not one). `report` = a listed token whose Perceptor verdict or report changed
-  (`tool: "perceptor"`), or that got a new sAlpha report or decline (`tool: "salpha"`); one row
-  can give both. `row` is the row exactly as `GET /api/calls?horizon=1d` returns it (so
-  `return_pct`, `peak_pct` and `drawdown_pct` are those of `horizon`, always `1d`). Rows that
-  leave the list send nothing.
+  (`tool: "perceptor"`), or that got a new sAlpha report or decline (`tool: "salpha"`), or a
+  new or changed Perceptor re-scan ("Perceptor today", `tool: "perceptor_today"`: a newer
+  re-scan or another verdict; never the call-time verdict); one row can give several. `row`
+  is the row exactly as `GET /api/calls?horizon=1d` returns it (so `return_pct`, `peak_pct`
+  and `drawdown_pct` are those of `horizon`, always `1d`). Rows that leave the list send
+  nothing.
 - `reload` = ask for the list again instead: `{"calls":25,"reports":3}` when one read found
   more than 20 changes, `{"missed":true}` when events after the browser's `Last-Event-ID`
   can no longer be sent (see below).

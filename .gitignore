@@ -17,3 +17,6 @@ scoutanalytics_data/
 ml/.venv/
 __pycache__/
 *.pem
+
+# Model reports copied from the server (not committed)
+/ml-results/

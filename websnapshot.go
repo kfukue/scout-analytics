@@ -182,6 +182,28 @@ type webSnapshot struct {
 	percID   []int32
 	salphaID []int32
 	reports  map[int]*webReport
+	// todayVerd[i] and todayAt[i]: row i's "Perceptor today" (its latest
+	// re-scan): the verdict as a webTodayVerdict code (0 = none) and when it
+	// ran (Unix nanoseconds, 0 = none). Only webSnapshotEvents reads them.
+	todayVerd []uint8
+	todayAt   []int64
+}
+
+// webTodayVerdict codes a "Perceptor today" verdict for webSnapshot.todayVerd:
+// 0 = no re-scan, then clean, caution, red_flags, and anything else.
+func webTodayVerdict(v *string) uint8 {
+	if v == nil {
+		return 0
+	}
+	switch *v {
+	case "clean":
+		return 1
+	case "caution":
+		return 2
+	case "red_flags":
+		return 3
+	}
+	return 4
 }
 
 // webReportMaxBytes: the most of one text (report, summary, label) the
@@ -546,6 +568,8 @@ func newWebSnapshot(rows []ScoutWebRow, updatePosts int, prev *webSnapshot, cfg 
 	s.searchAt = make([]uint32, n+1)
 	s.percID = make([]int32, n)
 	s.salphaID = make([]int32, n)
+	s.todayVerd = make([]uint8, n)
+	s.todayAt = make([]int64, n)
 	s.rowJSON = make([]byte, 0, n*1030) // about 955 bytes a row
 	s.search = make([]byte, 0, n*72)
 	var one bytes.Buffer // one encoded row
@@ -572,6 +596,10 @@ func newWebSnapshot(rows []ScoutWebRow, updatePosts int, prev *webSnapshot, cfg 
 		}
 		if r.SAlphaID != nil {
 			s.salphaID[i] = int32(*r.SAlphaID)
+		}
+		s.todayVerd[i] = webTodayVerdict(r.PerceptorTodayVerd)
+		if r.PerceptorTodayAt != nil {
+			s.todayAt[i] = r.PerceptorTodayAt.UnixNano()
 		}
 
 		one.Reset()

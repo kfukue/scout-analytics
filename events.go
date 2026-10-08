@@ -129,6 +129,10 @@ const webEventsMaxPerRefresh = 20
 // another window.
 const webEventHorizon = "1d"
 
+// webEventPerceptorToday: the tool of a "report" event for a new "Perceptor
+// today" (a re-scan by the rescan lane), never the call-time verdict.
+const webEventPerceptorToday = "perceptor_today"
+
 // webEventOut is one event to publish: its SSE event name and its data (JSON
 // on one line).
 type webEventOut struct {
@@ -138,9 +142,11 @@ type webEventOut struct {
 
 // webSnapshotEvents compares two snapshots and returns the events for what
 // changed: a "call" for each new row, a "report" for each row whose Perceptor
-// verdict or report, or sAlpha report (or decline), changed. Rows that went
-// away send nothing. More than webEventsMaxPerRefresh events become one
-// "reload". Both snapshots are in place already and are only read.
+// verdict or report, or sAlpha report (or decline), changed, and a "report"
+// with tool perceptor_today for each row with a new or changed re-scan
+// ("Perceptor today"). Rows that went away send nothing. More than
+// webEventsMaxPerRefresh events become one "reload". Both snapshots are in
+// place already and are only read.
 func webSnapshotEvents(prev, next *webSnapshot) []webEventOut {
 	if prev == nil || next == nil || prev.version == next.version {
 		return nil
@@ -165,6 +171,9 @@ func webSnapshotEvents(prev, next *webSnapshot) []webEventOut {
 			}
 			if next.salphaID[j] != 0 && next.salphaID[j] != prev.salphaID[i] {
 				changes = append(changes, change{pos: int32(j), tool: webToolSAlpha})
+			}
+			if next.todayVerd[j] != 0 && (next.todayVerd[j] != prev.todayVerd[i] || next.todayAt[j] != prev.todayAt[i]) {
+				changes = append(changes, change{pos: int32(j), tool: webEventPerceptorToday})
 			}
 			i++
 			j++
