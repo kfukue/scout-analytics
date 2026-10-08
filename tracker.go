@@ -112,10 +112,16 @@ func (r *trackRun) cycle(ctx context.Context, batch int) (more bool) {
 // the node, and they share one rate limit. The GeckoTerminal source stays one
 // at a time (its API allowance is small).
 func (s *scanner) trackWorkers() int {
-	if s.pc.Source != "onchain" {
+	return s.pc.trackWorkers()
+}
+
+// trackWorkers is the tracker's worker count for this price config; see
+// scanner.trackWorkers. The database pool is sized from it too.
+func (pc priceConfig) trackWorkers() int {
+	if pc.Source != "onchain" {
 		return 1
 	}
-	return max(s.pc.Workers, 1)
+	return max(pc.Workers, 1)
 }
 
 // trackRun is the tracker's pool of workers, and the bookkeeping that gives

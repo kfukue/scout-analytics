@@ -515,7 +515,7 @@ Only use the feature columns as model inputs; everything about the future is an 
 | `SCOUT_PONS_HOOK` | `0xE5e70264…6Be044` | hook of graduated Pons v4 pools (`off` = any hook) |
 | `SCOUT_RUG_LIQ_USD` | `500` | rugged when the USD value of the pool's **quote side** (ETH/WETH, USDG, stock token …) is below this; settable in `.env`. `0` = USD check off, but an empty pool still counts. Negative values are rejected |
 | `SCOUT_TRACK_INTERVAL` | `1m` | how often due checks are processed |
-| `SCOUT_TRACK_WORKERS` | `8` | calls tracked at the same time (on-chain source); a free worker takes the next due call at once (see "What the tracker logs") |
+| `SCOUT_TRACK_WORKERS` | `8` | calls tracked at the same time (on-chain source); a free worker takes the next due call at once (see "What the tracker logs"); also sizes the database pool (the tracker's worker count + 4, between 4 and 32; see "Recording to a SQL database (Postgres)") |
 | `SCOUT_RPC_PARALLEL` | `8` | block ranges of one scan fetched from the node at the same time |
 | `SCOUT_RPC_MAX_INFLIGHT` | `64` | most requests in flight to the node at once (workers × ranges, capped here) |
 | `SCOUT_RPC_LOG_CACHE` | `300000` | swap logs kept in memory so repeat calls of a token are not scanned twice (`0` = off) |
@@ -924,19 +924,26 @@ stored in the DB for reference; it doesn't affect delivery unless you make it a 
 ## Recording to a SQL database (Postgres)
 
 Every call, report and delivery is recorded **in the same database your API uses**. The
-scanner calls `database.SetupDatabase()` (in `internal/database`, copied unchanged from
-the API repo), so it uses the same settings from
+scanner calls `database.SetupDatabase()` (in `internal/database`, copied from the API repo;
+the only addition is the pool size, see below), so it uses the same settings from
 `.env`: `DB_USER`, `DB_PASS`, `DB_NAME_DEV`, `APP_ENV`, and `GETH_HOST_PATH` (LOCAL_GETH) or
 `HOST_SECRET_PATH` + `SSL_CERT_FILE_PATH` (Cloud SQL). Nothing extra to configure.
 
 The startup log confirms where it writes, e.g.
-`recording to SQL via database.SetupDatabase (DB_USER, APP_ENV=…) → database "assetdb", schema "public", user "…"`.
+`recording to SQL via database.SetupDatabase (DB_USER, APP_ENV=…) → database "assetdb", schema "public", user "…", pool of at most 16 connections (default for 12 tracker worker(s))`.
 The tables are created in that database's `public` schema on first start.
+
+Pool size: each process opens at most the tracker's worker count (`SCOUT_TRACK_WORKERS` with
+the on-chain source, 1 with GeckoTerminal) + 4 connections, between 4 and 32 (on-chain: 12
+with the default 8 workers, 16 with 12; GeckoTerminal: 5). Connections are opened only when
+needed, so the listener and the website use far fewer than that. With `SCOUT_DATABASE_URL`,
+`pool_max_conns` in the DSN (e.g. `…?pool_max_conns=10` or `… pool_max_conns=10`) overrides
+it. The website's live-update `LISTEN` uses one more connection outside the pool.
 
 ```
 SCOUT_DB=repo                # default: the repo's database package
 # SCOUT_DB=off               # run without recording
-# SCOUT_DATABASE_URL="host=… port=5432 user=… password=… dbname=… sslmode=disable"   # optional override
+# SCOUT_DATABASE_URL="host=… port=5432 user=… password=… dbname=… sslmode=disable"   # optional override; add pool_max_conns=N to set the pool size
 SCOUT_DB_AUTO_MIGRATE=true   # creates/upgrades the tables on startup; false = run scoutanalytics.sql yourself
 ```
 
@@ -1108,7 +1115,8 @@ read on demand (see below).
   and the page leaves the table as it is. A refresh that finds the same data in the database
   keeps the same `ETag`, so an idle site costs a few hundred bytes per open tab per refresh.
   The `ETag` of `/api/summary` follows the counts only, so it stays "not modified" while rows
-  change but the counts do not.
+  change but the counts do not. With `days` (the age filter) the `ETag` of `/api/calls` also
+  changes when a call drops out of the window as time goes on, even if the data did not.
 - JSON and the page's text files are sent gzip-compressed to clients that ask for it
   (`Accept-Encoding: gzip`; every browser does) when the answer is 1 KB or larger — a page of
   50 rows goes from about 30 KB to about 5 KB.
@@ -1157,8 +1165,8 @@ other sites):
   is not). Nothing to set up; the 30-second refresh keeps running in any case, so a page
   without the stream (refused, blocked by a proxy, an old browser) is at most 30 seconds behind.
   - **A new call** goes on top of the table, briefly highlighted, when the table shows the
-    newest calls first (Date ▼) on page 1 and the token matches the search and the Perceptor
-    filter. Otherwise a **"N new — refresh"** button appears above the table; it switches to
+    newest calls first (Date ▼) on page 1 and the token matches the search, the Perceptor
+    filter and the "Calls from the last" choice. Otherwise a **"N new — refresh"** button appears above the table; it switches to
     the newest calls, page 1, and reloads.
   - **A new Perceptor verdict, or a new sAlpha report or decline**, updates that token's row
     in place (verdict, "sA" badge, an open detail panel).
@@ -1186,10 +1194,32 @@ other sites):
     all its tabs; every open tab of this page holds one for its stream. With many tabs of the
     page open in one browser, the other requests of those tabs can wait. HTTPS with HTTP/2
     (a reverse proxy) does not have this limit.
-- **Calls** — the columns, in this order:
-  Date (links to the post) | Token | Symbol (both link to GMGN) | Calls (`×N` when the token was
-  called N > 1 times, empty otherwise; hover for "Called N times, last on …") | Perceptor |
-  Status | Entry $ | Call MC | Latest MC | Latest % | Peak % | Worst drop % | 1h | 1d | 3d | 7d | 30d.
+- **Reading the list.** Each row starts with what matters now: the token, **Latest %** (the
+  return at the most recent price, as a badge coloured by size: rugged/−100%, down by half or
+  more, down, flat, up to 2×, 2×–11×, 11× and more; every value but a flat `0.0%` carries its
+  sign, so colour is never the only cue) and, under it, how long ago that price was read
+  ("12m ago", "2d ago"; "just now" under a minute), counted to the time the website last read
+  the database. **stale** = older than twice the tracker's prod schedule (30 min for calls
+  under 30 days old, 2 h for older or rugged ones, which prod refreshes every hour with
+  `SCOUT_LATEST_REFRESH_OLD=1h`; a drained pool is re-stamped at that same pace; fixed in
+  `app.js` as `STALE_OLD_MS`, not read from `SCOUT_LATEST_REFRESH_*`, so with the 24 h default
+  older calls show stale after 2 h), so the tracker may be stopped or behind; **quiet** = no trade in the 7 days before the reading. The header row and
+  the Token column stay in view while scrolling. ▸ (or a click on the row) opens the call's performance (entry and latest price,
+  when the price was read and the last trade, the call's age, Call MC → Latest MC, peak and
+  worst drop for the chosen window) and its Perceptor/sAlpha reports.
+- **Calls from the last 1d / 7d / 30d / All.** Shows only calls posted within that many days
+  (× 24 hours) of the snapshot time. It goes by the date of the row's (first) call: a token
+  first called 60 days ago and again yesterday is not under 7d. Import progress is not
+  filtered. Kept in the address (`?days=7`; the page takes only 1, 7
+  and 30 from it, anything else shows All). The API takes `GET /api/calls?days=N` (whole days,
+  1–3650; anything else is a 400; leave it out for all); the answer carries `"days"` (0 = all),
+  and the total counts only the matching calls ("N calls from the last 7 days" under the
+  table).
+- **Calls** — 16 columns, in this order:
+  Token (the name links to GMGN; the symbol follows in grey when it differs from the name) |
+  Latest % | Latest MC | Call MC | Date (links to the post) | Perceptor | Status | Calls (`×N`
+  when the token was called N > 1 times, empty otherwise; hover for "Called N times, last on
+  …") | Entry $ | Peak % | Worst drop % | 1h | 1d | 3d | 7d | 30d.
   - **1h, 1d, 3d, 7d, 30d** are the return over each window (the number the old single
     "Return %" column showed for that window), all five side by side. A dash until the window
     has passed and been recorded.
@@ -1200,13 +1230,18 @@ other sites):
     any of 1h … 30d; click again to reverse. ▲/▼ shows the column and direction (also as
     `aria-sort`). Rows without a value are always last; ties by call id. Worst drop % is not
     sortable.
-  - Search by token name, symbol or address. 50 per page. On a narrow screen the table scrolls
-    sideways inside its box; the page itself does not.
-- **Row detail (the token's reports)** — the **▸** button before the date of every row opens a
-  panel under the row with the token's reports; a click anywhere else on the row does the same,
+  - Search by token name, symbol or address. 50 per page. The table scrolls inside its box: sideways
+    on a narrow screen (the page itself does not), and down when it is taller than the window.
+- **Row detail (performance and the token's reports)** — the **▸** button in the Token cell of
+  every row opens a panel under the row; a click anywhere else on the row does the same,
   except on a link (the post, GMGN, the Perceptor report) or while selecting text. The button
   is a real button: Tab to it and press Enter or Space; it says whether the row is open
   (`aria-expanded`). The panel shows:
+  - **Performance**, drawn from the row at once (the reports below load separately): when it
+    was called (and how long ago), Latest % as a badge, entry price (60 s after the post),
+    latest price, when that price was read (how long ago, "stale"/"quiet" as in the list, and
+    how old the call was then), the last trade, Call MC → Latest MC, and Peak % and Worst drop
+    % for the window chosen. A call not priced in USD shows only that it has no dollar price.
   - **Perceptor**: the verdict once (the report's own verdict line, e.g. "No red flags found",
     or the words "no red flags" / "caution" / "red flags" when it has none) and its time, the
     summary, and "Open the Perceptor report" (https links only);
@@ -1226,8 +1261,9 @@ other sites):
   - A text longer than 32 KB is cut there and marked "Cut at 32 KB."; a long one scrolls
     inside the panel. The panel is never wider than the visible part of the table box, also on
     a phone while the table is scrolled sideways.
-  The panel is loaded when it is opened ("Loading…" until then; an error notice if it cannot
-  be loaded, tried again with the next refresh). Open rows **stay open**, with their content,
+  The reports are loaded when the panel is opened ("Loading…" until then; an error notice if
+  they cannot be loaded, tried again with the next refresh); the performance block is redrawn
+  from the row with every refresh. Open rows **stay open**, with their content,
   through the 30-second refresh, **Refresh now**, sorting, the window selector, searching and
   paging (a row that is on another page is open again when you come back to it). When a newer
   report arrives the panel is updated with the next refresh. If the row's call is no longer in
@@ -1260,20 +1296,23 @@ other sites):
   A scan that failed, timed out or was rate-limited does not count, and a report whose
   verdict could not be read counts as not scanned.
 - Every number is **in USD and measured from the entry 60 seconds after the post** (the
-  `*_late_*` columns). A call tracked in another asset (no USD source for its pair) shows a
-  dash for Entry $, Call MC and Latest MC and one "no USD price" cell across Latest % … 30d.
+  `*_late_*` columns). A call tracked in another asset (no USD source for its pair) shows
+  "no USD price" in Latest %, a dash for Latest MC, Call MC and Entry $, and one dash across
+  Peak % … 30d.
   Sorting by anything but Date lists the USD-priced calls only.
-- **Latest %** (the column after "Latest MC") is the return at the most recent price,
-  from the same entry, followed by how old the call was when that price was read:
-  `+35.2% · 60d` (`45m` under an hour, `30h` under two days, otherwise days). It comes from
-  the tracker's latest-price pass (about every 15 minutes for calls under 30 days old, once
-  a day for older ones) and does not change with the window selector. `· quiet` is added
-  when the last trade is more than 7 days older than the reading (the price is then that of
-  an old trade); the tooltip gives both times. A dash means no latest price has been read yet.
-- **Call MC** (after "Entry $") is the market cap given in the call post: its "called at"
+- **Latest %** (the column after "Token") is the return at the most recent price, from the
+  same entry, as a coloured badge (see "Reading the list"), with how long ago that price was
+  read under it: `+35.2%` / `12m ago` (`45m` under an hour, `30h` under two days, otherwise days), plus
+  `· stale` and `· quiet` when they apply (`12m ago · quiet`). It comes from the tracker's
+  latest-price pass (about every 15 minutes for calls under 30 days old, once a day for older
+  ones) and does not change with the window selector. Quiet = the last trade is more than 7
+  days older than the reading (the price is then that of an old trade). The tooltip gives the
+  time of the reading, of the last trade and how old the call was then. A dash means no
+  latest price has been read yet.
+- **Call MC** (after "Latest MC") is the market cap given in the call post: its "called at"
   figure, or its "📈 Mcap" line when the post has no usable "called at" (missing, zero or
   below, or not a finite number) (`scout_call_metrics`).
-  **Latest MC** (after "Call MC") is an **estimate**, since the latest market cap is not
+  **Latest MC** (after "Latest %") is an **estimate**, since the latest market cap is not
   stored: the post's market cap (the Mcap line first, else "called at", by the same rule) ×
   the latest price ÷ the price at the post. It assumes the token supply has not changed. Both are written
   compactly (`$850`, `$45.2k`, `$1.3M`, `$2.1B`, and from $1 trillion on in powers of ten:
@@ -1328,7 +1367,7 @@ not `usd`. `total_calls` = every real call in `scout_calls`, repeats included; `
 in `scout_calls` (not calls: they are in none of the other numbers and are not listed).
 
 `GET /api/calls` — one page of first calls, one row per token (from the snapshot);
-`q`, `sort`, `usd_only`, `verdict`, paging and `total` all apply to that list, so a repeat call is never
+`q`, `sort`, `usd_only`, `verdict`, `days`, paging and `total` all apply to that list, so a repeat call is never
 returned and cannot be found by its own name or symbol:
 
 | Parameter | Values | Default | |
@@ -1339,6 +1378,7 @@ returned and cannot be found by its own name or symbol:
 | `horizon` | `1h`, `1d`, `3d`, `7d`, `30d` | `1d` | which window `return_pct` / `peak_pct` / `drawdown_pct` (and `sort=return` / `peak`) are for; the page sets it with its Peak / worst drop selector |
 | `usd_only` | `1`, `0` | `1` for every `sort` but `date`, else `0` | `1` = only tokens whose first call has `price_unit = usd` |
 | `verdict` | `clean`, `caution`, `red_flags`, `not_scanned`, or several separated by commas (`verdict=clean,caution`) | *(none = all)* | the token's Perceptor verdict (see below); with several, a token with any of them. The parameter may also be repeated (`verdict=clean&verdict=caution`); all values add up, repeats and empty items are ignored, so `verdict=` = all, and so do all four. `clean` = no red flags found; `not_scanned` = no completed Perceptor report, or one whose verdict is `unknown`. The order does not matter: `caution,clean` is the same question, with the same `ETag`, as `clean,caution` |
+| `days` | 1 – 3650 (whole days) | *(none = all)* | only tokens whose first call was posted within the last `days` × 24 hours, counted back from the snapshot time (`snapshot_at`), not the time of the request; `days=0` is a 400 (leave it out for all) |
 | `page` | 1 … | `1` | |
 | `per` | 1 – 200 | `50` | |
 
@@ -1346,7 +1386,7 @@ Any other value or parameter, or any parameter but `verdict` given twice → HTT
 
 ```json
 {"total": 3105, "page": 1, "per": 50, "horizon": "1d", "sort": "date", "dir": "desc", "usd_only": false, "verdict": "", "verdicts": [],
- "snapshot_at": "2026-10-02T14:30:00.123Z",
+ "days": 0, "snapshot_at": "2026-10-02T14:30:00.123Z",
  "calls": [{"call_id": 812, "message_id": 10002, "message_date": "2026-10-01T14:30:00Z",
    "post_url": "https://t.me/scoutrobinhood/10002",
    "contract_address": "0x…", "token_name": "Malfoid", "token_symbol": "MALFOID",
@@ -1407,6 +1447,7 @@ finite, or when the result is not finite. `latest_mcap_usd` is also `null` whene
 `/api/summary`). `verdict` in the response repeats the filter that was applied, in the order `clean`, `caution`,
 `red_flags`, `not_scanned`, separated by commas (`"clean,caution"`; a single value as asked,
 `"clean"`; `""` when none or all four), and `verdicts` is the same list as an array (`[]` = all).
+`days` repeats the age filter (`0` = all); `total` then counts only the calls within it.
 `perceptor_verdict` and `perceptor_url` are **per token**: the verdict (`clean`, `caution`,
 `red_flags` or `unknown`) and report link of the latest completed Perceptor investigation
 (`scout_investigations`, tool `perceptor`, `status = completed`, newest `requested_at`) with
