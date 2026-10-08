@@ -16,3 +16,4 @@ scoutanalytics_data/
 # Python
 ml/.venv/
 __pycache__/
+*.pem
