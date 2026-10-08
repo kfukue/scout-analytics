@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"maps"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -192,12 +193,25 @@ func TestWebSnapshotEvents(t *testing.T) {
 			return rows
 		}
 	}
+	setToday := func(pos int, verdict string, at time.Time) edit {
+		return func(rows []ScoutWebRow, _ map[int]*ScoutWebReport) []ScoutWebRow {
+			rows[pos].PerceptorTodayVerd, rows[pos].PerceptorTodayURL, rows[pos].PerceptorTodayAt = sp(verdict), sp("https://example.com/today"), &at
+			return rows
+		}
+	}
+	todayAt := time.Date(2026, 10, 9, 12, 0, 0, 0, time.UTC)
 	for _, tc := range []struct {
 		name  string
 		edits []edit
 		want  []gotEvent
 	}{
 		{"nothing changed", nil, nil},
+		{"a first Perceptor today", []edit{setToday(plain, "caution", todayAt)},
+			[]gotEvent{{"report", base[plain].CallID, "perceptor_today"}}},
+		{"a Perceptor today next to a call-time report", []edit{setToday(both, "unknown", todayAt)},
+			[]gotEvent{{"report", base[both].CallID, "perceptor_today"}}},
+		{"a call-time verdict and a Perceptor today at once", []edit{setPerceptor(plain, "red_flags", 5000001), setToday(plain, "caution", todayAt)},
+			[]gotEvent{{"report", base[plain].CallID, "perceptor"}, {"report", base[plain].CallID, "perceptor_today"}}},
 		{"a new row", []edit{addRow(newID)}, []gotEvent{{"call", newID, ""}}},
 		{"a first Perceptor report", []edit{setPerceptor(plain, "red_flags", 5000001)},
 			[]gotEvent{{"report", base[plain].CallID, "perceptor"}}},
@@ -242,6 +256,38 @@ func TestWebSnapshotEvents(t *testing.T) {
 			}
 		})
 	}
+	// A row that already has a "Perceptor today": a newer re-scan sends an
+	// event (also with the same verdict), the same one or none does not.
+	for _, tc := range []struct {
+		name string
+		edit edit
+		want []gotEvent
+	}{
+		{"the same re-scan", setToday(plain, "clean", todayAt), nil},
+		{"the same re-scan, another row changed", func(rows []ScoutWebRow, reports map[int]*ScoutWebReport) []ScoutWebRow {
+			return setSAlpha(both, 6000004, "text")(rows, reports)
+		}, []gotEvent{{"report", base[both].CallID, "salpha"}}},
+		{"a newer re-scan, same verdict", setToday(plain, "clean", todayAt.Add(time.Hour)),
+			[]gotEvent{{"report", base[plain].CallID, "perceptor_today"}}},
+		{"another verdict", setToday(plain, "red_flags", todayAt),
+			[]gotEvent{{"report", base[plain].CallID, "perceptor_today"}}},
+		{"the re-scan went away", func(rows []ScoutWebRow, _ map[int]*ScoutWebReport) []ScoutWebRow {
+			rows[plain].PerceptorTodayVerd, rows[plain].PerceptorTodayURL, rows[plain].PerceptorTodayAt = nil, nil, nil
+			return rows
+		}, nil},
+	} {
+		t.Run("today: "+tc.name, func(t *testing.T) {
+			prevRows := setToday(plain, "clean", todayAt)(cloneWebRows(base), nil)
+			prev := snapWithReports(t, prevRows, baseReports)
+			reports := maps.Clone(baseReports)
+			rows := tc.edit(setToday(plain, "clean", todayAt)(cloneWebRows(base), nil), reports)
+			next := snapWithReports(t, rows, reports)
+			got := decodeEvents(t, webSnapshotEvents(prev, next))
+			if fmt.Sprint(got) != fmt.Sprint(tc.want) {
+				t.Fatalf("events %v, want %v (previous: clean at %s)", got, tc.want, todayAt)
+			}
+		})
+	}
 	t.Run("the first snapshot", func(t *testing.T) {
 		if evs := webSnapshotEvents(nil, snapWithReports(t, cloneWebRows(base), baseReports)); evs != nil {
 			t.Fatalf("got %d events for the first snapshot, want none", len(evs))
@@ -256,6 +302,17 @@ func TestWebSnapshotEvents(t *testing.T) {
 		want := fmt.Sprintf(`{"calls":%d,"reports":0}`, webEventsMaxPerRefresh+1)
 		if len(evs) != 1 || string(evs[0].data) != want {
 			t.Fatalf("got %v, want one reload with %s", evs, want)
+		}
+	})
+	t.Run("reload counts, Perceptor today only", func(t *testing.T) {
+		rows := cloneWebRows(base)
+		for k := 0; k <= webEventsMaxPerRefresh; k++ {
+			rows = setToday(k, "caution", todayAt)(rows, nil)
+		}
+		evs := webSnapshotEvents(snapWithReports(t, cloneWebRows(base), baseReports), snapWithReports(t, rows, baseReports))
+		want := fmt.Sprintf(`{"calls":0,"reports":%d}`, webEventsMaxPerRefresh+1)
+		if len(evs) != 1 || evs[0].kind != "reload" || string(evs[0].data) != want {
+			t.Fatalf("got %v after %d re-scans, want one reload with %s", evs, webEventsMaxPerRefresh+1, want)
 		}
 	})
 }
