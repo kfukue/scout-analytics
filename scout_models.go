@@ -85,6 +85,27 @@ type ScoutCall struct {
 // TableName returns the table name for this model.
 func (ScoutCall) TableName() string { return "scout_calls" }
 
+// ScoutCallPostCA is the (post, CA) key of a scout_calls row.
+type ScoutCallPostCA struct {
+	MessageID       int    `json:"message_id"`
+	ContractAddress string `json:"contract_address"`
+}
+
+// ScoutCallToRequeue is a scout_calls row left queued (or dropped because the
+// job queue was full) with no completed investigation: a restarted listener
+// puts it back in the queue.
+type ScoutCallToRequeue struct {
+	ID              int       `json:"id"`
+	MessageID       int       `json:"message_id"`
+	MessageDate     time.Time `json:"message_date"`
+	MessageText     string    `json:"message_text"`
+	ContractAddress string    `json:"contract_address"`
+	Status          string    `json:"status"`
+	// CAInvestigated: another call of the same token has a completed
+	// investigation, so this one is a duplicate rather than a scan to redo.
+	CAInvestigated bool `json:"ca_investigated"`
+}
+
 // ScoutInvestigation is one tool's request + report for one CA.
 type ScoutInvestigation struct {
 	ID              *int            `json:"id"`               //1
@@ -377,15 +398,16 @@ type ScoutWebReport struct {
 	URL     *string
 }
 
-// ScoutWebCallsFilter selects a page of the call list (first calls only). Sort, Dir, Horizon and Verdict
-// must be values of the fixed lists below (parseWebCallsQuery checks them; the snapshot rejects anything else).
+// ScoutWebCallsFilter selects a page of the call list (first calls only). Sort, Dir and Horizon must be
+// values of the fixed lists below, and Verdict a comma list of the names below (parseWebCallsQuery checks
+// them; the snapshot rejects anything else).
 type ScoutWebCallsFilter struct {
 	Q       string // substring of token name, symbol or contract address ("" = all)
 	Sort    string // date | return | peak | latest | call_mc | latest_mc | return_1h … return_30d
 	Dir     string // desc | asc
 	Horizon string // 1h | 1d | 3d | 7d | 30d
 	USDOnly bool   // only calls priced in USD
-	Verdict string // "" = all | clean | caution | red_flags | not_scanned (no completed Perceptor report, or unknown)
+	Verdict string // normalised comma list in the order clean,caution,red_flags,not_scanned, e.g. "clean,caution" ("" = all: none or all four given); not_scanned = no completed Perceptor report, or unknown
 	Page    int    // 1-based
 	Per     int    // rows per page
 }

@@ -280,6 +280,79 @@ func (st *ScoutStore) SelectScoutCalls(ctx context.Context, contractAddress stri
 	return out, rows.Err()
 }
 
+// MaxScoutCallMessageID returns the newest post id recorded for a channel;
+// ok is false when the channel has no rows. The listener resumes from it.
+func (st *ScoutStore) MaxScoutCallMessageID(ctx context.Context, channelID int64) (id int, ok bool, err error) {
+	var newest *int
+	if err := st.Pool.QueryRow(ctx, `SELECT MAX(message_id) FROM scout_calls WHERE channel_id = $1`, channelID).Scan(&newest); err != nil {
+		return 0, false, fmt.Errorf("reading the newest post id of channel %d: %w", channelID, err)
+	}
+	if newest == nil {
+		return 0, false, nil
+	}
+	return *newest, true, nil
+}
+
+// SelectScoutCallPostCAs returns the (post, CA) pairs recorded for a channel
+// with a post id above afterID, so a restarted listener does not handle them again.
+func (st *ScoutStore) SelectScoutCallPostCAs(ctx context.Context, channelID int64, afterID int) ([]ScoutCallPostCA, error) {
+	rows, err := st.Pool.Query(ctx, `SELECT message_id, contract_address FROM scout_calls
+		WHERE channel_id = $1 AND message_id > $2 ORDER BY message_id, id`, channelID, afterID)
+	if err != nil {
+		return nil, fmt.Errorf("reading posts of channel %d after %d: %w", channelID, afterID, err)
+	}
+	defer rows.Close()
+	var out []ScoutCallPostCA
+	for rows.Next() {
+		var p ScoutCallPostCA
+		if err := rows.Scan(&p.MessageID, &p.ContractAddress); err != nil {
+			return nil, fmt.Errorf("scanning a post of channel %d: %w", channelID, err)
+		}
+		out = append(out, p)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("reading posts of channel %d after %d: %w", channelID, afterID, err)
+	}
+	return out, nil
+}
+
+// SelectScoutCallsToRequeue returns a channel's calls with status queued or
+// dropped (the job queue was full) that have no completed investigation and
+// were posted at or after since, oldest first. A restarted listener queues
+// them again (see requeue in catchup.go). older is the number of such calls
+// posted before since: they are left as they are (fixed by hand if needed).
+func (st *ScoutStore) SelectScoutCallsToRequeue(ctx context.Context, channelID int64, since time.Time) (calls []ScoutCallToRequeue, older int, err error) {
+	// the same predicates in both queries; only the date test differs
+	const stuck = `c.channel_id = $1 AND c.status IN ($2, $3)
+		  AND NOT EXISTS (SELECT 1 FROM scout_investigations i WHERE i.call_id = c.id AND i.status = $4)`
+	rows, err := st.Pool.Query(ctx, `SELECT c.id, c.message_id, c.message_date, c.message_text, c.contract_address, c.status,
+			EXISTS (SELECT 1 FROM scout_investigations o
+				WHERE o.status = $4 AND (o.contract_address = c.contract_address
+					OR (c.contract_address LIKE '0x%' AND lower(o.contract_address) = lower(c.contract_address))))
+		FROM scout_calls c
+		WHERE `+stuck+` AND c.message_date >= $5
+		ORDER BY c.message_id, c.id`, channelID, CallStatusQueued, CallStatusDropped, investigationCompleted, since)
+	if err != nil {
+		return nil, 0, fmt.Errorf("reading the calls of channel %d to queue again: %w", channelID, err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var c ScoutCallToRequeue
+		if err := rows.Scan(&c.ID, &c.MessageID, &c.MessageDate, &c.MessageText, &c.ContractAddress, &c.Status, &c.CAInvestigated); err != nil {
+			return nil, 0, fmt.Errorf("scanning a call of channel %d to queue again: %w", channelID, err)
+		}
+		calls = append(calls, c)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, 0, fmt.Errorf("reading the calls of channel %d to queue again: %w", channelID, err)
+	}
+	if err := st.Pool.QueryRow(ctx, `SELECT count(*) FROM scout_calls c WHERE `+stuck+` AND c.message_date < $5`,
+		channelID, CallStatusQueued, CallStatusDropped, investigationCompleted, since).Scan(&older); err != nil {
+		return nil, 0, fmt.Errorf("counting the older stuck calls of channel %d: %w", channelID, err)
+	}
+	return calls, older, nil
+}
+
 // ---------------------------------------------------------------------------
 // scout_investigation_tools
 // ---------------------------------------------------------------------------

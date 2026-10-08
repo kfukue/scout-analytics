@@ -13,6 +13,8 @@ import (
 	"math/rand"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"reflect"
 	"slices"
 	"sort"
 	"strings"
@@ -236,7 +238,7 @@ func referencePage(rows []ScoutWebRow, f ScoutWebCallsFilter) (ids []int, total 
 		if r.PerceptorVerd != nil && *r.PerceptorVerd != levelUnknown {
 			verdict = *r.PerceptorVerd
 		}
-		if f.Verdict != "" && f.Verdict != verdict {
+		if f.Verdict != "" && !slices.Contains(strings.Split(f.Verdict, ","), verdict) {
 			continue
 		}
 		match = append(match, r)
@@ -361,7 +363,8 @@ func TestWebSnapshotPageMatchesReference(t *testing.T) {
 			for _, dir := range []string{"desc", "asc"} {
 				for _, hz := range ScoutWebHorizons {
 					for _, usdOnly := range []bool{false, true} {
-						for _, verdict := range []string{"", "clean", "caution", "red_flags", "not_scanned"} {
+						for _, verdict := range []string{"", "clean", "caution", "red_flags", "not_scanned",
+							"clean,caution", "not_scanned,red_flags,caution", "red_flags,not_scanned"} {
 							for _, q := range []string{"", "pe", "PEPE c", "0x", "t1", "so1111", "nothing matches"} {
 								for _, pg := range [][2]int{{1, 50}, {2, 50}, {3, 7}, {1, 200}, {1000000, 200}, {1, 1}} {
 									f := ScoutWebCallsFilter{Q: q, Sort: sortBy, Dir: dir, Horizon: hz, USDOnly: usdOnly, Verdict: verdict, Page: pg[0], Per: pg[1]}
@@ -378,7 +381,7 @@ func TestWebSnapshotPageMatchesReference(t *testing.T) {
 				}
 			}
 		}
-		if checked != 11*2*5*2*5*7*6 {
+		if checked != 11*2*5*2*8*7*6 {
 			t.Fatalf("checked %d combinations", checked)
 		}
 		// the market caps sent are the ones worked out the obvious way
@@ -982,6 +985,8 @@ var benchWebQueries = []struct{ name, query string }{
 	{"q", "q=pe"},
 	{"verdict", "verdict=clean"},
 	{"q_verdict_peak", "q=pe&verdict=clean&sort=peak"},
+	{"verdicts", "verdict=clean,caution"},
+	{"q_verdicts_peak", "q=pe&verdict=caution,clean&sort=peak"},
 	{"asc_30d_usd", "sort=return&dir=asc&horizon=30d"},
 	{"q_no_match", "q=zzzzzz"},
 	{"last_page", "page=240"},
@@ -1499,5 +1504,101 @@ func TestWebCallEndpoint(t *testing.T) {
 	}
 	if rec := getWeb(ws, fmt.Sprintf("/api/call?id=%d", rows[0].CallID)); rec.Code != 404 {
 		t.Fatalf("a row that has gone: %d", rec.Code)
+	}
+}
+
+// TestParseWebVerdicts: the verdict parameter of /api/calls as a list
+// separated by commas, repeated, or both; written back in one order.
+func TestParseWebVerdicts(t *testing.T) {
+	for _, tc := range []struct {
+		query string
+		want  string // the filter's Verdict; "!" = an error
+	}{
+		{"", ""},
+		{"verdict=", ""},
+		{"verdict=,", ""},
+		{"verdict=clean", "clean"},
+		{"verdict=not_scanned", "not_scanned"},
+		{"verdict=clean,caution", "clean,caution"},
+		{"verdict=caution,clean", "clean,caution"},
+		{"verdict=caution&verdict=clean", "clean,caution"},
+		{"verdict=clean,clean&verdict=clean", "clean"},
+		{"verdict=,clean,,red_flags,", "clean,red_flags"},
+		{"verdict=not_scanned,red_flags,caution", "caution,red_flags,not_scanned"},
+		{"verdict=not_scanned,red_flags,caution,clean", ""}, // every bucket = all
+		{"verdict=clean&verdict=caution&verdict=red_flags&verdict=not_scanned", ""},
+		{"verdict=bad", "!"},
+		{"verdict=clean,bad", "!"},
+		{"verdict=clean&verdict=bad", "!"},
+		{"verdict=CLEAN", "!"},
+		{"verdict=clean,%20caution", "!"},
+		{"verdict=all", "!"},
+		{"verdict=unknown", "!"},
+		{"sort=date&sort=date", "!"}, // only verdict may be repeated
+		{"q=a&q=b", "!"},
+	} {
+		t.Run(tc.query, func(t *testing.T) {
+			v, err := url.ParseQuery(tc.query)
+			if err != nil {
+				t.Fatal(err)
+			}
+			f, err := parseWebCallsQuery(v)
+			if tc.want == "!" {
+				if err == nil {
+					t.Fatalf("parseWebCallsQuery(%q) = %q, want an error", tc.query, f.Verdict)
+				}
+				return
+			}
+			if err != nil || f.Verdict != tc.want {
+				t.Fatalf("parseWebCallsQuery(%q) = %q, %v; want %q", tc.query, f.Verdict, err, tc.want)
+			}
+		})
+	}
+}
+
+// TestWebVerdictSetETag: the same set of verdicts, however written, gets the
+// same ETag and the same answer; another set gets another ETag. The answer
+// echoes the set.
+func TestWebVerdictSetETag(t *testing.T) {
+	ws := benchWebServer(t, 300)
+	get := func(q string) (string, webCallsJSON) {
+		t.Helper()
+		rec := getWeb(ws, "/api/calls?"+q)
+		if rec.Code != 200 {
+			t.Fatalf("?%s: %d %s", q, rec.Code, rec.Body)
+		}
+		var res webCallsJSON
+		dec := json.NewDecoder(rec.Body)
+		dec.DisallowUnknownFields()
+		if err := dec.Decode(&res); err != nil {
+			t.Fatalf("?%s: %v", q, err)
+		}
+		return rec.Header().Get("ETag"), res
+	}
+	same := []string{"verdict=clean,caution", "verdict=caution,clean", "verdict=caution&verdict=clean", "verdict=clean,caution,clean,"}
+	tag0, res0 := get(same[0])
+	if res0.Verdict != "clean,caution" || !reflect.DeepEqual(res0.Verdicts, []string{"clean", "caution"}) || res0.Total == 0 {
+		t.Fatalf("?%s: verdict %q %q, total %d; want \"clean,caution\" [clean caution], some rows", same[0], res0.Verdict, res0.Verdicts, res0.Total)
+	}
+	for _, q := range same[1:] {
+		if tag, res := get(q); tag != tag0 || !reflect.DeepEqual(res, res0) {
+			t.Errorf("?%s: ETag %s, want %s (as ?%s), same answer %v", q, tag, tag0, same[0], reflect.DeepEqual(res, res0))
+		}
+	}
+	tagClean, resClean := get("verdict=clean")
+	tagCaution, resCaution := get("verdict=caution")
+	if tagClean == tag0 || tagCaution == tag0 {
+		t.Errorf("one verdict has the ETag of two: %s %s %s", tagClean, tagCaution, tag0)
+	}
+	if resClean.Total+resCaution.Total != res0.Total {
+		t.Errorf("total clean %d + caution %d, want clean,caution %d", resClean.Total, resCaution.Total, res0.Total)
+	}
+	if resClean.Verdict != "clean" || !reflect.DeepEqual(resClean.Verdicts, []string{"clean"}) {
+		t.Errorf("verdict=clean echoed as %q %q", resClean.Verdict, resClean.Verdicts)
+	}
+	tagAll, resAll := get("")
+	tagEvery, resEvery := get("verdict=red_flags,not_scanned,caution,clean")
+	if tagAll != tagEvery || resEvery.Verdict != "" || !reflect.DeepEqual(resEvery.Verdicts, []string{}) || !reflect.DeepEqual(resAll, resEvery) {
+		t.Errorf("every verdict: ETag %s (all: %s), verdict %q %q", tagEvery, tagAll, resEvery.Verdict, resEvery.Verdicts)
 	}
 }

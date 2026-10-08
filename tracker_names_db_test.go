@@ -101,7 +101,7 @@ func TestFillTokenNames(t *testing.T) {
 	ids := map[string]int{}
 	post := func(key string, msgID int, ca string) {
 		t.Helper()
-		id, _ := s.recordCallInfo(postAt(msgID, now.Add(-time.Duration(msgID)*time.Hour), ca), ca, nil, CallStatusBackfill)
+		id, _ := s.recordCallInfo(context.Background(), postAt(msgID, now.Add(-time.Duration(msgID)*time.Hour), ca), ca, nil, CallStatusBackfill)
 		if id == nil {
 			t.Fatalf("call %s not recorded", key)
 		}

@@ -47,16 +47,22 @@
   <section aria-label="Calls">
     <div class="controls">
       <input id="search" type="search" placeholder="Search token name or symbol" aria-label="Search token name or symbol" maxlength="100" autocomplete="off" spellcheck="false">
-      <label class="filter" for="verdict">
-        <span>Perceptor</span>
-        <select id="verdict" autocomplete="off">
-          <option value="" selected>All reports</option>
-          <option value="clean">No red flags found</option>
-          <option value="caution">Caution</option>
-          <option value="red_flags">Red flags</option>
-          <option value="not_scanned">Not scanned</option>
-        </select>
-      </label>
+      <div class="multi" id="verdict-pick">
+        <button type="button" id="verdict-btn" class="multi-btn" aria-expanded="false" aria-controls="verdict-panel">
+          <span id="verdict-label" class="multi-label">Perceptor: all</span><span class="multi-caret" aria-hidden="true">▾</span>
+        </button>
+        <div id="verdict-panel" class="multi-panel" hidden>
+          <fieldset>
+            <legend>Show Perceptor verdicts</legend>
+            <label class="multi-opt"><input type="checkbox" name="verdict" value="clean" autocomplete="off"> No red flags</label>
+            <label class="multi-opt"><input type="checkbox" name="verdict" value="caution" autocomplete="off"> Caution</label>
+            <label class="multi-opt"><input type="checkbox" name="verdict" value="red_flags" autocomplete="off"> Red flags</label>
+            <label class="multi-opt"><input type="checkbox" name="verdict" value="not_scanned" autocomplete="off"> Not scanned</label>
+          </fieldset>
+          <p class="multi-hint muted small">None ticked = all.</p>
+          <button type="button" id="verdict-all" class="btn btn-quiet multi-all">All (clear)</button>
+        </div>
+      </div>
       <div class="window-pick">
         <span id="horizons-label" class="muted">Peak / worst drop over</span>
         <div id="horizons" class="segmented compact" role="group" aria-labelledby="horizons-label">

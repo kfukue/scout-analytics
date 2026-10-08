@@ -130,7 +130,7 @@ button { font: inherit; color: inherit; }
 
 /* Filters: the reference's inputs (36px, 4px radius, grey border) */
 .controls { display: flex; flex-wrap: wrap; gap: 12px 16px; align-items: center; margin-bottom: 8px; }
-#search, .filter select {
+#search {
   height: 36px;
   min-width: 0;
   padding: 0 12px;
@@ -142,10 +142,50 @@ button { font: inherit; color: inherit; }
 }
 #search { flex: 1 1 240px; max-width: 360px; }
 #search::placeholder { color: var(--muted); opacity: 1; }
-#search:focus, .filter select:focus { border-color: var(--accent); outline: none; }
-#search:focus-visible, .filter select:focus-visible { outline: 2px solid var(--accent); outline-offset: 0; }
-.filter { display: inline-flex; align-items: center; gap: 8px; min-width: 0; color: var(--text-2); font-weight: 500; }
-.filter select { max-width: 100%; padding: 0 8px; font-weight: 400; }
+#search:focus { border-color: var(--accent); outline: none; }
+#search:focus-visible { outline: 2px solid var(--accent); outline-offset: 0; }
+/* Perceptor multi-select: a button like the inputs, opening a small card of
+   checkboxes under it */
+.multi { position: relative; display: inline-block; min-width: 0; max-width: 100%; }
+.multi-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  height: 36px;
+  max-width: 100%;
+  padding: 0 10px 0 12px;
+  color: var(--text);
+  background: var(--surface);
+  border: 1px solid var(--border-input);
+  border-radius: 4px;
+  cursor: pointer;
+}
+.multi-btn:hover, .multi-btn[aria-expanded="true"] { border-color: var(--accent); }
+.multi-btn:focus-visible { outline-offset: 0; }
+.multi-label { min-width: 0; max-width: 34ch; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.multi-caret { color: var(--muted); font-size: 12px; }
+.multi-btn[aria-expanded="true"] .multi-caret { transform: rotate(180deg); }
+.multi-panel {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 0;
+  z-index: 20;
+  width: max-content;
+  min-width: 100%;
+  max-width: calc(100vw - 24px);
+  padding: 10px 12px 12px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, .15);
+}
+.multi-panel fieldset { margin: 0; padding: 0; border: 0; min-width: 0; }
+.multi-panel legend { padding: 0; margin-bottom: 6px; font-size: 12px; font-weight: 600; color: var(--muted); }
+.multi-opt { display: flex; align-items: center; gap: 8px; min-height: 32px; padding: 0 4px; border-radius: 4px; color: var(--text-2); cursor: pointer; }
+.multi-opt:hover { background: var(--row-hover); }
+.multi-opt input { width: 16px; height: 16px; margin: 0; accent-color: var(--accent); cursor: pointer; }
+.multi-hint { margin: 6px 4px 8px; }
+.multi-all { width: 100%; }
 /* Window selector: a segmented control (grey track, white pill for the choice) */
 .window-pick { display: inline-flex; align-items: center; gap: 8px; flex-wrap: wrap; min-width: 0; color: var(--text-2); font-weight: 500; }
 .window-pick .muted { color: var(--text-2); }
@@ -302,6 +342,7 @@ td.detail-cell { padding: 0; white-space: normal; }
   .stats { grid-template-columns: 1fr 1fr; gap: 8px; }
   .stats dd { font-size: 16px; }
   #search { max-width: none; flex-basis: 100%; }
+  .multi-label { max-width: calc(100vw - 80px); }
   th, td { padding: 6px 8px; }
 }
 @media (prefers-reduced-motion: reduce) { .bar-fill, .row-toggle .chev { transition: none; } }

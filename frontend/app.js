@@ -29,9 +29,13 @@
     caution: { text: 'caution', cls: 'pv pv-caution' },
     red_flags: { text: 'red flags', cls: 'pv pv-red' }
   };
-  var VERDICT_FILTERS = ['', 'clean', 'caution', 'red_flags', 'not_scanned'];
+  // The Perceptor filter: the buckets, in the order the server writes them,
+  // and the short words of the button that summarises the choice.
+  var VERDICT_FILTERS = ['clean', 'caution', 'red_flags', 'not_scanned'];
+  var VERDICT_FILTER_TEXT = { clean: 'No red flags', caution: 'Caution', red_flags: 'Red flags', not_scanned: 'Not scanned' };
 
-  var state = { q: '', sort: 'date', dir: 'desc', horizon: '1d', verdict: '', page: 1 };
+  // verdicts: the Perceptor buckets to show, in VERDICT_FILTERS order; [] = all.
+  var state = { q: '', sort: 'date', dir: 'desc', horizon: '1d', verdicts: [], page: 1 };
   var loadedOnce = false;
   var searchTimer = null;
   // The request for the list that is on its way (null = none). A new request
@@ -611,7 +615,7 @@
 
     if (calls.length === 0) {
       if (state.page > pages) { state.page = pages; loadCalls(false); return; }
-      setMessage(state.q ? 'No calls match this search.' : (state.verdict ? 'No calls match this filter.' : 'No calls yet.'), false);
+      setMessage(state.q ? 'No calls match this search.' : (state.verdicts.length ? 'No calls match this filter.' : 'No calls yet.'), false);
     } else {
       setMessage('', false);
     }
@@ -667,7 +671,8 @@
     p.set('sort', state.sort);
     p.set('dir', state.dir);
     p.set('horizon', state.horizon);
-    if (state.verdict) { p.set('verdict', state.verdict); }
+    // always in one order: the address decides whether to ask "has it changed?"
+    if (state.verdicts.length) { p.set('verdict', state.verdicts.join(',')); }
     p.set('page', String(state.page));
     p.set('per', String(PER_PAGE));
     var url = 'api/calls?' + p.toString();
@@ -876,13 +881,7 @@
       }, DEBOUNCE_MS);
     });
 
-    $('verdict').addEventListener('change', function (ev) {
-      var v = ev.target.value;
-      if (VERDICT_FILTERS.indexOf(v) < 0 || v === state.verdict) { return; }
-      state.verdict = v;
-      state.page = 1;
-      loadCalls(false);
-    });
+    bindVerdictPicker();
 
     $('prev').addEventListener('click', function () {
       if (state.page > 1) { state.page--; loadCalls(false); }
@@ -890,6 +889,126 @@
     $('next').addEventListener('click', function () {
       state.page++;
       loadCalls(false);
+    });
+  }
+
+  // ---- Perceptor filter (several verdicts at once) --------------------------
+  //
+  // A button that opens a small panel of checkboxes; a change applies at once.
+  // None ticked, or all four, is "all". The choice is kept in localStorage
+  // (the page keeps none of its filters in the address).
+
+  var VERDICTS_KEY = 'scout.verdicts';
+
+  // The known buckets of list, once each, in VERDICT_FILTERS order; every
+  // bucket is the same as none ([] = all).
+  function normVerdicts(list) {
+    var out = [];
+    for (var i = 0; i < VERDICT_FILTERS.length; i++) {
+      if (Array.isArray(list) && list.indexOf(VERDICT_FILTERS[i]) >= 0) { out.push(VERDICT_FILTERS[i]); }
+    }
+    return out.length === VERDICT_FILTERS.length ? [] : out;
+  }
+
+  // The words of the button, e.g. "Perceptor: No red flags + Caution".
+  function verdictLabel(list) {
+    if (!list.length) { return 'Perceptor: all'; }
+    var words = [];
+    for (var i = 0; i < list.length; i++) { words.push(VERDICT_FILTER_TEXT[list[i]]); }
+    return 'Perceptor: ' + words.join(' + ');
+  }
+
+  function readVerdicts() {
+    var v = null;
+    try { v = window.localStorage.getItem(VERDICTS_KEY); } catch (e) { return []; }
+    return typeof v === 'string' && v ? normVerdicts(v.split(',')) : [];
+  }
+
+  function writeVerdicts(list) {
+    try {
+      if (list.length) {
+        window.localStorage.setItem(VERDICTS_KEY, list.join(','));
+      } else {
+        window.localStorage.removeItem(VERDICTS_KEY);
+      }
+    } catch (e) {
+      // storage blocked (private mode, settings): the choice lasts while the page is open
+    }
+  }
+
+  function verdictBoxes() { return $('verdict-panel').querySelectorAll('input[type="checkbox"]'); }
+
+  function renderVerdictLabel() {
+    var text = verdictLabel(state.verdicts);
+    $('verdict-label').textContent = text;
+    $('verdict-btn').title = text;
+  }
+
+  function setVerdicts(list) {
+    var next = normVerdicts(list);
+    if (next.join(',') === state.verdicts.join(',')) { return; }
+    state.verdicts = next;
+    state.page = 1;
+    writeVerdicts(next);
+    renderVerdictLabel();
+    loadCalls(false);
+  }
+
+  function verdictPanelOpen() { return $('verdict-btn').getAttribute('aria-expanded') === 'true'; }
+
+  function openVerdictPanel() {
+    $('verdict-panel').hidden = false;
+    $('verdict-btn').setAttribute('aria-expanded', 'true');
+    var first = verdictBoxes()[0];
+    if (first) { first.focus(); }
+  }
+
+  // focusButton: put the focus back on the button (Esc, a click of the button).
+  function closeVerdictPanel(focusButton) {
+    if (!verdictPanelOpen()) { return; }
+    $('verdict-panel').hidden = true;
+    $('verdict-btn').setAttribute('aria-expanded', 'false');
+    if (focusButton) { $('verdict-btn').focus(); }
+  }
+
+  function bindVerdictPicker() {
+    var pick = $('verdict-pick');
+    state.verdicts = readVerdicts();
+    // the ticks follow the saved choice (a reload may keep the old ticks)
+    var boxes = verdictBoxes();
+    for (var i = 0; i < boxes.length; i++) { boxes[i].checked = state.verdicts.indexOf(boxes[i].value) >= 0; }
+    renderVerdictLabel();
+    $('verdict-btn').addEventListener('click', function () {
+      if (verdictPanelOpen()) { closeVerdictPanel(true); } else { openVerdictPanel(); }
+    });
+    $('verdict-panel').addEventListener('change', function (ev) {
+      var t = ev.target;
+      if (!t || t.type !== 'checkbox') { return; }
+      var picked = [];
+      var all = verdictBoxes();
+      for (var j = 0; j < all.length; j++) {
+        if (all[j].checked) { picked.push(all[j].value); }
+      }
+      setVerdicts(picked);
+    });
+    $('verdict-all').addEventListener('click', function () {
+      var all = verdictBoxes();
+      for (var j = 0; j < all.length; j++) { all[j].checked = false; }
+      setVerdicts([]);
+    });
+    pick.addEventListener('keydown', function (ev) {
+      if ((ev.key === 'Escape' || ev.key === 'Esc') && verdictPanelOpen()) {
+        ev.preventDefault();
+        closeVerdictPanel(true);
+      }
+    });
+    // a click or tap anywhere else closes it, and so does the focus leaving it
+    document.addEventListener('pointerdown', function (ev) {
+      if (verdictPanelOpen() && !pick.contains(ev.target)) { closeVerdictPanel(false); }
+    });
+    pick.addEventListener('focusout', function (ev) {
+      var to = ev.relatedTarget;
+      if (to && !pick.contains(to)) { closeVerdictPanel(false); }
     });
   }
 
@@ -953,9 +1072,9 @@
 
   // Whether a row passes the search and the Perceptor filter of the page, the
   // way the server decides it (search: name, symbol or address contains the
-  // text, letter case ignored).
+  // text, letter case ignored; verdict: the row's bucket is one of those chosen).
   function rowMatchesFilters(c) {
-    if (state.verdict && verdictBucket(c.perceptor_verdict) !== state.verdict) { return false; }
+    if (state.verdicts.length && state.verdicts.indexOf(verdictBucket(c.perceptor_verdict)) < 0) { return false; }
     if (state.q) {
       var q = state.q.toLowerCase();
       var fields = [c.token_name, c.token_symbol, c.contract_address];
@@ -1306,8 +1425,6 @@
 
   bind();
   bindLive();
-  // a reload can keep the old choice in the select: start from "All reports"
-  $('verdict').value = '';
   renderHeaders();
   loadSummary();
   loadCalls(false);

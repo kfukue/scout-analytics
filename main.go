@@ -73,6 +73,12 @@ type config struct {
 	ScanGap      time.Duration // pause between consecutive CAs
 	PollInterval time.Duration // re-check the channel for missed posts (0 = off)
 
+	// Catch-up after a restart (see catchup.go): of the posts missed while the
+	// listener was down, the newest CatchUpMax posts no older than CatchUpMaxAge
+	// are handled live; the rest are stored only, like -backfill.
+	CatchUpMax    int           // SCOUT_CATCHUP_MAX
+	CatchUpMaxAge time.Duration // SCOUT_CATCHUP_MAX_AGE (0 = no age limit)
+
 	StateDir string
 	DryRun   bool
 
@@ -163,6 +169,9 @@ func loadConfig(envFile string) (*config, error) {
 		return nil, err
 	}
 	if c.Price, err = loadPriceConfig(); err != nil {
+		return nil, err
+	}
+	if c.CatchUpMax, c.CatchUpMaxAge, err = loadCatchUpConfig(); err != nil {
 		return nil, err
 	}
 	if c.NotifyBotToken != "" && c.NotifyChatID == "" {
@@ -282,11 +291,30 @@ func (s *seenStore) markNew(ca string) bool {
 		return false
 	}
 	s.m[k] = time.Now()
-	b, _ := json.MarshalIndent(s.m, "", "  ")
+	s.saveLocked()
+	return true
+}
+
+// forget removes ca, so a later call of the token is investigated again. Used
+// when a call queued before a restart is stored only after all (requeue).
+func (s *seenStore) forget(ca string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	k := caKey(ca)
+	if _, ok := s.m[k]; !ok {
+		return
+	}
+	delete(s.m, k)
+	s.saveLocked()
+}
+
+// saveLocked writes the file; s.mu must be held. A failure is logged: the
+// in-memory set stays right for this process.
+func (s *seenStore) saveLocked() {
+	b, _ := json.MarshalIndent(s.m, "", "  ") // a map[string]time.Time always encodes
 	if err := os.WriteFile(s.path, b, 0o600); err != nil {
 		log.Printf("warning: saving seen CAs: %v", err)
 	}
-	return true
 }
 
 type scanRecord struct {
@@ -360,7 +388,11 @@ type scanner struct {
 
 	postMu      sync.Mutex
 	handled     map[string]bool // "msgID|ca" (and "msgID" for CA-less posts) already processed
+	pending     map[int]bool    // scout_calls ids in s.queue or being processed (guarded by postMu)
+	olderNoted  bool            // requeue logged the stuck calls older than its window (guarded by postMu)
 	sourceInput tg.InputChannelClass
+
+	cursorMu sync.Mutex // serialises writes of the poll cursor file
 }
 
 func newScanner(cfg *config) *scanner {
@@ -371,6 +403,7 @@ func newScanner(cfg *config) *scanner {
 		queue:   make(chan job, 500),
 		byBot:   map[int64]*toolRunner{},
 		handled: map[string]bool{},
+		pending: map[int]bool{},
 	}
 	for _, t := range cfg.Tools {
 		s.runners = append(s.runners, newToolRunner(t))
@@ -427,7 +460,7 @@ func (s *scanner) onChannelPost(msg *tg.Message) {
 	cas := extractCAs(msg.Message, urls, s.cfg.Chains)
 	var fresh []string
 	for _, ca := range cas {
-		k := strconv.Itoa(msg.ID) + "|" + caKey(ca)
+		k := handledKey(msg.ID, ca)
 		if !s.handled[k] {
 			s.handled[k] = true
 			fresh = append(fresh, ca)
@@ -461,11 +494,19 @@ func (s *scanner) onChannelPost(msg *tg.Message) {
 		log.Printf("post %d: queued %s", msg.ID, ca)
 		select {
 		case s.queue <- job{CA: ca, SourceMsg: msg.ID, SourceText: msg.Message, CallID: callID, Meta: metaOf(msg.Message)}:
+			if callID != nil {
+				s.pending[*callID] = true
+			}
 		default:
 			log.Printf("queue full, dropping %s", ca)
 			s.setCallStatus(callID, CallStatusDropped)
 		}
 	}
+}
+
+// handledKey is the key of one (post, CA) pair in scanner.handled.
+func handledKey(msgID int, ca string) string {
+	return strconv.Itoa(msgID) + "|" + caKey(ca)
 }
 
 // messagesOf returns the plain messages in a history/search result.
@@ -514,17 +555,41 @@ func (s *scanner) fetchPosts(ctx context.Context, ids []int) ([]*tg.Message, err
 // poll is a safety net next to live updates: Telegram does not always push
 // every post of a large channel to user accounts, so every PollInterval we ask
 // for posts newer than the last one polled. Already-handled posts are skipped.
+//
+// It first resumes from the saved cursor (the database's newest post, or the
+// cursor file): it queues again the calls left queued before the restart and
+// catches up the posts missed while the listener was down (catchup.go); with
+// no saved cursor it starts at the channel's newest post. That start runs once
+// even when polling is off (SCOUT_POLL_INTERVAL=0); with polling on, a failed
+// start is retried every interval. The cursor file is updated whenever the
+// cursor moves. poll returns when ctx is done.
 func (s *scanner) poll(ctx context.Context) {
+	s.pollWith(ctx, tgPollSource{s: s})
+}
+
+func (s *scanner) pollWith(ctx context.Context, src pollSource) {
+	p := &poller{s: s, src: src}
+	err := p.begin(ctx)
 	if s.cfg.PollInterval <= 0 {
+		switch {
+		case err != nil && ctx.Err() == nil:
+			log.Printf("%v (not retried: SCOUT_POLL_INTERVAL=0; restart the listener to try again)", err)
+		case err == nil:
+			log.Printf("polling @%s is off (SCOUT_POLL_INTERVAL=0); the catch-up ran once, up to post %d (from %s)", s.cfg.SourceChannel, p.cursor, p.from)
+		}
 		return
 	}
-	cursor := 0
-	if top, err := s.fetchNewPosts(ctx, 0, 1); err != nil {
-		log.Printf("poll: initial read of @%s failed: %v", s.cfg.SourceChannel, err)
-	} else if len(top) > 0 {
-		cursor = top[len(top)-1].ID // start from now; no backfill of old posts
+	if err != nil && ctx.Err() == nil {
+		log.Printf("%v (trying again every %s)", err, s.cfg.PollInterval)
 	}
-	log.Printf("polling @%s every %s as a backup (starting after post %d)", s.cfg.SourceChannel, s.cfg.PollInterval, cursor)
+	announced := false
+	announce := func() {
+		if p.started && !announced {
+			announced = true
+			log.Printf("polling @%s every %s as a backup (starting after post %d, from %s)", s.cfg.SourceChannel, s.cfg.PollInterval, p.cursor, p.from)
+		}
+	}
+	announce()
 	t := time.NewTicker(s.cfg.PollInterval)
 	defer t.Stop()
 	for {
@@ -533,23 +598,13 @@ func (s *scanner) poll(ctx context.Context) {
 			return
 		case <-t.C:
 		}
-		if cursor == 0 {
-			if top, err := s.fetchNewPosts(ctx, 0, 1); err == nil && len(top) > 0 {
-				cursor = top[len(top)-1].ID
+		if err := p.tick(ctx); err != nil {
+			if ctx.Err() != nil {
+				return
 			}
-			continue
+			log.Print(err)
 		}
-		msgs, err := s.fetchNewPosts(ctx, cursor, 50)
-		if err != nil {
-			log.Printf("poll: %v", err)
-			continue
-		}
-		for _, m := range msgs {
-			s.onChannelPost(m) // no-op if the live update already handled it
-			if m.ID > cursor {
-				cursor = m.ID
-			}
-		}
+		announce()
 	}
 }
 
@@ -781,6 +836,7 @@ func (s *scanner) worker(ctx context.Context) {
 			return
 		case j := <-s.queue:
 			s.process(ctx, j, !s.cfg.DryRun)
+			s.jobDone(j)
 			select {
 			case <-ctx.Done():
 				return
@@ -788,6 +844,17 @@ func (s *scanner) worker(ctx context.Context) {
 			}
 		}
 	}
+}
+
+// jobDone takes a processed job's call out of s.pending (its status is final
+// by now), so a later requeue sees the database's status instead.
+func (s *scanner) jobDone(j job) {
+	if j.CallID == nil {
+		return
+	}
+	s.postMu.Lock()
+	defer s.postMu.Unlock()
+	delete(s.pending, *j.CallID)
 }
 
 // investigateAll runs every tool for one CA in parallel.
@@ -903,7 +970,7 @@ func (s *scanner) process(ctx context.Context, j job, deliver bool) []*toolResul
 // ---------------------------------------------------------------------------
 
 func (s *scanner) recordCall(msg *tg.Message, ca string, urls []string, status string) *int {
-	id, _ := s.recordCallInfo(msg, ca, urls, status)
+	id, _ := s.recordCallInfo(context.Background(), msg, ca, urls, status) // whether the row is new does not matter here
 	return id
 }
 
@@ -911,15 +978,27 @@ func (s *scanner) recordCall(msg *tg.Message, ca string, urls []string, status s
 // tracking row; created reports whether the call was new. An update post is
 // recorded with status "update" whatever status was asked for, and gets no
 // parsed data and no tracking row.
-func (s *scanner) recordCallInfo(msg *tg.Message, ca string, urls []string, status string) (*int, bool) {
+func (s *scanner) recordCallInfo(ctx context.Context, msg *tg.Message, ca string, urls []string, status string) (*int, bool) {
+	id, created, err := s.storeCall(ctx, msg, ca, urls, status)
+	if err != nil {
+		log.Print(err)
+	}
+	return id, created
+}
+
+// storeCall is recordCallInfo returning the error of the scout_calls write
+// instead of logging it (the call metrics and tracking rows are still logged
+// only: the call itself is recorded then). It records nothing and returns
+// nil, false, nil when the database is off.
+func (s *scanner) storeCall(ctx context.Context, msg *tg.Message, ca string, urls []string, status string) (*int, bool, error) {
 	if s.db == nil {
-		return nil, false
+		return nil, false, nil
 	}
 	update := postKind(msg.Message) == PostKindUpdate
 	if update {
 		status = CallStatusUpdate
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	id, created, err := s.db.UpsertScoutCall(ctx, &ScoutCall{
 		ChannelID:       s.sourceChannelID,
@@ -933,11 +1012,10 @@ func (s *scanner) recordCallInfo(msg *tg.Message, ca string, urls []string, stat
 		Status:          status,
 	})
 	if err != nil {
-		log.Printf("db: insert scout_calls %s: %v", ca, err)
-		return nil, false
+		return nil, false, fmt.Errorf("db: insert scout_calls %s: %w", ca, err)
 	}
 	if update {
-		return id, created
+		return id, created, nil
 	}
 	if meta := metaOf(msg.Message); meta != nil {
 		if err := s.db.UpsertCallMetrics(ctx, *id, meta); err != nil {
@@ -954,7 +1032,7 @@ func (s *scanner) recordCallInfo(msg *tg.Message, ca string, urls []string, stat
 			log.Printf("db: tracking for post %d: %v", msg.ID, err)
 		}
 	}
-	return id, created
+	return id, created, nil
 }
 
 // metaOf parses the call post; nil when it isn't in the call format.
@@ -1669,8 +1747,16 @@ func main() {
 	for {
 		start := time.Now()
 		err := run(ctx, s, func(ctx context.Context) error {
+			// poll is waited for before this connection's body returns, so a
+			// reconnect never runs two catch-ups or two pollers at once.
+			var pollWG sync.WaitGroup
+			defer pollWG.Wait()
 			go s.worker(ctx)
-			go s.poll(ctx)
+			pollWG.Add(1)
+			go func() {
+				defer pollWG.Done()
+				s.poll(ctx)
+			}()
 			if *listenOnly {
 				log.Printf("listen-only: the performance tracker is not running in this process (new calls are still queued; run -track separately)")
 			} else {

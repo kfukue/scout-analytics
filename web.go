@@ -274,7 +274,8 @@ type webCallsResponse struct {
 	Sort       string         `json:"sort"`
 	Dir        string         `json:"dir"`
 	USDOnly    bool           `json:"usd_only"`
-	Verdict    string         `json:"verdict"`     // the Perceptor filter; "" = all
+	Verdict    string         `json:"verdict"`     // the Perceptor filter as a list, e.g. "clean,caution"; "" = all
+	Verdicts   []string       `json:"verdicts"`    // the same list as an array; [] = all
 	SnapshotAt time.Time      `json:"snapshot_at"` // when the list was last read from the database
 	Calls      []ScoutWebCall `json:"calls"`
 }
@@ -289,7 +290,7 @@ func parseWebCallsQuery(v url.Values) (ScoutWebCallsFilter, error) {
 		if !webCallsParams[k] {
 			return f, errors.New("unknown parameter (use q, sort, dir, horizon, usd_only, verdict, page, per)")
 		}
-		if len(vals) != 1 {
+		if len(vals) != 1 && k != "verdict" { // verdict may be repeated: the values add up
 			return f, fmt.Errorf("%s: given more than once", k)
 		}
 	}
@@ -335,9 +336,11 @@ func parseWebCallsQuery(v url.Values) (ScoutWebCallsFilter, error) {
 		return f, err
 	}
 	f.USDOnly = usdOnly == "1"
-	if err := oneOf("verdict", &f.Verdict, "clean", "caution", "red_flags", "not_scanned"); err != nil {
+	set, err := parseWebVerdicts(v["verdict"])
+	if err != nil {
 		return f, err
 	}
+	f.Verdict = webVerdictList(set)
 	if err := intIn("page", &f.Page, 1, webMaxPage); err != nil {
 		return f, err
 	}
@@ -355,6 +358,52 @@ func parseWebCallsQuery(v url.Values) (ScoutWebCallsFilter, error) {
 	f.Q = q
 	return f, nil
 }
+
+// parseWebVerdicts reads the verdict values of /api/calls: each one a list
+// separated by commas (verdict=clean,caution), and the parameter may be given
+// more than once (verdict=clean&verdict=caution); all of them add up. Empty
+// items are skipped (so verdict= is all), repeats are fine, anything else is
+// an error.
+func parseWebVerdicts(vals []string) (uint8, error) {
+	var set uint8
+	for _, v := range vals {
+		for v != "" {
+			var item string
+			item, v, _ = strings.Cut(v, ",")
+			if item == "" {
+				continue
+			}
+			b, ok := webVerdictBuckets[item]
+			if !ok {
+				return 0, errors.New("verdict: use clean, caution, red_flags or not_scanned, or a list of them separated by commas")
+			}
+			set |= 1 << b
+		}
+	}
+	return set, nil
+}
+
+// webVerdictLists[set]: a set of Perceptor buckets written the one way it is
+// used in the filter, the answer and the ETag: in the order clean, caution,
+// red_flags, not_scanned, separated by commas. No bucket or every bucket is ""
+// (all). Worked out once, so a request does not build the text.
+var webVerdictLists = func() (out [webVerdictAll + 1]string) {
+	for set := range out {
+		if set == 0 || set == int(webVerdictAll) {
+			continue
+		}
+		var names []string
+		for b, name := range webVerdictNames {
+			if set&(1<<b) != 0 {
+				names = append(names, name)
+			}
+		}
+		out[set] = strings.Join(names, ",")
+	}
+	return out
+}()
+
+func webVerdictList(set uint8) string { return webVerdictLists[set&webVerdictAll] }
 
 // webStaticTypes: the only file types the page server hands out, with fixed
 // content types (the operating system's own table is not trusted for this).
@@ -989,6 +1038,27 @@ func (s *webServer) callsETag(snap *webSnapshot, f ScoutWebCallsFilter) string {
 	return `W/"` + snap.version + "-" + hex.EncodeToString(sum[:10]) + `"`
 }
 
+// webVerdictSlices[set]: the list of webVerdictLists[set] as an array for the
+// answer ([] = all). Shared and never changed.
+var webVerdictSlices = func() (out [webVerdictAll + 1][]string) {
+	for set, list := range webVerdictLists {
+		out[set] = []string{}
+		if list != "" {
+			out[set] = strings.Split(list, ",")
+		}
+	}
+	return out
+}()
+
+// webVerdictSlice: the filter's list as an array for the answer ([] = all).
+func webVerdictSlice(list string) []string {
+	set, err := webVerdictSet(list)
+	if err != nil || set == webVerdictAll {
+		return []string{}
+	}
+	return webVerdictSlices[set]
+}
+
 func (s *webServer) handleCalls(w http.ResponseWriter, r *http.Request) {
 	vals, err := url.ParseQuery(r.URL.RawQuery)
 	if err != nil {
@@ -1019,7 +1089,8 @@ func (s *webServer) handleCalls(w http.ResponseWriter, r *http.Request) {
 	if err == nil {
 		// everything but the rows, which are already encoded in the snapshot
 		head, err = json.Marshal(webCallsResponse{Total: total, Page: f.Page, Per: f.Per, Horizon: f.Horizon,
-			Sort: f.Sort, Dir: f.Dir, USDOnly: f.USDOnly, Verdict: f.Verdict, SnapshotAt: snap.loadedAt, Calls: []ScoutWebCall{}})
+			Sort: f.Sort, Dir: f.Dir, USDOnly: f.USDOnly, Verdict: f.Verdict, Verdicts: webVerdictSlice(f.Verdict),
+			SnapshotAt: snap.loadedAt, Calls: []ScoutWebCall{}})
 		if err == nil && !bytes.HasSuffix(head, []byte(webNoCallsJSON)) {
 			err = errors.New("unexpected encoding of the answer")
 		}
