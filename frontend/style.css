@@ -327,6 +327,27 @@ a.pv:hover { text-decoration: underline; text-underline-offset: 2px; }
 /* "sA": the token has an sAlpha report (open the row to read it) */
 .sa-badge { margin-left: 6px; padding: 0 6px; font-size: 11px; color: var(--b-blue); background: var(--b-blue-bg); cursor: help; }
 .badge-rug { color: var(--b-rug); background: var(--b-rug-bg); cursor: help; }
+/* "Perceptor today": a re-scan long after the call, never the call-time
+   verdict, so it looks different: outlined with a dashed line, square
+   corners, no fill, smaller, on a line of its own under the cell's badges. */
+.today-line { display: block; margin-top: 3px; line-height: 1; }
+.pv-today {
+  display: inline-block;
+  padding: 0 6px;
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 16px;
+  border: 1px dashed currentColor;
+  border-radius: 3px;
+  white-space: nowrap;
+}
+.pv-today-clean { color: var(--b-green); }
+.pv-today-caution { color: var(--b-orange); }
+.pv-today-red { color: var(--b-red); }
+.pv-today-unknown { color: var(--muted); }
+a.pv-today:hover { text-decoration: underline; text-underline-offset: 2px; }
+.detail-today:empty { display: none; }
+.detail-today .report-meta .pv-today { vertical-align: 1px; }
 
 /* Row detail: the toggle in the first cell, and the detail row under it */
 tbody tr.call-row { cursor: pointer; }
