@@ -24,7 +24,7 @@ func testStore(t *testing.T) *ScoutStore {
 		t.Skip("SCOUT_TEST_DATABASE_URL not set")
 	}
 	ctx := context.Background()
-	st, err := NewScoutStore(ctx, dsn)
+	st, err := NewScoutStore(ctx, dsn, 8)
 	if err != nil {
 		t.Fatal(err)
 	}

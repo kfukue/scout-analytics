@@ -28,6 +28,14 @@
   --b-red-bg: #fff5f5; --b-red: #c92a2a;
   --b-blue-bg: #e7f5ff; --b-blue: #1864ab;
   --b-rug-bg: #c92a2a; --b-rug: #ffffff;
+  /* return badges by size (Latest %): background / text, all AA (4.5:1+) */
+  --rb-rug-bg: #c92a2a; --rb-rug: #ffffff;
+  --rb-bad-bg: #ffe3e3; --rb-bad: #a51d1d;
+  --rb-neg-bg: #fff5f5; --rb-neg: #c92a2a;
+  --rb-zero-bg: #f1f3f5; --rb-zero: #495057;
+  --rb-up-bg: #ebfbee; --rb-up: #237a36;
+  --rb-2x-bg: #d3f9d8; --rb-2x: #1a5c29;
+  --rb-10x-bg: #237a36; --rb-10x: #ffffff;
 }
 @media (prefers-color-scheme: dark) {
   :root {
@@ -54,6 +62,13 @@
     --b-red-bg: #3e2729; --b-red: #ffa8a8;
     --b-blue-bg: #1f3346; --b-blue: #a5d8ff;
     --b-rug-bg: #c92a2a; --b-rug: #ffffff;
+    --rb-rug-bg: #c92a2a; --rb-rug: #ffffff;
+    --rb-bad-bg: #5c2326; --rb-bad: #ffd8d8;
+    --rb-neg-bg: #3e2729; --rb-neg: #ffa8a8;
+    --rb-zero-bg: #373a40; --rb-zero: #c1c2c5;
+    --rb-up-bg: #26392c; --rb-up: #8ce99a;
+    --rb-2x-bg: #2f5a3a; --rb-2x: #d3f9d8;
+    --rb-10x-bg: #8ce99a; --rb-10x: #0b2e13;
   }
 }
 
@@ -207,38 +222,90 @@ button { font: inherit; color: inherit; }
 .segmented.compact button { height: 26px; min-width: 36px; padding: 0 8px; font-size: 13px; }
 #explain { margin-bottom: 12px; }
 
-/* The table scrolls sideways inside this box; the page itself never does.
-   It is also the size container of the row detail (100cqw = its visible width). */
+/* The table scrolls inside this box (sideways, and down when it is taller
+   than the window), so its header row and its Token column can stay in view
+   (sticky); the page itself never scrolls sideways. It is also the size
+   container of the row detail (100cqw = its visible width). */
 .table-wrap {
-  overflow-x: auto;
+  overflow: auto;
   max-width: 100%;
+  max-height: calc(100vh - 24px);
+  max-height: calc(100dvh - 24px);
   background: var(--surface);
   border: 1px solid var(--border);
   border-radius: 4px;
   box-shadow: var(--shadow);
   container-type: inline-size;
+  /* the sticky cells' z-index stays inside the table (menus open above it) */
+  isolation: isolate;
+  /* a focused cell is scrolled clear of the sticky header row and Token
+     column (--head-h, --tok-w: their size, set by app.js) */
+  scroll-padding-top: var(--head-h, 40px);
+  scroll-padding-left: var(--tok-w, 0px);
 }
+/* ...but what is itself sticky (the header row, the Token column, the row
+   detail box) is always in view: no scrolling the table to reach it */
+th.tok *, td.tok *, .detail-box * {
+  scroll-margin-left: calc(-1 * var(--tok-w, 0px));
+}
+thead th * { scroll-margin-top: calc(-1 * var(--head-h, 40px)); }
 th.win.first, td.win.first { border-left: 1px solid var(--border); }
-table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+/* separate borders: collapsed ones do not move with sticky cells */
+table { width: 100%; border-collapse: separate; border-spacing: 0; font-variant-numeric: tabular-nums; }
 th, td { padding: 7px 8px; text-align: left; white-space: nowrap; border-bottom: 1px solid var(--border); }
 tbody tr:last-child td { border-bottom: 0; }
 /* hover only, no zebra: an open detail row would flip the stripes */
 tbody tr:hover { background: var(--row-hover); }
 th { background: var(--subtle); color: var(--text-2); font-weight: 700; font-size: 13px; }
+/* the header row stays on top while the rows scroll under it */
+thead th { position: sticky; top: 0; z-index: 2; }
+/* the Token column stays at the left while the table scrolls sideways; its
+   cells need a background of their own in every state of the row */
+th.tok, td.tok { position: sticky; left: 0; z-index: 1; box-shadow: inset -1px 0 0 var(--border); }
+td.tok { background: var(--surface); }
+thead th.tok { z-index: 3; }
+tbody tr:hover > td.tok, tbody tr.call-row.open > td.tok { background: var(--row-hover); }
+tbody tr.call-row.fresh > td.tok { background: var(--b-blue-bg); }
+td.tok { white-space: nowrap; }
+.tok-names { display: inline-flex; flex-direction: column; vertical-align: middle; line-height: 1.3; min-width: 0; }
 th.num, td.num { text-align: right; }
 td.center { text-align: center; }
 button.sort { background: none; border: 0; padding: 0; margin: 0; font-weight: 700; color: inherit; cursor: pointer; }
 button.sort:hover { color: var(--accent-text); }
 th[aria-sort] button.sort { color: var(--accent-text); }
-.token { display: inline-block; max-width: 24ch; overflow: hidden; text-overflow: ellipsis; vertical-align: bottom; }
-.symbol { display: inline-block; max-width: 14ch; overflow: hidden; text-overflow: ellipsis; vertical-align: bottom; }
+.token { display: inline-block; max-width: 24ch; overflow: hidden; text-overflow: ellipsis; vertical-align: bottom; font-weight: 600; }
+.symbol { display: inline-block; max-width: 14ch; overflow: hidden; text-overflow: ellipsis; vertical-align: bottom; color: var(--muted); font-size: 12px; }
 th.calls, td.calls { width: 1%; padding-left: 4px; padding-right: 4px; text-align: center; }
 td.calls { color: var(--muted); }
 .repeat { cursor: help; }
 .pos { color: var(--pos); }
 .neg { color: var(--neg); }
+.big { font-weight: 700; }
 .age { color: var(--muted); font-size: 12px; }
+/* Latest %: the badge, and under it how long ago the price was read */
+td.latest .price-age { display: block; line-height: 1.3; margin-top: 2px; }
+.age.stale, .price-age.stale { color: var(--warn); font-weight: 600; }
 td.latest, td.mc { cursor: default; }
+td.nousd { font-size: 12px; }
+/* Return badges by size; the sign is always written too */
+.rb {
+  display: inline-block;
+  min-width: 6ch;
+  padding: 0 6px;
+  font-weight: 700;
+  line-height: 22px;
+  border-radius: 4px;
+  text-align: right;
+  white-space: nowrap;
+}
+.rb-rug { color: var(--rb-rug); background: var(--rb-rug-bg); }
+.rb-bad { color: var(--rb-bad); background: var(--rb-bad-bg); }
+.rb-neg { color: var(--rb-neg); background: var(--rb-neg-bg); }
+.rb-zero { color: var(--rb-zero); background: var(--rb-zero-bg); }
+.rb-up { color: var(--rb-up); background: var(--rb-up-bg); }
+.rb-2x { color: var(--rb-2x); background: var(--rb-2x-bg); box-shadow: inset 0 0 0 1px currentColor; }
+.rb-10x { color: var(--rb-10x); background: var(--rb-10x-bg); }
+.legend .rb { line-height: 18px; font-size: 12px; min-width: 0; }
 td[title] { cursor: help; }
 
 /* Badges: pills (the reference's light badge); the words differ, so colour is
@@ -281,6 +348,8 @@ tbody tr.call-row.open td { border-bottom-color: transparent; }
   cursor: pointer;
 }
 .row-toggle:hover { color: var(--text); border-color: var(--border-input); }
+/* inset: the cell sits at the box's left edge and under the sticky header */
+.row-toggle:focus-visible { outline-offset: -2px; }
 .row-toggle .chev { display: inline-block; transition: transform .15s ease; }
 .row-toggle[aria-expanded="true"] .chev { transform: rotate(90deg); }
 tbody tr.detail-row, tbody tr.detail-row:hover { background: var(--subtle); }
@@ -295,17 +364,31 @@ td.detail-cell { padding: 0; white-space: normal; }
   max-width: 1366px;
   padding: 12px;
   display: grid;
-  grid-template-columns: 1fr 1fr;
   gap: 12px;
   cursor: auto;
 }
 @supports (container-type: inline-size) {
-  .detail-box { width: 100cqw; max-width: none; }
+  /* --sbw: the vertical scrollbar of the table box, when the browser counts
+     it in 100cqw (set by app.js; 0 when it does not, or without script) */
+  .detail-box { width: calc(100cqw - var(--sbw, 0px)); max-width: none; }
 }
+/* measures 100cqw of the table box (see watchScrollbar in app.js) */
+.cq-probe { position: absolute; top: 0; left: 0; width: 0; height: 0; visibility: hidden; pointer-events: none; }
+@supports (container-type: inline-size) {
+  .cq-probe { width: 100cqw; }
+}
+/* the reports side by side, under the performance */
+.detail-reports { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
 @container (max-width: 640px) {
-  .detail-box { grid-template-columns: minmax(0, 1fr); }
+  .detail-reports { grid-template-columns: minmax(0, 1fr); }
 }
-.detail-box > * { min-width: 0; }
+.detail-box > *, .detail-reports > * { min-width: 0; }
+.detail-perf:empty { display: none; }
+.perf-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 6px 16px; margin: 0; }
+.perf-list > div { display: flex; flex-direction: column; min-width: 0; }
+.perf-list dt { color: var(--muted); font-size: 12px; font-weight: 600; }
+.perf-list dd { margin: 0; white-space: normal; overflow-wrap: anywhere; font-variant-numeric: tabular-nums; }
+.perf-list .rb { min-width: 0; }
 .detail-box .report {
   padding: 12px 14px;
   background: var(--surface);
@@ -344,6 +427,9 @@ td.detail-cell { padding: 0; white-space: normal; }
   #search { max-width: none; flex-basis: 100%; }
   .multi-label { max-width: calc(100vw - 80px); }
   th, td { padding: 6px 8px; }
+  /* the sticky Token column takes at most about a third of a phone screen */
+  .token { max-width: 11ch; }
+  .symbol { max-width: 11ch; }
 }
 @media (prefers-reduced-motion: reduce) { .bar-fill, .row-toggle .chev { transition: none; } }
 
@@ -379,7 +465,7 @@ td.detail-cell { padding: 0; white-space: normal; }
 .new-calls { display: block; margin: 0 0 10px; height: 32px; padding: 0 14px; }
 tbody tr.call-row.fresh { background: var(--b-blue-bg); }
 @media (prefers-reduced-motion: no-preference) {
-  tbody tr.call-row { transition: background-color 1.2s ease; }
+  tbody tr.call-row, tbody tr.call-row > td.tok { transition: background-color 1.2s ease; }
 }
 .live-notices {
   position: fixed;

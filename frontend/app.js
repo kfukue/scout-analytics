@@ -14,9 +14,14 @@
   // The window columns, in the order of HORIZONS: the field of each row and
   // the sort value of its header.
   var WINDOW_FIELDS = ['return_1h_pct', 'return_1d_pct', 'return_3d_pct', 'return_7d_pct', 'return_30d_pct'];
-  // Cells after Latest MC that "no USD price" spans: Latest %, Peak %, Worst
+  // The cells at the end of a row that "no USD price" spans: Peak %, Worst
   // drop % and the five windows. Must match the headers in index.html.
-  var NO_USD_SPAN = 3 + HORIZONS.length;
+  var NO_USD_SPAN = 2 + HORIZONS.length;
+  // Columns of the table (index.html), for the detail row when the header
+  // cannot be counted.
+  var COLUMNS = 11 + HORIZONS.length;
+  // "Calls from the last …": the choices of the age filter, in days (0 = all).
+  var DAY_CHOICES = [1, 7, 30];
   var STATUS_TEXT = {
     pending: 'pending', tracking: 'tracking', done: 'done',
     no_pool: 'no pool', error: 'error', gave_up: 'gave up'
@@ -35,7 +40,15 @@
   var VERDICT_FILTER_TEXT = { clean: 'No red flags', caution: 'Caution', red_flags: 'Red flags', not_scanned: 'Not scanned' };
 
   // verdicts: the Perceptor buckets to show, in VERDICT_FILTERS order; [] = all.
-  var state = { q: '', sort: 'date', dir: 'desc', horizon: '1d', verdicts: [], page: 1 };
+  // days: only calls from the last that many days (one of DAY_CHOICES; 0 = all).
+  var state = { q: '', sort: 'date', dir: 'desc', horizon: '1d', verdicts: [], days: 0, page: 1 };
+  // The server's time of the data shown (X-Snapshot-At, in ms; NaN until the
+  // first answer): "now" for every "… ago" on the page, so the ages are those
+  // of the data as read, and move on with every refresh, also one answered
+  // "not modified".
+  var snapshotMs = NaN;
+  // The rows shown, by call_id (for the performance block of the row detail).
+  var rowData = {};
   var loadedOnce = false;
   var searchTimer = null;
   // The request for the list that is on its way (null = none). A new request
@@ -112,6 +125,9 @@
       ' ' + pad2(d.getHours()) + ':' + pad2(d.getMinutes());
   }
 
+  // "day" or "7 days", after "the last".
+  function daysText(n) { return n === 1 ? 'day' : fmtInt(n) + ' days'; }
+
   function fmtTime(d) { return pad2(d.getHours()) + ':' + pad2(d.getMinutes()) + ':' + pad2(d.getSeconds()); }
 
   // Huge values in scientific notation with superscript digits, so a column
@@ -183,9 +199,34 @@
 
   function isHugePct(v) { return isNum(v) && fmtPct(v).indexOf('×') >= 0; }
 
+  // Size of a return, for its badge: rugged (or all lost), down by half or
+  // more, down, flat, up to 2×, 2× to 11×, 11× and more. The sign is always
+  // written as well, so colour is never the only cue.
+  function returnBucket(v, rugged) {
+    if (!isNum(v)) { return ''; }
+    if (rugged === true || v <= -99.95) { return 'rb-rug'; }
+    if (fmtPct(v) === '0.0%') { return 'rb-zero'; }
+    if (v <= -50) { return 'rb-bad'; }
+    if (v < 0) { return 'rb-neg'; }
+    if (v < 100) { return 'rb-up'; }
+    if (v < 1000) { return 'rb-2x'; }
+    return 'rb-10x';
+  }
+
+  // A return as a badge coloured by its size (the Latest % column and the
+  // row detail).
+  function returnBadge(v, rugged) {
+    var b = el('span', 'rb ' + returnBucket(v, rugged), fmtPct(v));
+    if (isHugePct(v)) { b.title = exactPct(v); }
+    return b;
+  }
+
+  // A window, peak or worst-drop cell: coloured text only (calm); a gain of
+  // 100% or more is bold.
   function pctCell(v) {
     var td = el('td', 'num', fmtPct(v));
     if (isNum(v) && fmtPct(v) !== '0.0%') { td.classList.add(v > 0 ? 'pos' : 'neg'); }
+    if (isNum(v) && v >= 100) { td.classList.add('big'); }
     if (isHugePct(v)) { td.title = exactPct(v); }
     return td;
   }
@@ -199,8 +240,23 @@
   }
 
   var QUIET_MS = 7 * 24 * 3600 * 1000; // last trade this much older than the reading: "quiet"
+  // The tracker reads the latest price about every 15 minutes for calls under
+  // 30 days old and every hour for older ones (prod runs with
+  // SCOUT_LATEST_REFRESH_OLD=1h since the 8 Oct deploy); a price older than
+  // twice that is "stale" (the tracker may be stopped or behind). Rugged calls
+  // found by the tracker (rug_block in their on-chain state, latestDueSQL) are
+  // re-stamped at the old pace (SCOUT_LATEST_REFRESH_OLD) at any age; the page
+  // has just the rugged flag, a superset of those, so every rugged call gets
+  // the old limit: never a false "stale" (a young call flagged by the "< 5% of
+  // entry" rule is still read every 15 minutes, so on it a stopped tracker
+  // shows only after 2 h).
+  // STALE_OLD_MS must follow SCOUT_LATEST_REFRESH_OLD (2x its value): raise it
+  // again if that setting is raised (48 h for the 24 h default).
+  var YOUNG_CALL_MS = 30 * 86400 * 1000;
+  var STALE_YOUNG_MS = 30 * 60 * 1000;
+  var STALE_OLD_MS = 2 * 3600 * 1000;
 
-  // Age of a call in the largest unit that reads well: 45m, 30h, 60d.
+  // Age in the largest unit that reads well: 45m, 30h, 60d.
   function fmtAge(seconds) {
     if (!isNum(seconds)) { return ''; }
     var s = Math.max(0, seconds);
@@ -209,29 +265,94 @@
     return Math.floor(s / 86400) + 'd';
   }
 
-  // "Latest %": the return at the most recent price, then a quiet label with
-  // the age of the call when that price was read, e.g. "+35.2% · 60d".
+  // How long ago, e.g. "12m ago", "5h ago", "2d ago"; under a minute "just now".
+  function fmtAgo(ms) {
+    if (!isNum(ms)) { return ''; }
+    return ms < 60000 ? 'just now' : fmtAge(ms / 1000) + ' ago';
+  }
+
+  // "Now" for the ages on the page: the server's time of the data shown
+  // (this browser's clock until the first answer).
+  function nowMs() { return isFinite(snapshotMs) ? snapshotMs : Date.now(); }
+
+  function timeMs(iso) { return typeof iso === 'string' ? new Date(iso).getTime() : NaN; }
+
+  // Whether a price read at readMs is stale at now for a call posted at callMs
+  // (rugged: refreshed at the old pace whatever its age).
+  function isStale(readMs, callMs, rugged, now) {
+    var young = !rugged && isFinite(callMs) && now - callMs < YOUNG_CALL_MS;
+    var limit = young ? STALE_YOUNG_MS : STALE_OLD_MS;
+    return now - readMs > limit;
+  }
+
+  // A label of how old the latest price is ("12m ago · stale · quiet"),
+  // written again by updateAges whenever "now" moves on.
+  function priceAgeNode(c, className) {
+    var n = el('span', 'price-age ' + (className || ''));
+    var readAt = timeMs(c.latest_at);
+    var tradeAt = timeMs(c.latest_trade_at);
+    n.dataset.at = String(readAt);
+    n.dataset.call = String(timeMs(c.message_date));
+    if (c.rugged === true) { n.dataset.rugged = '1'; }
+    if (!isNaN(readAt) && !isNaN(tradeAt) && readAt - tradeAt > QUIET_MS) { n.dataset.quiet = '1'; }
+    drawPriceAge(n, nowMs());
+    return n;
+  }
+
+  function drawPriceAge(n, now) {
+    var at = Number(n.dataset.at);
+    if (!isFinite(at)) { n.textContent = ''; return; }
+    var stale = isStale(at, Number(n.dataset.call), n.dataset.rugged === '1', now);
+    n.textContent = fmtAgo(Math.max(0, now - at)) + (stale ? ' · stale' : '') + (n.dataset.quiet === '1' ? ' · quiet' : '');
+    n.classList.toggle('stale', stale);
+  }
+
+  // "… ago" of a time (data-t, ms) in the row detail.
+  function agoNode(ms) {
+    var n = el('span', 'rel-age');
+    n.dataset.t = String(ms);
+    n.textContent = fmtAgo(Math.max(0, nowMs() - ms));
+    return n;
+  }
+
+  // Writes every "… ago" on the page again for the current "now": after each
+  // answer of the list, also when it is "not modified" or has the same rows,
+  // so the ages keep moving while the tracker (and so the data) stands still.
+  function updateAges() {
+    var now = nowMs();
+    var root = $('rows');
+    var ages = root.querySelectorAll('.price-age');
+    for (var i = 0; i < ages.length; i++) { drawPriceAge(ages[i], now); }
+    var rel = root.querySelectorAll('.rel-age');
+    for (var j = 0; j < rel.length; j++) {
+      var t = Number(rel[j].dataset.t);
+      if (isFinite(t)) { rel[j].textContent = fmtAgo(Math.max(0, now - t)); }
+    }
+  }
+
+  // Takes the server's time of an answer (X-Snapshot-At) as "now".
+  function setSnapshotTime(iso) {
+    var t = timeMs(iso);
+    if (isFinite(t)) { snapshotMs = t; }
+  }
+
+  // "Latest %": the return at the most recent price as a badge, and under it
+  // how long ago that price was read, e.g. "+35.2%" / "12m ago". The exact
+  // times and the age of the call are in the title (and in the row detail).
   function latestCell(c) {
     var td = el('td', 'num latest');
     var v = c.latest_return_pct;
     if (!isNum(v)) { td.textContent = DASH; return td; }
-    var text = fmtPct(v);
-    var val = el('span', 'latest-val', text);
-    if (text !== '0.0%') { val.classList.add(v > 0 ? 'pos' : 'neg'); }
-    td.appendChild(val);
-
-    var readAt = new Date(c.latest_at).getTime();
-    var tradeAt = (typeof c.latest_trade_at === 'string') ? new Date(c.latest_trade_at).getTime() : NaN;
-    var quiet = !isNaN(readAt) && !isNaN(tradeAt) && readAt - tradeAt > QUIET_MS;
-    var age = fmtAge(c.latest_age_seconds);
-    var label = (age ? ' · ' + age : '') + (quiet ? ' · quiet' : '');
-    if (label) { td.appendChild(el('span', 'age', label)); }
+    td.appendChild(returnBadge(v, c.rugged));
+    var age = priceAgeNode(c, 'age');
+    td.appendChild(age);
 
     var tip = [];
     if (isHugePct(v)) { tip.push(exactPct(v)); }
-    if (!isNaN(readAt)) { tip.push('Price as of ' + fmtDate(c.latest_at)); }
-    if (!isNaN(tradeAt)) { tip.push('last trade ' + fmtDate(c.latest_trade_at)); }
-    if (tip.length) { td.title = tip.join('; ') + (quiet ? ' (no recent trades)' : ''); }
+    if (!isNaN(timeMs(c.latest_at))) { tip.push('Price read ' + fmtDate(c.latest_at)); }
+    if (!isNaN(timeMs(c.latest_trade_at))) { tip.push('last trade ' + fmtDate(c.latest_trade_at)); }
+    if (isNum(c.latest_age_seconds)) { tip.push('the call was ' + fmtAge(c.latest_age_seconds) + ' old then'); }
+    if (tip.length) { td.title = tip.join('; ') + (age.dataset.quiet === '1' ? ' (no recent trades)' : ''); }
     return td;
   }
 
@@ -253,54 +374,66 @@
       (isNum(c.salpha_report_id) ? c.salpha_report_id : 0);
   }
 
+  function tokenName(c) {
+    return (typeof c.token_name === 'string' && c.token_name.trim() !== '') ? c.token_name : shortAddress(c.contract_address);
+  }
+
+  // One row, "now" first: Token (and symbol) · Latest % (and how old that
+  // price is) · Latest MC · Call MC · Date · Perceptor · Status · Calls ·
+  // Entry $ · Peak % · Worst drop % · the five windows. The order must match
+  // the headers in index.html.
   function buildRow(c) {
     var tr = el('tr', 'call-row');
     var key = callKey(c);
-    var name = (typeof c.token_name === 'string' && c.token_name.trim() !== '') ? c.token_name : shortAddress(c.contract_address);
+    var name = tokenName(c);
 
-    var tdDate = el('td', 'date');
+    // Token: stays in view when the table scrolls sideways (sticky), with the
+    // toggle of the row detail, so a narrow screen still shows whose row it is.
+    var tdToken = el('td', 'tok');
     if (key) {
       tr.dataset.callId = key;
-      // opens the row detail (the token's reports); a real button, so it
-      // works with the keyboard
+      // opens the row detail (performance and the token's reports); a real
+      // button, so it works with the keyboard
       var tog = el('button', 'row-toggle');
       tog.type = 'button';
       tog.setAttribute('aria-expanded', 'false');
-      tog.setAttribute('aria-label', 'Reports of ' + name);
-      tog.title = 'Show the Perceptor and sAlpha reports';
+      tog.setAttribute('aria-label', 'Details of ' + name);
+      tog.title = 'Show the performance and the Perceptor and sAlpha reports';
       var chev = el('span', 'chev', '▸');
       chev.setAttribute('aria-hidden', 'true');
       tog.appendChild(chev);
-      tdDate.appendChild(tog);
+      tdToken.appendChild(tog);
     }
-    var dateNode = linkOrText(c.post_url, fmtDate(c.message_date));
-    tdDate.appendChild(dateNode);
-    tr.appendChild(tdDate);
-
-    var tdToken = el('td');
+    var names = el('span', 'tok-names');
     var tokenNode = linkOrText(c.gmgn_url, name, 'token');
     tokenNode.title = name + '\n' + String(c.contract_address || '');
-    tdToken.appendChild(tokenNode);
+    names.appendChild(tokenNode);
+    if (typeof c.token_symbol === 'string' && c.token_symbol.trim() !== '' && c.token_symbol !== name) {
+      var symNode = el('span', 'symbol', c.token_symbol);
+      symNode.title = c.token_symbol;
+      names.appendChild(symNode);
+    }
+    tdToken.appendChild(names);
     tr.appendChild(tdToken);
 
-    var tdSym = el('td');
-    if (typeof c.token_symbol === 'string' && c.token_symbol.trim() !== '') {
-      var symNode = linkOrText(c.gmgn_url, c.token_symbol, 'symbol');
-      symNode.title = c.token_symbol;
-      tdSym.appendChild(symNode);
+    var unit = c.price_unit;
+    var noUSD = typeof unit === 'string' && unit !== '' && unit !== 'usd';
+    if (noUSD) {
+      // tracked, but in another asset: no number here would be in dollars
+      var tdNo = el('td', 'num muted nousd', 'no USD price');
+      tdNo.title = 'The token trades against an asset with no dollar price';
+      tr.appendChild(tdNo);
+      tr.appendChild(el('td', 'num', DASH)); // latest market cap
+      tr.appendChild(el('td', 'num', DASH)); // call market cap
     } else {
-      tdSym.textContent = DASH;
+      tr.appendChild(latestCell(c));
+      tr.appendChild(mcapCell(c.latest_mcap_usd, 'Estimate (market cap in the post × latest price ÷ price at the post)'));
+      tr.appendChild(mcapCell(c.call_mcap_usd, 'Market cap in the post'));
     }
-    tr.appendChild(tdSym);
 
-    // The list has one row per token (its first call); this marks tokens called again.
-    var tdCalls = el('td', 'calls');
-    if (isNum(c.call_count) && c.call_count > 1) {
-      var rep = el('span', 'repeat', '×' + fmtInt(c.call_count));
-      rep.title = 'Called ' + fmtInt(c.call_count) + ' times, last on ' + fmtDate(c.last_call_date);
-      tdCalls.appendChild(rep);
-    }
-    tr.appendChild(tdCalls);
+    var tdDate = el('td', 'date');
+    tdDate.appendChild(linkOrText(c.post_url, fmtDate(c.message_date)));
+    tr.appendChild(tdDate);
 
     // Latest Perceptor report of the token; a dash when it was never scanned
     // (or the report had no readable verdict).
@@ -334,30 +467,33 @@
     }
     tr.appendChild(tdStatus);
 
-    var unit = c.price_unit;
-    if (typeof unit === 'string' && unit !== '' && unit !== 'usd') {
-      // tracked, but in another asset: no number here would be in dollars
+    // The list has one row per token (its first call); this marks tokens called again.
+    var tdCalls = el('td', 'calls');
+    if (isNum(c.call_count) && c.call_count > 1) {
+      var rep = el('span', 'repeat', '×' + fmtInt(c.call_count));
+      rep.title = 'Called ' + fmtInt(c.call_count) + ' times, last on ' + fmtDate(c.last_call_date);
+      tdCalls.appendChild(rep);
+    }
+    tr.appendChild(tdCalls);
+
+    if (noUSD) {
       tr.appendChild(el('td', 'num', DASH)); // entry
-      tr.appendChild(el('td', 'num', DASH)); // call market cap
-      tr.appendChild(el('td', 'num', DASH)); // latest market cap
-      var td = el('td', 'center muted', 'no USD price');
-      td.colSpan = NO_USD_SPAN; // latest, peak, worst drop and the windows
+      var td = el('td', 'center muted', DASH);
+      td.colSpan = NO_USD_SPAN; // peak, worst drop and the windows
+      td.title = 'No USD price: no performance is shown';
       tr.appendChild(td);
-    } else {
-      var tdEntry = el('td', 'num', fmtPrice(c.entry_price_usd));
-      if (isNum(c.entry_price_usd) && fmtPrice(c.entry_price_usd).indexOf('×') >= 0) { tdEntry.title = '$' + exactText(c.entry_price_usd, 0); }
-      tr.appendChild(tdEntry);
-      tr.appendChild(mcapCell(c.call_mcap_usd, 'Market cap in the post'));
-      tr.appendChild(mcapCell(c.latest_mcap_usd, 'Estimate (market cap in the post × latest price ÷ price at the post)'));
-      tr.appendChild(latestCell(c));
-      tr.appendChild(peakCell(c));
-      tr.appendChild(pctCell(c.drawdown_pct));
-      for (var w = 0; w < WINDOW_FIELDS.length; w++) {
-        var wc = pctCell(c[WINDOW_FIELDS[w]]);
-        wc.classList.add('win');
-        if (w === 0) { wc.classList.add('first'); }
-        tr.appendChild(wc);
-      }
+      return tr;
+    }
+    var tdEntry = el('td', 'num', fmtPrice(c.entry_price_usd));
+    if (isNum(c.entry_price_usd) && fmtPrice(c.entry_price_usd).indexOf('×') >= 0) { tdEntry.title = '$' + exactText(c.entry_price_usd, 0); }
+    tr.appendChild(tdEntry);
+    tr.appendChild(peakCell(c));
+    tr.appendChild(pctCell(c.drawdown_pct));
+    for (var w = 0; w < WINDOW_FIELDS.length; w++) {
+      var wc = pctCell(c[WINDOW_FIELDS[w]]);
+      wc.classList.add('win');
+      if (w === 0) { wc.classList.add('first'); }
+      tr.appendChild(wc);
     }
     return tr;
   }
@@ -374,7 +510,7 @@
 
   function colCount() {
     var n = document.querySelectorAll('thead th').length;
-    return n > 0 ? n : 17;
+    return n > 0 ? n : COLUMNS;
   }
 
   function setExpanded(tr, key, open) {
@@ -389,7 +525,9 @@
     }
   }
 
-  // The detail row of a call: made once, kept while the page is open.
+  // The detail row of a call: made once, kept while the page is open. It has
+  // two parts: the performance of the row (from the row itself, drawn again
+  // whenever the row changes) and the token's reports (from GET api/call).
   function detailRowFor(key) {
     var tr = detailRows[key];
     if (tr) { return tr; }
@@ -398,11 +536,81 @@
     var td = el('td', 'detail-cell');
     td.colSpan = colCount();
     var box = el('div', 'detail-box');
+    box.appendChild(el('div', 'detail-perf'));
+    box.appendChild(el('div', 'detail-reports'));
     td.appendChild(box);
     tr.appendChild(td);
     detailRows[key] = tr;
+    drawPerf(key);
     drawDetail(key);
     return tr;
+  }
+
+  // One line of the performance block: a term and its value (text or nodes).
+  function perfItem(dl, term, parts) {
+    var div = el('div');
+    div.appendChild(el('dt', '', term));
+    var dd = el('dd');
+    for (var i = 0; i < parts.length; i++) {
+      if (parts[i] === null || parts[i] === undefined || parts[i] === '') { continue; }
+      dd.appendChild(typeof parts[i] === 'string' ? document.createTextNode(parts[i]) : parts[i]);
+    }
+    div.appendChild(dd);
+    dl.appendChild(div);
+  }
+
+  // A percentage as coloured text, with the exact value in the title when it
+  // is written in powers of ten.
+  function pctNode(v) {
+    var n = el('span', '', fmtPct(v));
+    if (isNum(v) && fmtPct(v) !== '0.0%') { n.className = v > 0 ? 'pos' : 'neg'; }
+    if (isHugePct(v)) { n.title = exactPct(v); }
+    return n;
+  }
+
+  // The performance block of the row detail, from the row as last drawn.
+  function drawPerf(key) {
+    var tr = detailRows[key];
+    var c = rowData[key];
+    if (!tr) { return; }
+    var box = tr.querySelector('.detail-perf');
+    box.textContent = '';
+    if (!c) { return; }
+    var sec = el('section', 'report perf');
+    sec.appendChild(el('h3', 'report-title', 'Performance'));
+    var dl = el('dl', 'perf-list');
+    var called = timeMs(c.message_date);
+    var callParts = [fmtDate(c.message_date)];
+    if (!isNaN(called)) { callParts.push(' (', agoNode(called), ')'); }
+    perfItem(dl, 'Called', callParts);
+    var unit = c.price_unit;
+    if (typeof unit === 'string' && unit !== '' && unit !== 'usd') {
+      perfItem(dl, 'Performance', ['none: the token trades against an asset with no dollar price']);
+      sec.appendChild(dl);
+      box.appendChild(sec);
+      return;
+    }
+    var v = c.latest_return_pct;
+    perfItem(dl, 'Latest %', [isNum(v) ? returnBadge(v, c.rugged) : DASH]);
+    perfItem(dl, 'Entry price', [fmtPrice(c.entry_price_usd), isNum(c.entry_price_usd) ? ' (60 s after the post)' : '']);
+    perfItem(dl, 'Latest price', [fmtPrice(c.latest_price_usd)]);
+    var readAt = timeMs(c.latest_at);
+    if (!isNaN(readAt)) {
+      perfItem(dl, 'Price read', [fmtDate(c.latest_at), ' (', priceAgeNode(c, ''), ')',
+        isNum(c.latest_age_seconds) ? '; the call was ' + fmtAge(c.latest_age_seconds) + ' old then' : '']);
+    } else {
+      perfItem(dl, 'Price read', ['not yet']);
+    }
+    var tradeAt = timeMs(c.latest_trade_at);
+    if (!isNaN(tradeAt)) {
+      perfItem(dl, 'Last trade', [fmtDate(c.latest_trade_at), ' (', agoNode(tradeAt), ')']);
+    }
+    perfItem(dl, 'Call MC → Latest MC', [fmtMcap(c.call_mcap_usd), ' → ', fmtMcap(c.latest_mcap_usd)]);
+    var peak = c.rugged === true ? el('span', '', DASH + ' (rugged)') : pctNode(c.peak_pct);
+    perfItem(dl, 'Peak % (' + state.horizon + ')', [peak]);
+    perfItem(dl, 'Worst drop % (' + state.horizon + ')', [pctNode(c.drawdown_pct)]);
+    sec.appendChild(dl);
+    box.appendChild(sec);
   }
 
   function reportMeta(parts) {
@@ -459,11 +667,11 @@
     return sec;
   }
 
-  // Draws what is known of a call's detail into its detail row.
+  // Draws what is known of a call's reports into its detail row.
   function drawDetail(key) {
     var tr = detailRows[key];
     if (!tr) { return; }
-    var box = tr.querySelector('.detail-box');
+    var box = tr.querySelector('.detail-reports');
     var d = details[key];
     box.textContent = '';
     if (!d || (d.status === 'loading' && !d.data)) {
@@ -581,10 +789,14 @@
     for (var j = 0; j < hb.length; j++) {
       hb[j].setAttribute('aria-pressed', hb[j].dataset.horizon === state.horizon ? 'true' : 'false');
     }
+    var db = document.querySelectorAll('#days button');
+    for (var k = 0; k < db.length; k++) {
+      db[k].setAttribute('aria-pressed', Number(db[k].dataset.days) === state.days ? 'true' : 'false');
+    }
     $('explain').textContent = 'All numbers in USD, measured from the price 60 seconds after the post. ' +
-      HORIZONS.join(', ') + ' = the return over that window. Peak % and Worst drop % are over ' + state.horizon +
-      ' (the selector changes only these two). Latest % is the return at the most recent price, with the age of the' +
-      ' call at that time.';
+      'Latest % is the return at the most recent price; under it, how long ago that price was read ("stale" = older' +
+      ' than 30 minutes, or 2 hours for older or rugged calls). ' + HORIZONS.join(', ') + ' = the return over that window. Peak % and' +
+      ' Worst drop % are over ' + state.horizon + ' (the selector changes only these two).';
   }
 
   function renderCalls(data) {
@@ -592,16 +804,20 @@
     var frag = document.createDocumentFragment();
     var calls = Array.isArray(data.calls) ? data.calls : [];
     var reopen = [];
+    rowData = {};
     for (var i = 0; i < calls.length; i++) {
       var tr = buildRow(calls[i]);
       frag.appendChild(tr);
       var key = callKey(calls[i]);
       if (!key) { continue; }
       rowReports[key] = reportIds(calls[i]);
+      rowData[key] = calls[i];
       if (openRows[key]) {
-        // still open: the same detail node goes back under the row
+        // still open: the same detail node goes back under the row, with the
+        // performance of the row as it is now
         setExpanded(tr, key, true);
         frag.appendChild(detailRowFor(key));
+        drawPerf(key);
         reopen.push(key);
       }
     }
@@ -615,7 +831,8 @@
 
     if (calls.length === 0) {
       if (state.page > pages) { state.page = pages; loadCalls(false); return; }
-      setMessage(state.q ? 'No calls match this search.' : (state.verdicts.length ? 'No calls match this filter.' : 'No calls yet.'), false);
+      setMessage(state.q ? 'No calls match this search.' : (state.verdicts.length ? 'No calls match this filter.'
+        : state.days ? 'No calls in the last ' + daysText(state.days) + '.' : 'No calls yet.'), false);
     } else {
       setMessage('', false);
     }
@@ -630,6 +847,7 @@
     $('prev').disabled = state.page <= 1;
     $('next').disabled = state.page >= pages;
     $('total').textContent = fmtInt(total) + (total === 1 ? ' call' : ' calls') +
+      (isNum(data.days) && data.days > 0 ? ' from the last ' + daysText(data.days) : '') +
       (data.usd_only ? ' (priced in USD only)' : '');
     return pages;
   }
@@ -657,7 +875,7 @@
 
   // Everything of an answer that the table shows (not the time it was read).
   function callsSignature(d) {
-    return JSON.stringify([d.total, d.page, d.per, d.horizon, d.sort, d.dir, d.usd_only, d.verdict, d.calls]);
+    return JSON.stringify([d.total, d.page, d.per, d.horizon, d.sort, d.dir, d.usd_only, d.verdict, d.days, d.calls]);
   }
 
   // quiet = background refresh: no "Loading…", and the rows stay if it fails.
@@ -673,6 +891,7 @@
     p.set('horizon', state.horizon);
     // always in one order: the address decides whether to ask "has it changed?"
     if (state.verdicts.length) { p.set('verdict', state.verdicts.join(',')); }
+    if (state.days) { p.set('days', String(state.days)); }
     p.set('page', String(state.page));
     p.set('per', String(PER_PAGE));
     var url = 'api/calls?' + p.toString();
@@ -686,16 +905,20 @@
       loadedOnce = true;
       var hadError = callsErrorShown;
       callsErrorShown = false;
+      // the server's time moves on with every refresh, also when nothing
+      // else does: the "… ago" labels follow it in every case below
+      setSnapshotTime(res.at);
       if (res.data === null) {
-        // not modified: the table is current
+        // not modified: the rows are current, only their ages move on
         if (hadError) { renderCalls(shown.data); }
+        updateAges();
         return;
       }
       var sig = callsSignature(res.data);
       var same = shown.data !== null && shown.url === url && shown.sig === sig;
       shown = { url: url, etag: res.etag, sig: sig, data: res.data };
-      if (same && !hadError) { return; } // same rows: nothing to draw
-      renderCalls(res.data);
+      if (!same || hadError) { renderCalls(res.data); } // same rows: nothing to draw again
+      updateAges();
     }).catch(function (err) {
       if (!mine()) { return; } // cancelled by a newer request
       callsAbort = null;
@@ -743,7 +966,11 @@
   // "Updated hh:mm:ss": when the server last read the database.
   function showUpdated(iso) {
     var when = new Date(iso);
-    if (!isNaN(when.getTime())) { $('summary-updated').textContent = 'Updated ' + fmtTime(when); }
+    if (!isNaN(when.getTime())) {
+      $('summary-updated').textContent = 'Updated ' + fmtTime(when);
+      // a newer server time also moves the "… ago" labels of the rows on
+      if (!(when.getTime() <= snapshotMs)) { setSnapshotTime(iso); updateAges(); }
+    }
     $('summary-error').hidden = true;
   }
 
@@ -882,6 +1109,7 @@
     });
 
     bindVerdictPicker();
+    bindDaysPicker();
 
     $('prev').addEventListener('click', function () {
       if (state.page > 1) { state.page--; loadCalls(false); }
@@ -896,7 +1124,7 @@
   //
   // A button that opens a small panel of checkboxes; a change applies at once.
   // None ticked, or all four, is "all". The choice is kept in localStorage
-  // (the page keeps none of its filters in the address).
+  // (not in the address; only the age filter is kept there).
 
   var VERDICTS_KEY = 'scout.verdicts';
 
@@ -1012,6 +1240,48 @@
     });
   }
 
+  // ---- Age filter ("Calls from the last 1d / 7d / 30d / All") ---------------
+  //
+  // Kept in the page's address (?days=7), so a link or a reload shows the same
+  // choice; without it, every call is shown (as before the filter existed).
+
+  function readDaysFromURL() {
+    var v = null;
+    try { v = new URLSearchParams(window.location.search).get('days'); } catch (e) { return 0; }
+    var n = Number(v);
+    return (DAY_CHOICES.indexOf(n) >= 0 && String(n) === v) ? n : 0;
+  }
+
+  function writeDaysToURL() {
+    if (!window.history || typeof window.history.replaceState !== 'function') { return; }
+    var p = new URLSearchParams(window.location.search);
+    if (state.days) { p.set('days', String(state.days)); } else { p.delete('days'); }
+    var qs = p.toString();
+    try {
+      window.history.replaceState(null, '', window.location.pathname + (qs ? '?' + qs : '') + window.location.hash);
+    } catch (e) {
+      // some browsers refuse it for pages opened from a file: the choice lasts while the page is open
+    }
+  }
+
+  function setDays(n) {
+    if (n !== 0 && DAY_CHOICES.indexOf(n) < 0) { return; }
+    if (n === state.days) { return; }
+    state.days = n;
+    state.page = 1;
+    writeDaysToURL();
+    renderHeaders();
+    loadCalls(false);
+  }
+
+  function bindDaysPicker() {
+    state.days = readDaysFromURL();
+    writeDaysToURL(); // drops a days= the page does not offer
+    Array.prototype.forEach.call(document.querySelectorAll('#days button'), function (b) {
+      b.addEventListener('click', function () { setDays(Number(b.dataset.days)); });
+    });
+  }
+
   // ---- Live updates (Server-Sent Events) -----------------------------------
   //
   // GET api/events streams what changed in the list: "call" (a new token row),
@@ -1075,6 +1345,11 @@
   // text, letter case ignored; verdict: the row's bucket is one of those chosen).
   function rowMatchesFilters(c) {
     if (state.verdicts.length && state.verdicts.indexOf(verdictBucket(c.perceptor_verdict)) < 0) { return false; }
+    if (state.days) {
+      // the server counts back from its snapshot time, and so does this
+      var posted = timeMs(c.message_date);
+      if (!isFinite(posted) || posted < nowMs() - state.days * 86400000) { return false; }
+    }
     if (state.q) {
       var q = state.q.toLowerCase();
       var fields = [c.token_name, c.token_symbol, c.contract_address];
@@ -1180,6 +1455,7 @@
     rows.insertBefore(tr, rows.firstChild);
     markFresh(tr);
     rowReports[key] = reportIds(c);
+    rowData[key] = c;
     calls.unshift(c);
     shown.data.total = (isNum(shown.data.total) ? shown.data.total : 0) + 1;
     var per = isNum(shown.data.per) && shown.data.per > 0 ? shown.data.per : PER_PAGE;
@@ -1211,11 +1487,12 @@
     tr.parentNode.replaceChild(fresh, tr);
     markFresh(fresh);
     rowReports[key] = reportIds(c);
+    rowData[key] = c;
     if (i >= 0) {
       shown.data.calls[i] = c;
       shown.sig = callsSignature(shown.data);
     }
-    if (openRows[key]) { refreshDetail(key); }
+    if (openRows[key]) { drawPerf(key); refreshDetail(key); }
   }
 
   function onLiveReload(d) {
@@ -1423,8 +1700,39 @@
     renderDesktopButton();
   }
 
+  // The table box scrolls down too (for the sticky header), and some browsers
+  // count its vertical scrollbar in 100cqw: the row detail would then reach
+  // under the scrollbar. A probe 100cqw wide tells by how much 100cqw is wider
+  // than the visible part of the box: that is --sbw, taken off in style.css.
+  // It also keeps --head-h and --tok-w (the sticky header row's height and
+  // the Token column's width) up to date for the box's scroll-padding.
+  function watchScrollbar() {
+    var wrap = document.querySelector('.table-wrap');
+    if (!wrap) { return; }
+    var probe = el('div', 'cq-probe');
+    probe.setAttribute('aria-hidden', 'true');
+    wrap.insertBefore(probe, wrap.firstChild);
+    var measure = function () {
+      var sbw = Math.max(0, probe.offsetWidth - wrap.clientWidth);
+      wrap.style.setProperty('--sbw', sbw + 'px');
+      // the sticky header row and Token column, for scroll-padding in style.css
+      var head = wrap.querySelector('thead');
+      var tok = wrap.querySelector('th.tok');
+      if (head) { wrap.style.setProperty('--head-h', Math.ceil(head.getBoundingClientRect().height) + 'px'); }
+      if (tok) { wrap.style.setProperty('--tok-w', Math.ceil(tok.getBoundingClientRect().width) + 'px'); }
+    };
+    measure();
+    if (typeof window.ResizeObserver === 'function') {
+      new window.ResizeObserver(measure).observe(wrap);
+      new window.ResizeObserver(measure).observe($('rows'));
+    } else {
+      window.addEventListener('resize', measure);
+    }
+  }
+
   bind();
   bindLive();
+  watchScrollbar();
   renderHeaders();
   loadSummary();
   loadCalls(false);

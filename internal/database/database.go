@@ -37,6 +37,12 @@ var DbConnV5 *pgx5.Conn
 
 // SetupDatabase
 func SetupDatabase() (*sql.DB, *pgxpool5.Pool, error) {
+	return SetupDatabaseMaxConns(0)
+}
+
+// SetupDatabaseMaxConns is SetupDatabase with the pgx pool's MaxConns set to
+// maxConns; 0 keeps pgxpool's default (max(4, NumCPU)).
+func SetupDatabaseMaxConns(maxConns int32) (*sql.DB, *pgxpool5.Pool, error) {
 	godotenv.Load()
 	var err error
 	dbURI := "host=%s port=%d user=%s password=%s dbname=%s sslmode=%s  sslrootcert=%s sslcert=%s sslkey=%s"
@@ -106,6 +112,9 @@ func SetupDatabase() (*sql.DB, *pgxpool5.Pool, error) {
 	config5, err := pgxpool5.ParseConfig(dbURI)
 	if err != nil {
 		log.Fatal(err)
+	}
+	if maxConns > 0 {
+		config5.MaxConns = maxConns
 	}
 	config5.AfterConnect = func(ctx context.Context, conn *pgx5.Conn) error {
 		pgxdecimal.Register(conn.TypeMap())

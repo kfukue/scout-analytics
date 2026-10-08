@@ -63,8 +63,40 @@ overrides them (see 7.4); `SCOUT_DB=off` disables recording;
 |---|---|
 | Command | `go run . -listen-only` |
 | Needs | Telegram (`API_ID`, `API_HASH`, `PHONE`, `TG_PASSWORD` if 2FA; session `SCOUT_SESSION_FILE`, default `scout.session.json`), database, `SCOUT_STATE_DIR` (default `scoutanalytics_data`). It does not need the nodes. |
-| Key vars | `SCOUT_SOURCE_CHANNEL` (scoutrobinhood), `SCOUT_NOTIFY_PEER` (default `me`), `SCOUT_DELIVER_LEVELS` (`clean,caution`), `SCOUT_TOOLS` (`perceptor,salpha`) and `SCOUT_TOOL_<CODE>_*`, `SCOUT_POLL_INTERVAL` (`20s`; with `0` the catch-up and requeue still run once at start, not retried), `SCOUT_CATCHUP_MAX` (`100`), `SCOUT_CATCHUP_MAX_AGE` (`24h`), `SCOUT_SCAN_GAP` (`3s`), `SCOUT_MODEL_URL` (off), `SCOUT_MODEL_TIMEOUT` (`5s`) |
-| Writes | `scout_calls`, `scout_investigations`, `scout_deliveries`, …; queues new calls for tracking; sends `pg_notify('scout_events', …)` for each new real call and report |
+| Key vars | `SCOUT_SOURCE_CHANNEL` (scoutrobinhood), `SCOUT_NOTIFY_PEER` (default `me`), `SCOUT_DELIVER_LEVELS` (`clean,caution`), `SCOUT_TOOLS` (`perceptor,salpha`) and `SCOUT_TOOL_<CODE>_*`, `SCOUT_POLL_INTERVAL` (`20s`; with `0` the catch-up and requeue still run once at start, not retried), `SCOUT_CATCHUP_MAX` (`100`), `SCOUT_CATCHUP_MAX_AGE` (`24h`), `SCOUT_SCAN_GAP` (`3s`), `SCOUT_MODEL_URL` (off), `SCOUT_MODEL_TIMEOUT` (`5s`), `SCOUT_RESCAN` (`off`) and `SCOUT_RESCAN_*` (below) |
+| Writes | `scout_calls`, `scout_investigations`, `scout_deliveries`, …; queues new calls for tracking; sends `pg_notify('scout_events', …)` for each new real call and report; with `SCOUT_RESCAN=on` also `scout_investigations` rows with `scan_kind = 'rescan'`, and a completed rescan notifies too (`"kind":"report"` with `"scan_kind":"rescan"`; a call's own report carries `"scan_kind":"live"`) |
+
+**Rescan lane (`SCOUT_RESCAN`, off by default).** Perceptor re-scans of first
+calls that have no Perceptor report, run inside this listener when the live
+queue is idle (README "Re-scanning calls without a Perceptor report").
+Settings and defaults: `SCOUT_RESCAN_MAX_AGE=720h`,
+`SCOUT_RESCAN_MAX_PER_DAY=100`, `SCOUT_RESCAN_GAP=10m`, `SCOUT_RESCAN_IDLE=5m`,
+`SCOUT_RESCAN_STATUSES=backfill,duplicate,failed,scanned`.
+
+- **Do not switch it on in prod before the website's "Perceptor today" label
+  is deployed.** Shipping the code with the lane off changes nothing but the
+  schema (the `scan_kind` column, added at the next start of any mode).
+- Before switching it on, see what it would do (database only, no Telegram,
+  no node): `go run . -rescan-missing -dry-run`. It lists and counts the
+  candidates and estimates the days needed. Like every mode it applies
+  `scoutanalytics.sql` first, so on prod run it only as part of the deploy,
+  in the 3.4 order, never while processes of the older version are running.
+  Before the deploy, count with a read-only pgAdmin query instead.
+- An invalid `SCOUT_RESCAN_*` value stops every mode at startup (`-track`
+  and `-web` read the same `.env`), not only the listener.
+- Load: at most `SCOUT_RESCAN_MAX_PER_DAY` Perceptor requests a day, at least
+  `SCOUT_RESCAN_GAP` apart, on the same account and pacing (2m5s) as live
+  calls; no node or tracker load. A live call can wait up to about 5 minutes
+  behind a re-scan in progress. Telegram `FLOOD_WAIT` or a Perceptor
+  rate-limit reply pauses the lane for at least an hour.
+- To switch it on: add `SCOUT_RESCAN=on` to `.env` and restart the listener
+  (stop it first). Check for `rescan: on — …` in the log; then one
+  `rescan: call …` line per re-scan. To stop it: `SCOUT_RESCAN=off` and
+  restart the listener.
+- Rolling back to a binary without the lane while `rescan` rows exist: the old
+  `scout_call_dataset_v` would count them as call-time Perceptor verdicts,
+  and the old website would show them as the token's Perceptor verdict.
+  Retrain or export only with the new binary's view in place.
 
 **Restart cost: missed posts and waiting calls are picked up on start, within
 limits.** Polling resumes from a saved cursor (the lower of the newest post in
@@ -281,7 +313,8 @@ restarts, so the units you did not restart keep running the old code until then.
      AND c.status IN ('queued', 'dropped')
      AND c.message_date < now() - interval '72 hours'
      AND NOT EXISTS (SELECT 1 FROM scout_investigations i
-                     WHERE i.call_id = c.id AND i.status = 'completed')
+                     WHERE i.call_id = c.id AND i.status = 'completed'
+                       AND i.scan_kind = 'live')
    ORDER BY c.message_id;
    ```
 
@@ -296,7 +329,8 @@ restarts, so the units you did not restart keep running the old code until then.
      AND c.status IN ('queued', 'dropped')
      AND c.message_date < now() - interval '72 hours'
      AND NOT EXISTS (SELECT 1 FROM scout_investigations i
-                     WHERE i.call_id = c.id AND i.status = 'completed');
+                     WHERE i.call_id = c.id AND i.status = 'completed'
+                       AND i.scan_kind = 'live');
    -- the row count must match the SELECT above; otherwise ROLLBACK;
    COMMIT;
    ```
@@ -652,13 +686,21 @@ For deployment it changes:
 
 ### 7.4 Database connections: `SCOUT_DATABASE_URL` vs `database.SetupDatabase`
 
-- With `SCOUT_DATABASE_URL` the pool is hard-coded to `MaxConns = 4`
-  (`NewScoutStore` in `scout_models.data.go`). That is too few for 12 tracker
-  workers, and it needs raising (code change) before prod switches to it.
-- The default path (`database.SetupDatabase`) sets no `MaxConns`. pgxpool's
-  default is `max(4, NumCPU)` per process. It also
-  fatally requires `.env` in the working directory.
-- Connection budget on the **shared** `assetdb`: about 3 processes × the pool
-  size, plus 1 `LISTEN` connection for `-web`, plus the main API and pgAdmin.
+- Pool size, both paths: at most the tracker's worker count
+  (`SCOUT_TRACK_WORKERS` with the on-chain source, 1 with GeckoTerminal) + 4
+  connections per process, between 4 and 32, so 16 for prod's `-track` with
+  12 workers (on-chain).
+  The startup line `recording to SQL via …` shows the value and where it came
+  from. Connections are opened only when used: the listener and `-web` stay at
+  a few each even with the same ceiling.
+- With `SCOUT_DATABASE_URL`, `pool_max_conns=N` in the DSN overrides the
+  default (never overridden by the code). The default path
+  (`database.SetupDatabase`) has no override and fatally requires `.env` in the
+  working directory. It also keeps 2 connections outside the pool (its
+  `database/sql` handle and a single `pgx` connection).
+- Connection budget on the **shared** `assetdb`: the pools (realistically about
+  12 to 16 for `-track`, a few each for the listener and `-web`; at most 3 × 16
+  if the units share the 12-worker setting), plus 2 per process on the default
+  path, plus 1 `LISTEN` connection for `-web`, plus the main API and pgAdmin.
   Keep the total below Postgres `max_connections`, which matters most on a
   small managed Postgres tier.

@@ -79,6 +79,8 @@ type config struct {
 	CatchUpMax    int           // SCOUT_CATCHUP_MAX
 	CatchUpMaxAge time.Duration // SCOUT_CATCHUP_MAX_AGE (0 = no age limit)
 
+	Rescan rescanConfig // SCOUT_RESCAN_*: Perceptor re-scans of first calls without a report (rescan.go)
+
 	StateDir string
 	DryRun   bool
 
@@ -172,6 +174,9 @@ func loadConfig(envFile string) (*config, error) {
 		return nil, err
 	}
 	if c.CatchUpMax, c.CatchUpMaxAge, err = loadCatchUpConfig(); err != nil {
+		return nil, err
+	}
+	if c.Rescan, err = loadRescanConfig(); err != nil {
 		return nil, err
 	}
 	if c.NotifyBotToken != "" && c.NotifyChatID == "" {
@@ -376,6 +381,10 @@ type scanner struct {
 	byBot   map[int64]*toolRunner
 
 	queue chan job
+
+	// rescan is the rescan lane (rescan.go); nil when it is off. Set before
+	// the worker starts.
+	rescan *rescanLane
 
 	listOnly bool // -list-chats: don't resolve the delivery target
 
@@ -828,21 +837,67 @@ func botAPISend(ctx context.Context, token, chatID, text string) error {
 	return nil
 }
 
-// worker processes queued CAs one at a time (replies can't be correlated otherwise).
+// worker processes queued CAs one at a time (replies can't be correlated
+// otherwise). With the rescan lane on, it looks at the lane whenever the live
+// queue is empty (at once, and every rescanTick while idle) and runs at most
+// one rescan at a time, in this goroutine: a live call that arrives meanwhile
+// waits for it to finish (rescan.go).
 func (s *scanner) worker(ctx context.Context) {
+	lane := s.rescan
+	lane.noteLive(time.Now()) // a new worker (start, reconnect) waits SCOUT_RESCAN_IDLE first
 	for {
+		// live calls first, without blocking
 		select {
 		case <-ctx.Done():
 			return
 		case j := <-s.queue:
-			s.process(ctx, j, !s.cfg.DryRun)
-			s.jobDone(j)
-			select {
-			case <-ctx.Done():
+			if !s.runLive(ctx, j) {
 				return
-			case <-time.After(s.cfg.ScanGap):
 			}
+			continue
+		default:
 		}
+		if lane != nil && lane.step(ctx, s.db, func() int { return len(s.queue) }) {
+			continue
+		}
+		var tick <-chan time.Time // nil (never ready) with the lane off
+		var timer *time.Timer
+		if lane != nil {
+			timer = time.NewTimer(rescanTick)
+			tick = timer.C
+		}
+		select {
+		case <-ctx.Done():
+			stopTimer(timer)
+			return
+		case j := <-s.queue:
+			stopTimer(timer)
+			if !s.runLive(ctx, j) {
+				return
+			}
+		case <-tick:
+		}
+	}
+}
+
+// stopTimer stops t (nil is fine).
+func stopTimer(t *time.Timer) {
+	if t != nil {
+		t.Stop()
+	}
+}
+
+// runLive processes one live job, then waits SCOUT_SCAN_GAP. It returns
+// false when ctx ended during the wait.
+func (s *scanner) runLive(ctx context.Context, j job) bool {
+	s.process(ctx, j, !s.cfg.DryRun)
+	s.jobDone(j)
+	s.rescan.noteLive(time.Now())
+	select {
+	case <-ctx.Done():
+		return false
+	case <-time.After(s.cfg.ScanGap):
+		return true
 	}
 }
 
@@ -1062,11 +1117,25 @@ func (s *scanner) recordInvestigation(j job, r *toolResult) *int {
 	if runner == nil || runner.toolID == nil {
 		return nil
 	}
+	row := investigationRow(r, j.CallID, j.CA, *runner.toolID)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	id, err := s.db.InsertScoutInvestigation(ctx, row)
+	if err != nil {
+		log.Printf("db: insert scout_investigations %s/%s: %v", r.Spec.Code, j.CA, err)
+		return nil
+	}
+	return id
+}
+
+// investigationRow is the scout_investigations row of one tool's result for
+// ca (a live scan; the rescan lane sets ScanKind itself).
+func investigationRow(r *toolResult, callID *int, ca string, toolID int) *ScoutInvestigation {
 	done := r.CompletedAt
 	row := &ScoutInvestigation{
-		CallID:          j.CallID,
-		ToolID:          *runner.toolID,
-		ContractAddress: j.CA,
+		CallID:          callID,
+		ToolID:          toolID,
+		ContractAddress: ca,
 		RequestText:     r.Command,
 		RequestedAt:     r.RequestedAt,
 		CompletedAt:     &done,
@@ -1091,14 +1160,7 @@ func (s *scanner) recordInvestigation(j job, r *toolResult) *int {
 	if r.Err != nil {
 		row.Error = strPtr(r.Err.Error())
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	id, err := s.db.InsertScoutInvestigation(ctx, row)
-	if err != nil {
-		log.Printf("db: insert scout_investigations %s/%s: %v", r.Spec.Code, j.CA, err)
-		return nil
-	}
-	return id
+	return row
 }
 
 func (s *scanner) recordDelivery(j job, header string, investigationIDs []int, sendErr error) {
@@ -1509,6 +1571,7 @@ func main() {
 	retryGaveUp := flag.Bool("retry-gave-up", false, "with -retry-no-pool: also gave_up calls")
 	retryLaunchpad := flag.String("retry-launchpad", "", "with -retry-no-pool: only calls whose launchpad or dex is one of these, comma-separated, e.g. pons_v2 (case, spaces and _ ignored)")
 	retryDryRun := flag.Bool("retry-dry-run", false, "with -retry-no-pool: only print what would be reset")
+	rescanMissing := flag.Bool("rescan-missing", false, "with -dry-run: list and count the first calls without a Perceptor report that the rescan lane (SCOUT_RESCAN) would re-scan under the current settings, and how long it would take, then exit (DB only; nothing is scanned)")
 	flag.Parse()
 	if !*retryNoPool && (*retryGaveUp || *retryLaunchpad != "" || *retryDryRun) {
 		log.Fatal("-retry-gave-up, -retry-launchpad and -retry-dry-run are used with -retry-no-pool")
@@ -1519,6 +1582,11 @@ func main() {
 		log.Fatal(err)
 	}
 	cfg.DryRun = *dryRun
+
+	if *rescanMissing && !*dryRun {
+		fmt.Println("-rescan-missing scans nothing itself: the rescan lane runs inside the listener with SCOUT_RESCAN=on (see README, \"Re-scanning calls without a Perceptor report\"). Add -dry-run to see what it would re-scan.")
+		return
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -1546,18 +1614,22 @@ func main() {
 		if err := s.registerTools(ctx); err != nil {
 			log.Fatalf("database: register tools: %v", err)
 		}
-		log.Printf("recording to SQL via %s → %s (tables scout_calls, scout_investigations, scout_deliveries, …)",
-			dbSource, db.Describe(ctx))
+		log.Printf("recording to SQL via %s → %s, pool of at most %d connections (%s) (tables scout_calls, scout_investigations, scout_deliveries, …)",
+			dbSource, db.Describe(ctx), db.Pool.Config().MaxConns, db.MaxConnsFrom)
 	} else {
 		log.Println("SCOUT_DB=off — not recording to SQL")
 	}
 
 	// Modes that need only the database (no Telegram login).
-	if *exportPath != "" || *trackOnly || *trackOnce || *webOnly || *retryNoPool {
+	if *exportPath != "" || *trackOnly || *trackOnce || *webOnly || *retryNoPool || *rescanMissing {
 		if s.db == nil {
 			log.Fatal("these modes need the database (SCOUT_DB=off is set)")
 		}
 		switch {
+		case *rescanMissing: // with -dry-run (checked above)
+			if err := runRescanDryRun(ctx, s.db, os.Stdout, cfg.Rescan, time.Now()); err != nil {
+				log.Fatalf("rescan dry run: %v", err)
+			}
 		case *retryNoPool:
 			f := RetryFilter{GaveUp: *retryGaveUp, Launchpads: parseLaunchpads(*retryLaunchpad)}
 			if *retryLaunchpad != "" && len(f.Launchpads) == 0 {
@@ -1743,6 +1815,7 @@ func main() {
 	}
 
 	// Long-running mode with reconnect/backoff.
+	s.rescan = s.newRescanLane(cfg.Rescan) // nil when off (logs one line when on)
 	backoff := 5 * time.Second
 	for {
 		start := time.Now()
@@ -1801,8 +1874,11 @@ func main() {
 //     DB_USER, DB_PASS, DB_NAME_DEV, APP_ENV, GETH_HOST_PATH / HOST_SECRET_PATH, SSL_CERT_FILE_PATH),
 //     i.e. the same connection the API uses.
 func openScoutStore(ctx context.Context, cfg *config) (*ScoutStore, string, error) {
+	// The pool is sized for the workers the tracker really runs (one with the
+	// GeckoTerminal source), not the raw SCOUT_TRACK_WORKERS.
+	workers := cfg.Price.trackWorkers()
 	if cfg.DatabaseURL != "" {
-		st, err := NewScoutStore(ctx, cfg.DatabaseURL)
+		st, err := NewScoutStore(ctx, cfg.DatabaseURL, workers)
 		return st, "SCOUT_DATABASE_URL", err
 	}
 	switch cfg.DBMode {
@@ -1812,7 +1888,7 @@ func openScoutStore(ctx context.Context, cfg *config) (*ScoutStore, string, erro
 	default:
 		return nil, "", fmt.Errorf("unknown SCOUT_DB=%q (use repo or off)", cfg.DBMode)
 	}
-	pool, err := setupRepoDatabase()
+	pool, err := setupRepoDatabase(defaultPoolMaxConns(workers))
 	if err != nil {
 		return nil, "", err
 	}
@@ -1824,18 +1900,20 @@ func openScoutStore(ctx context.Context, cfg *config) (*ScoutStore, string, erro
 	if err := pool.Ping(pctx); err != nil {
 		return nil, "", fmt.Errorf("ping via database.SetupDatabase: %w", err)
 	}
-	return NewScoutStoreFromPool(pool), "database.SetupDatabase (DB_USER, APP_ENV=" + os.Getenv("APP_ENV") + ")", nil
+	st := NewScoutStoreFromPool(pool)
+	st.MaxConnsFrom = defaultPoolSource(workers)
+	return st, "database.SetupDatabase (DB_USER, APP_ENV=" + os.Getenv("APP_ENV") + ")", nil
 }
 
-// setupRepoDatabase calls the repo's database.SetupDatabase, turning its panic
-// on a failed ping into an error.
-func setupRepoDatabase() (pool *pgxpool.Pool, err error) {
+// setupRepoDatabase calls the repo's database.SetupDatabase with a pool of at
+// most maxConns connections, turning its panic on a failed ping into an error.
+func setupRepoDatabase(maxConns int32) (pool *pgxpool.Pool, err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			err = fmt.Errorf("database.SetupDatabase: %v", r)
 		}
 	}()
-	database.DbConn, database.DbConnPgx, err = database.SetupDatabase()
+	database.DbConn, database.DbConnPgx, err = database.SetupDatabaseMaxConns(maxConns)
 	return database.DbConnPgx, err
 }
 
