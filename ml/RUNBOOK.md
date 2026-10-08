@@ -9,6 +9,40 @@ scores into deliveries. `SCOUT_MODEL_URL` stays unset until the product
 manager has read the report and said the gates passed. Scores never filter
 deliveries in any case.
 
+## Quick way: one script
+
+`ml/run_training.sh` runs steps 1, 2, 4, 5 and 6 below in one go, with the
+same commands and flags, plus the step 9 check (`SCOUT_MODEL_URL` in `.env`:
+it warns, without showing the value, and goes on). It stops at the first
+failure and says which step failed; when a command inside a step failed, it
+also shows the last 20 lines of that command's output to paste. It always
+deletes `$ML/data/calls.csv` when it exits, also on an error or Ctrl+C. It
+does not run the step 3 queries and does not start `serve.py`.
+
+Do not pull `main` into the deployed checkout for this: that changes the code
+the listener runs (and its next restart applies the new schema). Instead take
+a copy of the script from `origin/main` into `~/scout-ml` and run that copy:
+
+```bash
+cd /path/to/scout-analytics                # the deployed checkout (REPO), with .env
+git fetch origin main && mkdir -p ~/scout-ml \
+  && git show origin/main:ml/run_training.sh > ~/scout-ml/run_training.sh \
+  && REPO="$PWD" ML=~/scout-ml bash ~/scout-ml/run_training.sh
+# weekly re-runs, venv already installed:          ... bash ~/scout-ml/run_training.sh --skip-install
+# export with a built binary instead of go run:    ... bash ~/scout-ml/run_training.sh --binary ./scoutanalytics
+```
+
+Write `ML=~/scout-ml` without quotes (or `ML="$HOME/scout-ml"`): the script
+refuses a quoted `~`, a relative path, a path inside `$REPO`, and a `$REPO`
+inside `$ML` (or reached through `$ML/src`, e.g. a symlink). Do not run
+the copy of the script inside `$ML/src/ml/`: step 1 rewrites that file while
+it runs, so the script refuses to start from there.
+
+At the end it prints the path of `report.md` and the train time; paste the
+report as in step 8. Step output is kept in `$ML/logs/`. The step-by-step
+below remains the reference; use it when the script stops or to run a single
+step.
+
 Time: about 10 minutes the first time (mostly `pip install`), then about
 2 minutes per run. Memory: the export and training each need under 0.5 GB
 (training took about 10 s and peaked at about 200 MB on synthetic data of the
@@ -281,6 +315,10 @@ never decide whether a call is delivered.
 rm -f "$ML/data/calls.csv"
 git -C "$REPO" worktree remove --force "$ML/src"   # --force: ignores __pycache__ left by the tests
 ```
+
+If `$ML/src` was deleted by hand, git still lists it; clear only that entry with
+`git -C "$REPO" worktree remove --force "$ML/src"` (do not use
+`git worktree prune` in the deployed checkout; it clears every stale entry).
 
 The venv and `$ML/models` can stay for the next weekly retrain (repeat steps
 1, 4, 5 and 6).
