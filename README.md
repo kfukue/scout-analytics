@@ -1557,3 +1557,11 @@ of the limit below, and `snapshot_at` is the snapshot as it already was. Afterwa
 CAs are processed one at a time; within a CA all tools run in parallel (replies are
 matched to each bot, so they can't get mixed up). The client reconnects with
 backoff if the connection drops. Ctrl+C to stop.
+
+## Licence
+
+PolyForm Noncommercial License 1.0.0 (see [LICENSE](LICENSE)): free for personal, research and
+other non-commercial use. Commercial use requires permission — contact @kfukue on GitHub.
+
+`.claude/agents/react-coder.md` is adapted from wshobson/agents under its MIT licence
+(attribution kept in that file).
