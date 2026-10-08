@@ -34,7 +34,7 @@ train, report, cleanup): [`RUNBOOK.md`](RUNBOOK.md).
 
 ## Export data
 
-    <go binary> -export-dataset calls.csv
+    go run . -export-dataset calls.csv       # from the repo root (or: <go binary> -export-dataset calls.csv)
 
 CSV with a header, one column per view column, empty string for NULL,
 `true`/`false`, RFC3339 timestamps. No database at hand:

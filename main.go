@@ -9,11 +9,11 @@
 //
 // Run from the repo root (so the root .env is picked up):
 //
-//	go run ./telegrambot/scoutanalytics                 # listen forever
-//	go run ./telegrambot/scoutanalytics -dry-run        # listen, log verdicts, deliver nothing
-//	go run ./telegrambot/scoutanalytics -scan 0xABC...  # one-off scan: print + deliver (add -no-deliver to only print)
+//	go run .                 # listen forever
+//	go run . -dry-run        # listen, log verdicts, deliver nothing
+//	go run . -scan 0xABC...  # one-off scan: print + deliver (add -no-deliver to only print)
 //
-// See README.md in this folder for configuration.
+// See README.md for configuration.
 package main
 
 import (
@@ -44,7 +44,7 @@ import (
 	"github.com/gotd/td/tgerr"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/joho/godotenv"
-	"github.com/kfukue/geth-analytics-api/database"
+	"github.com/kfukue/scoutanalytics/internal/database"
 )
 
 // ---------------------------------------------------------------------------
@@ -1797,7 +1797,7 @@ func main() {
 // openScoutStore picks the database:
 //   - SCOUT_DATABASE_URL set → that DSN
 //   - SCOUT_DB=off           → no recording
-//   - otherwise              → the repo's database package (database.SetupDatabase:
+//   - otherwise              → internal/database (database.SetupDatabase:
 //     DB_USER, DB_PASS, DB_NAME_DEV, APP_ENV, GETH_HOST_PATH / HOST_SECRET_PATH, SSL_CERT_FILE_PATH),
 //     i.e. the same connection the API uses.
 func openScoutStore(ctx context.Context, cfg *config) (*ScoutStore, string, error) {

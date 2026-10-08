@@ -1,0 +1,52 @@
+{
+  "agent": "product-manager",
+  "permissions": {
+    "allow": [
+      "Bash(go vet:*)",
+      "Bash(go test:*)",
+      "Bash(go build:*)",
+      "Bash(gofmt:*)",
+      "Bash(python -m pytest:*)",
+      "Bash(git status:*)",
+      "Bash(git diff:*)",
+      "Bash(git log:*)",
+      "Bash(git show:*)",
+      "Bash(node --check:*)",
+      "Bash(ml/.venv/Scripts/python.exe -m pytest:*)",
+      "Bash(./ml/.venv/Scripts/python.exe -m pytest:*)",
+      "Bash(.venv/Scripts/python.exe -m pytest:*)",
+      "Bash(./.venv/Scripts/python.exe -m pytest:*)",
+      "PowerShell(go vet:*)",
+      "PowerShell(go test:*)",
+      "PowerShell(go build:*)",
+      "PowerShell(gofmt:*)",
+      "PowerShell(python -m pytest:*)",
+      "PowerShell(git status:*)",
+      "PowerShell(git diff:*)",
+      "PowerShell(git log:*)",
+      "PowerShell(git show:*)",
+      "PowerShell(node --check:*)",
+      "PowerShell(ml\\.venv\\Scripts\\python.exe -m pytest:*)",
+      "PowerShell(.\\ml\\.venv\\Scripts\\python.exe -m pytest:*)",
+      "PowerShell(ml/.venv/Scripts/python.exe -m pytest:*)",
+      "PowerShell(./ml/.venv/Scripts/python.exe -m pytest:*)",
+      "PowerShell(.venv\\Scripts\\python.exe -m pytest:*)",
+      "PowerShell(.\\.venv\\Scripts\\python.exe -m pytest:*)",
+      "PowerShell(.venv/Scripts/python.exe -m pytest:*)",
+      "PowerShell(./.venv/Scripts/python.exe -m pytest:*)"
+    ],
+    "deny": [
+      "Read(./.env)",
+      "Read(./.env.*)",
+      "Read(./scout.session.json)",
+      "Read(./scoutanalytics_data/**)",
+      "Read(**/.env)",
+      "Read(**/.env.*)",
+      "Read(**/scout.session.json)",
+      "Read(**/scoutanalytics_data/**)",
+      "Read(**/calls.csv)",
+      "Bash(git push:*)",
+      "PowerShell(git push:*)"
+    ]
+  }
+}

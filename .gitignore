@@ -1,0 +1,18 @@
+# Binaries and test output
+*.exe
+*.exe~
+*.test
+*.out
+/scoutanalytics
+
+# Secrets and local state (never commit)
+.env
+.env.*
+scout.session.json
+*.session.json
+scoutanalytics_data/
+*.csv
+
+# Python
+ml/.venv/
+__pycache__/

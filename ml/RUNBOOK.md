@@ -19,33 +19,35 @@ takes about 1 GB and 1 to 2 minutes. Disk: about 400 MB for the venv, about
 ## 0. Paths
 
 ```bash
-REPO=/path/to/geth-analytics-api   # the deployed checkout (runs main); .env is where you start the listener
+REPO=/path/to/scoutanalytics      # the deployed checkout of kfukue/scoutanalytics (runs main); .env is where you start the listener
 ML=~/scout-ml                      # everything this runbook creates; outside the repo
 mkdir -p "$ML"
 ```
 
+This runbook assumes prod already runs from the new `kfukue/scoutanalytics`
+checkout (HANDOFF.md, section 5, cut-over checklist).
+
 The CSV contains every call (addresses, symbols, outcomes). It never goes
-into the repo: only the repo-root `calls.csv` of the owner's PC is ignored,
-by a local exclude that the server does not have.
+into the repo: keep it under `$ML/data` (the repo's `.gitignore` also
+ignores `*.csv`, but do not rely on that).
 
 ## 1. Get the ml/ code with the fixes (once per change to ml/)
 
 The fixes from 7 October 2026 (repeat calls excluded, columns checked against
-the view) are on `scout-call-model` once the owner has committed and pushed
-them; `main` has an older `ml/`. Train from a separate worktree
-of the branch, so the deployed checkout is not touched:
+the view) are on `main`. Train from a separate worktree of `origin/main`, so
+the deployed checkout is not touched:
 
 ```bash
-git -C "$REPO" fetch origin scout-call-model
-git -C "$REPO" worktree add --detach "$ML/src" origin/scout-call-model
-# later, to update it:  git -C "$ML/src" checkout --detach origin/scout-call-model  (after the fetch above)
+git -C "$REPO" fetch origin main
+git -C "$REPO" worktree add --detach "$ML/src" origin/main
+# later, to update it:  git -C "$ML/src" checkout --detach origin/main  (after the fetch above)
 
 # refuse the old ml/ (it would train on repeat calls): this file comes with the fixes
-test -f "$ML/src/telegrambot/scoutanalytics/ml/tests/test_view_columns.py" && echo "ml/ is up to date" || echo "OLD ml/: stop; the fixes are not pushed yet"
+test -f "$ML/src/ml/tests/test_view_columns.py" && echo "ml/ is up to date" || echo "OLD ml/: stop; the fixes are not pushed yet"
 ```
 
-Once those commits are merged into `main` and pulled, `$REPO/telegrambot/scoutanalytics/ml`
-works as well; then use that path instead of `$ML/src/...` below.
+If `$REPO` is up to date with `origin/main`, `$REPO/ml` works as well; then
+use that path instead of `$ML/src/ml` below.
 
 ## 2. Python venv (once)
 
@@ -56,7 +58,7 @@ python3 --version                      # must say 3.11 or newer
 sudo apt-get install -y python3-venv libgomp1   # Debian/Ubuntu: venv module, OpenMP runtime for LightGBM
 python3 -m venv "$ML/venv"
 "$ML/venv/bin/python" -m pip install -U pip
-"$ML/venv/bin/python" -m pip install -r "$ML/src/telegrambot/scoutanalytics/ml/requirements.txt"
+"$ML/venv/bin/python" -m pip install -r "$ML/src/ml/requirements.txt"
 ```
 
 If the server only has Python 3.10, stop here and tell the product manager
@@ -66,7 +68,7 @@ Check the install with the test suite (synthetic data only, about 30 s;
 `-p no:cacheprovider` keeps it from writing a cache into the worktree):
 
 ```bash
-cd "$ML/src/telegrambot/scoutanalytics/ml"
+cd "$ML/src/ml"
 "$ML/venv/bin/python" -m pytest tests -q -p no:cacheprovider
 ```
 
@@ -156,7 +158,7 @@ listener and tracker are not affected.
 umask 077
 mkdir -p "$ML/data"
 cd "$REPO"                         # must contain .env, as when you start the listener with go run
-SCOUT_DB_AUTO_MIGRATE=false go run ./telegrambot/scoutanalytics -export-dataset "$ML/data/calls.csv"
+SCOUT_DB_AUTO_MIGRATE=false go run . -export-dataset "$ML/data/calls.csv"
 # or, with a built binary:  SCOUT_DB_AUTO_MIGRATE=false ./scoutanalytics -export-dataset "$ML/data/calls.csv"
 ```
 
@@ -167,7 +169,7 @@ than the ~4,733 first calls. Do not open, copy or paste the file.
 ## 5. Train
 
 ```bash
-cd "$ML/src/telegrambot/scoutanalytics/ml"
+cd "$ML/src/ml"
 time "$ML/venv/bin/python" train.py --csv "$ML/data/calls.csv" --out "$ML/models"
 ```
 

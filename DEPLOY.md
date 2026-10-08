@@ -24,14 +24,16 @@ the `ops/*/README.md` files (pgAdmin scripts).
  │                                                           │    │  RPC_URL)            │
  │ Postgres 17, database assetdb (SHARED with the main API)  │    └─────────▲───────────┘
  │                                                           │              │ eth_call /
- │ go run ./telegrambot/scoutanalytics -listen-only  ────────┼── Telegram   │ getLogs
- │ go run ./telegrambot/scoutanalytics -track  ──────────────┼──────────────┘
- │ go run ./telegrambot/scoutanalytics -web   (:8090 or SCOUT_WEB_ADDR)
+ │ go run . -listen-only  ───────────────────────────────────┼── Telegram   │ getLogs
+ │ go run . -track  ─────────────────────────────────────────┼──────────────┘
+ │ go run . -web   (:8090 or SCOUT_WEB_ADDR)
  └──────────────────────────────────────────────────────────┘
  owner's Windows workstation: development, git push, SQL through pgAdmin
 ```
 
-- Production runs the `main` branch; development is on `scout-call-model`.
+- Production runs the `main` branch; development is on a work branch merged
+  with a PR. The repo is `kfukue/scoutanalytics` (moved from
+  `kfukue/geth-analytics`, `telegrambot/scoutanalytics`, history kept).
 - Nitro must keep `--execution.rpc.log-history=0`. Without the full log index,
   old block ranges are read one block at a time and the tracker slows to a crawl.
 - **`assetdb` is shared with the main API.** Every scout process applies
@@ -45,7 +47,7 @@ the `ops/*/README.md` files (pgAdmin scripts).
 
 All three run from the **repo root**. Their working directory must hold `.env`:
 `loadConfig` reads `API_ID`/`API_HASH` in every mode, and
-`database.SetupDatabase` loads `.env` from the working directory.
+`database.SetupDatabase` (`internal/database`) loads `.env` from the working directory.
 Note that `godotenv.Load` does not override variables that are already set, so
 a value in the process environment (systemd `Environment=`) wins over `.env`.
 
@@ -59,7 +61,7 @@ overrides them (see 7.4); `SCOUT_DB=off` disables recording;
 
 | | |
 |---|---|
-| Command | `go run ./telegrambot/scoutanalytics -listen-only` |
+| Command | `go run . -listen-only` |
 | Needs | Telegram (`API_ID`, `API_HASH`, `PHONE`, `TG_PASSWORD` if 2FA; session `SCOUT_SESSION_FILE`, default `scout.session.json`), database, `SCOUT_STATE_DIR` (default `scoutanalytics_data`). It does not need the nodes. |
 | Key vars | `SCOUT_SOURCE_CHANNEL` (scoutrobinhood), `SCOUT_NOTIFY_PEER` (default `me`), `SCOUT_DELIVER_LEVELS` (`clean,caution`), `SCOUT_TOOLS` (`perceptor,salpha`) and `SCOUT_TOOL_<CODE>_*`, `SCOUT_POLL_INTERVAL` (`20s`; with `0` the catch-up and requeue still run once at start, not retried), `SCOUT_CATCHUP_MAX` (`100`), `SCOUT_CATCHUP_MAX_AGE` (`24h`), `SCOUT_SCAN_GAP` (`3s`), `SCOUT_MODEL_URL` (off), `SCOUT_MODEL_TIMEOUT` (`5s`) |
 | Writes | `scout_calls`, `scout_investigations`, `scout_deliveries`, …; queues new calls for tracking; sends `pg_notify('scout_events', …)` for each new real call and report |
@@ -141,7 +143,7 @@ not be written: the catch-up stopped there and is retried from post X.
 
 | | |
 |---|---|
-| Command (prod) | `SCOUT_RPC_RPS=300 SCOUT_TRACK_WORKERS=12 SCOUT_RPC_PARALLEL=4 SCOUT_RPC_MAX_INFLIGHT=48 go run ./telegrambot/scoutanalytics -track` |
+| Command (prod) | `SCOUT_RPC_RPS=300 SCOUT_TRACK_WORKERS=12 SCOUT_RPC_PARALLEL=4 SCOUT_RPC_MAX_INFLIGHT=48 go run . -track` |
 | Needs | database, Nitro (`SCOUT_RPC_URL`, default `http://localhost:8540`), Erigon (`SCOUT_MAINNET_RPC_URL`). No Telegram connection, but `API_ID`/`API_HASH` must be in `.env`. |
 | Key vars (README defaults) | `SCOUT_RPC_RPS` (0 = unlimited; prod 300), `SCOUT_TRACK_WORKERS` (8; prod 12), `SCOUT_RPC_PARALLEL` (8; prod 4), `SCOUT_RPC_MAX_INFLIGHT` (64; prod 48), `SCOUT_RPC_LOG_CHUNK` (200000; prod unset), `SCOUT_TRACK_INTERVAL` (`1m`), `SCOUT_LATEST_REFRESH` (`on`; prod on), `SCOUT_LATEST_REFRESH_RECENT` (`15m`), `SCOUT_LATEST_REFRESH_OLD` (`24h`), `SCOUT_LATEST_BATCH` (200), `SCOUT_RUG_LIQ_USD` (500, set in `.env`), `SCOUT_CHAINLINK_FEEDS` (in `.env`; 10–33 stock feeds, plus `asset_chains`), `SCOUT_MAINNET_CHAINLINK_FEEDS`, `SCOUT_MAINNET_RPC_RPS` (0), `SCOUT_STABLES` (USDG), `SCOUT_PRICE_LOOKBACK_BLOCKS` (8640000), `SCOUT_DISCOVERY_BLOCKS` (18000), `SCOUT_PONS_FACTORY`, `SCOUT_PONS_HOOK`, `SCOUT_RPC_LOG_CACHE` (300000), `SCOUT_PERF_HORIZONS` (`1h,1d,3d,7d,30d`), `SCOUT_PRICE_SOURCE` (`onchain`) |
 
@@ -165,7 +167,7 @@ repeat …; …` or `tracking: idle — …; next check in …`, and per latest-
 
 | | |
 |---|---|
-| Command | `go run ./telegrambot/scoutanalytics -web` |
+| Command | `go run . -web` |
 | Needs | database only. `API_ID`/`API_HASH` must still be in `.env`. Uses one extra connection outside its pool for `LISTEN scout_events`. |
 | Key vars | `SCOUT_WEB_ADDR` (`:8090`; in `.env` on prod; use `127.0.0.1:8090` behind a proxy), `SCOUT_WEB_REFRESH` (`15s`), `SCOUT_WEB_DIR` (empty = page built into the binary), `SCOUT_GMGN_URL` |
 
@@ -184,14 +186,14 @@ when the token count changes or a read is slow. Problems show as
 
 ### 3.0 Common steps
 
-On the PC: commit and push `scout-call-model`, merge to `main` with a PR (the
+On the PC: commit and push the work branch, merge to `main` with a PR (the
 owner does this). On the server:
 
 ```bash
-cd /srv/geth-analytics                     # EDIT: the server's repo root
+cd /srv/scoutanalytics                     # EDIT: the server's repo root
 git rev-parse HEAD > /tmp/scout-prev-commit   # note what runs now
 git checkout main && git pull
-git log --oneline "$(cat /tmp/scout-prev-commit)"..HEAD -- telegrambot/scoutanalytics   # what changed
+git log --oneline "$(cat /tmp/scout-prev-commit)"..HEAD   # what changed
 ```
 
 **Today (`go run`):** the restart itself compiles the new code. Rollback is
@@ -201,7 +203,7 @@ git log --oneline "$(cat /tmp/scout-prev-commit)"..HEAD -- telegrambot/scoutanal
 **With a built binary (section 4):**
 
 ```bash
-go build -o /opt/scoutanalytics/scoutanalytics.new ./telegrambot/scoutanalytics
+go build -o /opt/scoutanalytics/scoutanalytics.new .
 cp -p /opt/scoutanalytics/scoutanalytics /opt/scoutanalytics/scoutanalytics.prev
 mv /opt/scoutanalytics/scoutanalytics.new /opt/scoutanalytics/scoutanalytics
 # then restart only the units the change needs (below)
@@ -225,7 +227,7 @@ restarts, so the units you did not restart keep running the old code until then.
 
 1. **Before deploying, check for a full re-track:**
    ```bash
-   git diff "$(cat /tmp/scout-prev-commit)"..HEAD -- telegrambot/scoutanalytics | grep -n onchainStateVersion
+   git diff "$(cat /tmp/scout-prev-commit)"..HEAD | grep -n onchainStateVersion
    ```
    Today it is `const onchainStateVersion = 2`. A higher number makes the tracker
    re-track **every** call from scratch, which means hours to days of node load.
@@ -233,7 +235,7 @@ restarts, so the units you did not restart keep running the old code until then.
 2. With the new code, run `-price-check` on 2–3 affected tokens **before**
    restarting. It is read-only and exits. Run it from the repo root so `.env`
    is found: today
-   `go run ./telegrambot/scoutanalytics -price-check 0xTokenCA -price-at 6h`;
+   `go run . -price-check 0xTokenCA -price-at 6h`;
    with the binary flow
    `/opt/scoutanalytics/scoutanalytics.new -price-check 0xTokenCA -price-at 6h`
    (before the `mv`).
@@ -363,7 +365,7 @@ Build (from the repo root, as in 3.0):
 
 ```bash
 sudo install -d -o scout -g scout /opt/scoutanalytics       # EDIT: user
-go build -o /opt/scoutanalytics/scoutanalytics ./telegrambot/scoutanalytics
+go build -o /opt/scoutanalytics/scoutanalytics .
 ```
 
 Notes for all three:
@@ -410,7 +412,7 @@ StartLimitBurst=3
 Type=simple
 User=scout
 Group=scout
-WorkingDirectory=/srv/geth-analytics
+WorkingDirectory=/srv/scoutanalytics
 # flock: a second copy (e.g. a manual run with the same wrapper) refuses to start.
 ExecStart=/usr/bin/flock -n /run/lock/scout-listener.lock /opt/scoutanalytics/scoutanalytics -listen-only
 Restart=on-failure
@@ -453,7 +455,7 @@ StartLimitBurst=5
 Type=simple
 User=scout
 Group=scout
-WorkingDirectory=/srv/geth-analytics
+WorkingDirectory=/srv/scoutanalytics
 EnvironmentFile=/etc/scoutanalytics/track.env
 ExecStart=/opt/scoutanalytics/scoutanalytics -track
 Restart=on-failure
@@ -482,7 +484,7 @@ StartLimitBurst=10
 Type=simple
 User=scout
 Group=scout
-WorkingDirectory=/srv/geth-analytics
+WorkingDirectory=/srv/scoutanalytics
 # Enable ONLY once nginx (section 5) is in front: binds to this machine only and
 # wins over SCOUT_WEB_ADDR in .env. Enabled now, it would cut off http://<server IP>:8090.
 #Environment=SCOUT_WEB_ADDR=127.0.0.1:8090
@@ -638,7 +640,8 @@ the owner plans **GCP Pub/Sub** (already used by the main API):
 
 ### 7.3 Repo move to `kfukue/scoutanalytics`
 
-Planned and on hold. See [HANDOFF.md, section 5](HANDOFF.md#5-repo-migration-on-hold-until-the-pending-tasks-are-done).
+Done in this repo (history kept); pending the owner's push and the prod
+cut-over. The checklist is in [HANDOFF.md, section 5](HANDOFF.md#5-repo-migration-done-pending-push-and-prod-cut-over).
 For deployment it changes:
 
 - the build command (`go build -o … .` at the new root);

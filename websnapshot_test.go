@@ -996,7 +996,7 @@ var benchWebQueries = []struct{ name, query string }{
 // ("page/…"), the whole request with its JSON ("http/…", "gzip/…"), a request
 // answered 304, and building the snapshot. No database needed:
 //
-//	go test -run '^$' -bench WebSnapshot -benchmem ./telegrambot/scoutanalytics
+//	go test -run '^$' -bench WebSnapshot -benchmem .
 func BenchmarkWebSnapshot(b *testing.B) {
 	const n = 12000
 	ws := benchWebServer(b, n)

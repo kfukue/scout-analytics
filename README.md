@@ -1,5 +1,8 @@
 # scoutanalytics
 
+> Moved from `kfukue/geth-analytics` (`telegrambot/scoutanalytics`), history kept.
+> Commit hashes cited in older notes refer to the old repository.
+
 Watches **@scoutrobinhood**, pulls every contract address (CA) out of new posts and
 sends it to every **investigation tool** in parallel:
 
@@ -15,7 +18,7 @@ call, every tool's report and every delivery can be recorded in Postgres.
 It logs in as your Telegram *user* account (a regular bot can't read other
 channels or talk to other bots). It reuses `API_ID`, `API_HASH`, `PHONE` from the
 repo-root `.env`, but keeps its own session file so it won't fight with the
-existing telegrambot session.
+API repo's telegrambot session.
 
 ## Run
 
@@ -23,18 +26,18 @@ From the repo root:
 
 ```bash
 # 1. one CA — prints every tool's report + verdict and delivers it (if the gate allows)
-go run ./telegrambot/scoutanalytics -scan 0xYourTestCA
+go run . -scan 0xYourTestCA
 #    print only, don't send:
-go run ./telegrambot/scoutanalytics -scan 0xYourTestCA -no-deliver
+go run . -scan 0xYourTestCA -no-deliver
 
 # 1b. process a specific call post (prints what it found in the post, then investigates + delivers)
-go run ./telegrambot/scoutanalytics -post 10002          # or -post https://t.me/scoutrobinhood/10002
+go run . -post 10002          # or -post https://t.me/scoutrobinhood/10002
 
 # 2. watch the channel but deliver nothing (verdicts go to the log)
-go run ./telegrambot/scoutanalytics -dry-run
+go run . -dry-run
 
 # 3. real thing
-go run ./telegrambot/scoutanalytics
+go run .
 ```
 
 First run asks for the Telegram login code (and uses `TG_PASSWORD` if you have 2FA).
@@ -807,7 +810,7 @@ Check it with `./scoutanalytics -test-notify` (sends one test message and exits)
 If Telegram later rejects the chat (`PEER_ID_INVALID`, e.g. the group was upgraded to a
 supergroup), the scanner looks `SCOUT_NOTIFY_PEER` up again and retries once.
 
-Not sure of the name or id? `go run ./telegrambot/scoutanalytics -list-chats` prints
+Not sure of the name or id? `go run . -list-chats` prints
 all your groups and channels with their ids. On startup the log shows where reports
 will go, e.g. `reports will be delivered to supergroup "scout analytics" (id 1234567890)`.
 
@@ -921,7 +924,8 @@ stored in the DB for reference; it doesn't affect delivery unless you make it a 
 ## Recording to a SQL database (Postgres)
 
 Every call, report and delivery is recorded **in the same database your API uses**. The
-scanner calls the repo's `database.SetupDatabase()`, so it uses the same settings from
+scanner calls `database.SetupDatabase()` (in `internal/database`, copied unchanged from
+the API repo), so it uses the same settings from
 `.env`: `DB_USER`, `DB_PASS`, `DB_NAME_DEV`, `APP_ENV`, and `GETH_HOST_PATH` (LOCAL_GETH) or
 `HOST_SECRET_PATH` + `SSL_CERT_FILE_PATH` (Cloud SQL). Nothing extra to configure.
 
@@ -1006,7 +1010,7 @@ FROM scout_investigations_v GROUP BY 1,2,3 ORDER BY 1 DESC, 2;
 DB integration tests (use a THROWAWAY database; they drop and recreate the scout_* tables):
 
 ```
-SCOUT_TEST_DATABASE_URL=postgres://postgres@localhost:5432/scout_test?sslmode=disable go test ./telegrambot/scoutanalytics
+SCOUT_TEST_DATABASE_URL=postgres://postgres@localhost:5432/scout_test?sslmode=disable go test -p 1 .
 ```
 
 ## Website
@@ -1016,7 +1020,7 @@ channel called, with the performance of its first call. It runs as **its own pro
 needs only the database (no Telegram login, same as `-track`):
 
 ```bash
-./scoutanalytics -web          # or: go run ./telegrambot/scoutanalytics -web
+./scoutanalytics -web          # or: go run . -web
 # → website on http://[::]:8090 …   open http://<this machine>:8090/
 ```
 

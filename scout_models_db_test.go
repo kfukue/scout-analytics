@@ -15,7 +15,7 @@ import (
 // Integration tests. They run only when SCOUT_TEST_DATABASE_URL points at a
 // THROWAWAY Postgres database (they drop and recreate the scout_* tables), e.g.
 //
-//	SCOUT_TEST_DATABASE_URL=postgres://postgres@localhost:5432/scout_test?sslmode=disable go test ./telegrambot/scoutanalytics
+//	SCOUT_TEST_DATABASE_URL=postgres://postgres@localhost:5432/scout_test?sslmode=disable go test -p 1 .
 
 func testStore(t *testing.T) *ScoutStore {
 	t.Helper()

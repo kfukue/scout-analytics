@@ -6,17 +6,27 @@ to the agents in `.claude/agents/` (see "Agent setup").
 
 First message to give it:
 
-> Read telegrambot/scoutanalytics/HANDOFF.md and README.md, then check
+> Read HANDOFF.md and README.md, then check
 > "Prod state and pending owner actions" with me before starting "Next work".
+
+**Moved from `kfukue/geth-analytics` (history kept).** This repo,
+`kfukue/scoutanalytics`, is `telegrambot/scoutanalytics` of
+`kfukue/geth-analytics` extracted with `git filter-repo --subdirectory-filter`
+from that repo's `main` at 4369a1d (PR #20), plus one standalone commit (own
+`go.mod`, `internal/database`, paths). Every commit hash in this file before
+section 5 is an **old-repo** hash; the rewritten hashes for the ones that
+matter are in section 5. Package `main` is at the repo root: `go run .`.
 
 ## What the system is
 
-Branch `scout-call-model`. Production runs `main`.
+Repo `kfukue/scoutanalytics`, branch `main` (the only branch carried over).
+Production runs `main` of the old repo at 4369a1d (the owner confirmed the
+server has the latest); it moves to this repo with the cut-over in section 5.
 
 - Listener: reads @scoutrobinhood, tells real calls from "hit 3X" update posts
   (`postkind.go`), sends new tokens to @perceptor0xBot and @salpha_research_bot,
   delivers to the private group, records to Postgres. After a restart it
-  catches up on missed posts (section 2).
+  catches up on missed posts (section 1, 08b3a71).
 - Tracker (`-track`): on-chain prices from Uniswap v2/v3/v4 pools and Pons V2
   bonding curves, returns at 1h/1d/3d/7d/30d, 5-minute and hourly candles,
   pre-call trading stats, token names from `name()`. Only the first real call of
@@ -59,52 +69,49 @@ Merged to `main` through PRs #10–#14 (the last is a527d2c, up to 40e1888):
     at `SIM_MAX_RET_PCT = +1000%` (owner approved), tracker columns forbidden as
     model inputs.
 
-Committed and pushed on `origin/scout-call-model`, **not yet merged to
-`main`** (`origin/main` stops at 40e1888 as of 7 Oct; confirm with the owner
-what the server actually runs):
+Pushed to `origin/scout-call-model` (local branch even with it, at 08b3a71)
+and merged to `main` through PRs #15–#19 (the last is 21139e1, 7 Oct 23:06
+-07:00, up to 08b3a71; `main` and the branch have the same tree). Then #20
+(4369a1d, merging d49fe9c: handoff and ops index after the liquidity
+re-track). The old repo's `origin/main` at 4369a1d and `origin/scout-call-model`
+at d49fe9c have the same tree for `telegrambot/scoutanalytics`; this repo was
+extracted from 4369a1d.
 
-- 4cd2bd5: Pons-v4 re-track skips rows already tracked by the Pons-aware code.
-- 39b1bac: website restyle (after oca.lylelabs.io), sAlpha declines, rugged
-  rows without a peak, 10ⁿ numbers, one Perceptor line.
-- 4eb6fbe: previous handoff.
-- 7a54f78: USD-repair ops scripts (`ops/2026-10-usd-repair`).
-- 7cf8dd3: SSE live updates (`GET /api/events`; the listener `NOTIFY`s, the web
-  process `LISTEN`s and refreshes its snapshot; notices only for calls < 1h
-  old; `-backfill` sends no NOTIFY).
-- 14052f8: rolling worker queue, deterministic `blockAt` + head cache, segment
-  checkpoints, USD own-pool whole-history fix, the no-price-yet cap,
-  `-price-check` loads the DB feeds.
-- bde6d81: `.claude/` agent setup and permissions, including the
-  `PowerShell(git push:*)` deny.
-- 75f666c: liquidity re-track scripts; ML first-call-only training rows, view
-  columns test, `ml/RUNBOOK.md`.
-- 2da28ab: ops rename (`2026-10-v4-retrack` → `2026-10-07-liquidity-retrack`)
-  and the ops index `ops/README.md`.
+- #15: 4cd2bd5: Pons-v4 re-track skips rows already tracked by the Pons-aware
+  code.
+- #16: 39b1bac: website restyle (after oca.lylelabs.io), sAlpha declines,
+  rugged rows without a peak, 10ⁿ numbers, one Perceptor line. 4eb6fbe:
+  previous handoff.
+- #17: 7a54f78: USD-repair ops scripts (`ops/2026-10-usd-repair`). 7cf8dd3: SSE
+  live updates (`GET /api/events`; the listener `NOTIFY`s, the web process
+  `LISTEN`s and refreshes its snapshot; notices only for calls < 1h old;
+  `-backfill` sends no NOTIFY). 14052f8: rolling worker queue, deterministic
+  `blockAt` + head cache, segment checkpoints, USD own-pool whole-history fix,
+  the no-price-yet cap, `-price-check` loads the DB feeds. bde6d81: `.claude/`
+  agent setup and permissions, including the `PowerShell(git push:*)` deny.
+- #18: 75f666c: liquidity re-track scripts; ML first-call-only training rows,
+  view columns test, `ml/RUNBOOK.md`. 2da28ab: ops rename
+  (`2026-10-v4-retrack` → `2026-10-07-liquidity-retrack`) and the ops index
+  `ops/README.md`.
+- #19: 08b3a71 (one commit; the subject line only mentions the multi-select):
+  - **Listener catch-up** after a restart: the resume cursor is min(DB,
+    `poll_cursor.json`); the newest `SCOUT_CATCHUP_MAX` (default 100) missed
+    posts no older than `SCOUT_CATCHUP_MAX_AGE` (default 24h) are handled live,
+    older ones stored only; calls still `queued`/`dropped` within 72h are
+    requeued; polling reads full batches (`catchup.go` and tests).
+  - **Perceptor multi-select** filter on the website (`verdict=clean,caution`).
+  - **`DEPLOY.md`** (new).
 
-## 2. Not yet committed (owner must commit and push)
+Prod runs the old repo's `main` at 4369a1d (the owner confirmed the server has
+the latest), from the old checkout, until the cut-over in section 5.
 
-`git status` on 7 October still shows this work in the working tree only:
+## 2. Not yet committed
 
-- **Listener catch-up** after a restart: the resume cursor is min(DB,
-  `poll_cursor.json`); the newest `SCOUT_CATCHUP_MAX` (default 100) missed
-  posts no older than `SCOUT_CATCHUP_MAX_AGE` (default 24h) are handled live,
-  older ones stored only; calls still `queued`/`dropped` within 72h are
-  requeued; polling reads full batches.
-- **Perceptor multi-select** filter on the website (`verdict=clean,caution`).
-- **`DEPLOY.md`** (new).
-
-Files, all under `telegrambot/scoutanalytics/`:
-
-- modified: `README.md`, `frontend/app.js`, `frontend/index.html`,
-  `frontend/style.css`, `main.go`, `scout_models.data.go`, `scout_models.go`,
-  `tracker.go`, `tracker_names_db_test.go`, `web.go`, `web_db_test.go`,
-  `websnapshot.go`, `websnapshot_test.go`
-- untracked: `DEPLOY.md`, `catchup.go`, `catchup_db_test.go`, `catchup_test.go`
-- plus this `HANDOFF.md`, `ops/README.md` and
-  `ops/2026-10-07-liquidity-retrack/README.md` (docs, 7 Oct).
-
-Run the reviewer agent on this diff, then commit as separate clean commits
-(catch-up; multi-select; DEPLOY.md; docs) before the repo migration.
+Nothing. The 7 October doc edits (`ops/README.md`,
+`ops/2026-10-07-liquidity-retrack/README.md`) are committed in d49fe9c
+(PR #20, 4369a1d). The corrected text of this `HANDOFF.md`, saved after
+d49fe9c, is carried into this repo's standalone commit; the old repo's
+uncommitted copy can be discarded.
 
 ## 3. Prod state and pending owner actions
 
@@ -123,9 +130,9 @@ State on 7 October:
 
 Pending owner actions:
 
-1. Commit section 2 (after the reviewer), push, merge to `main` and deploy
-   (restart the listener and `-web`).
-2. Decide about `stash@{0}` (Next work 1).
+1. Create the empty private repo `kfukue/scoutanalytics` and push this repo's
+   `main` (section 5).
+2. The prod cut-over to the new checkout (section 5, checklist).
 3. **Prod settings** (for reference):
    - `-track` with `SCOUT_RPC_RPS=300 SCOUT_TRACK_WORKERS=12
      SCOUT_RPC_PARALLEL=4 SCOUT_RPC_MAX_INFLIGHT=48`, latest-price pass on.
@@ -135,16 +142,14 @@ Pending owner actions:
 
 ## 4. Next work, in order (owner's decision)
 
-1. **The stash decision:** `stash@{0}` ("On codex/scout-dashboard:
-   scout-dashboard before main sync 2026-10-06"; touches the scout README,
-   `main.go`, `scout_models.data.go`, `scoutanalytics.sql`, `tracker.go` and a
-   test). The PM recommends leaving it: it is probably superseded and will not
-   move to the new repo. (`stash@{1..3}` are old GitHub Desktop stashes from
+1. Done: **the stash decision.** `stash@{0}` ("On codex/scout-dashboard:
+   scout-dashboard before main sync 2026-10-06") stays behind in the old repo;
+   it did not move here. (`stash@{1..3}` are old GitHub Desktop stashes from
    other branches.)
-2. **The repo migration to `kfukue/scoutanalytics`** (section 5), BEFORE ML
-   training.
-3. **The first ML training** via `ml/RUNBOOK.md`, run from the new repo (the
-   runbook paths are updated in the standalone commit). No GPU needed: CPU
+2. Done, pending the owner's push and the prod cut-over: **the repo migration
+   to `kfukue/scoutanalytics`** (section 5), BEFORE ML training.
+3. **The first ML training** via `ml/RUNBOOK.md`, run from this repo after the
+   cut-over (the runbook paths are for this layout). No GPU needed: CPU
    only, it takes seconds. The long (30d) horizon is skipped until about
    mid-November. The gates are strict; scores stay out of deliveries until a
    report passes. ml-coder agent.
@@ -167,24 +172,72 @@ Later:
   posts no longer matters (training uses first calls only, so they are
   near-constant).
 
-## 5. Repo migration (next, after the stash decision)
+## 5. Repo migration (done; pending push and prod cut-over)
 
-- Plan: `git filter-repo --subdirectory-filter telegrambot/scoutanalytics` on a
-  fresh clone of **`https://github.com/kfukue/geth-analytics.git`** (the real
-  remote, not geth-analytics-api), from `origin/scout-call-model`.
-- New module `github.com/kfukue/scoutanalytics`, `package main` at the root.
-- Copy `database/database.go` to `internal/database` unchanged (same `.env`);
-  new `.gitignore`; copy `.claude/` with paths rewritten; docs to `go run .`;
-  update the paths in `ml/RUNBOOK.md`.
-- Pre-checks done: no secrets ever in history (all refs); `origin/main` has
-  nothing the branch lacks; `codex/scout-dashboard` is local-only with no
-  unique commits. Recount the commits before the filter (35 touch
-  `telegrambot/scoutanalytics` on `origin/scout-call-model` as of 7 Oct).
-- Blockers: the uncommitted work in section 2 (commit and push it first) and
-  the stash decision.
-- Prod cut-over: copy `.env`; stop the old listener before starting the new one
-  (never two on one Telegram session); copy `scout.session.json` and
-  `scoutanalytics_data/`; start with `go run .`; rollback = restart the old one.
+**Moved from `kfukue/geth-analytics` (history kept).**
+
+- Done on 7 October: `git filter-repo --subdirectory-filter
+  telegrambot/scoutanalytics --refs main` on a fresh clone of
+  `https://github.com/kfukue/geth-analytics.git`, from `origin/main` at 4369a1d
+  (same tree as `origin/scout-call-model` for this folder). 37 commits touch
+  the folder (55 with merges). No secrets anywhere in the extracted history
+  (no `.env`, `*session.json`, `calls.csv`, `scoutanalytics_data/` or `.exe`
+  object). Only `main` was carried over; the old stash stayed behind.
+- Then one standalone commit, no functional changes: module
+  `github.com/kfukue/scoutanalytics` (`go.mod`/`go.sum` from the old repo,
+  `go mod tidy`, same versions for every module still required);
+  `internal/database/database.go` copied unchanged from the old
+  `database/database.go` (same `.env` variables); new `.gitignore`; `.claude/`
+  copied with paths rewritten; docs and comments to `go run .` from the repo
+  root.
+- Old → new hashes (filter-repo rewrote every commit): 4369a1d → 7a4edaa
+  (PR #20 merge), d49fe9c → 34d70c4, 21139e1 → 0795e9e (PR #19 merge),
+  08b3a71 → b10251b. Older hashes in this file and in the ops READMEs are
+  old-repo hashes; `git log --grep` or the subject line finds them here.
+
+Owner's push (from the extracted repo on the PC): create the empty private
+repo `kfukue/scoutanalytics` on GitHub (no README, licence or .gitignore), then
+`git remote add origin https://github.com/kfukue/scoutanalytics.git` and
+`git push -u origin main`.
+
+**Prod cut-over checklist** (the old checkout stays untouched for rollback):
+
+1. On the server, clone the new repo next to the old checkout, e.g.
+   `git clone https://github.com/kfukue/scoutanalytics.git /srv/scoutanalytics`
+   (EDIT the path; a private repo needs a deploy key or token on the server).
+   `go build -o /tmp/scout-new .` in it compiles everything before any
+   downtime.
+2. Copy `.env` from the old checkout into the new one with `cp -p` (never
+   print or paste it). Check yourself, without pasting
+   values, that the path-valued settings in `.env` still resolve from the new
+   folder: `SSL_CERT_FILE_PATH` (the three `.pem` files), any credentials file
+   for Secret Manager (`HOST_SECRET_PATH` access), and `SCOUT_SESSION_FILE`,
+   `SCOUT_STATE_DIR`, `SCOUT_WEB_DIR`, `SCOUT_RPC_LOG_CACHE` if set. Relative
+   paths need the files copied too, or absolute paths.
+3. Optional read-only check from the new folder (needs `.env`):
+   `go run . -price-check 0xTokenCA -price-at 6h`. It confirms the database and
+   node settings and exits.
+4. Stop the old processes, **listener first** (never two listeners on one
+   Telegram session; `pgrep -af listen-only` must print nothing), then `-track`
+   and `-web` (never two trackers at once).
+5. Only now, with the old listener stopped (the session file and the state are
+   final), copy `scout.session.json` with `cp -p` and `scoutanalytics_data/`
+   (with `poll_cursor.json`) with `cp -a`. Never print or paste them.
+6. Start from the new folder: `go run . -listen-only`, then
+   `SCOUT_RPC_RPS=300 SCOUT_TRACK_WORKERS=12 SCOUT_RPC_PARALLEL=4
+   SCOUT_RPC_MAX_INFLIGHT=48 go run . -track`, then `go run . -web`. Check the
+   `recording to SQL via …` line, the catch-up lines, `website on …`, and
+   `curl /api/summary` (DEPLOY.md section 6).
+7. Rollback: stop the new listener first, then the others; restart the old
+   ones from the old checkout (still at 4369a1d). Its listener resumes from the
+   lower of the database and its own `poll_cursor.json`.
+8. After the cut-over: record `git rev-parse HEAD` in the new checkout for
+   DEPLOY.md 3.0 (the old `/tmp/scout-prev-commit` hash is not in this
+   history). The systemd drafts in DEPLOY.md use
+   `WorkingDirectory=/srv/scoutanalytics` (EDIT).
+9. Removing `telegrambot/scoutanalytics` from the old repo is a separate,
+   later decision; nothing in the old repo was changed.
+
 - Later: `database.go` fatally requires `.env` in the working directory.
 
 ## Rules the owner has set
@@ -222,8 +275,7 @@ Later:
 
 ## How to test
 
-- `go vet ./telegrambot/scoutanalytics` and
-  `go test -race ./telegrambot/scoutanalytics`. Database tests need
+- From the repo root: `go vet .` and `go test -race .`. Database tests need
   `SCOUT_TEST_DATABASE_URL` pointing at a throwaway Postgres named
   `scout_test` (`TestOpenScoutStoreSelection` needs that name), run with
   `-p 1`; without it they are skipped.
@@ -242,15 +294,16 @@ Later:
 
 ## Deploying
 
-See `DEPLOY.md` (not committed yet, section 2) for the full steps. In short:
-the owner commits and pushes `scout-call-model` from the PC, merges it into
-`main` with a PR, and deploys `main` on the server: `git checkout main && git
-pull`, then restarts the processes that changed:
+See `DEPLOY.md` (committed in 08b3a71) for the full steps. In short:
+the owner commits and pushes a work branch from the PC, merges it into
+`main` with a PR, and deploys `main` on the server (after the cut-over, in the
+new checkout): `git checkout main && git pull`, then restarts the processes
+that changed, from the repo root:
 
-- `go run ./telegrambot/scoutanalytics -listen-only`
-- `SCOUT_RPC_RPS=300 SCOUT_TRACK_WORKERS=12 SCOUT_RPC_PARALLEL=4 SCOUT_RPC_MAX_INFLIGHT=48 go run ./telegrambot/scoutanalytics -track`
+- `go run . -listen-only`
+- `SCOUT_RPC_RPS=300 SCOUT_TRACK_WORKERS=12 SCOUT_RPC_PARALLEL=4 SCOUT_RPC_MAX_INFLIGHT=48 go run . -track`
   (latest-price pass on; `SCOUT_RPC_LOG_CHUNK` unset, default 200000).
-- `go run ./telegrambot/scoutanalytics -web`. A reverse proxy in front must
+- `go run . -web`. A reverse proxy in front must
   pass the `Host` header unchanged, or the same-origin check makes
   `POST /api/refresh` return 403.
 
@@ -259,15 +312,17 @@ run.
 
 ## Agent setup
 
-- `.claude/agents/` (committed in bde6d81): `coder` (Go + plain JS website,
+- `.claude/agents/` (committed in bde6d81 in the old repo; copied here in the
+  standalone commit with paths for this layout): `coder` (Go + plain JS website,
   with the Go, JS, CSP and Charts rules), `ml-coder`, `react-coder`, `infra`
   (approval-gated), `reviewer`, `researcher`, `product-manager`. All 7 are
   active.
 - The reviewer runs before every commit.
 - At most 3 coding agents in parallel (owner's limit).
-- `settings.json`: read-only git, `node --check` and the ml venv pytest are
-  allowed; secrets are denied in any folder; `git push` is denied for both Bash
-  and PowerShell; clutter is listed in `.git/info/exclude`.
+- `settings.json`: read-only git, `node --check` and the ml venv pytest
+  (`ml/.venv`, or `.venv` from inside `ml/`) are allowed; secrets are denied in
+  any folder; `git push` is denied for both Bash and PowerShell. Binaries,
+  secrets, state, CSVs and the venv are in `.gitignore`.
 - New or changed agents load only after a Claude Code restart.
 - Lessons:
   - Parallel coders must have disjoint files (parallel README edits got mixed
