@@ -26,6 +26,10 @@ var scoutSchemaSQL string
 type ScoutStore struct {
 	Pool  *pgxpool.Pool
 	owned bool // true when this store opened the pool (and must close it)
+
+	// MaxConnsFrom says where the pool's MaxConns came from, for the startup
+	// log ("pool_max_conns in the DSN" or "default for N tracker workers").
+	MaxConnsFrom string
 }
 
 // NewScoutStoreFromPool wraps an existing pool, e.g. database.DbConnPgx from
@@ -34,14 +38,68 @@ func NewScoutStoreFromPool(pool *pgxpool.Pool) *ScoutStore {
 	return &ScoutStore{Pool: pool}
 }
 
+// Pool size. pgxpool opens connections only when they are needed (MinConns
+// is 0), so MaxConns is a ceiling: a process holds about as many connections
+// as it uses at the same time, and a listener or website process with a high
+// ceiling still opens only a few.
+//
+// A tracker worker holds a connection for one query at a time, never across
+// node requests (no transaction in the tracker or latest-price path); the
+// latest-price pass runs on the same workers. On top of the workers come the
+// dispatcher's reads and the cycle's own queries (status, token names,
+// Chainlink feeds), which run one at a time, and in the default mode (no
+// -listen-only) the listener's scans and tool results in the same process.
+// The website's LISTEN connection is dialled separately, outside the pool.
+const (
+	poolConnsHeadroom = 4  // dispatcher and cycle queries, listener in the same process, slack
+	poolConnsMin      = 4  // the old fixed size
+	poolConnsCap      = 32 // keeps one process well below Postgres' default max_connections (100)
+)
+
+// defaultPoolMaxConns is the pool size used when the DSN does not set
+// pool_max_conns: the tracker workers plus headroom, at least poolConnsMin
+// and at most poolConnsCap.
+func defaultPoolMaxConns(workers int) int32 {
+	return int32(min(max(workers+poolConnsHeadroom, poolConnsMin), poolConnsCap))
+}
+
+// applyPoolMaxConns sets cfg.MaxConns to defaultPoolMaxConns(workers) unless
+// dsn sets pool_max_conns itself (pgxpool has already applied it to cfg), and
+// returns where the value came from.
+func applyPoolMaxConns(dsn string, cfg *pgxpool.Config, workers int) (string, error) {
+	// pgxpool.ParseConfig removes pool_max_conns from the runtime parameters,
+	// so parse once more to see whether the DSN sets it. Comparing cfg.MaxConns
+	// with pgxpool's default would miss an explicit value equal to it.
+	cc, err := pgx.ParseConfig(dsn)
+	if err != nil {
+		return "", fmt.Errorf("parse SCOUT_DATABASE_URL: %w", err)
+	}
+	if _, ok := cc.RuntimeParams["pool_max_conns"]; ok {
+		return "pool_max_conns in SCOUT_DATABASE_URL", nil
+	}
+	cfg.MaxConns = defaultPoolMaxConns(workers)
+	return defaultPoolSource(workers), nil
+}
+
+// defaultPoolSource is the startup log's note for a pool sized by
+// defaultPoolMaxConns(workers).
+func defaultPoolSource(workers int) string {
+	return fmt.Sprintf("default for %d tracker worker(s)", workers)
+}
+
 // NewScoutStore connects to Postgres using a pgx DSN / URL, e.g.
-// postgres://user:pass@host:5432/dbname?sslmode=disable
-func NewScoutStore(ctx context.Context, dsn string) (*ScoutStore, error) {
+// postgres://user:pass@host:5432/dbname?sslmode=disable. workers is the
+// tracker's effective worker count (priceConfig.trackWorkers); it sizes the
+// pool unless the DSN sets pool_max_conns.
+func NewScoutStore(ctx context.Context, dsn string, workers int) (*ScoutStore, error) {
 	cfg, err := pgxpool.ParseConfig(dsn)
 	if err != nil {
 		return nil, fmt.Errorf("parse SCOUT_DATABASE_URL: %w", err)
 	}
-	cfg.MaxConns = 4
+	from, err := applyPoolMaxConns(dsn, cfg, workers)
+	if err != nil {
+		return nil, err
+	}
 	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {
 		return nil, err
@@ -52,7 +110,7 @@ func NewScoutStore(ctx context.Context, dsn string) (*ScoutStore, error) {
 		pool.Close()
 		return nil, fmt.Errorf("ping db: %w", err)
 	}
-	return &ScoutStore{Pool: pool, owned: true}, nil
+	return &ScoutStore{Pool: pool, owned: true, MaxConnsFrom: from}, nil
 }
 
 func (st *ScoutStore) Close() {

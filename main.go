@@ -1546,8 +1546,8 @@ func main() {
 		if err := s.registerTools(ctx); err != nil {
 			log.Fatalf("database: register tools: %v", err)
 		}
-		log.Printf("recording to SQL via %s → %s (tables scout_calls, scout_investigations, scout_deliveries, …)",
-			dbSource, db.Describe(ctx))
+		log.Printf("recording to SQL via %s → %s, pool of at most %d connections (%s) (tables scout_calls, scout_investigations, scout_deliveries, …)",
+			dbSource, db.Describe(ctx), db.Pool.Config().MaxConns, db.MaxConnsFrom)
 	} else {
 		log.Println("SCOUT_DB=off — not recording to SQL")
 	}
@@ -1801,8 +1801,11 @@ func main() {
 //     DB_USER, DB_PASS, DB_NAME_DEV, APP_ENV, GETH_HOST_PATH / HOST_SECRET_PATH, SSL_CERT_FILE_PATH),
 //     i.e. the same connection the API uses.
 func openScoutStore(ctx context.Context, cfg *config) (*ScoutStore, string, error) {
+	// The pool is sized for the workers the tracker really runs (one with the
+	// GeckoTerminal source), not the raw SCOUT_TRACK_WORKERS.
+	workers := cfg.Price.trackWorkers()
 	if cfg.DatabaseURL != "" {
-		st, err := NewScoutStore(ctx, cfg.DatabaseURL)
+		st, err := NewScoutStore(ctx, cfg.DatabaseURL, workers)
 		return st, "SCOUT_DATABASE_URL", err
 	}
 	switch cfg.DBMode {
@@ -1812,7 +1815,7 @@ func openScoutStore(ctx context.Context, cfg *config) (*ScoutStore, string, erro
 	default:
 		return nil, "", fmt.Errorf("unknown SCOUT_DB=%q (use repo or off)", cfg.DBMode)
 	}
-	pool, err := setupRepoDatabase()
+	pool, err := setupRepoDatabase(defaultPoolMaxConns(workers))
 	if err != nil {
 		return nil, "", err
 	}
@@ -1824,18 +1827,20 @@ func openScoutStore(ctx context.Context, cfg *config) (*ScoutStore, string, erro
 	if err := pool.Ping(pctx); err != nil {
 		return nil, "", fmt.Errorf("ping via database.SetupDatabase: %w", err)
 	}
-	return NewScoutStoreFromPool(pool), "database.SetupDatabase (DB_USER, APP_ENV=" + os.Getenv("APP_ENV") + ")", nil
+	st := NewScoutStoreFromPool(pool)
+	st.MaxConnsFrom = defaultPoolSource(workers)
+	return st, "database.SetupDatabase (DB_USER, APP_ENV=" + os.Getenv("APP_ENV") + ")", nil
 }
 
-// setupRepoDatabase calls the repo's database.SetupDatabase, turning its panic
-// on a failed ping into an error.
-func setupRepoDatabase() (pool *pgxpool.Pool, err error) {
+// setupRepoDatabase calls the repo's database.SetupDatabase with a pool of at
+// most maxConns connections, turning its panic on a failed ping into an error.
+func setupRepoDatabase(maxConns int32) (pool *pgxpool.Pool, err error) {
 	defer func() {
 		if r := recover(); r != nil {
 			err = fmt.Errorf("database.SetupDatabase: %v", r)
 		}
 	}()
-	database.DbConn, database.DbConnPgx, err = database.SetupDatabase()
+	database.DbConn, database.DbConnPgx, err = database.SetupDatabaseMaxConns(maxConns)
 	return database.DbConnPgx, err
 }
 

@@ -652,13 +652,21 @@ For deployment it changes:
 
 ### 7.4 Database connections: `SCOUT_DATABASE_URL` vs `database.SetupDatabase`
 
-- With `SCOUT_DATABASE_URL` the pool is hard-coded to `MaxConns = 4`
-  (`NewScoutStore` in `scout_models.data.go`). That is too few for 12 tracker
-  workers, and it needs raising (code change) before prod switches to it.
-- The default path (`database.SetupDatabase`) sets no `MaxConns`. pgxpool's
-  default is `max(4, NumCPU)` per process. It also
-  fatally requires `.env` in the working directory.
-- Connection budget on the **shared** `assetdb`: about 3 processes × the pool
-  size, plus 1 `LISTEN` connection for `-web`, plus the main API and pgAdmin.
+- Pool size, both paths: at most the tracker's worker count
+  (`SCOUT_TRACK_WORKERS` with the on-chain source, 1 with GeckoTerminal) + 4
+  connections per process, between 4 and 32, so 16 for prod's `-track` with
+  12 workers (on-chain).
+  The startup line `recording to SQL via …` shows the value and where it came
+  from. Connections are opened only when used: the listener and `-web` stay at
+  a few each even with the same ceiling.
+- With `SCOUT_DATABASE_URL`, `pool_max_conns=N` in the DSN overrides the
+  default (never overridden by the code). The default path
+  (`database.SetupDatabase`) has no override and fatally requires `.env` in the
+  working directory. It also keeps 2 connections outside the pool (its
+  `database/sql` handle and a single `pgx` connection).
+- Connection budget on the **shared** `assetdb`: the pools (realistically about
+  12 to 16 for `-track`, a few each for the listener and `-web`; at most 3 × 16
+  if the units share the 12-worker setting), plus 2 per process on the default
+  path, plus 1 `LISTEN` connection for `-web`, plus the main API and pgAdmin.
   Keep the total below Postgres `max_connections`, which matters most on a
   small managed Postgres tier.
