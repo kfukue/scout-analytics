@@ -43,8 +43,7 @@ def fit_lgbm(X_train, y_train, X_val=None, y_val=None, n_estimators=None):
     (walk-forward) or an unusable validation part: fixed rounds, no calibrator.
     """
     y_val = None if y_val is None else np.asarray(y_val, dtype=int)
-    usable_val = (n_estimators is None and y_val is not None
-                  and min(y_val.sum(), len(y_val) - y_val.sum()) >= MIN_CLASS_ROWS // 3)
+    usable_val = n_estimators is None and y_val is not None and usable_holdout(y_val)
     params = dict(LGBM_PARAMS)
     fit_kw = {}
     if usable_val:
@@ -58,12 +57,28 @@ def fit_lgbm(X_train, y_train, X_val=None, y_val=None, n_estimators=None):
         model.fit(X_train, np.asarray(y_train, dtype=int), categorical_feature=CATEGORICAL, **fit_kw)
     calibrator, note = None, None
     if usable_val:
-        raw = model.predict(X_val, raw_score=True).reshape(-1, 1)
-        calibrator = LogisticRegression(C=1e6, max_iter=1000).fit(raw, y_val)
+        calibrator = fit_platt(model.predict(X_val, raw_score=True), y_val)
     elif n_estimators is None:
         note = ("validation part too small for early stopping/calibration: "
                 f"fixed {FALLBACK_ROUNDS} rounds, probabilities uncalibrated")
     return {"model": model, "calibrator": calibrator, "note": note}
+
+
+def usable_holdout(y) -> bool:
+    """Enough of each class in a held-out part to drive early stopping/calibration."""
+    y = np.asarray(y, dtype=int)
+    return min(y.sum(), len(y) - y.sum()) >= MIN_CLASS_ROWS // 3
+
+
+def fit_platt(raw, y):
+    """Platt scaling: a 1-d logistic fit of the outcome on the raw margin."""
+    return LogisticRegression(C=1e6, max_iter=1000).fit(
+        np.asarray(raw, dtype=float).reshape(-1, 1), np.asarray(y, dtype=int))
+
+
+def best_rounds(fitted: dict) -> int:
+    m = fitted["model"]
+    return int(m.best_iteration_ or m.n_estimators)
 
 
 def predict(fitted: dict, X) -> np.ndarray:
@@ -91,13 +106,34 @@ class Bundle:
         self.models = {name: joblib.load(self.dir / f"{name}.joblib")
                        for name in self.meta["models"]}
 
+    def levels(self, bucket: str) -> dict:
+        """Category levels the bucket's models were trained with.
+
+        meta.json keeps one set per trained bucket (learned from that bucket's
+        training rows); an older meta.json has one flat set for all buckets."""
+        levels = self.meta.get("category_levels") or {}
+        if self.flat_levels:
+            return levels
+        return levels.get(bucket, {})
+
+    @property
+    def flat_levels(self) -> bool:
+        """Old meta.json layout: one flat set of levels, matched case-sensitively."""
+        return bool(set(self.meta.get("category_levels") or {}) & set(CATEGORICAL))
+
+    def features(self, row, bucket: str):
+        """The feature matrix the bucket's models get for `row` (or rows)."""
+        return build_features(row, self.levels(bucket), self.meta["features"],
+                              exact_levels=self.flat_levels)
+
     def score(self, row: dict) -> dict:
-        """Score one raw view row -> the /score response body."""
-        X = build_features(row, self.meta["category_levels"], self.meta["features"])
+        """Score one raw view row -> the /score response body. A bucket
+        without a runner model (skipped at training) is left out."""
         buckets, parts = [], [f"Model {self.version}"]
         for b, cfg in BUCKETS.items():
             if f"{b}_runner" not in self.models:
                 continue
+            X = self.features(row, b)
             runner = float(predict(self.models[f"{b}_runner"], X)[0])
             collapse = None
             text = f"{cfg['title']}: {cfg['runner_word']} {runner * 100:.0f}%"

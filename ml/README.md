@@ -22,7 +22,14 @@ The same holds for what the tracker discovers after the call: `rugged`,
 `current_liquidity_usd`, `current_price_usd`, `entry_price_source` and the
 pool it found (`pool_dex`, `pool_address`, ...; any `current_*` or `pool_*`
 column). The post's own `dex` and `launchpad` are known at the call and stay
-features.
+features. Their levels (and `quote_asset`, `perceptor_verdict`) are matched
+without regard to case and surrounding spaces, and are learned from the
+training rows of each split only; a level not seen there is treated as missing.
+An older model whose `meta.json` has one flat set of levels is still served
+with the exact, case-sensitive matching it was trained with.
+`prior_calls` and `secs_since_prev_call` stay in the view but are not features:
+training uses first calls only, where they are always 0 and NULL
+(`UNUSED_VIEW_COLUMNS` in `scout_ml/config.py`).
 
 ## Install
 
@@ -56,13 +63,28 @@ quality gates fail; read the report.
 
 How it validates (no random splits):
 
-- rows ordered by `message_date`; train = earliest 70%, validation = next 15%
-  (early stopping + calibration), test = latest 15%;
-- embargo: train/validation rows posted less than the bucket horizon before
-  the next boundary are dropped, so no outcome window reaches into a later part;
+- `short` and `3day`: rows ordered by `message_date`; train = earliest 70%,
+  validation = next 15% (early stopping + calibration), test = latest 15%;
+  train/validation rows posted less than the bucket horizon before the next
+  boundary are dropped (embargo), so no outcome window reaches into a later part;
+- `medium` and `long`: no validation part. Test = the calls of the last 14
+  days (`FORWARD_TEST_DAYS`), from a midnight UTC date (a date, not a row
+  quantile); train = calls posted before that date minus the horizon. The
+  number of boosting rounds and the Platt calibration come from a purged,
+  time-ordered 5-fold inside the train part only: training rows posted
+  within one horizon before or after a held-out fold are purged, rounds =
+  median best iteration over the usable folds, calibration is fitted on the
+  out-of-fold scores, and the saved model is refitted on the whole train part.
+  The rounds and the Platt calibration thus come from the smaller fold models
+  and are applied to the model refitted on the whole train part; this is
+  standard practice and can slightly underestimate the rounds.
+  Nothing from the test period reaches training, rounds, calibration or
+  category levels;
 - all calls of a token go to the part where its first call falls (address
-  compared without regard to letter case);
-- walk-forward: train up to week N, test on week N+1, for every week.
+  compared without regard to letter case). Training uses first calls only,
+  so this drops nothing; the report counts embargo and token drops apart;
+- walk-forward: train up to week N, test on week N+1, for every week (the
+  main model's round count; category levels from each window's training rows).
 
 Calls without a pool (`no_pool`, `gave_up`, or no late entry price) and rows
 whose prices are not in USD are excluded; the report says how many. The tracker
@@ -100,22 +122,33 @@ buy-everything" alone; labels are not affected. Both caps are in
 
 1. **Verdict** - PASS/FAIL per bucket. PASS needs all of: top-10% lift >= 2;
    skipping the 30% highest collapse scores removes >= 40% of collapses; the
-   top-10% simulation beats buy-everything in every walk-forward week.
+   top-10% simulation beats buy-everything in every walk-forward week. Each
+   top-10% lift (test and every walk-forward week) comes with an approximate
+   95% interval (Wilson interval of the runner rate in the top 10%, divided by
+   the base rate) and the runner counts in the top 10% and overall; the gate
+   uses the point value.
 2. **Data and exclusions**, **Feature coverage** - how much data there was and
    which columns are mostly empty (coverage is measured on the calls left
    after the exclusions).
 3. Per bucket: class balance (with warnings for labels under 10% / over 90%
    and for skipped models), test metrics for LightGBM and the logistic
    baseline (ROC AUC, PR AUC, Brier), the gate values, the money simulation,
-   the walk-forward table, calibration by decile, top features.
+   the walk-forward table, calibration by decile, top features. `medium` and
+   `long` also show the purged k-fold (folds used, rounds per fold,
+   out-of-fold rows used for calibration).
 
 If LightGBM is not clearly better than the logistic baseline, the data does
 not yet support the more complex model. A bucket is skipped (with the reason
 in the report) when it has fewer than 300 usable rows or a label has fewer
-than 30 positives or negatives in training. The `long` bucket needs well over
-30 days of history *after* the embargo: with about 70 days of data it is
-skipped, and until roughly 230 days its validation part is empty, so it is
-trained with a fixed number of rounds and left uncalibrated (the report says so).
+than 30 positives or negatives in training. The `long` bucket is skipped
+("not enough matured 30d data (N rows over D days, need ...)") until at least
+2,000 calls with a 30-day outcome span at least 120 days (`MIN_MATURED`):
+about 75 days of train calls so that the purged k-fold keeps training rows,
+plus the 30-day embargo and the 14-day test. With calls from 28 July 2026 that
+is an export from about 25 December 2026. A skipped bucket writes no model
+file, and the scoring service leaves it out. If fewer than 3 folds of the
+k-fold are usable, a model is trained with a fixed number of rounds and left
+uncalibrated (the report says so).
 
 ## Run the scoring service
 
@@ -132,7 +165,10 @@ trained with a fixed number of rounds and left uncalibrated (the report says so)
 
 Nulls, missing columns and unknown keys are fine (treated as missing).
 Outcome columns in the row are ignored. Only buckets with a trained runner
-model appear; without a collapse model `collapse_prob` is null.
+model appear (a skipped bucket, e.g. `long` before its data has matured, has
+no line); without a collapse model `collapse_prob` is null. Each bucket is
+scored with the category levels its models were trained with (stored per
+bucket in `meta.json`).
 `runner_rank_pct` is where the runner score falls among the scores of the
 test-period calls at training time (0-100). Both endpoints return 503 while
 no model has been trained.
@@ -158,7 +194,7 @@ roll back, write an older version name into `models/LATEST`. Compare the new
     scout_ml/config.py    buckets, thresholds, feature lists, forbidden columns, gates
     scout_ml/features.py  build_features(): the one function used by training AND serving
     scout_ml/labels.py    net-of-tax labels and usable-row rules
-    scout_ml/validate.py  time split, embargo, token grouping, walk-forward, metrics
+    scout_ml/validate.py  time splits, embargo, purged k-fold, token grouping, walk-forward, metrics
     scout_ml/model.py     LightGBM + calibration, logistic baseline, serving bundle
     scout_ml/report.py    report.md
     train.py  serve.py  make_synthetic.py  tests/
