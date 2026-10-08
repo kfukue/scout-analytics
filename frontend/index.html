@@ -64,6 +64,15 @@
         </div>
       </div>
       <div class="window-pick">
+        <span id="days-label" class="muted">Calls from the last</span>
+        <div id="days" class="segmented compact" role="group" aria-labelledby="days-label">
+          <button type="button" data-days="1" aria-pressed="false">1d</button>
+          <button type="button" data-days="7" aria-pressed="false">7d</button>
+          <button type="button" data-days="30" aria-pressed="false">30d</button>
+          <button type="button" data-days="0" aria-pressed="true">All</button>
+        </div>
+      </div>
+      <div class="window-pick">
         <span id="horizons-label" class="muted">Peak / worst drop over</span>
         <div id="horizons" class="segmented compact" role="group" aria-labelledby="horizons-label">
           <button type="button" data-horizon="1h" aria-pressed="false">1h</button>
@@ -81,16 +90,15 @@
       <table>
         <thead>
           <tr>
+            <th scope="col" class="tok">Token</th>
+            <th scope="col" class="num" data-sort="latest" title="Return at the latest price, and how long ago that price was read"><button type="button" class="sort">Latest %</button></th>
+            <th scope="col" class="num" data-sort="latest_mc"><button type="button" class="sort">Latest MC</button></th>
+            <th scope="col" class="num" data-sort="call_mc"><button type="button" class="sort">Call MC</button></th>
             <th scope="col" data-sort="date"><button type="button" class="sort">Date</button></th>
-            <th scope="col">Token</th>
-            <th scope="col">Symbol</th>
-            <th scope="col" class="calls">Calls</th>
             <th scope="col">Perceptor</th>
             <th scope="col">Status</th>
+            <th scope="col" class="calls">Calls</th>
             <th scope="col" class="num">Entry $</th>
-            <th scope="col" class="num" data-sort="call_mc"><button type="button" class="sort">Call MC</button></th>
-            <th scope="col" class="num" data-sort="latest_mc"><button type="button" class="sort">Latest MC</button></th>
-            <th scope="col" class="num" data-sort="latest"><button type="button" class="sort">Latest %</button></th>
             <th scope="col" class="num" data-sort="peak" data-window="1"><button type="button" class="sort">Peak %</button></th>
             <th scope="col" class="num" id="th-drawdown" data-window="1">Worst drop %</th>
             <th scope="col" class="num win first" data-sort="return_1h" title="Return % over 1h"><button type="button" class="sort">1h</button></th>
@@ -123,8 +131,9 @@
         <div><dt>gave up</dt><dd>More than 30 days old and still no pool or no trades.</dd></div>
         <div><dt><span class="badge badge-rug">rugged</span></dt><dd>Shown in Status, in place of the tracking status (hover over it to see that), when the pool was drained: its quote side (ETH/WETH, USDG …) fell below the rug threshold ($500 by default), or the pool was emptied; after the last window also when the price fell below 5% of entry. From the rug on the price counts as 0: the windows that end after it show −100% (the returns are as recorded), Peak % shows a dash (–) and so does Latest MC.</dd></div>
         <div id="legend-perceptor"><dt>Perceptor</dt><dd>The latest on-chain check of the token by the Perceptor bot; the words link to its report. <span class="pv pv-clean">no red flags</span> = the check found none. <span class="pv pv-caution">caution</span> = it found something to look at before buying. <span class="pv pv-red">red flags</span> = it found serious warning signs. Only calls picked up live are scanned: calls imported from history were never scanned, so they show a dash (–).</dd></div>
-        <div id="legend-reports"><dt><span aria-hidden="true">▸</span> and <span class="sa-badge">sA</span></dt><dd>▸ before the date (or a click on the row) opens the token's reports under the row: the latest Perceptor report (verdict, summary and link) and the latest sAlpha report (its text and link). <span class="sa-badge">sA</span> next to the Perceptor verdict = the token has an sAlpha report. About half of sAlpha's replies are empty; an empty reply counts as no report, so the latest reply with text is shown, or "No sAlpha report". A reply that declines ("Not enough public signals to generate a report …", "Too little liquidity or trading activity to research yet") is not a report either: no <span class="sa-badge">sA</span>, an older real report is shown when there is one, otherwise the detail says "sAlpha did not generate a report" with the reason.</dd></div>
-        <div id="legend-latest"><dt>Latest %</dt><dd>The return at the most recent price, measured from the same entry (60 seconds after the post), followed by how old the call was when that price was read, for example <span class="age">45m</span>, <span class="age">30h</span> or <span class="age">60d</span>. It is refreshed about every 15 minutes for calls under 30 days old and once a day for older ones. The window selector does not affect it. <span class="age">quiet</span> = no trade in the 7 days before the price was read, so it is the price of an older trade. Hover over the number for the exact times.</dd></div>
+        <div id="legend-reports"><dt><span aria-hidden="true">▸</span> and <span class="sa-badge">sA</span></dt><dd>▸ before the token (or a click on the row) opens its details under the row: its performance (entry and latest price, Latest %, when the price was read and the last trade, the call's age, Call MC and Latest MC, Peak % and Worst drop % over the window chosen), the latest Perceptor report (verdict, summary and link) and the latest sAlpha report (its text and link). <span class="sa-badge">sA</span> next to the Perceptor verdict = the token has an sAlpha report. About half of sAlpha's replies are empty; an empty reply counts as no report, so the latest reply with text is shown, or "No sAlpha report". A reply that declines ("Not enough public signals to generate a report …", "Too little liquidity or trading activity to research yet") is not a report either: no <span class="sa-badge">sA</span>, an older real report is shown when there is one, otherwise the detail says "sAlpha did not generate a report" with the reason.</dd></div>
+        <div id="legend-latest"><dt>Latest %</dt><dd>The return at the most recent price, measured from the same entry (60 seconds after the post). Its colour follows its size: <span class="rb rb-rug">−100.0%</span> rugged or all lost, <span class="rb rb-bad">−62.0%</span> down by half or more, <span class="rb rb-neg">−12.0%</span> down, <span class="rb rb-zero">0.0%</span> flat (rounds to 0.0%), <span class="rb rb-up">+45.0%</span> up to 2×, <span class="rb rb-2x">+340%</span> 2× to 11×, <span class="rb rb-10x">+2,400%</span> 11× and more. Under it: how long ago that price was read, for example <span class="age">12m ago</span>, <span class="age">5h ago</span> or <span class="age">2d ago</span>, counted to the time the website last read the database. The price is refreshed about every 15 minutes for calls under 30 days old and every hour for older ones (a call whose pool was drained, also every hour); <span class="age stale">stale</span> = older than 30 minutes, or 2 hours for older or rugged calls, so the tracker may be stopped or behind. <span class="age">quiet</span> = no trade in the 7 days before the price was read, so it is the price of an older trade. The window selector does not affect it. Hover over the number (or open the row) for the exact times and the call's age.</dd></div>
+        <div id="legend-days"><dt>Calls from the last</dt><dd>Shows only the calls posted within the last day, 7 days or 30 days (counted back from the time the website last read the database); All shows every call. The choice is kept in the page's address (for example <code>?days=7</code>), so a bookmark keeps it. The count under the table counts only the calls shown.</dd></div>
         <div id="legend-windows"><dt>1h, 1d, 3d, 7d, 30d</dt><dd>The return over that window, in USD, measured from the price 60 seconds after the post (not the price in the post). A dash (–) until the window has passed and been recorded. Click a column to sort by it.</dd></div>
         <div id="legend-peak"><dt>Peak %, Worst drop %</dt><dd>The highest and the lowest price within the window chosen with the "Peak / worst drop over" selector (1h to 30d), from the same entry. Only these two columns follow the selector. A rugged call shows no peak (–).</dd></div>
         <div id="legend-huge"><dt>3.9×10⁴⁷</dt><dd>Very large numbers (a return of ±1,000,000% or more, an amount of $1 trillion or more) are written in powers of ten so the columns keep their width: +3.9×10⁴⁷% = +390,000,…,000%. Hover over the number for the exact value.</dd></div>

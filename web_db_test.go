@@ -232,6 +232,7 @@ type webCallsJSON struct {
 	USDOnly  bool          `json:"usd_only"`
 	Verdict  string        `json:"verdict"`
 	Verdicts []string      `json:"verdicts"`
+	Days     int           `json:"days"`
 	At       string        `json:"snapshot_at"`
 	Calls    []webCallJSON `json:"calls"`
 }
@@ -1157,7 +1158,7 @@ func TestWebPerceptorVerdict(t *testing.T) {
 			t.Errorf("?%s: %d %s", bad, code, body)
 		}
 	}
-	if _, _, err := fx.web.snap.Load().page(ScoutWebCallsFilter{Sort: "date", Dir: "desc", Horizon: "1d", Page: 1, Per: 10, Verdict: "x' OR 1=1"}, nil); err == nil {
+	if _, _, err := fx.web.snap.Load().page(ScoutWebCallsFilter{Sort: "date", Dir: "desc", Horizon: "1d", Page: 1, Per: 10, Verdict: "x' OR 1=1"}, webAllAges, nil); err == nil {
 		t.Error("the snapshot accepted an unknown verdict")
 	}
 }

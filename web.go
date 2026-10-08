@@ -276,19 +276,30 @@ type webCallsResponse struct {
 	USDOnly    bool           `json:"usd_only"`
 	Verdict    string         `json:"verdict"`     // the Perceptor filter as a list, e.g. "clean,caution"; "" = all
 	Verdicts   []string       `json:"verdicts"`    // the same list as an array; [] = all
+	Days       int            `json:"days"`        // the age filter: calls from the last Days days (of SnapshotAt); 0 = all
 	SnapshotAt time.Time      `json:"snapshot_at"` // when the list was last read from the database
 	Calls      []ScoutWebCall `json:"calls"`
 }
 
-var webCallsParams = map[string]bool{"q": true, "sort": true, "dir": true, "horizon": true, "usd_only": true, "verdict": true, "page": true, "per": true}
+var webCallsParams = map[string]bool{"q": true, "sort": true, "dir": true, "horizon": true, "usd_only": true, "verdict": true, "days": true, "page": true, "per": true}
+
+// webCallsQuery is what /api/calls asks for: the filter of the list and the
+// age filter (kept here rather than in ScoutWebCallsFilter, as only the
+// website's snapshot applies it).
+type webCallsQuery struct {
+	ScoutWebCallsFilter
+	// Days: only calls posted within the last Days days (1 … webMaxDays),
+	// counted back from the time the snapshot was read; 0 = all
+	Days int
+}
 
 // parseWebCallsQuery validates the query string of /api/calls. Every value is
 // checked against a fixed list or range; the error text is safe to show.
-func parseWebCallsQuery(v url.Values) (ScoutWebCallsFilter, error) {
-	f := ScoutWebCallsFilter{Sort: "date", Dir: "desc", Horizon: "1d", Page: 1, Per: webDefaultPer}
+func parseWebCallsQuery(v url.Values) (webCallsQuery, error) {
+	f := webCallsQuery{ScoutWebCallsFilter: ScoutWebCallsFilter{Sort: "date", Dir: "desc", Horizon: "1d", Page: 1, Per: webDefaultPer}}
 	for k, vals := range v {
 		if !webCallsParams[k] {
-			return f, errors.New("unknown parameter (use q, sort, dir, horizon, usd_only, verdict, page, per)")
+			return f, errors.New("unknown parameter (use q, sort, dir, horizon, usd_only, verdict, days, page, per)")
 		}
 		if len(vals) != 1 && k != "verdict" { // verdict may be repeated: the values add up
 			return f, fmt.Errorf("%s: given more than once", k)
@@ -341,6 +352,9 @@ func parseWebCallsQuery(v url.Values) (ScoutWebCallsFilter, error) {
 		return f, err
 	}
 	f.Verdict = webVerdictList(set)
+	if err := intIn("days", &f.Days, 1, webMaxDays); err != nil {
+		return f, err
+	}
 	if err := intIn("page", &f.Page, 1, webMaxPage); err != nil {
 		return f, err
 	}
@@ -1031,10 +1045,18 @@ func (s *webServer) handleRefresh(w http.ResponseWriter, r *http.Request) {
 
 // callsETag: the snapshot's version plus what was asked. Two ways of writing
 // the same question (order of the parameters, defaults left out, letter case
-// of the search text) get the same ETag.
-func (s *webServer) callsETag(snap *webSnapshot, f ScoutWebCallsFilter) string {
-	sum := sha256.Sum256([]byte(fmt.Sprintf("%s\x00%s\x00%s\x00%s\x00%t\x00%s\x00%d\x00%d",
-		strings.ToLower(f.Q), f.Sort, f.Dir, f.Horizon, f.USDOnly, f.Verdict, f.Page, f.Per)))
+// of the search text) get the same ETag. since is the cutoff of the age filter
+// (webSnapshot.ageCutoff): with one, the ETag also holds how many rows are
+// recent enough. The version stays the same while the rows do (a stopped
+// tracker), but time goes on and rows fall out of "the last 7 days": the count
+// changes exactly when the rows let through do.
+func (s *webServer) callsETag(snap *webSnapshot, f webCallsQuery, since int64) string {
+	recent := -1
+	if since != webAllAges {
+		recent = snap.countSince(since)
+	}
+	sum := sha256.Sum256([]byte(fmt.Sprintf("%s\x00%s\x00%s\x00%s\x00%t\x00%s\x00%d\x00%d\x00%d\x00%d",
+		strings.ToLower(f.Q), f.Sort, f.Dir, f.Horizon, f.USDOnly, f.Verdict, f.Page, f.Per, f.Days, recent)))
 	return `W/"` + snap.version + "-" + hex.EncodeToString(sum[:10]) + `"`
 }
 
@@ -1074,7 +1096,8 @@ func (s *webServer) handleCalls(w http.ResponseWriter, r *http.Request) {
 	if snap == nil {
 		return
 	}
-	etag := s.callsETag(snap, f)
+	since := snap.ageCutoff(f.Days)
+	etag := s.callsETag(snap, f, since)
 	s.snapshotHeaders(w, snap, etag)
 	if s.notModified(w, r, etag) {
 		return
@@ -1084,13 +1107,13 @@ func (s *webServer) handleCalls(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var room [webMaxPer]int32
-	rows, total, err := snap.page(f, room[:0])
+	rows, total, err := snap.page(f.ScoutWebCallsFilter, since, room[:0])
 	var head []byte
 	if err == nil {
 		// everything but the rows, which are already encoded in the snapshot
 		head, err = json.Marshal(webCallsResponse{Total: total, Page: f.Page, Per: f.Per, Horizon: f.Horizon,
 			Sort: f.Sort, Dir: f.Dir, USDOnly: f.USDOnly, Verdict: f.Verdict, Verdicts: webVerdictSlice(f.Verdict),
-			SnapshotAt: snap.loadedAt, Calls: []ScoutWebCall{}})
+			Days: f.Days, SnapshotAt: snap.loadedAt, Calls: []ScoutWebCall{}})
 		if err == nil && !bytes.HasSuffix(head, []byte(webNoCallsJSON)) {
 			err = errors.New("unexpected encoding of the answer")
 		}

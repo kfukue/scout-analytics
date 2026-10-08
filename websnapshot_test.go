@@ -328,7 +328,7 @@ func mustWebSnapshot(tb testing.TB, rows []ScoutWebRow, updatePosts int, prev *w
 // pageIDs returns the call ids of one page and the total.
 func pageIDs(tb testing.TB, s *webSnapshot, f ScoutWebCallsFilter) ([]int, int) {
 	tb.Helper()
-	pos, total, err := s.page(f, nil)
+	pos, total, err := s.page(f, webAllAges, nil)
 	if err != nil {
 		tb.Fatalf("%+v: %v", f, err)
 	}
@@ -437,7 +437,7 @@ func TestWebSnapshotPageMatchesReference(t *testing.T) {
 		{Sort: "date", Dir: "desc", Horizon: "1d", Page: 1, Per: 10, Verdict: "unknown"},
 		{Sort: "date", Dir: "desc", Horizon: "1d", Page: 1, Per: 10, Q: "a\x00b"},
 	} {
-		if _, _, err := snap.page(bad, nil); err == nil {
+		if _, _, err := snap.page(bad, webAllAges, nil); err == nil {
 			t.Errorf("%+v: no error", bad)
 		}
 	}
@@ -992,6 +992,16 @@ var benchWebQueries = []struct{ name, query string }{
 	{"last_page", "page=240"},
 }
 
+// benchWebDaysQueries: questions asked with the age filter (days=…).
+var benchWebDaysQueries = []struct{ name, query string }{
+	{"default", ""},
+	{"date_asc", "dir=asc"},
+	{"sort_latest", "sort=latest"},
+	{"verdicts", "verdict=clean,caution"},
+	{"q_verdict_peak", "q=pe&verdict=clean&sort=peak"},
+	{"last_page", "page=120"},
+}
+
 // BenchmarkWebSnapshot: filter + sort + page on a snapshot of 12,000 rows
 // ("page/…"), the whole request with its JSON ("http/…", "gzip/…"), a request
 // answered 304, and building the snapshot. No database needed:
@@ -1011,7 +1021,25 @@ func BenchmarkWebSnapshot(b *testing.B) {
 			b.ReportAllocs()
 			var room [webMaxPer]int32
 			for i := 0; i < b.N; i++ {
-				if _, _, err := snap.page(f, room[:0]); err != nil {
+				if _, _, err := snap.page(f.ScoutWebCallsFilter, snap.ageCutoff(f.Days), room[:0]); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+	// the age filter, with a cutoff in the middle of the made-up dates (they
+	// are months old, so a real days=7 would match nothing and measure nothing)
+	mid := snap.dates[snap.order[webSortKeyDate][n/2]]
+	for _, c := range benchWebDaysQueries {
+		f, err := parseWebCallsQuery(httptest.NewRequest("GET", "/api/calls?"+c.query, nil).URL.Query())
+		if err != nil {
+			b.Fatal(err)
+		}
+		b.Run("page_days/"+c.name, func(b *testing.B) {
+			b.ReportAllocs()
+			var room [webMaxPer]int32
+			for i := 0; i < b.N; i++ {
+				if _, _, err := snap.page(f.ScoutWebCallsFilter, mid, room[:0]); err != nil {
 					b.Fatal(err)
 				}
 			}
@@ -1050,6 +1078,16 @@ func BenchmarkWebSnapshot(b *testing.B) {
 		req.Header.Set("Accept-Encoding", "gzip")
 		serve(b, req, 200)
 	})
+	// the whole request with the age filter: the snapshot read one day after
+	// the middle of the made-up dates, so days=1 keeps about half the rows
+	aged := *snap
+	aged.loadedAt = time.Unix(0, mid).Add(24 * time.Hour).UTC()
+	ws.snap.Store(&aged)
+	for _, c := range benchWebDaysQueries {
+		b.Run("http_days/"+c.name, func(b *testing.B) {
+			serve(b, httptest.NewRequest("GET", "/api/calls?days=1&"+c.query, nil), 200)
+		})
+	}
 	ws.snap.Store(snap)
 	b.Run("http/summary", func(b *testing.B) { serve(b, httptest.NewRequest("GET", "/api/summary", nil), 200) })
 	b.Run("http/not_modified", func(b *testing.B) {
@@ -1600,5 +1638,210 @@ func TestWebVerdictSetETag(t *testing.T) {
 	tagEvery, resEvery := get("verdict=red_flags,not_scanned,caution,clean")
 	if tagAll != tagEvery || resEvery.Verdict != "" || !reflect.DeepEqual(resEvery.Verdicts, []string{}) || !reflect.DeepEqual(resAll, resEvery) {
 		t.Errorf("every verdict: ETag %s (all: %s), verdict %q %q", tagEvery, tagAll, resEvery.Verdict, resEvery.Verdicts)
+	}
+}
+
+// recentRows returns the rows posted at since or later (all for webAllAges).
+func recentRows(rows []ScoutWebRow, since int64) []ScoutWebRow {
+	var out []ScoutWebRow
+	for _, r := range rows {
+		if since == webAllAges || r.MessageDate.UnixNano() >= since {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+// TestWebSnapshotAgeFilterMatchesReference: the age filter ("calls from the
+// last N days") lets through exactly the rows posted at the cutoff or later,
+// combined with every sort, direction, search, Perceptor filter and page, with
+// the right total.
+func TestWebSnapshotAgeFilterMatchesReference(t *testing.T) {
+	for _, n := range []int{0, 1, 7, 600} {
+		raw := syntheticWebRows(n, int64(n)+7)
+		snap := mustWebSnapshot(t, cloneWebRows(raw), 0, nil)
+		// cutoffs: none, before every row, after every row, exactly on the
+		// date of a row (several rows share it), and just after it
+		cutoffs := []int64{webAllAges, time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC).UnixNano(), time.Date(2100, 1, 1, 0, 0, 0, 0, time.UTC).UnixNano()}
+		if n > 0 {
+			mid := raw[n/2].MessageDate.UnixNano()
+			cutoffs = append(cutoffs, mid, mid+1, raw[0].MessageDate.UnixNano())
+		}
+		for _, since := range cutoffs {
+			sub := recentRows(raw, since)
+			if got := snap.countSince(since); got != len(sub) {
+				t.Fatalf("n=%d countSince(%d) = %d, want %d", n, since, got, len(sub))
+			}
+			for _, sortBy := range []string{"date", "return", "latest", "call_mc", "return_7d"} {
+				for _, dir := range []string{"desc", "asc"} {
+					for _, usdOnly := range []bool{false, true} {
+						for _, verdict := range []string{"", "clean", "caution,not_scanned"} {
+							for _, q := range []string{"", "pe", "nothing matches"} {
+								for _, pg := range [][2]int{{1, 50}, {2, 50}, {3, 7}, {1, 200}, {1000000, 200}, {1, 1}} {
+									f := ScoutWebCallsFilter{Q: q, Sort: sortBy, Dir: dir, Horizon: "7d", USDOnly: usdOnly, Verdict: verdict, Page: pg[0], Per: pg[1]}
+									pos, total, err := snap.page(f, since, nil)
+									if err != nil {
+										t.Fatalf("n=%d since=%d %+v: %v", n, since, f, err)
+									}
+									got := []int{}
+									for _, p := range pos {
+										got = append(got, int(snap.ids[p]))
+									}
+									want, wantTotal := referencePage(sub, f)
+									if total != wantTotal || fmt.Sprint(got) != fmt.Sprint(want) {
+										t.Fatalf("n=%d since=%d %+v:\n got %d %v\nwant %d %v", n, since, f, total, got, wantTotal, want)
+									}
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+}
+
+// ageFilterServer is a website over 300 made-up rows whose snapshot was read
+// at loadedAt.
+func ageFilterServer(t *testing.T, loadedAt time.Time) (*webServer, []ScoutWebRow) {
+	t.Helper()
+	ws := benchWebServer(t, 300)
+	raw := syntheticWebRows(300, 42) // the rows of benchWebServer
+	ws.snap.Load().loadedAt = loadedAt
+	return ws, raw
+}
+
+func decodeCalls(t *testing.T, rec *httptest.ResponseRecorder) webCallsJSON {
+	t.Helper()
+	var res webCallsJSON
+	dec := json.NewDecoder(rec.Body)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&res); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	return res
+}
+
+// TestWebCallsDaysParam: days=N of /api/calls keeps the calls posted within N
+// days of the snapshot's time, in whole days from 1 to webMaxDays; anything
+// else is refused. It works with the search, the Perceptor filter and every
+// sort, the total counts only what it lets through, and the answer says which
+// filter it used.
+func TestWebCallsDaysParam(t *testing.T) {
+	// the made-up rows are posted over about 2 days from 2026-01-01: the
+	// snapshot is read 3 days after the first post
+	at := time.Date(2026, 1, 4, 0, 0, 0, 0, time.UTC)
+	ws, raw := ageFilterServer(t, at)
+	for _, tc := range []struct {
+		query string
+		code  int
+	}{
+		{"days=1", 200}, {"days=7", 200}, {"days=30", 200}, {"days=3650", 200},
+		{"days=0", 400}, {"days=-1", 400}, {"days=3651", 400}, {"days=7d", 400}, {"days=07", 400},
+		{"days=", 400}, {"days=1.5", 400}, {"days=all", 400}, {"days=7&days=7", 400}, {"days=%207", 400},
+	} {
+		if rec := getWeb(ws, "/api/calls?"+tc.query); rec.Code != tc.code {
+			t.Errorf("GET /api/calls?%s: %d, want %d (%s)", tc.query, rec.Code, tc.code, rec.Body)
+		}
+	}
+	for _, tc := range []string{
+		"days=1",
+		"days=1&dir=asc",
+		"days=2&sort=return&horizon=7d",
+		"days=2&sort=latest&dir=asc",
+		"days=2&verdict=clean,caution",
+		"days=2&verdict=clean&q=pe&sort=peak",
+		"days=1&q=PE&sort=return_1h&per=200",
+		"days=2&page=2&per=20",
+		"days=30",
+	} {
+		t.Run(tc, func(t *testing.T) {
+			v, err := url.ParseQuery(tc)
+			if err != nil {
+				t.Fatal(err)
+			}
+			f, err := parseWebCallsQuery(v)
+			if err != nil {
+				t.Fatalf("parseWebCallsQuery(%q): %v", tc, err)
+			}
+			rec := getWeb(ws, "/api/calls?"+tc)
+			if rec.Code != 200 {
+				t.Fatalf("GET /api/calls?%s: %d %s", tc, rec.Code, rec.Body)
+			}
+			res := decodeCalls(t, rec)
+			if res.Days != f.Days || f.Days == 0 {
+				t.Errorf("?%s: days %d in the answer, want %d", tc, res.Days, f.Days)
+			}
+			since := at.Add(-time.Duration(f.Days) * 24 * time.Hour)
+			sub := recentRows(raw, since.UnixNano())
+			want, wantTotal := referencePage(sub, f.ScoutWebCallsFilter)
+			got := []int{}
+			for _, c := range res.Calls {
+				got = append(got, c.CallID)
+				d, err := time.Parse(time.RFC3339Nano, c.MessageDate)
+				if err != nil || d.Before(since) {
+					t.Errorf("?%s: call %d posted %s, before the cutoff %s", tc, c.CallID, c.MessageDate, since)
+				}
+			}
+			if res.Total != wantTotal || fmt.Sprint(got) != fmt.Sprint(want) {
+				t.Errorf("?%s:\n got %d %v\nwant %d %v", tc, res.Total, got, wantTotal, want)
+			}
+			// the filter must matter for this test to mean anything (days=30 keeps every row)
+			if _, allTotal := referencePage(raw, f.ScoutWebCallsFilter); f.Days < 30 && wantTotal == allTotal {
+				t.Errorf("?%s: total %d with and without the age filter; pick another snapshot time", tc, wantTotal)
+			}
+		})
+	}
+	// without days the answer says 0 and has every row
+	if res := decodeCalls(t, getWeb(ws, "/api/calls")); res.Days != 0 || res.Total != 300 {
+		t.Errorf("no days: days %d, total %d; want 0, 300", res.Days, res.Total)
+	}
+}
+
+// TestWebCallsDaysETag: with the age filter, the ETag changes when a later
+// snapshot time pushes a row out of the window (even though the rows, and so
+// the snapshot's version, are the same: the tracker may be stopped), and stays
+// when the rows let through stay the same. Without the filter the time does
+// not count.
+func TestWebCallsDaysETag(t *testing.T) {
+	at := time.Date(2026, 1, 4, 0, 0, 0, 0, time.UTC)
+	ws, raw := ageFilterServer(t, at)
+	snap := ws.snap.Load()
+	tag := func(path string) string {
+		t.Helper()
+		rec := getWeb(ws, path)
+		if rec.Code != 200 {
+			t.Fatalf("GET %s: %d %s", path, rec.Code, rec.Body)
+		}
+		return rec.Header().Get("ETag")
+	}
+	tag1, tagAll := tag("/api/calls?days=2"), tag("/api/calls")
+	// the oldest row the window lets through
+	since := at.Add(-48 * time.Hour)
+	var oldest time.Time
+	for _, r := range recentRows(raw, since.UnixNano()) {
+		if oldest.IsZero() || r.MessageDate.Before(oldest) {
+			oldest = r.MessageDate
+		}
+	}
+	if oldest.IsZero() || !oldest.After(since) {
+		t.Fatalf("no row strictly inside the window (oldest %s, cutoff %s)", oldest, since)
+	}
+	// a little later, still before the oldest row drops out
+	snap.loadedAt = at.Add(oldest.Sub(since) / 2)
+	if got := tag("/api/calls?days=2"); got != tag1 {
+		t.Errorf("same rows let through: ETag %s, want %s", got, tag1)
+	}
+	// later: the oldest row is out
+	snap.loadedAt = at.Add(oldest.Sub(since) + time.Nanosecond)
+	if got := tag("/api/calls?days=2"); got == tag1 {
+		t.Errorf("a row left the window but the ETag stayed %s", got)
+	}
+	if got := tag("/api/calls"); got != tagAll {
+		t.Errorf("no age filter: ETag %s changed with the snapshot time (was %s)", got, tagAll)
+	}
+	// a client holding the old ETag gets the new list, not 304
+	if rec := getWeb(ws, "/api/calls?days=2", "If-None-Match", tag1); rec.Code != 200 {
+		t.Errorf("old ETag after a row left the window: %d, want 200", rec.Code)
 	}
 }

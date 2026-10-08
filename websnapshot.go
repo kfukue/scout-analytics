@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"math"
 	"slices"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -147,6 +148,9 @@ type webSnapshot struct {
 	// search[searchAt[i]:searchAt[i+1]].
 	search   []byte
 	searchAt []uint32
+	// dates[i]: when row i was posted (MessageDate, Unix nanoseconds); the
+	// age filter ("calls from the last N days") compares them with its cutoff.
+	dates []int64
 	// order[k] lists the rows sorted by key k, descending, the way the list is
 	// shown: rows with a value first (highest first, ties by the higher call
 	// id), then the rows without one (higher call id first). nonNull[k] is the
@@ -734,6 +738,7 @@ func (s *webSnapshot) buildOrders(rows []ScoutWebRow) {
 		return cmp.Compare(b, a)
 	})
 	s.order[webSortKeyDate], s.nonNull[webSortKeyDate] = byDate, n
+	s.dates = dates
 
 	const per = webPerfPerRow
 	// byValue: the rows with a value, highest first (ties: higher call id
@@ -801,11 +806,39 @@ func (s *webSnapshot) markMatches(q string, bits []uint64) {
 	}
 }
 
+// webAllAges: the cutoff of page that lets every row through (no age filter).
+const webAllAges int64 = math.MinInt64
+
+// webMaxDays: the largest age filter /api/calls takes (days=1 … webMaxDays).
+const webMaxDays = 3650
+
+// ageCutoff returns the cutoff of page for "calls from the last days days":
+// days × 24 hours before the snapshot was read from the database (not the
+// time of the request, so one snapshot always gives the same answer).
+// days ≤ 0 means no age filter.
+func (s *webSnapshot) ageCutoff(days int) int64 {
+	if days <= 0 {
+		return webAllAges
+	}
+	return s.loadedAt.Add(-time.Duration(days) * 24 * time.Hour).UnixNano()
+}
+
+// countSince returns the number of rows posted at since or later (all of them
+// for webAllAges). Those rows are the first ones of the date order.
+func (s *webSnapshot) countSince(since int64) int {
+	if since == webAllAges {
+		return s.n
+	}
+	ord := s.order[webSortKeyDate]
+	return sort.Search(len(ord), func(i int) bool { return s.dates[ord[i]] < since })
+}
+
 // page appends to dst the rows (positions) of one page of the list, in order,
 // and returns them with the number of rows that match the filter. The list
 // holds each token's first call only, so search, sort, paging and the total all
-// work on one row per token.
-func (s *webSnapshot) page(f ScoutWebCallsFilter, dst []int32) ([]int32, int, error) {
+// work on one row per token. since is the age filter: only rows posted at
+// since (Unix nanoseconds) or later count; webAllAges = no age filter.
+func (s *webSnapshot) page(f ScoutWebCallsFilter, since int64, dst []int32) ([]int32, int, error) {
 	h, ok := webHorizonIndex(f.Horizon)
 	if !ok {
 		return dst, 0, fmt.Errorf("unknown horizon %q", f.Horizon)
@@ -857,10 +890,30 @@ func (s *webSnapshot) page(f ScoutWebCallsFilter, dst []int32) ([]int32, int, er
 	}
 	every := set == webVerdictAll // no Perceptor filter
 
+	// The age filter. In the date order the rows it lets through are one block
+	// (the newest ones), so only that block is read; with any other sort every
+	// row is checked.
+	lo, hi, checkDate := 0, n, false
+	if since != webAllAges {
+		recent := s.countSince(since)
+		switch {
+		case key != webSortKeyDate:
+			checkDate = true
+		case asc:
+			lo = n - recent
+		default:
+			hi = recent
+		}
+	}
+
 	total, known := 0, false
 	var bits []uint64
-	if q == "" {
-		// without a search text the total is already counted: stop at the end of the page
+	switch {
+	case q == "" && every && usd == 0 && !checkDate:
+		// every row of the block matches: the total is its size
+		total, known = hi-lo, true
+	case q == "" && since == webAllAges:
+		// without a search text or an age filter the total is already counted
 		u := 0
 		if f.USDOnly {
 			u = 1
@@ -875,10 +928,12 @@ func (s *webSnapshot) page(f ScoutWebCallsFilter, dst []int32) ([]int32, int, er
 			}
 		}
 		known = true
-		if skip >= total {
-			return dst, total, nil
-		}
-	} else {
+	}
+	// with a known total: stop at the end of the page
+	if known && skip >= total {
+		return dst, total, nil
+	}
+	if q != "" {
 		bp := webBitsPool.Get().(*[]uint64)
 		defer webBitsPool.Put(bp)
 		words := (n + 63) / 64
@@ -889,11 +944,11 @@ func (s *webSnapshot) page(f ScoutWebCallsFilter, dst []int32) ([]int32, int, er
 		clear(bits)
 		s.markMatches(q, bits)
 	}
-	start, matched := 0, 0
-	if known && every && usd == 0 { // every row matches: jump to the page
-		start, matched = skip, skip
+	start, matched := lo, 0
+	if known && every && usd == 0 && !checkDate { // every row of the block matches: jump to the page
+		start, matched = lo+skip, skip
 	}
-	for i := start; i < n; i++ {
+	for i := start; i < hi; i++ {
 		pos := order[i]
 		if asc {
 			if i < nn {
@@ -906,6 +961,9 @@ func (s *webSnapshot) page(f ScoutWebCallsFilter, dst []int32) ([]int32, int, er
 			continue
 		}
 		if bits != nil && bits[pos>>6]&(1<<(pos&63)) == 0 {
+			continue
+		}
+		if checkDate && s.dates[pos] < since {
 			continue
 		}
 		if matched >= skip && len(dst)-base < f.Per {
