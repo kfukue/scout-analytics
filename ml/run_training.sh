@@ -240,10 +240,10 @@ fi
 src_head="$(git -C "$ML/src" rev-parse HEAD)"
 want_head="$(git -C "$REPO" rev-parse origin/main)"
 [ "$src_head" = "$want_head" ] || die "$ML/src is not a worktree of $REPO (HEAD $src_head, origin/main $want_head); ${NOT_OURS_HINT}"
-if [ -f "$ML/src/ml/tests/test_view_columns.py" ]; then
+if grep -q '^MIN_MATURED' "$ML/src/ml/scout_ml/config.py" 2>/dev/null; then
     echo "ml/ is up to date ($(git -C "$ML/src" rev-parse --short HEAD))"
 else
-    die "OLD ml/: $ML/src/ml/tests/test_view_columns.py is missing; the fixes are not on origin/main yet"
+    die "OLD ml/: $ML/src/ml/scout_ml/config.py has no MIN_MATURED; the fixes of 9 October (long skip, forward split for medium/long) are not on origin/main yet"
 fi
 
 # ---------------------------------------------------------------------------

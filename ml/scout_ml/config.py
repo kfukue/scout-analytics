@@ -35,7 +35,8 @@ IDENTITY = ["call_id", "message_id", "message_date", "contract_address",
             "call_status", "token_symbol"]
 CATEGORICAL = ["dex", "launchpad", "quote_asset", "perceptor_verdict"]
 PRE_VOL = [f"pre_{s}_vol_{w}" for s in ("buy", "sell") for w in _WINDOWS]
-NUMERIC_RAW = (
+# Numeric columns of the view, in view order (builds VIEW_COLUMNS below).
+VIEW_NUMERIC = (
     ["called_at_mcap_usd", "mcap_usd", "liq_usd", "liq_pct", "tax_buy_pct",
      "tax_sell_pct", "age_seconds", "holders", "proof_elite", "proof_good",
      "live_buys_elite_count", "live_buys_good_count", "live_buys_elite_usd",
@@ -44,6 +45,14 @@ NUMERIC_RAW = (
     + [f"pre_{k}_{w}" for k in ("swaps", "buys", "sells") for w in _WINDOWS]
     + PRE_VOL
     + [f"pre_price_chg_{w}_pct" for w in _WINDOWS] + ["pre_first_trade_age_s"])
+# View columns that are known at the call (not leaky) but carry no information
+# for the rows the model trains on: training uses first calls only, and for a
+# first call `prior_calls` is always 0 and `secs_since_prev_call` always NULL
+# (the view counts / takes max() over earlier calls of the same address). They
+# stay in the view and in VIEW_COLUMNS, but are never model inputs.
+UNUSED_VIEW_COLUMNS = ["prior_calls", "secs_since_prev_call"]
+# Raw numeric model inputs.
+NUMERIC_RAW = [c for c in VIEW_NUMERIC if c not in UNUSED_VIEW_COLUMNS]
 OUTCOMES = [f"{m}{late}_{h}" for h in HORIZONS for late in ("", "_late")
             for m in ("ret", "max_gain", "max_dd")]
 BOOKKEEPING = ["tracking_status", "pool_address", "pool_dex", "entry_price_usd",
@@ -54,7 +63,7 @@ LATEST_VIEW = ["latest_price_usd", "latest_return_pct", "latest_checked_at"]
 # Exactly the columns of scout_call_dataset_v (scoutanalytics.sql), in order;
 # tests/test_view_columns.py compares this list with the SQL.
 VIEW_COLUMNS = (["call_id", "message_id", "message_date", "contract_address", "call_status",
-                 "post_kind", "token_symbol", "token_name", "dex", "launchpad"] + NUMERIC_RAW
+                 "post_kind", "token_symbol", "token_name", "dex", "launchpad"] + VIEW_NUMERIC
                 + ["pre_vol_unit", "perceptor_verdict"] + BOOKKEEPING + OUTCOMES + LATEST_VIEW)
 
 # --- Leakage guard ---------------------------------------------------------
@@ -104,10 +113,39 @@ NO_LOG = set(["liq_pct", "tax_buy_pct", "tax_sell_pct", "proof_elite", "proof_go
              + [f"pre_price_chg_{w}_pct" for w in _WINDOWS]
              + [f"pre_buy_vol_share_{w}" for w in _WINDOWS])
 LOG1P_FEATURES = [c for c in NUMERIC_FEATURES if c not in NO_LOG]
-MIN_CATEGORY_COUNT = 20  # rarer category levels are treated as missing
+# Category levels are learned from the training rows of each split only (main
+# split, every walk-forward window, every inner k-fold), after lower-casing
+# and stripping; rarer levels, and levels never seen in training, are missing.
+MIN_CATEGORY_COUNT = 20
 
 # --- Validation ------------------------------------------------------------
+# `short` and `3day`: row-quantile split train 70% / validation 15% / test 15%
+# (validation drives early stopping and calibration), embargo = horizon.
 TRAIN_FRAC, VAL_FRAC = 0.70, 0.15      # test = the latest remaining 15%
+# `medium` and `long` (long horizons, where a horizon-length embargo between
+# three parts left almost no validation rows): no validation part. The test
+# part is forward only: the calls of the last FORWARD_TEST_DAYS days of the
+# bucket's labelled data, starting at a midnight UTC date; train = calls
+# posted before that date minus the horizon (embargo). Boosting rounds and
+# Platt calibration come from a purged, time-ordered KFOLD_K-fold inside the
+# train part only: folds are contiguous in time; training rows posted within
+# one horizon before or after a fold are purged; calibration is fitted on the
+# out-of-fold scores. A fold is used only when its fit part has MIN_CLASS_ROWS
+# of each class and its held-out part MIN_CLASS_ROWS // 3 of each; with fewer
+# than KFOLD_MIN_FOLDS usable folds the model falls back to FALLBACK_ROUNDS,
+# uncalibrated (the report says so).
+FORWARD_SPLIT_BUCKETS = ("medium", "long")
+FORWARD_TEST_DAYS = 14
+KFOLD_K = 5
+KFOLD_MIN_FOLDS = 3
+# A bucket is skipped until enough calls have a matured outcome: at least
+# `rows` usable rows AND `span_days` between the first and the last of them.
+# long (30d): the purged 5-fold needs about 75 days of train calls so that at
+# least 4 folds keep training rows after purging 30 days on both sides; plus
+# the 30-day embargo and the 14-day test part: 75 + 30 + 14 = 119, so 120.
+# With calls from 28 Jul 2026 that is first met by calls up to about
+# 25 Nov 2026, i.e. by an export from about 25 Dec 2026 (their 30d is due).
+MIN_MATURED = {"long": {"rows": 2000, "span_days": 120}}
 MIN_BUCKET_ROWS = 300                  # fewer usable rows -> bucket skipped
 MIN_CLASS_ROWS = 30                    # per class, in the training part
 MIN_WINDOW_TEST_ROWS = 50              # walk-forward weeks smaller than this are skipped
@@ -122,7 +160,12 @@ LGBM_PARAMS = dict(objective="binary", n_estimators=600, learning_rate=0.05,
                    subsample_freq=1, colsample_bytree=0.8, reg_lambda=1.0,
                    random_state=7, n_jobs=2, verbose=-1)
 EARLY_STOPPING_ROUNDS = 50
-FALLBACK_ROUNDS = 150  # used when the validation part cannot drive early stopping
+FALLBACK_ROUNDS = 150  # used when the validation part / k-fold cannot drive early stopping
+
+# --- Report: interval around the top-10% lift -------------------------------
+# Wilson score interval (95%) on the runner rate in the top 10%, divided by
+# the runner rate of all calls in the same part (treated as fixed).
+LIFT_CI_Z = 1.96
 
 
 def is_forbidden(col: str) -> bool:
