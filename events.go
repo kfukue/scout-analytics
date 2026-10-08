@@ -57,6 +57,9 @@ type scoutEvent struct {
 	CallID int    `json:"call_id"`
 	Tool   string `json:"tool,omitempty"` // report: perceptor | salpha
 	ID     int    `json:"id,omitempty"`   // report: the investigation id
+	// ScanKind (report only): ScanKindLive, or ScanKindRescan for a re-scan by
+	// the rescan lane (today's verdict, not the call's report).
+	ScanKind string `json:"scan_kind,omitempty"`
 }
 
 // payload returns the notification text: JSON, under scoutEventMaxPayload bytes.
@@ -72,7 +75,8 @@ func (e scoutEvent) payload() (string, error) {
 }
 
 // scoutReportEvent returns the notification for an investigation just stored:
-// only a completed Perceptor or sAlpha report of a call has one.
+// only a completed Perceptor or sAlpha report of a call has one. Its scan_kind
+// tells a call's report (live) from a re-scan (rescan).
 func scoutReportEvent(r *ScoutInvestigation, toolCode *string) (scoutEvent, bool) {
 	if r == nil || r.CallID == nil || r.ID == nil || toolCode == nil || r.Status != investigationCompleted {
 		return scoutEvent{}, false
@@ -80,7 +84,11 @@ func scoutReportEvent(r *ScoutInvestigation, toolCode *string) (scoutEvent, bool
 	if *toolCode != webToolPerceptor && *toolCode != webToolSAlpha {
 		return scoutEvent{}, false
 	}
-	return scoutEvent{Kind: scoutEventReport, CallID: *r.CallID, Tool: *toolCode, ID: *r.ID}, true
+	kind := r.ScanKind
+	if kind == "" {
+		kind = ScanKindLive
+	}
+	return scoutEvent{Kind: scoutEventReport, CallID: *r.CallID, Tool: *toolCode, ID: *r.ID, ScanKind: kind}, true
 }
 
 // scoutNotifyLog: at most one "could not notify" line a minute, for all stores.
