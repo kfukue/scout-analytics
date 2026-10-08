@@ -38,6 +38,16 @@
   // and the short words of the button that summarises the choice.
   var VERDICT_FILTERS = ['clean', 'caution', 'red_flags', 'not_scanned'];
   var VERDICT_FILTER_TEXT = { clean: 'No red flags', caution: 'Caution', red_flags: 'Red flags', not_scanned: 'Not scanned' };
+  // "Perceptor today": the token's latest Perceptor re-scan, run long after the
+  // call (perceptor_today_*). Never the verdict at the time of the call: its own
+  // words ("today: …") and an outlined style, and the Perceptor filter and its
+  // counts never use it.
+  var TODAY_TEXT = {
+    clean: { text: 'no red flags', cls: 'pv-today pv-today-clean' },
+    caution: { text: 'caution', cls: 'pv-today pv-today-caution' },
+    red_flags: { text: 'red flags', cls: 'pv-today pv-today-red' }
+  };
+  var TODAY_UNKNOWN = { text: 'no readable verdict', cls: 'pv-today pv-today-unknown' };
 
   // verdicts: the Perceptor buckets to show, in VERDICT_FILTERS order; [] = all.
   // days: only calls from the last that many days (one of DAY_CHOICES; 0 = all).
@@ -88,6 +98,21 @@
   }
 
   function isHttps(u) { return typeof u === 'string' && u.indexOf('https://') === 0; }
+
+  // The "Perceptor today" of a row: words, style and the date of the re-scan;
+  // null when the token has none.
+  function todayOf(c) {
+    if (!c || typeof c.perceptor_today_verdict !== 'string' || c.perceptor_today_verdict === '') { return null; }
+    var v = Object.prototype.hasOwnProperty.call(TODAY_TEXT, c.perceptor_today_verdict) ? TODAY_TEXT[c.perceptor_today_verdict] : TODAY_UNKNOWN;
+    var at = typeof c.perceptor_today_at === 'string' ? fmtDate(c.perceptor_today_at) : DASH;
+    return { text: v.text, cls: v.cls, at: at === DASH ? '' : at, url: c.perceptor_today_url };
+  }
+
+  // The words of the title of a "Perceptor today" label.
+  function todayTitle(t, linked) {
+    return 'Perceptor re-scan' + (t.at ? ' on ' + t.at : '') + ', not the verdict at call time' +
+      (linked ? ' (opens the re-scan report)' : '');
+  }
 
   // A link that opens in a new tab, or plain text when the address is not https.
   function linkOrText(url, text, className) {
@@ -437,20 +462,29 @@
 
     // Latest Perceptor report of the token; a dash when it was never scanned
     // (or the report had no readable verdict).
-    var tdPerc = el('td');
+    var tdPerc = el('td', 'perc');
     var pv = Object.prototype.hasOwnProperty.call(VERDICT_TEXT, c.perceptor_verdict) ? VERDICT_TEXT[c.perceptor_verdict] : null;
     if (pv) {
       var pvNode = linkOrText(c.perceptor_url, pv.text, pv.cls);
       if (pvNode.tagName === 'A') { pvNode.title = 'Open the Perceptor report'; }
       tdPerc.appendChild(pvNode);
     } else {
-      tdPerc.textContent = DASH;
+      tdPerc.appendChild(document.createTextNode(DASH));
     }
     // the token has an sAlpha report with text (an empty reply counts as none)
     if (c.has_salpha_report === true) {
       var sa = el('span', 'sa-badge', 'sA');
       sa.title = 'sAlpha report available: open the row (▸) to read it';
       tdPerc.appendChild(sa);
+    }
+    // "Perceptor today": a re-scan long after the call, on a line of its own
+    var today = todayOf(c);
+    if (today) {
+      var line = el('span', 'today-line');
+      var tNode = linkOrText(today.url, 'today: ' + today.text, today.cls);
+      tNode.title = todayTitle(today, tNode.tagName === 'A');
+      line.appendChild(tNode);
+      tdPerc.appendChild(line);
     }
     tr.appendChild(tdPerc);
 
@@ -537,6 +571,7 @@
     td.colSpan = colCount();
     var box = el('div', 'detail-box');
     box.appendChild(el('div', 'detail-perf'));
+    box.appendChild(el('div', 'detail-today'));
     box.appendChild(el('div', 'detail-reports'));
     td.appendChild(box);
     tr.appendChild(td);
@@ -568,11 +603,13 @@
     return n;
   }
 
-  // The performance block of the row detail, from the row as last drawn.
+  // The performance block of the row detail, from the row as last drawn, and
+  // the "Perceptor today" block (also from the row).
   function drawPerf(key) {
     var tr = detailRows[key];
     var c = rowData[key];
     if (!tr) { return; }
+    drawToday(key);
     var box = tr.querySelector('.detail-perf');
     box.textContent = '';
     if (!c) { return; }
@@ -610,6 +647,27 @@
     perfItem(dl, 'Peak % (' + state.horizon + ')', [peak]);
     perfItem(dl, 'Worst drop % (' + state.horizon + ')', [pctNode(c.drawdown_pct)]);
     sec.appendChild(dl);
+    box.appendChild(sec);
+  }
+
+  // The "Perceptor today (re-scan)" block of the row detail, from the row as
+  // last drawn (GET api/call has the call-time reports only). Empty when the
+  // token has no re-scan.
+  function drawToday(key) {
+    var tr = detailRows[key];
+    if (!tr) { return; }
+    var box = tr.querySelector('.detail-today');
+    box.textContent = '';
+    var t = todayOf(rowData[key]);
+    if (!t) { return; }
+    var sec = el('section', 'report report-today');
+    sec.appendChild(el('h3', 'report-title', 'Perceptor today (re-scan)'));
+    var parts = [el('span', t.cls, 'today: ' + t.text)];
+    if (t.at) { parts.push(t.at); }
+    sec.appendChild(reportMeta(parts));
+    sec.appendChild(el('p', 'muted small', 'A Perceptor re-scan made long after the call, not the verdict at call time. ' +
+      'The Perceptor filter and its counts use the call-time verdict only.'));
+    if (isHttps(t.url)) { sec.appendChild(linkOrText(t.url, 'Open the re-scan report', 'report-link')); }
     box.appendChild(sec);
   }
 
@@ -1285,7 +1343,9 @@
   // ---- Live updates (Server-Sent Events) -----------------------------------
   //
   // GET api/events streams what changed in the list: "call" (a new token row),
-  // "report" (a token's Perceptor verdict or sAlpha report changed) and
+  // "report" (a token's Perceptor verdict or sAlpha report changed, or, with
+  // tool perceptor_today, its Perceptor re-scan, "Perceptor today", which
+  // updates the row without a notice, sound or desktop alert) and
   // "reload" (many changes at once, or events were missed). A new row goes on
   // top of the table only when the table shows the newest calls first, on page
   // 1, and the row matches the search and the Perceptor filter; otherwise a
@@ -1470,7 +1530,10 @@
     var c = d.row;
     var key = callKey(c);
     if (!key) { return; }
-    liveNotice('report', c, d.tool);
+    // A Perceptor re-scan ("Perceptor today") is about an old call, up to 100 a
+    // day: it updates the row quietly, with no notice, sound or desktop alert,
+    // so it never pushes the call-time notices out of the corner.
+    if (d.tool !== 'perceptor_today') { liveNotice('report', c, d.tool); }
     var tr = findRow(key);
     if (!tr) { return; }
     if (!rowMatchesFilters(c)) { loadCalls(true); return; } // no longer in this filter
@@ -1511,7 +1574,8 @@
   }
 
   // The notice of an event: token, verdict and a GMGN link; a sound and a
-  // desktop notification when they are switched on.
+  // desktop notification when they are switched on. Not called for a
+  // Perceptor re-scan (tool perceptor_today), which only updates its row.
   function liveNotice(kind, c, tool) {
     var title, text, cls;
     if (kind === 'report' && tool === 'salpha') {

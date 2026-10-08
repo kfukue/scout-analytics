@@ -1,7 +1,7 @@
 # Scout analytics: handoff to Claude Code
 
-Up to date as of 8 October 2026 (later the same day). Start Claude Code in
-the repo root; `.claude/settings.json` makes the session the product
+Up to date as of 8 October 2026 (evening: 4e7e049 deployed). Start Claude
+Code in the repo root; `.claude/settings.json` makes the session the product
 manager, which delegates to the agents in `.claude/agents/` (see "Agent setup").
 
 First message to give it:
@@ -21,7 +21,7 @@ matter are in section 5. Package `main` is at the repo root: `go run .`.
 
 Repo `kfukue/scout-analytics`, branch `main` (the only branch carried over).
 Production runs from a checkout of this repo since the cut-over (section 5,
-owner confirmed 8 October); the prod commit is PENDING (section 3).
+owner confirmed 8 October); prod runs `main` at **4e7e049** (section 3).
 
 - Listener: reads @scoutrobinhood, tells real calls from "hit 3X" update posts
   (`postkind.go`), sends new tokens to @perceptor0xBot and @salpha_research_bot,
@@ -38,8 +38,9 @@ owner confirmed 8 October); the prod commit is PENDING (section 3).
   filter, legend and a per-row report detail pane. Plain JavaScript in
   `frontend/` (no framework, no build step).
 - Model (`ml/`): labels for four holding periods, logistic baseline and
-  LightGBM, time-split validation with pass/fail gates, scoring service. Not
-  trained on real data yet; `ml/RUNBOOK.md` has the steps.
+  LightGBM, time-split validation with pass/fail gates, scoring service. First
+  trained on prod 8 October, all gates FAIL (section 4 item 1);
+  `ml/RUNBOOK.md` has the steps.
 
 ## 1. Shipped
 
@@ -105,11 +106,12 @@ extracted from 4369a1d.
 Since the cut-over (8 October) prod runs from the new checkout of this repo
 (section 5); the old checkout (old repo at 4369a1d) is kept for rollback.
 
-## 2. On the work branch, not merged yet
+## 2. Merged and deployed: the 8 October work and the re-scan backend
 
-The 8 October work is committed by the owner on branch
-`work/2026-10-08-ml-pool-web` (local, **not pushed yet**), four commits on
-top of c968316 (`main`):
+Both branches went out together. `work/2026-10-09-perceptor-rescan`
+(stacked on `work/2026-10-08-ml-pool-web`) was merged as PR #1 into
+`main` = **4e7e049**. Because it was stacked, the PR also brought in the
+8 October commits:
 
 - 26da9d8: ML script (a).
 - 4707e77: DB pool size (b). **It also contains all of the README changes of
@@ -118,12 +120,8 @@ top of c968316 (`main`):
 - 5ad017c: website code (c): `frontend/*` and the web Go files, including the
   2 h stale limit.
 - e50695b: HANDOFF.
-
-All reviewed (the stale-limit delta was reviewed after the commit: no
-must-fix). Not deployed. Next: the owner pushes the branch and opens a PR into
-`main` (say in the PR description that the website README docs are in
-4707e77); deploy after the merge (see "Deploying" for the tracker settings
-and the checks).
+- 0a46f28: the Perceptor re-scan backend (section 4 item 2).
+- c3a1cec: HANDOFF for the re-scan.
 
 a. **One-command ML training**: `ml/run_training.sh` (new), `.gitattributes`
    (new: `*.sh` always LF), `ml/RUNBOOK.md` ("Quick way: one script" and the
@@ -140,9 +138,9 @@ c. **Website readability + `?days=` age filter**: `frontend/*`, `web.go`,
    `websnapshot.go`, `web_db_test.go`, `websnapshot_test.go`, README website
    section. Reviewed.
 
-Also in the working tree, uncommitted and not part of this branch's
-commits: the Perceptor re-scan (section 4 item 2), to be committed on
-`work/2026-10-09-perceptor-rescan`, stacked on this branch.
+In progress: the website "Perceptor today" label on
+`work/2026-10-09-perceptor-today-label` (from `main` at 4e7e049; section 4
+item 2).
 
 ## 3. Prod state and pending owner actions
 
@@ -160,56 +158,151 @@ State on 7 October:
   `SCOUT_CHAINLINK_FEEDS` as a backup (the env var wins on conflict).
 
 Done 8 October (owner confirmed): `kfukue/scout-analytics` created and `main`
-pushed; prod cut-over to the new checkout. Prod `git rev-parse HEAD`:
-**PENDING** (needed for DEPLOY.md 3.0; action 2 below).
+pushed; prod cut-over to the new checkout. Prod `git rev-parse HEAD` =
+**4e7e049**, run on the server (owner confirmed 8 October; for DEPLOY.md
+3.0).
+
+Deployed 8 October (owner confirmed):
+
+- The processes were restarted on 4e7e049.
+- The tracker startup lines show: the pool at most 16 connections for 12
+  tracker workers; 33 Robinhood feeds from the asset database; "latest
+  prices on: … every 1h0m0s for older ones; at most 400 call(s) per cycle".
+- `SCOUT_LATEST_REFRESH_OLD=1h SCOUT_LATEST_BATCH=400` are now in the prod
+  `.env`.
+- `SCOUT_RESCAN` is unset: the re-scan lane is off.
+- Lesson: the first restart picked up a different `.env` file and ran with
+  the defaults (24h/200). The tracker reads `.env` from the folder it is
+  started in, and a variable already set in the shell wins over the file.
+  After every restart, check the `latest prices on:` line.
+
+Still to confirm in prod:
+
+- the `latest prices: … waiting` count falling over the first 1–2 hours;
+- the listener catch-up/polling lines and the `website on …` line;
+- the phone check of the new table and the "stale" label.
 
 Pending owner actions:
 
-1. Push `work/2026-10-08-ml-pool-web` and open the PR into `main` (section 2).
-2. Prod `git rev-parse HEAD`, **run on the server** in the new checkout. The
-   hash sent on 8 October (c968316…) came from the owner's PC (local `main`),
-   so prod's is still PENDING.
-3. First ML training by hand via `ml/RUNBOOK.md` (`ml/run_training.sh` works
-   on the server only after the PR is merged); paste `report.md` and the
-   training time.
-4. Optional: the Perceptor re-scan count via a read-only query in pgAdmin
-   (the PM provides it). `-rescan-missing -dry-run` migrates the schema, so
-   it must not run on prod before the rescan deploy.
-5. Commit the rescan work on `work/2026-10-09-perceptor-rescan` (section
-   4 item 2 has the branch and file list).
-6. Decisions: failed-rescan limit 2 or 3 (section 4 item 2); the
-   early-transaction plan questions (section 4 item 4);
-   `.claude/commands.txt` (below).
+1. Done 8 October: the first ML training (model 20261008-1852; results in
+   section 4 item 1).
+2. Decide the failed-rescan limit: 2 or 3 (section 4 item 2).
+3. Answer the five early-transaction questions (section 4 item 4).
+4. `.claude/commands.txt`: add to `.gitignore` or delete (below).
+5. Optional: the sizing queries (read-only, in pgAdmin).
+6. No longer needed (resolved by query, 8 October): `-price-check` on
+   calls 664, 578 and 504 (the "Uniswap V4" flat calls, section 4 item 1).
+7. Answer the five Analytics page questions (section 4 item 5; the PM chose
+   defaults meanwhile).
 
 `.claude/commands.txt` is an untracked local prompt file (no secrets). It
 should go in `.gitignore` or be deleted; the owner decides.
 
 Decisions taken 8 October: the 1-hour latest-price refresh for old calls is
 approved; the Perceptor re-scan is approved with the defaults in section 4;
-`env.tmp` in the session scratchpad was deleted by the owner.
+`env.tmp` in the session scratchpad was deleted by the owner. Decided
+8 October: long model waits until about 25 December (option a).
 
 **Prod settings** (for reference):
 
 - `-track` with `SCOUT_RPC_RPS=300 SCOUT_TRACK_WORKERS=12
   SCOUT_RPC_PARALLEL=4 SCOUT_RPC_MAX_INFLIGHT=48`, latest-price pass on;
-  from the deploy of `work/2026-10-08-ml-pool-web` also
-  `SCOUT_LATEST_REFRESH_OLD=1h SCOUT_LATEST_BATCH=400` (the website's 2 h
-  stale limit assumes it; see "Deploying").
+  `SCOUT_LATEST_REFRESH_OLD=1h SCOUT_LATEST_BATCH=400` are in the prod
+  `.env` since 8 October (the website's 2 h stale limit assumes them).
+- `SCOUT_RESCAN` unset (lane off) until the label is deployed.
 - The web port is `SCOUT_WEB_ADDR` in `.env`.
 - Nitro runs with `--execution.rpc.log-history=0` (full log index; a full
   node, not an archive). Keep it, or old ranges slow down again.
 
+**Firewall** (prod server, 8 October):
+
+- ufw: 8090 is allowed on tailscale0. 5432 is restricted to 10.0.0.0/24;
+  the LAN rule for 8090 may still need adding.
+- The Nitro node runs in Docker (`offchainlabs/nitro-node:v3.11.2`,
+  container cool_allen, bridge network) and publishes 8540/8541 on 0.0.0.0.
+  Docker-published ports bypass ufw. Optional later: publish on 127.0.0.1
+  only, which needs a node restart.
+
 ## 4. Next work, in order (owner's decision)
 
-1. **The first ML training**, run by the owner on the prod server via
-   `ml/RUNBOOK.md` (or `ml/run_training.sh` once the PR is merged); he reports
-   the result to the PM. No GPU needed: CPU only, it takes seconds. The long
-   (30d) horizon is skipped until about mid-November. The gates are strict;
-   scores stay out of deliveries until a report passes. ml-coder agent.
+1. **ML model** (ml-coder agent). Run by the owner on the prod server via
+   `ml/RUNBOOK.md` ("Quick way"). No GPU needed: CPU only. The long (30d)
+   horizon is skipped until it has 2,000 matured rows over 120 days, about
+   25 December 2026; the owner chose on 8 October to wait rather than
+   loosen the threshold. The gates are strict; scores stay out of
+   deliveries until a report passes.
+   - **First training on prod, 8 October:** model 20261008-1852, all four
+     buckets FAIL. 4,709 first calls after exclusions. Train time 6 s.
+     Python 3.11 was installed alongside the system 3.10 (Ubuntu 22.04);
+     the venv was created with `python3.11 -m venv ~/scout-ml/venv`. Never
+     replace the system python3. Reports copied to the PC go in
+     `ml-results/` (gitignored).
+   - **Results:** the collapse models are strong (test ROC AUC 0.80–0.87;
+     skipping the top 30% avoids about 50% of collapses). Runner lift
+     fails: short 1.16, 3day 1.83 (CI about 0.9–3.2), medium 0.52, long
+     not meaningful. Buying all calls loses −21% (1d), −27% (3d), −44%
+     (7d).
+   - **ML fixes done (ml-coder, 8 October; on the branch, not yet
+     merged):**
+     - drop `secs_since_prev_call`/`prior_calls` (always NULL/0 for first
+       calls);
+     - categorical levels from train rows only, case-insensitive (old
+       saved models with flat meta keep exact matching, so the model on
+       the server scores as trained until retrained);
+     - a real `long` skip;
+     - for medium/long, a 14-day date-based forward test plus purged
+       k-fold (K=5, at least 3 usable folds, else a fixed 150 rounds)
+       inside train for the rounds and Platt calibration;
+     - Wilson lift intervals in the report;
+     - the `run_training.sh` guard now checks `MIN_MATURED` in
+       `config.py`.
+     - The gates are unchanged.
+     - Tested locally: 74 pytest passed.
+     - Next: the owner merges, then retrains on prod with
+       `REPO="$PWD" ML=~/scout-ml bash ~/scout-ml/run_training.sh
+       --skip-install` and copies `report.md` to `ml-results/`.
+   - **Queued ML items:**
+     - Group DEX names and quote assets into stable families. There are
+       about 50 posted DEX names, many short-lived and time-specific: e.g.
+       "Pons" until mid-Aug then "Pons V2", "Pools Trade Instant" in Aug
+       only, "O1 Rwa" for one week.
+     - Calibrate on recent weeks or weight recent calls (the base rate
+       drifts week to week).
+     - A "dead after the call" label/flag (e.g. fewer than about 50
+       trades in the 24 h after the call), so flat dead tokens are not
+       counted as safe non-collapses.
+     - Optional: refit on all data before saving the model.
+     - Optional: case-insensitive `pre_vol_unit` / `price_unit`.
+   - **Query findings (the owner ran them 8 October):**
+     - Pons V2 is a steady pump and dump: the 1d collapse rate is 0.58–0.83
+       every week; the median peak is +50–90%, then −75 to −90%.
+     - The Uniswap v4 collapse rate fell from 0.57–0.75 (late Aug to mid
+       Sep) to 0.16–0.26 (from 21 Sep).
+     - Backfilled and live calls agree in the same week (no provenance
+       artefact).
+     - Collapses are rarely total losses (0–9%).
+   - **"Uniswap V4" flat calls, resolved 8 October: real dead tokens, not
+     a tracker bug; no fix and no re-track.**
+     - About 230 first calls posted "DEX: Uniswap V4", quoted in ETH, in
+       the weeks of 21 and 28 Sep (to about 2 Oct); e.g. calls 664, 578,
+       504.
+     - The owner's read-only query showed the tracker follows the active
+       pool: 100–250 buy-heavy swaps in the 60 minutes before the call,
+       then only 0–30 trades in the next 24 h; flat price; latest return
+       about −10% (ETH drift). No zero-amount (hook) swaps.
+     - The implied mcap is about 10x below the posted mcap (likely a 10B
+       supply).
+     - A second pattern, 2–5 Oct: many tokens peak at about 9.0–9.3e-8 ETH
+       with lows of about 4.5–5e-8 ETH; likely templated launches with a
+       fixed liquidity range.
+     - ML impact: the low v4 collapse rate from 21 Sep is partly dead
+       tokens counted as non-collapses, hence the queued "dead after the
+       call" item.
 2. **Perceptor re-scan of first calls without a Perceptor report**
-   (approved 8 October with the defaults below). **Done (backend): built,
-   reviewed twice (no leak, no must-fix), tested locally; uncommitted in the
-   working tree, waiting for the owner's commit** (8 October, later).
+   (approved 8 October with the defaults below). **Backend merged
+   (0a46f28, in PR #1 = 4e7e049) and deployed 8 October, lane off.** The
+   website "Perceptor today" label is in progress on
+   `work/2026-10-09-perceptor-today-label`.
    - What it does, backend only:
      - `scan_kind` column on `scout_investigations` (`'live'`/`'rescan'`,
        idempotent `ADD COLUMN IF NOT EXISTS`, default `'live'`) with a
@@ -235,17 +328,14 @@ approved; the Perceptor re-scan is approved with the defaults in section 4;
      throwaway-Postgres run gave 286 PASS / 0 SKIP, including the 8
      `rescan_db_test.go` tests. Web benchmark roughly unchanged (HTTP paths
      ≤ 0.21 ms/op).
-   - Commit plan: the owner creates `work/2026-10-09-perceptor-rescan` from
-     `work/2026-10-08-ml-pool-web` (stacked; the files overlap) and commits
-     these 15 files. Its PR **waits until the 8 October PR is merged**
-     (owner's choice), then targets `main`. Deploy order: 8 October first,
-     then the rescan (one schema line at a time).
+   - Shipped: committed on `work/2026-10-09-perceptor-rescan` (stacked on
+     `work/2026-10-08-ml-pool-web`), merged as PR #1 (4e7e049), deployed
+     8 October with the 8 October work.
    - Prod notes:
-     - Do not switch `SCOUT_RESCAN=on` before the website "Perceptor today"
+     - Do not set `SCOUT_RESCAN=on` before the website "Perceptor today"
        label is deployed.
-     - `-rescan-missing -dry-run` migrates the schema like every mode, so it
-       must not run on prod before the deploy. Until then the count comes
-       from a read-only pgAdmin query (pending owner action 4).
+     - The candidate count: a read-only pgAdmin query (the PM provides
+       it).
      - Send the dry run's output to a file (it may be thousands of lines).
      - Rollback caveat: an old binary would read rescan rows as call-time
        verdicts (in DEPLOY.md).
@@ -254,9 +344,10 @@ approved; the Perceptor re-scan is approved with the defaults in section 4;
        `rescanFailedLimit = 2`) or after 3.
      - The daily cap can undercount while database inserts fail (the gap
        still holds).
-     - A "Perceptor today" change sends no SSE event (the page shows it at
-       the next list reload); consider it in the label step.
-   - Next step on this line: the frontend "Perceptor today" label (`coder`).
+     - A "Perceptor today" change sends no SSE event in 4e7e049; the label
+       branch adds one (`report` with `tool: perceptor_today`).
+   - Next step on this line: the frontend "Perceptor today" label (`coder`,
+     in progress on `work/2026-10-09-perceptor-today-label`).
    - Off by default: `SCOUT_RESCAN=on`. Settings and defaults:
      `SCOUT_RESCAN_MAX_AGE=720h`, `SCOUT_RESCAN_MAX_PER_DAY=100`,
      `SCOUT_RESCAN_GAP=10m`, `SCOUT_RESCAN_IDLE=5m`,
@@ -270,7 +361,7 @@ approved; the Perceptor re-scan is approved with the defaults in section 4;
    - The existing `-scan`/`-post` must not be used for this: they deliver,
      overwrite status, and would leak today's verdict into the ML features.
 3. **Fresher latest price for old calls** (approved 8 October, config only,
-   ships with the deploy of `work/2026-10-08-ml-pool-web`; see "Deploying"):
+   deployed 8 October in 4e7e049, now in the prod `.env`; see "Deploying"):
    `SCOUT_LATEST_REFRESH_OLD=1h SCOUT_LATEST_BATCH=400` on the tracker. No
    history re-run; ≈ 133k `eth_getLogs`/day in total (≈ 1.5 req/s),
    +108k/day (≈ +1.25 req/s) over today's ≈ 25k; old calls' latest price at
@@ -308,7 +399,7 @@ approved; the Perceptor re-scan is approved with the defaults in section 4;
      −99.99, not rugged at the call).
    - Phases:
      - P0: the owner runs read-only queries Q1–Q5. Q5 filters on
-       `scan_kind`, so drop that filter if it runs before the rescan deploy.
+       `scan_kind`; the column is in prod since 4e7e049.
      - P1: offline pilot of about 450 calls (150 rug-by-7d / 150 +100% / 150
        neither); a one-off, rate-limited, read-only exporter; files on the
        server; no schema change; about 8k `eth_getLogs`, under 1 h.
@@ -326,6 +417,20 @@ approved; the Perceptor re-scan is approved with the defaults in section 4;
      - the pilot size and the server folder;
      - the look-back cap for old tokens (7 days?).
    - No coder work until the owner approves.
+5. **Analytics page** (planning approved in principle 8 October; build
+   after the "Perceptor today" label is committed).
+   - A separate page with a summary, a by-Perceptor-verdict table and a
+     by-week table, also split by DEX family.
+   - One compact per-call feed from the snapshot (no per-request DB
+     query), aggregated in the browser.
+   - Medians first; horizons not yet due shown as n/total; rugged = −100%;
+     realistic (late) entry.
+   - Defaults the PM chose until the owner answers his five questions
+     (section 3, action 7):
+     - weeks Monday–Sunday UTC;
+     - returns before tax (matching the list);
+     - tables first, charts (ECharts) in phase 2;
+     - the 1d horizon by default.
 
 Later:
 
@@ -378,8 +483,8 @@ Later:
 
 - Done on 8 October (owner confirmed): `main` pushed to
   `kfukue/scout-analytics`, and the prod cut-over below completed; prod runs
-  from the new checkout. Prod `git rev-parse HEAD`: **PENDING** (from the
-  owner).
+  from the new checkout. Prod `git rev-parse HEAD` = **4e7e049**, run on
+  the server (owner confirmed 8 October).
 - Rollback: the old checkout (old repo at 4369a1d) is kept; step 7 below.
 
 **Prod cut-over checklist** (done 8 October; kept for reference):
@@ -482,9 +587,10 @@ that changed, from the repo root:
 - `go run . -listen-only`
 - `SCOUT_RPC_RPS=300 SCOUT_TRACK_WORKERS=12 SCOUT_RPC_PARALLEL=4 SCOUT_RPC_MAX_INFLIGHT=48 go run . -track`
   (latest-price pass on; `SCOUT_RPC_LOG_CHUNK` unset, default 200000).
-  From the deploy of `work/2026-10-08-ml-pool-web`, add
-  `SCOUT_LATEST_REFRESH_OLD=1h SCOUT_LATEST_BATCH=400` to that line, at the
-  same restart as the website deploy.
+  `SCOUT_LATEST_REFRESH_OLD=1h SCOUT_LATEST_BATCH=400` are in the prod
+  `.env` (since 8 October). Start it from the checkout folder, so it reads
+  that `.env`; a variable set in the shell wins over the file. Check the
+  `latest prices on:` line after every restart.
 - `go run . -web`. A reverse proxy in front must
   pass the `Host` header unchanged, or the same-origin check makes
   `POST /api/refresh` return 403.
@@ -492,7 +598,9 @@ that changed, from the repo root:
 After a tracker change: `-price-check` on 2–3 affected tokens before the full
 run.
 
-Checks after deploying `work/2026-10-08-ml-pool-web`:
+Checks after deploying `work/2026-10-08-ml-pool-web` (deployed 8 October in
+4e7e049; the pool, feeds and latest-prices startup lines were seen; the
+`waiting` count, listener and phone checks are still to confirm):
 
 - Tracker startup line: "pool of at most 16 connections (default for 12
   tracker worker(s))".
@@ -530,6 +638,8 @@ Checks after deploying `work/2026-10-08-ml-pool-web`:
     file-level splits when possible.
   - In Git Bash `grep -c $'\r'` reports 0 even for CRLF files; count CRs with
     `tr -cd '\r' | wc -c`.
+  - The owner merged the stacked branch directly (PR #1). A PR from a
+    stacked branch includes the base branch's commits.
 
 ## Reference
 
