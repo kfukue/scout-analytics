@@ -29,8 +29,9 @@ func TestScoutEventPayload(t *testing.T) {
 		want string
 	}{
 		{"call", scoutEvent{Kind: scoutEventCall, CallID: 42}, `{"kind":"call","call_id":42}`},
-		{"perceptor report", scoutEvent{Kind: scoutEventReport, CallID: 42, Tool: "perceptor", ID: 7}, `{"kind":"report","call_id":42,"tool":"perceptor","id":7}`},
-		{"salpha report", scoutEvent{Kind: scoutEventReport, CallID: 1, Tool: "salpha", ID: 2147483647}, `{"kind":"report","call_id":1,"tool":"salpha","id":2147483647}`},
+		{"perceptor report", scoutEvent{Kind: scoutEventReport, CallID: 42, Tool: "perceptor", ID: 7, ScanKind: ScanKindLive}, `{"kind":"report","call_id":42,"tool":"perceptor","id":7,"scan_kind":"live"}`},
+		{"perceptor rescan", scoutEvent{Kind: scoutEventReport, CallID: 42, Tool: "perceptor", ID: 8, ScanKind: ScanKindRescan}, `{"kind":"report","call_id":42,"tool":"perceptor","id":8,"scan_kind":"rescan"}`},
+		{"salpha report", scoutEvent{Kind: scoutEventReport, CallID: 1, Tool: "salpha", ID: 2147483647, ScanKind: ScanKindLive}, `{"kind":"report","call_id":1,"tool":"salpha","id":2147483647,"scan_kind":"live"}`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			got, err := tc.ev.payload()
@@ -56,14 +57,21 @@ func TestScoutReportEvent(t *testing.T) {
 	inv := func(status string, callID *int) *ScoutInvestigation {
 		return &ScoutInvestigation{ID: &id, CallID: callID, Status: status}
 	}
+	rescan := func(status string) *ScoutInvestigation {
+		r := inv(status, &call)
+		r.ScanKind = ScanKindRescan
+		return r
+	}
 	for _, tc := range []struct {
 		name string
 		inv  *ScoutInvestigation
 		code *string
 		want *scoutEvent
 	}{
-		{"completed perceptor", inv(investigationCompleted, &call), code("perceptor"), &scoutEvent{Kind: "report", CallID: 42, Tool: "perceptor", ID: 7}},
-		{"completed salpha", inv(investigationCompleted, &call), code("salpha"), &scoutEvent{Kind: "report", CallID: 42, Tool: "salpha", ID: 7}},
+		{"completed perceptor", inv(investigationCompleted, &call), code("perceptor"), &scoutEvent{Kind: "report", CallID: 42, Tool: "perceptor", ID: 7, ScanKind: "live"}},
+		{"completed perceptor rescan", rescan(investigationCompleted), code("perceptor"), &scoutEvent{Kind: "report", CallID: 42, Tool: "perceptor", ID: 7, ScanKind: "rescan"}},
+		{"failed perceptor rescan", rescan("failed"), code("perceptor"), nil},
+		{"completed salpha", inv(investigationCompleted, &call), code("salpha"), &scoutEvent{Kind: "report", CallID: 42, Tool: "salpha", ID: 7, ScanKind: "live"}},
 		{"failed perceptor", inv("failed", &call), code("perceptor"), nil},
 		{"timeout salpha", inv("timeout", &call), code("salpha"), nil},
 		{"another tool", inv(investigationCompleted, &call), code("other"), nil},

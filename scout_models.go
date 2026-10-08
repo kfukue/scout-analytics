@@ -35,6 +35,12 @@ const (
 	investigationRateLimited = "rate_limited" // bot kept answering "try again in N s"
 )
 
+// Kinds of investigation (scout_investigations.scan_kind).
+const (
+	ScanKindLive   = "live"   // run when the call came in (or by -scan / -post)
+	ScanKindRescan = "rescan" // Perceptor re-scan long after the call (rescan lane): never a call-time feature
+)
+
 // Delivery statuses.
 const (
 	DeliveryStatusSent   = "sent"
@@ -133,6 +139,8 @@ type ScoutInvestigation struct {
 	CreatedAt       time.Time       `json:"created_at"`       //23
 	UpdatedBy       string          `json:"updated_by"`       //24
 	UpdatedAt       time.Time       `json:"updated_at"`       //25
+	// ScanKind: ScanKindLive (default when empty) or ScanKindRescan.
+	ScanKind string `json:"scan_kind"` //26
 
 	ToolCode string `json:"tool_code,omitempty"` // filled by selects (join), not a column
 }
@@ -259,8 +267,9 @@ var ScoutWebHorizons = [5]string{"1h", "1d", "3d", "7d", "30d"}
 // call (in PriceUnit); Tracked says the call has an entry price at all.
 // CallCount and LastCallDate describe all real calls of the token (update posts
 // left out; contract address compared without regard to letter case).
-// PerceptorVerd and PerceptorURL are the token's latest completed Perceptor
-// report (any post of the token), nil when it was never scanned; PerceptorID is
+// PerceptorVerd and PerceptorURL are the token's latest completed live
+// Perceptor report (scan_kind 'live', any post of the token), nil when it was
+// never scanned at the time of a call; PerceptorID is
 // that investigation's id. SAlphaID is the token's latest completed sAlpha
 // investigation whose report_text is not empty (nor only white space), nil
 // when there is none; a reply that only declines to report (see
@@ -284,9 +293,17 @@ type ScoutWebRow struct {
 	PerceptorVerd   *string // clean | caution | red_flags | unknown
 	PerceptorURL    *string
 	PerceptorID     *int
-	SAlphaID        *int
-	CallCount       int
-	LastCallDate    time.Time
+	// "Perceptor today": the token's latest completed rescan (scan_kind
+	// 'rescan', run long after the call by the rescan lane): its verdict
+	// (clean | caution | red_flags | unknown), link and time (completed_at,
+	// else requested_at); all nil without one. Never mixed into the fields
+	// above, which come from live scans only.
+	PerceptorTodayVerd *string
+	PerceptorTodayURL  *string
+	PerceptorTodayAt   *time.Time
+	SAlphaID           *int
+	CallCount          int
+	LastCallDate       time.Time
 	// The tracker's latest-price pass (in PriceUnit; nil until the first refresh):
 	// return as of the most recent pool price, measured like Perf from the late
 	// entry; that price; when it was read; and the time of the trade behind it.
@@ -379,6 +396,15 @@ type ScoutWebCall struct {
 	HasSAlpha         bool `json:"has_salpha_report"`
 	PerceptorReportID *int `json:"perceptor_report_id"`
 	SAlphaReportID    *int `json:"salpha_report_id"`
+	// "Perceptor today": the token's latest completed Perceptor re-scan by the
+	// rescan lane, run long after the call (SCOUT_RESCAN): its verdict (clean |
+	// caution | red_flags | unknown), report link (https only) and when it ran.
+	// All three are nil without one. perceptor_verdict, perceptor_url and
+	// perceptor_report_id above (and the Perceptor filter) come from scans
+	// made at the time of a call only, never from a re-scan.
+	PerceptorTodayVerd *string    `json:"perceptor_today_verdict"`
+	PerceptorTodayURL  *string    `json:"perceptor_today_url"`
+	PerceptorTodayAt   *time.Time `json:"perceptor_today_at"`
 }
 
 // ScoutWebReport is one investigation as the website's row detail shows it

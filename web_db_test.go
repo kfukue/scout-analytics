@@ -217,9 +217,12 @@ type webCallJSON struct {
 	CallMcapUSD   *float64 `json:"call_mcap_usd"`
 	LatestMcapUSD *float64 `json:"latest_mcap_usd"`
 
-	HasSAlpha         bool `json:"has_salpha_report"`
-	PerceptorReportID *int `json:"perceptor_report_id"`
-	SAlphaReportID    *int `json:"salpha_report_id"`
+	HasSAlpha          bool    `json:"has_salpha_report"`
+	PerceptorReportID  *int    `json:"perceptor_report_id"`
+	SAlphaReportID     *int    `json:"salpha_report_id"`
+	PerceptorTodayVerd *string `json:"perceptor_today_verdict"`
+	PerceptorTodayURL  *string `json:"perceptor_today_url"`
+	PerceptorTodayAt   *string `json:"perceptor_today_at"`
 }
 
 type webCallsJSON struct {

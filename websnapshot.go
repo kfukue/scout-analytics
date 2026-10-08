@@ -418,6 +418,7 @@ func (c webConfig) webCall(r *ScoutWebRow) ScoutWebCall {
 		CallCount: r.CallCount, LastCallDate: r.LastCallDate,
 		CallMcapUSD: r.callMcap, LatestMcapUSD: r.latestMcap,
 		HasSAlpha: r.SAlphaID != nil && !r.salphaDeclined, PerceptorReportID: r.PerceptorID, SAlphaReportID: r.SAlphaID,
+		PerceptorTodayVerd: r.PerceptorTodayVerd, PerceptorTodayURL: r.PerceptorTodayURL, PerceptorTodayAt: r.PerceptorTodayAt,
 	}
 }
 
@@ -505,6 +506,17 @@ func newWebSnapshot(rows []ScoutWebRow, updatePosts int, prev *webSnapshot, cfg 
 				*p = nil // not an id the snapshot can hold
 			}
 		}
+		// "Perceptor today" (a rescan): the same link rule; no verdict, no
+		// link or time either; the time in UTC like the others
+		if r.PerceptorTodayURL != nil && !strings.HasPrefix(*r.PerceptorTodayURL, "https://") {
+			r.PerceptorTodayURL = nil
+		}
+		if r.PerceptorTodayVerd == nil {
+			r.PerceptorTodayURL, r.PerceptorTodayAt = nil, nil
+		}
+		if r.PerceptorTodayAt != nil {
+			*r.PerceptorTodayAt = r.PerceptorTodayAt.UTC()
+		}
 		r.verdict = webBucketNotScanned
 		if r.PerceptorVerd != nil {
 			if b, ok := webVerdictBuckets[*r.PerceptorVerd]; ok {
@@ -534,7 +546,7 @@ func newWebSnapshot(rows []ScoutWebRow, updatePosts int, prev *webSnapshot, cfg 
 	s.searchAt = make([]uint32, n+1)
 	s.percID = make([]int32, n)
 	s.salphaID = make([]int32, n)
-	s.rowJSON = make([]byte, 0, n*940) // about 870 bytes a row
+	s.rowJSON = make([]byte, 0, n*1030) // about 955 bytes a row
 	s.search = make([]byte, 0, n*72)
 	var one bytes.Buffer // one encoded row
 	enc := json.NewEncoder(&one)
@@ -687,6 +699,9 @@ func hashWebRows(rows []ScoutWebRow, updatePosts int, gmgn string) string {
 		}
 		opt(r.PerceptorVerd)
 		opt(r.PerceptorURL)
+		opt(r.PerceptorTodayVerd)
+		opt(r.PerceptorTodayURL)
+		optTime(r.PerceptorTodayAt)
 		num(int64(r.CallCount))
 		num(r.LastCallDate.UnixNano())
 		optFlt(r.LatestReturn)
