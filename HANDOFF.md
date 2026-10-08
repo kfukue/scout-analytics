@@ -1,6 +1,6 @@
 # Scout analytics: handoff to Claude Code
 
-Up to date as of 7 October 2026. Start Claude Code in the repo root;
+Up to date as of 8 October 2026. Start Claude Code in the repo root;
 `.claude/settings.json` makes the session the product manager, which delegates
 to the agents in `.claude/agents/` (see "Agent setup").
 
@@ -20,8 +20,8 @@ matter are in section 5. Package `main` is at the repo root: `go run .`.
 ## What the system is
 
 Repo `kfukue/scout-analytics`, branch `main` (the only branch carried over).
-Production runs `main` of the old repo at 4369a1d (the owner confirmed the
-server has the latest); it moves to this repo with the cut-over in section 5.
+Production runs from a checkout of this repo since the cut-over (section 5,
+owner confirmed 8 October); the prod commit is PENDING (section 3).
 
 - Listener: reads @scoutrobinhood, tells real calls from "hit 3X" update posts
   (`postkind.go`), sends new tokens to @perceptor0xBot and @salpha_research_bot,
@@ -34,9 +34,9 @@ server has the latest); it moves to this repo with the cut-over in section 5.
   keeps a current return per token. Rolling worker queue.
 - Website (`-web`, no login, read-only): one row per token from an in-memory
   snapshot refreshed every 15 seconds, live updates over Server-Sent Events, a
-  "Refresh now" button, 17 columns, search, sorts, Perceptor filter, legend and
-  a per-row report detail pane. Plain JavaScript in `frontend/` (no framework,
-  no build step).
+  "Refresh now" button, 16 columns (17 before 2c), search, sorts, Perceptor
+  filter, legend and a per-row report detail pane. Plain JavaScript in
+  `frontend/` (no framework, no build step).
 - Model (`ml/`): labels for four holding periods, logistic baseline and
   LightGBM, time-split validation with pass/fail gates, scoring service. Not
   trained on real data yet; `ml/RUNBOOK.md` has the steps.
@@ -102,16 +102,29 @@ extracted from 4369a1d.
   - **Perceptor multi-select** filter on the website (`verdict=clean,caution`).
   - **`DEPLOY.md`** (new).
 
-Prod runs the old repo's `main` at 4369a1d (the owner confirmed the server has
-the latest), from the old checkout, until the cut-over in section 5.
+Since the cut-over (8 October) prod runs from the new checkout of this repo
+(section 5); the old checkout (old repo at 4369a1d) is kept for rollback.
 
-## 2. Not yet committed
+## 2. On the work branch, not merged yet
 
-Nothing. The 7 October doc edits (`ops/README.md`,
-`ops/2026-10-07-liquidity-retrack/README.md`) are committed in d49fe9c
-(PR #20, 4369a1d). The corrected text of this `HANDOFF.md`, saved after
-d49fe9c, is carried into this repo's standalone commit; the old repo's
-uncommitted copy can be discarded.
+Today's work (8 October) is on branch `work/2026-10-08-ml-pool-web`, one
+commit each for a, b, c (reviewed 8 October); PR to `main` pending; not
+deployed.
+
+a. **One-command ML training**: `ml/run_training.sh` (new), `.gitattributes`
+   (new: `*.sh` always LF), `ml/RUNBOOK.md` ("Quick way: one script" and the
+   Cleanup note). Tested locally on Windows with stubs, not on Linux.
+b. **DB pool size**: `clamp(effective tracker workers + 4, 4, 32)` (effective =
+   `SCOUT_TRACK_WORKERS` with the on-chain source, 1 with GeckoTerminal); an
+   explicit `pool_max_conns` in `SCOUT_DATABASE_URL` is respected; the startup
+   line shows the pool size and where it came from. Files: `main.go`,
+   `scout_models.data.go`, `tracker.go`, `internal/database/database.go`,
+   `poolconns_test.go` (new), `scout_models_db_test.go`, README/DEPLOY.
+   `internal/database` is no longer an unchanged copy of the API repo's (new
+   `SetupDatabaseMaxConns`).
+c. **Website readability + `?days=` age filter**: `frontend/*`, `web.go`,
+   `websnapshot.go`, `web_db_test.go`, `websnapshot_test.go`, README website
+   section. Reviewed.
 
 ## 3. Prod state and pending owner actions
 
@@ -128,39 +141,75 @@ State on 7 October:
 - The 33 asset_chains feeds are live from the DB; `.env` still has
   `SCOUT_CHAINLINK_FEEDS` as a backup (the env var wins on conflict).
 
-Pending owner actions:
+8 October: the owner pushed `main` to `kfukue/scout-analytics` and completed
+the prod cut-over (owner confirmed). Prod runs from the new checkout. Prod
+`git rev-parse HEAD`: **PENDING** (to come from the owner; needed for
+DEPLOY.md 3.0).
 
-1. Create the empty private repo `kfukue/scout-analytics` and push this repo's
-   `main` (section 5).
-2. The prod cut-over to the new checkout (section 5, checklist).
+Owner actions:
+
+1. Done (8 October): create `kfukue/scout-analytics` and push `main`.
+2. Done (8 October): the prod cut-over to the new checkout. Still to send:
+   the prod `git rev-parse HEAD` (above).
 3. **Prod settings** (for reference):
    - `-track` with `SCOUT_RPC_RPS=300 SCOUT_TRACK_WORKERS=12
-     SCOUT_RPC_PARALLEL=4 SCOUT_RPC_MAX_INFLIGHT=48`, latest-price pass on.
+     SCOUT_RPC_PARALLEL=4 SCOUT_RPC_MAX_INFLIGHT=48`, latest-price pass on;
+     after the 8 Oct deploy also `SCOUT_LATEST_REFRESH_OLD=1h
+     SCOUT_LATEST_BATCH=400` (the website's 2 h stale limit assumes it).
    - The web port is `SCOUT_WEB_ADDR` in `.env`.
    - Nitro runs with `--execution.rpc.log-history=0` (full log index; a full
      node, not an archive). Keep it, or old ranges slow down again.
 
 ## 4. Next work, in order (owner's decision)
 
-1. Done: **the stash decision.** `stash@{0}` ("On codex/scout-dashboard:
-   scout-dashboard before main sync 2026-10-06") stays behind in the old repo;
-   it did not move here. (`stash@{1..3}` are old GitHub Desktop stashes from
-   other branches.)
-2. Done, pending the owner's push and the prod cut-over: **the repo migration
-   to `kfukue/scout-analytics`** (section 5), BEFORE ML training.
-3. **The first ML training** via `ml/RUNBOOK.md`, run from this repo after the
-   cut-over (the runbook paths are for this layout). No GPU needed: CPU
-   only, it takes seconds. The long (30d) horizon is skipped until about
-   mid-November. The gates are strict; scores stay out of deliveries until a
-   report passes. ml-coder agent.
+1. **The first ML training**, run by the owner on the prod server via
+   `ml/RUNBOOK.md` (or `ml/run_training.sh` once 2a is merged); he reports
+   the result to the PM. No GPU needed: CPU only, it takes seconds. The long
+   (30d) horizon is skipped until about mid-November. The gates are strict;
+   scores stay out of deliveries until a report passes. ml-coder agent.
+2. **Owner decisions (8 October):**
+   - **Fresher latest price for old calls**, approved 8 Oct: set
+     `SCOUT_LATEST_REFRESH_OLD=1h` and `SCOUT_LATEST_BATCH=400` on the
+     tracker at the same restart as the website deploy (the website's stale
+     limit assumes it). Config only, no history re-run; ≈ 133k
+     `eth_getLogs`/day in total (≈ 1.5 req/s), +108k/day (≈ +1.25 req/s) over
+     today's ≈ 25k; old calls' latest price at most about 1 h old instead of
+     about 24 h. The website's stale threshold for old and rugged calls
+     (`STALE_OLD_MS` in `frontend/app.js`) is now 2 h (was 48 h); without
+     the new setting, old calls would show "stale" after 2 h. Later
+     option: batched multi-pool
+     `eth_getLogs` for 15-minute freshness for all calls. Refresh on view is
+     rejected for now (30–90 s latency, the web process would have to write
+     a NOTIFY, no login).
+   - **Perceptor re-scan of first calls without a Perceptor report**
+     (approved 8 Oct, next to build, after the owner commits the 8 Oct
+     work): a low-priority lane inside the listener (one
+     Telegram session; never a second process); Perceptor only, no delivery,
+     no status/seen/score changes. Stored in `scout_investigations` with a new
+     idempotent column `scan_kind TEXT NOT NULL DEFAULT 'live'` (`'rescan'`),
+     excluded from `scout_call_dataset_v`'s Perceptor join and from the
+     requeue's `CAInvestigated` check; shown on the website as "Perceptor
+     today". Approved defaults: only calls up to 30 days old (configurable,
+     e.g. `SCOUT_RESCAN_MAX_AGE`); skip rugged and `latest_return_pct`
+     ≤ −99%; include tokens with no latest price yet; about a 10-minute gap;
+     only when idle; daily cap 100 to start. A live call can wait up to
+     about 5 min (shared account pacing 2m5s). The
+     existing `-scan`/`-post` must not be used for this: they deliver,
+     overwrite status, and would leak today's verdict into the ML features.
 
 Later:
 
 - ML label issues: the 30d collapse uses the `rugged` set after day 30;
   train/serve skew in `quote_asset` and `perceptor_verdict`.
 - GCP Pub/Sub for live updates when scaling (owner's plan).
-- `MaxConns` for `SCOUT_DATABASE_URL` is hard-coded to 4 (too low for 12
-  workers).
+- Resolved by 2b: `MaxConns` for `SCOUT_DATABASE_URL` was hard-coded to 4.
+- Website summary strip ("now" medians and shares); it changes the summary
+  `ETag`.
+- `-scan`/`-post` attach to the newest post of the token, not its first call.
+- FLOOD_WAIT is not handled on bot sends.
+- `internal/database/database.go` discards the `pgx5.Connect` /
+  `NewWithConfig` errors, keeps 2 connections outside the pool per process,
+  and fatally requires `.env` in the working directory.
 - Scatter plot with ECharts 6.1 after the model report (rules in `coder.md`,
   "Charts").
 - Other launchpads (about 46 unpriced calls); the launchpad query results are
@@ -172,7 +221,7 @@ Later:
   posts no longer matters (training uses first calls only, so they are
   near-constant).
 
-## 5. Repo migration (done; pending push and prod cut-over)
+## 5. Repo migration (done; pushed and cut over on 8 October)
 
 **Moved from `kfukue/geth-analytics` (history kept).**
 
@@ -182,12 +231,14 @@ Later:
   (same tree as `origin/scout-call-model` for this folder). 37 commits touch
   the folder (55 with merges). No secrets anywhere in the extracted history
   (no `.env`, `*session.json`, `calls.csv`, `scoutanalytics_data/` or `.exe`
-  object). Only `main` was carried over; the old stash stayed behind.
+  object). Only `main` was carried over; the old stash (`stash@{0}`, "On
+  codex/scout-dashboard: scout-dashboard before main sync 2026-10-06") stayed
+  behind in the old repo (owner's decision).
 - Then one standalone commit, no functional changes: module
   `github.com/kfukue/scout-analytics` (`go.mod`/`go.sum` from the old repo,
   `go mod tidy`, same versions for every module still required);
   `internal/database/database.go` copied unchanged from the old
-  `database/database.go` (same `.env` variables); new `.gitignore`; `.claude/`
+  `database/database.go` (same `.env` variables; since changed, see 2b); new `.gitignore`; `.claude/`
   copied with paths rewritten; docs and comments to `go run .` from the repo
   root.
 - Old → new hashes (filter-repo rewrote every commit): 4369a1d → 7a4edaa
@@ -195,12 +246,13 @@ Later:
   08b3a71 → b10251b. Older hashes in this file and in the ops READMEs are
   old-repo hashes; `git log --grep` or the subject line finds them here.
 
-Owner's push (from the extracted repo on the PC): create the empty private
-repo `kfukue/scout-analytics` on GitHub (no README, licence or .gitignore), then
-`git remote add origin https://github.com/kfukue/scout-analytics.git` and
-`git push -u origin main`.
+- Done on 8 October (owner confirmed): `main` pushed to
+  `kfukue/scout-analytics`, and the prod cut-over below completed; prod runs
+  from the new checkout. Prod `git rev-parse HEAD`: **PENDING** (from the
+  owner).
+- Rollback: the old checkout (old repo at 4369a1d) is kept; step 7 below.
 
-**Prod cut-over checklist** (the old checkout stays untouched for rollback):
+**Prod cut-over checklist** (done 8 October; kept for reference):
 
 1. On the server, clone the new repo next to the old checkout, e.g.
    `git clone https://github.com/kfukue/scout-analytics.git /srv/scout-analytics`
@@ -237,8 +289,6 @@ repo `kfukue/scout-analytics` on GitHub (no README, licence or .gitignore), then
    `WorkingDirectory=/srv/scout-analytics` (EDIT).
 9. Removing `telegrambot/scoutanalytics` from the old repo is a separate,
    later decision; nothing in the old repo was changed.
-
-- Later: `database.go` fatally requires `.env` in the working directory.
 
 ## Rules the owner has set
 
@@ -296,13 +346,14 @@ repo `kfukue/scout-analytics` on GitHub (no README, licence or .gitignore), then
 
 See `DEPLOY.md` (committed in 08b3a71) for the full steps. In short:
 the owner commits and pushes a work branch from the PC, merges it into
-`main` with a PR, and deploys `main` on the server (after the cut-over, in the
-new checkout): `git checkout main && git pull`, then restarts the processes
+`main` with a PR, and deploys `main` on the server (in the new checkout): `git checkout main && git pull`, then restarts the processes
 that changed, from the repo root:
 
 - `go run . -listen-only`
 - `SCOUT_RPC_RPS=300 SCOUT_TRACK_WORKERS=12 SCOUT_RPC_PARALLEL=4 SCOUT_RPC_MAX_INFLIGHT=48 go run . -track`
   (latest-price pass on; `SCOUT_RPC_LOG_CHUNK` unset, default 200000).
+  After the 8 Oct deploy, add `SCOUT_LATEST_REFRESH_OLD=1h SCOUT_LATEST_BATCH=400`
+  to that line (set at the same restart as the website deploy).
 - `go run . -web`. A reverse proxy in front must
   pass the `Host` header unchanged, or the same-origin check makes
   `POST /api/refresh` return 403.
