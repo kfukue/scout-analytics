@@ -1,8 +1,8 @@
 # Scout analytics: handoff to Claude Code
 
-Written 6–7 October 2026. Start Claude Code in the repo root; `.claude/settings.json`
-makes the session the product manager, which delegates to the agents in
-`.claude/agents/` (see "Agent setup").
+Up to date as of 7 October 2026. Start Claude Code in the repo root;
+`.claude/settings.json` makes the session the product manager, which delegates
+to the agents in `.claude/agents/` (see "Agent setup").
 
 First message to give it:
 
@@ -15,24 +15,25 @@ Branch `scout-call-model`. Production runs `main`.
 
 - Listener: reads @scoutrobinhood, tells real calls from "hit 3X" update posts
   (`postkind.go`), sends new tokens to @perceptor0xBot and @salpha_research_bot,
-  delivers to the private group, records to Postgres.
+  delivers to the private group, records to Postgres. After a restart it
+  catches up on missed posts (section 2).
 - Tracker (`-track`): on-chain prices from Uniswap v2/v3/v4 pools and Pons V2
   bonding curves, returns at 1h/1d/3d/7d/30d, 5-minute and hourly candles,
   pre-call trading stats, token names from `name()`. Only the first real call of
   each token is tracked; later calls get status `repeat`. A latest-price pass
-  keeps a current return per token.
+  keeps a current return per token. Rolling worker queue.
 - Website (`-web`, no login, read-only): one row per token from an in-memory
-  snapshot refreshed every 15 seconds, a "Refresh now" button, 17 columns,
-  search, sorts, Perceptor filter, legend and a per-row report detail pane.
-  Plain JavaScript in `frontend/` (no framework, no build step).
+  snapshot refreshed every 15 seconds, live updates over Server-Sent Events, a
+  "Refresh now" button, 17 columns, search, sorts, Perceptor filter, legend and
+  a per-row report detail pane. Plain JavaScript in `frontend/` (no framework,
+  no build step).
 - Model (`ml/`): labels for four holding periods, logistic baseline and
   LightGBM, time-split validation with pass/fail gates, scoring service. Not
-  trained on real data yet.
+  trained on real data yet; `ml/RUNBOOK.md` has the steps.
 
 ## 1. Shipped
 
-Committed and pushed on `scout-call-model`, merged to `main` through PRs
-(#10–#14); prod runs `main`.
+Merged to `main` through PRs #10–#14 (the last is a527d2c, up to 40e1888):
 
 - Latest % (514b073); eth_getLogs range-size fix (af8e8fe); Call MC and Latest
   MC columns (9894e0f); Refresh now and the 17-column layout (1f4e206);
@@ -45,136 +46,146 @@ Committed and pushed on `scout-call-model`, merged to `main` through PRs
   graduation found from indexed logs (no look-back limit), no PoolManager
   fallback for Pons.
 - In 40e1888 (the subject line only mentions ops and ML):
-  - v4 pool discovery via `Initialize` (no PoolManager-wide scan; the old
-    400-step backward walk is gone).
+  - v4 pool discovery via `Initialize` (no PoolManager-wide scan).
   - USD-source fix: one lookup chain everywhere (stablecoin → Robinhood feed →
     mainnet feed → own pool against ETH or a stablecoin, chosen per block); no
-    cached errors; the data-loss fix (state is saved only when every step of a
-    horizon segment succeeds); feeds loaded from `asset_chains`, with the env
-    var winning on conflict; Chainlink aggregator switches handled; the gecko
-    source uses reserve/2.
-  - Ops scripts (pgAdmin, A/B/C/D): `ops/2026-10-rug-retrack`,
-    `ops/2026-10-pons-v4-retrack`, `ops/2026-10-asset-chains-feeds`.
+    cached errors; state saved only when every step of a horizon segment
+    succeeds; feeds loaded from `asset_chains`, with the env var winning on
+    conflict; Chainlink aggregator switches handled; gecko uses reserve/2.
+  - Ops scripts: `ops/2026-10-rug-retrack`, `ops/2026-10-pons-v4-retrack`,
+    `ops/2026-10-asset-chains-feeds` (the asset_chains seed: 33 feeds, now live
+    from the DB; `chains.id` 21 = Robinhood Chain).
   - ML: outcomes over `MAX_OUTCOME_PCT = 1e5` excluded, simulation return capped
     at `SIM_MAX_RET_PCT = +1000%` (owner approved), tracker columns forbidden as
     model inputs.
-- 4cd2bd5 (Pons-v4 re-track skips rows already tracked by the Pons-aware code)
-  is pushed on `scout-call-model` but not yet merged to `main`. It changes only
-  the ops scripts, which the owner runs from the branch checkout.
+
+Committed and pushed on `origin/scout-call-model`, **not yet merged to
+`main`** (`origin/main` stops at 40e1888 as of 7 Oct; confirm with the owner
+what the server actually runs):
+
+- 4cd2bd5: Pons-v4 re-track skips rows already tracked by the Pons-aware code.
+- 39b1bac: website restyle (after oca.lylelabs.io), sAlpha declines, rugged
+  rows without a peak, 10ⁿ numbers, one Perceptor line.
+- 4eb6fbe: previous handoff.
+- 7a54f78: USD-repair ops scripts (`ops/2026-10-usd-repair`).
+- 7cf8dd3: SSE live updates (`GET /api/events`; the listener `NOTIFY`s, the web
+  process `LISTEN`s and refreshes its snapshot; notices only for calls < 1h
+  old; `-backfill` sends no NOTIFY).
+- 14052f8: rolling worker queue, deterministic `blockAt` + head cache, segment
+  checkpoints, USD own-pool whole-history fix, the no-price-yet cap,
+  `-price-check` loads the DB feeds.
+- bde6d81: `.claude/` agent setup and permissions, including the
+  `PowerShell(git push:*)` deny.
+- 75f666c: liquidity re-track scripts; ML first-call-only training rows, view
+  columns test, `ml/RUNBOOK.md`.
+- 2da28ab: ops rename (`2026-10-v4-retrack` → `2026-10-07-liquidity-retrack`)
+  and the ops index `ops/README.md`.
 
 ## 2. Not yet committed (owner must commit and push)
 
-The website follow-ups and restyle (Mantine-style, after oca.lylelabs.io):
+`git status` on 7 October still shows this work in the working tree only:
 
-- sAlpha declines ("Not enough public signals…", "Too little liquidity…") show
-  "sAlpha did not generate a report", with no badge.
-- One Perceptor line (no more "no red flags · No red flags found").
-- Rugged rows: the API sends no peak; Status shows only the "rugged" badge
-  (owner approved).
-- Huge numbers in 10ⁿ notation, exact value in the tooltip.
+- **Listener catch-up** after a restart: the resume cursor is min(DB,
+  `poll_cursor.json`); the newest `SCOUT_CATCHUP_MAX` (default 100) missed
+  posts no older than `SCOUT_CATCHUP_MAX_AGE` (default 24h) are handled live,
+  older ones stored only; calls still `queued`/`dropped` within 72h are
+  requeued; polling reads full batches.
+- **Perceptor multi-select** filter on the website (`verdict=clean,caution`).
+- **`DEPLOY.md`** (new).
 
-`git status` on 7 October shows exactly these uncommitted files, all under
-`telegrambot/scoutanalytics/`:
+Files, all under `telegrambot/scoutanalytics/`:
 
-- modified: `frontend/app.js`, `frontend/index.html`, `frontend/style.css`,
-  `scout_models.data.go`, `scout_models.go`, `web.go`, `web_db_test.go`,
-  `web_detail_db_test.go`, `websnapshot.go`, `websnapshot_test.go`
-- untracked: `websnapshot_rug_test.go`
-- also untracked: `.claude/` at the repo root (see "Agent setup").
+- modified: `README.md`, `frontend/app.js`, `frontend/index.html`,
+  `frontend/style.css`, `main.go`, `scout_models.data.go`, `scout_models.go`,
+  `tracker.go`, `tracker_names_db_test.go`, `web.go`, `web_db_test.go`,
+  `websnapshot.go`, `websnapshot_test.go`
+- untracked: `DEPLOY.md`, `catchup.go`, `catchup_db_test.go`, `catchup_test.go`
+- plus this `HANDOFF.md`, `ops/README.md` and
+  `ops/2026-10-07-liquidity-retrack/README.md` (docs, 7 Oct).
 
-Run the reviewer agent on this diff before giving the owner commit commands.
+Run the reviewer agent on this diff, then commit as separate clean commits
+(catch-up; multi-select; DEPLOY.md; docs) before the repo migration.
 
 ## 3. Prod state and pending owner actions
 
-1. **Pons-v4 re-track** (`ops/2026-10-pons-v4-retrack`): B ran on 539 calls,
-   `reset_at` 2026-10-06 23:16:27.758076-07. At the last C: 35 re-tracked (6
-   went back to the curve, so they had wrong entries; 20 on v4), race 0. Re-run
-   C until `waiting` = 0.
-2. **Rug re-track** (`ops/2026-10-rug-retrack`): 151 calls, `reset_at`
-   2026-10-06 15:13:37.355323-07. At the last C: 36 re-tracked, race 0. Confirm
-   it finished.
-3. **asset_chains seed** (`ops/2026-10-asset-chains-feeds`): run
-   `A_inspect.sql`, fill the EDIT values in B (`asset_type_id`, the chain row
-   values, `expected_count` 33), run B, then C. Token addresses are verified;
-   feed addresses come from the owner's paste.
-4. **USD repair:** calls stuck in a non-USD `price_unit` (ORBIO-type Pons
-   quotes, HOODon, RDDT, meme quotes) and calls that lost candle segments
-   ("candles to +…" errors). The selection SQL exists (in the USD coder's
-   report); it still has to become a tested pgAdmin script set in `ops/` like
-   the others (Next work 1).
-5. **REMINDER (the owner asked to be reminded):** decide whether to re-track
-   the 1,166 old Uniswap v4 calls. They have no stored liquidity (the old code
-   never measured v4), so the liquidity filter cannot select them. About 2–4
-   hours of tracker time.
-6. Commit and push the website work (section 2), merge, and deploy (restart
-   `-web`).
-7. Decide about `stash@{0}` ("On codex/scout-dashboard: scout-dashboard before
-   main sync 2026-10-06"; touches the scout README, `main.go`,
-   `scout_models.data.go`, `scoutanalytics.sql`, `tracker.go` and a test). It
-   is probably superseded and will not move to the new repo. (`stash@{1..3}`
-   are old GitHub Desktop stashes from other branches.)
-8. After the backlog clears, run the launchpad queries: status by launchpad;
-   error kinds; 3 sample CAs per unpriced launchpad. O1 Rwa: 59 of 60 were
-   just pending. Possible gaps: Lunch Pair V4 (0 done), Pools Trade.
-9. **Prod settings** (for reference):
+State on 7 October:
+
+- All re-tracks are done (see `ops/README.md`): rug 151, Pons-v4 539, USD
+  repair 50 + 1 nudge, liquidity 649 (cutoff 2026-10-06 12:53:00-07,
+  `reset_at` 2026-10-07 12:18:38.004137-07; 52 found rugged). The owner chose
+  to re-track only the pre-rug-guard v4 calls (647 at selection time) rather
+  than all 1,166 old v4 calls. No ops folder is pending.
+- About 4,733 first calls, about 99% priced.
+- Rugged: about 12% overall; 395 of 2,867 v4 calls.
+- No stuck `queued`/`dropped` calls (the requeue preview was empty).
+- The 33 asset_chains feeds are live from the DB; `.env` still has
+  `SCOUT_CHAINLINK_FEEDS` as a backup (the env var wins on conflict).
+
+Pending owner actions:
+
+1. Commit section 2 (after the reviewer), push, merge to `main` and deploy
+   (restart the listener and `-web`).
+2. Decide about `stash@{0}` (Next work 1).
+3. **Prod settings** (for reference):
    - `-track` with `SCOUT_RPC_RPS=300 SCOUT_TRACK_WORKERS=12
      SCOUT_RPC_PARALLEL=4 SCOUT_RPC_MAX_INFLIGHT=48`, latest-price pass on.
-   - `SCOUT_CHAINLINK_FEEDS` in `.env` (10–33 stock feeds); the web port is
-     `SCOUT_WEB_ADDR` in `.env`.
+   - The web port is `SCOUT_WEB_ADDR` in `.env`.
    - Nitro runs with `--execution.rpc.log-history=0` (full log index; a full
      node, not an archive). Keep it, or old ranges slow down again.
-10. Prod uses **pgAdmin** for SQL. Ops scripts must have no psql
-    meta-commands, and the `expected_count`/`reset_at` EDIT lines must be
-    marked with `<<< EDIT` on the exact line (the owner has twice edited the
-    wrong line).
 
-## 4. Next work (code), in order
+## 4. Next work, in order (owner's decision)
 
-1. USD-repair pgAdmin scripts (item 3.4), in `ops/` with the same A/B/C/D
-   layout, tested against a throwaway Postgres.
-2. `settings.json`: add `PowerShell(git push:*)` to deny (Bash rules do not
-   cover the PowerShell tool) and the matching PowerShell allows.
-3. Small fixes:
-   - `-price-check` should load the DB feeds (`main.go`, two lines);
-   - cap retries for an entry whose quote first traded after the call (then
-     fall back to quote units);
-   - deterministic choice of the call-time block;
-   - the "node type" wording.
-4. Tracker efficiency: a rolling worker queue (today each cycle waits for its
-   slowest call); the latest pass re-reads blocks the horizon scan reads later;
-   checkpoints within a horizon segment; head-block caching; the flaky test
-   `TestLatestPriceInterruptedLeavesRowUntouched`.
-5. Open question: should `prior_calls`, `calls_prev_1h` and `calls_prev_24h`
-   (model inputs) count update posts? They still do.
-6. Support for other launchpads, after item 3.8.
-7. **Train the baseline model** (the goal of the prediction plan) once the
-   backlog and re-tracks are done; ml-coder agent.
-8. Scatter plot with ECharts 6.1 (decided; the demo was in a former scratchpad
-   and is gone after the restart; rules in `coder.md`, "Charts").
-9. Push updates via Server-Sent Events (`GET /api/events`; the listener
-   `NOTIFY`s, the web process `LISTEN`s and refreshes its snapshot).
-10. Other call sources (Call Analyser channels; parked).
-11. DEPLOY.md / infra.
+1. **The stash decision:** `stash@{0}` ("On codex/scout-dashboard:
+   scout-dashboard before main sync 2026-10-06"; touches the scout README,
+   `main.go`, `scout_models.data.go`, `scoutanalytics.sql`, `tracker.go` and a
+   test). The PM recommends leaving it: it is probably superseded and will not
+   move to the new repo. (`stash@{1..3}` are old GitHub Desktop stashes from
+   other branches.)
+2. **The repo migration to `kfukue/scoutanalytics`** (section 5), BEFORE ML
+   training.
+3. **The first ML training** via `ml/RUNBOOK.md`, run from the new repo (the
+   runbook paths are updated in the standalone commit). No GPU needed: CPU
+   only, it takes seconds. The long (30d) horizon is skipped until about
+   mid-November. The gates are strict; scores stay out of deliveries until a
+   report passes. ml-coder agent.
 
-## 5. Repo migration (on hold until the pending tasks are done)
+Later:
+
+- ML label issues: the 30d collapse uses the `rugged` set after day 30;
+  train/serve skew in `quote_asset` and `perceptor_verdict`.
+- GCP Pub/Sub for live updates when scaling (owner's plan).
+- `MaxConns` for `SCOUT_DATABASE_URL` is hard-coded to 4 (too low for 12
+  workers).
+- Scatter plot with ECharts 6.1 after the model report (rules in `coder.md`,
+  "Charts").
+- Other launchpads (about 46 unpriced calls); the launchpad query results are
+  pending from the owner.
+- Other call sources (Call Analyser channels).
+- In-flight scans cut off by a stop end as `failed` and are not requeued.
+- Poison post: a stored-only post with a permanent DB error pauses polling.
+- Resolved: `prior_calls`, `calls_prev_1h` and `calls_prev_24h` counting update
+  posts no longer matters (training uses first calls only, so they are
+  near-constant).
+
+## 5. Repo migration (next, after the stash decision)
 
 - Plan: `git filter-repo --subdirectory-filter telegrambot/scoutanalytics` on a
   fresh clone of **`https://github.com/kfukue/geth-analytics.git`** (the real
   remote, not geth-analytics-api), from `origin/scout-call-model`.
 - New module `github.com/kfukue/scoutanalytics`, `package main` at the root.
 - Copy `database/database.go` to `internal/database` unchanged (same `.env`);
-  new `.gitignore`; copy `.claude/` with paths rewritten; docs to `go run .`.
+  new `.gitignore`; copy `.claude/` with paths rewritten; docs to `go run .`;
+  update the paths in `ml/RUNBOOK.md`.
 - Pre-checks done: no secrets ever in history (all refs); `origin/main` has
   nothing the branch lacks; `codex/scout-dashboard` is local-only with no
-  unique commits; 28 commits.
-- Blockers: the uncommitted website work (section 2) and the stash decision
-  (item 3.7).
+  unique commits. Recount the commits before the filter (35 touch
+  `telegrambot/scoutanalytics` on `origin/scout-call-model` as of 7 Oct).
+- Blockers: the uncommitted work in section 2 (commit and push it first) and
+  the stash decision.
 - Prod cut-over: copy `.env`; stop the old listener before starting the new one
   (never two on one Telegram session); copy `scout.session.json` and
   `scoutanalytics_data/`; start with `go run .`; rollback = restart the old one.
-- Later: `MaxConns` for `SCOUT_DATABASE_URL` is hard-coded to 4 and needs
-  raising for 12 workers; `database.go` fatally requires `.env` in the working
-  directory.
+- Later: `database.go` fatally requires `.env` in the working directory.
 
 ## Rules the owner has set
 
@@ -193,9 +204,16 @@ Run the reviewer agent on this diff before giving the owner commit commands.
 - Only real calls are scanned, delivered and tracked; one row per token.
 - The owner commits and pushes; agents' git commit and push are blocked by
   permissions. Never commit to `main`.
+- Wait for all checks (tests, reviewer) before committing; separate clean
+  commits per change.
 - Say "tested locally" unless it ran on the prod server. Flag anything that
   makes the tracker redo history or adds ongoing node load before shipping it.
-- Ask the owner before resetting calls; give him pgAdmin scripts (see 3.10).
+- Ask the owner before resetting calls; give him pgAdmin scripts.
+- Prod uses **pgAdmin** for SQL, and the owner edits in pgAdmin's editor. Ops
+  scripts must have no psql meta-commands; point him to the exact lines to
+  change, each marked `<<< EDIT` on that line (he has twice edited the wrong
+  line).
+- Ops folders get distinct names and a status row in `ops/README.md`.
 - One line of work at a time on this database: two branches migrating the same
   schema caused both production startup failures so far.
 - At most **3** coding agents in parallel, each on disjoint files.
@@ -224,7 +242,8 @@ Run the reviewer agent on this diff before giving the owner commit commands.
 
 ## Deploying
 
-The owner commits and pushes `scout-call-model` from the PC, merges it into
+See `DEPLOY.md` (not committed yet, section 2) for the full steps. In short:
+the owner commits and pushes `scout-call-model` from the PC, merges it into
 `main` with a PR, and deploys `main` on the server: `git checkout main && git
 pull`, then restarts the processes that changed:
 
@@ -240,16 +259,15 @@ run.
 
 ## Agent setup
 
-- `.claude/agents/`: `coder` (Go + plain JS website, with the Go, JS, CSP and
-  Charts rules), `ml-coder`, `react-coder`, `infra` (approval-gated),
-  `reviewer` (approved; run it before giving commit commands), `researcher`,
-  `product-manager`.
+- `.claude/agents/` (committed in bde6d81): `coder` (Go + plain JS website,
+  with the Go, JS, CSP and Charts rules), `ml-coder`, `react-coder`, `infra`
+  (approval-gated), `reviewer`, `researcher`, `product-manager`. All 7 are
+  active.
+- The reviewer runs before every commit.
 - At most 3 coding agents in parallel (owner's limit).
-- `.claude/` is untracked; the owner decides whether to commit it.
-- `settings.json` was tightened: read-only git, `node --check` and the ml venv
-  pytest are allowed; secrets are denied in any folder; clutter is listed in
-  `.git/info/exclude`. Still missing: the PowerShell `git push` deny (Next
-  work 2).
+- `settings.json`: read-only git, `node --check` and the ml venv pytest are
+  allowed; secrets are denied in any folder; `git push` is denied for both Bash
+  and PowerShell; clutter is listed in `.git/info/exclude`.
 - New or changed agents load only after a Claude Code restart.
 - Lessons:
   - Parallel coders must have disjoint files (parallel README edits got mixed
@@ -268,10 +286,11 @@ run.
   0xA5aAb3F0c6EeadF30Ef1D3Eb997108E976351feB) uses Uniswap v3. Source:
   github.com/ponsdotdev/pons-labs.
 - Robinhood stock tokens: addresses from
-  `https://api.robinhood.com/rhj/prices/<SYMBOL>` (chain 4663); feeds are
-  Chainlink "Standard Proxy" addresses; the 33 pairs are in
-  `ops/2026-10-asset-chains-feeds/B_seed.sql`. HOODon
+  `https://api.robinhood.com/rhj/prices/<SYMBOL>` (chain 4663; `chains.id` 21
+  in the API database); feeds are Chainlink "Standard Proxy" addresses; the 33
+  pairs are in `ops/2026-10-asset-chains-feeds/B_seed.sql`. HOODon
   (0xfb5b5778d45ae47f15323fb59b666c655174a79c) is not a Robinhood token; RDDT
   is official but has no feed.
 - Token names are read with ERC-20 `name()` into
   `scout_call_tracking.token_name` (and `token_symbol_onchain`).
+- One-off ops scripts and their status: `ops/README.md`.

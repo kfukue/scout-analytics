@@ -1,5 +1,7 @@
 # Re-track the old Uniswap v4 calls (pgAdmin version)
 
+**Status: DONE, 7 Oct 2026** (649 calls, cutoff 2026-10-06 12:53:00-07, `reset_at` 2026-10-07 12:18:38.004137-07; 52 found rugged). Never run B again.
+
 > **One-off, October 2026.** These scripts re-track the Uniswap v4 calls that
 > older tracker code tracked, so that every v4 call follows the current rules
 > before the first model training. They are run **by hand in pgAdmin**; the
