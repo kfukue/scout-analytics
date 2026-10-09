@@ -57,7 +57,7 @@ anything non-trivial (`DEPLOY.md` and `ml/RUNBOOK.md` for deploy and training).
 
 One coder at a time on overlapping files. Run coders in parallel only on
 disjoint files (name the files in each task) or in isolated git worktrees; at
-most 3 coding agents at once. Subagents start cold: give each one the goal, the
+most 5 coding agents at once. Subagents start cold: give each one the goal, the
 relevant files, the rules below, and what to report back.
 
 ## How to work

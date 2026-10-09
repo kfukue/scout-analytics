@@ -696,7 +696,7 @@ Checks after deploying `work/2026-10-08-ml-pool-web` (deployed 8 October in
   (approval-gated), `reviewer`, `researcher`, `product-manager`. All 7 are
   active.
 - The reviewer runs before every commit.
-- At most 3 coding agents in parallel (owner's limit).
+- At most 10 coding agents in parallel (owner's limit, raised 9 Oct 2026).
 - `settings.json`: read-only git, `node --check` and the ml venv pytest
   (`ml/.venv`, or `.venv` from inside `ml/`) are allowed; secrets are denied in
   any folder; `git push` is denied for both Bash and PowerShell. Binaries,
