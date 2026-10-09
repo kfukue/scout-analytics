@@ -45,7 +45,7 @@ def test_view_columns_match_the_sql_view():
 def test_every_view_column_is_a_feature_or_forbidden():
     """No view column may slip in unclassified: either a raw model input, or
     refused by the leakage guard (outcomes, tracker discovery, ids, display)."""
-    # date -> hour/weekday; dex -> dex_family (and itself when USE_RAW_DEX)
+    # date -> hour/weekday; dex -> dex_family and/or itself (DEX_INPUTS)
     inputs = set(C.NUMERIC_RAW) | set(C.CATEGORICAL_VIEW) | {"message_date"}
     unused = set(C.UNUSED_VIEW_COLUMNS)  # known at the call, but constant for first calls
     for c in C.VIEW_COLUMNS:
