@@ -45,7 +45,7 @@ type fakeChain struct {
 	logsHook func(addr string, from, to uint64) string
 	fullNode bool // no historical state: eth_call at old blocks fails
 	// stateFrom (with fullNode): the oldest block whose state the node still
-	// keeps for eth_getBalance (0 = none but latest), like a full node holding
+	// keeps for eth_call and eth_getBalance (0 = none but latest), like a full node holding
 	// recent state; balanceErr (optional): eth_getBalance answers this error.
 	stateFrom  uint64
 	balanceErr string
@@ -223,7 +223,7 @@ func (f *fakeChain) serve(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
-		if f.fullNode && tag != "latest" {
+		if f.fullNode && tag != "latest" && (f.stateFrom == 0 || num(tag) < f.stateFrom) {
 			fail("missing trie node 6b1f… (path ) state 0x… is not available")
 			return
 		}

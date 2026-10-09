@@ -14,7 +14,7 @@
 
   var A = window.AnaStats;
   var DASH = '–';
-  var FORMAT = 2;          // the body's "format" this page understands
+  var FORMAT = 3;          // the body's "format" this page understands
   var MIN_N = 20;          // fewer calls with data than this: the group is greyed out
   var REFRESH_MS = 60000;  // ask again (cheap: 304 while nothing changed)
   var REDRAW_MS = 600000;  // on a 304, draw again only this often ("not due yet" moves slowly)
@@ -43,7 +43,7 @@
   // category column); kind = how its values read ('usd' | 'count' | 'pct').
   var FACTORS = [
     { key: 'verdict', label: 'Perceptor verdict at the call', kind: 'cat' },
-    { key: 'mcap', label: 'Market cap at call (posted)', kind: 'usd' },
+    { key: 'mcap', label: 'Market cap at call (price × supply, fully diluted)', kind: 'usd' },
     { key: 'proof_elite', label: 'Elite holders', kind: 'count' },
     { key: 'proof_good', label: 'Good holders', kind: 'count' },
     { key: 'holders', label: 'Holders', kind: 'count' },

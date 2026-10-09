@@ -1075,7 +1075,7 @@ scout_calls ──< scout_investigations >── scout_investigation_tools
 | `scout_call_metrics` | call (1:1) | MCap, Liq, Liq %, Tax buy/sell, Age, launchpad, Holders, Proof elite/good, live-buy counts and $ per tier, `parsed` (JSONB) |
 | `scout_call_live_buys` | live-buy line of a call | `call_id`, `position`, `tier` (elite/good), `amount_usd`, `wallet_display` |
 | `scout_calls_v` (view) | call + its parsed data | for ad-hoc queries |
-| `scout_call_tracking` | call (1:1) | pool, entry price (+ source), status, next check, current liquidity, `rugged`; `latest_price_usd`, `latest_return_pct`, `latest_checked_at`, `latest_trade_at` (the latest-price pass) |
+| `scout_call_tracking` | call (1:1) | pool, entry price (+ source), status, next check, current liquidity, `rugged`; `latest_price_usd`, `latest_return_pct`, `latest_checked_at`, `latest_trade_at` (the latest-price pass); `token_supply`, `token_supply_block` (the token supply fill pass) |
 | `scout_call_returns` | call × horizon | `horizon`, `price_usd`, `return_pct`, `max_gain_pct`, `max_drawdown_pct`, `last_trade_at` |
 | `scout_call_dataset_v` (view) | call | features + pivoted outcomes; what `-export-dataset` writes |
 | `scout_calls` | CA found in a @scoutrobinhood post | `message_id`, `message_date`, `message_text`, `urls`, `contract_address`, `chain`, `status` (`queued` → `scanned`/`failed`, or `duplicate`/`dropped`; `backfill` = imported from history; `update` = an update post, recorded only), `post_kind` (`call` / `update`; NULL = stored before the column existed, not classified yet) |
@@ -1515,8 +1515,9 @@ dependencies; `go test` runs it when `node` is on the PATH). Only the visible ta
   choice); and the **hour × weekday** heat map (UTC; cell = mean or median, call count on
   hover; cells under 20 calls grey).
 - **By factor tab:** a factor known at the call: the Perceptor verdict at the call, the
-  **market cap at the call as posted** (the post's "called at" figure; a market cap worked out
-  from the tracker's entry price would need the token supply, which is not stored), elite
+  **market cap at the call, price × supply, fully diluted** (the price at the post × the
+  token's total supply read from the chain, see "Token supply" below; not the post's "called
+  at" figure, and no fallback to it), elite
   holders, good holders, holders, elite and good buyers (count), elite and good buys (USD),
   and the hour before the call (buy volume, sell volume, swaps, price change). Number factors
   are split into 4, 5 or 10 groups of about equal count (5 by default) over the calls with
@@ -1586,6 +1587,62 @@ the page shows the shortened address. `scout_call_dataset_v` gained `token_name`
 `token_symbol` is now the symbol from the post, or the on-chain one when the post has none.
 Names come from arbitrary contracts: control characters are removed, the length is capped
 (100 / 32 characters), and the page only ever shows them as text.
+
+**Token supply.** For the Analytics page's market cap at the call (price × supply), the tracker
+reads each token's `totalSupply()` / 10^`decimals()` and stores it, in whole tokens, in
+`scout_call_tracking.token_supply`, with the block it was read at in `token_supply_block`
+(on-chain price source only; calls with an entry price only). After every tracker cycle
+(`-track`, `-track-once`, or the listener's built-in tracker) it looks up to 200 tokens; repeat
+calls of a token are copied in the database. The supply is read at the entry block of the
+token's first call that has one (calls priced by GeckoTerminal have none) while the node still
+has that block's state (an archive node, or a recent block on a full node); when the node has
+no state at that block (checked with a state probe, so a reverting contract is not mistaken for
+it) the current supply is read instead, with the head block recorded, so burns or mints after
+the call are included, and older entry blocks are not tried again in that pass. This never
+changes how the tracker reads prices (it does not switch the price reads to event logs). It is
+the total supply, so the market cap is **fully diluted** (a Pons
+launch-curve token includes the supply still unsold on the curve). `token_supply_block` NULL =
+not looked up yet; `token_supply` NULL with a block = the contract gave no usable supply
+(no `totalSupply()`, or more than 36 decimals), not asked again; block 0 = nothing read: not an
+EVM address, or given up because the node answered that token with an error that looks like a
+busy node (for example a revert text containing "limit") in 3 passes in which the node otherwise
+answered (a later token, or a liveness request at the end of the pass), with no success in
+between (log: `token supply: 0x… gave an error in 3 passes in which the node otherwise answered
+…`; the count is kept in memory, so a restart starts it again and `-track-once`, one pass per
+process, never gives up). A token the node does not answer for is skipped for that pass; two in
+a row end the pass, and tokens that already gave such an error are tried last in the next
+pass, so they cannot hold up the others. The head block is read once per pass, so a supply read at latest may be a
+few blocks newer than the `token_supply_block` stored with it. Status, schedule and on-chain state are not
+touched, so nothing is tracked again. The log line is `token supply: looked up N token(s) (at
+entry block: a, at latest: b, none: c), G given up, M call(s) updated`. The supply is not in `scout_call_dataset_v` and is not an ML feature (a live score
+is made before the tracker has an entry price, and a later supply would leak what happened
+after the call).
+
+*Given-up tokens (recovery, owner decision).* A token given up gets `token_supply` NULL at
+`token_supply_block` 0 and is never asked again; nothing resets it automatically. To list them
+(read-only; an EVM address at block 0 is only written by giving up, a non-EVM address also gets
+block 0 but has no supply to read):
+
+```sql
+SELECT lower(contract_address) AS ca, count(*) AS calls
+FROM scout_call_tracking
+WHERE token_supply IS NULL AND token_supply_block = 0
+  AND contract_address ~ '^0x[0-9a-fA-F]{40}$'
+GROUP BY 1 ORDER BY 2 DESC;
+```
+
+Setting `token_supply_block` back to NULL makes the next supply pass ask the node again. Reset
+**every** row of a token (the pass copies a token's stored lookup to its other calls, so a
+partial reset is undone), for example for all of them:
+
+```sql
+UPDATE scout_call_tracking SET token_supply_block = NULL
+WHERE token_supply IS NULL AND token_supply_block = 0
+  AND contract_address ~ '^0x[0-9a-fA-F]{40}$';
+```
+
+(add `AND lower(contract_address) = lower('0x…')` for a single token). It touches only the
+supply columns, so nothing is tracked again.
 
 ### API
 
@@ -1773,7 +1830,7 @@ the list's other fields move, such as latest prices), `If-None-Match` → `304`,
 clients that take it; `503` before the first snapshot.
 
 ```json
-{"format": 2, "horizons": ["1h","1d","3d","7d","30d"], "horizon_seconds": [3600,86400,259200,604800,2592000],
+{"format": 3, "horizons": ["1h","1d","3d","7d","30d"], "horizon_seconds": [3600,86400,259200,604800,2592000],
  "quiet_below": 50, "verdicts": ["clean","caution","red_flags","unknown","none"],
  "families": ["v4","v2","pons","v3","gecko","untracked"], "dexes": ["Uniswap V4","Pons V2","…"], "quotes": ["WETH","USDG"],
  "columns": ["call_id","t","flags","verdict","family","dex","quote","trades_24h","no_data",
@@ -1800,9 +1857,11 @@ clients that take it; `503` before the first snapshot.
 - Then, per window: return, peak and worst drop (late entry, USD, %, rounded to 0.1; `null` when
   missing). A rugged call keeps its peak here.
 - Then the values known at the call (`null` when missing), read like `scout_call_dataset_v`:
-  `mcap` = `called_at_mcap_usd` of the post, the market cap **as posted** (positive, calls
-  priced in USD only; no fallback to the "Mcap" line; not worked out from the entry price, as
-  the token supply is not stored); `holders`, `proof_elite`, `proof_good`, `buys_elite_n`, `buys_good_n`
+  `mcap` = the market cap at the call worked out from the price: `entry_price_usd` (the price
+  at the post, not the late entry) × `scout_call_tracking.token_supply`, fully diluted (calls
+  priced in USD only; `null` when either is missing, zero or not finite, or the product is
+  above $10 trillion; no fallback to the posted `called_at_mcap_usd`; since format 3, before
+  it was the posted figure). Not in `scout_call_dataset_v`; `holders`, `proof_elite`, `proof_good`, `buys_elite_n`, `buys_good_n`
   (`live_buys_*_count`), `buys_elite_usd`, `buys_good_usd` (`live_buys_*_usd`) from
   `scout_call_metrics` (all `null` without a parsed post); `pre_buy_usd`, `pre_sell_usd`
   (`buy_vol_60m`, `sell_vol_60m`; `null` unless `vol_unit` is `usd`), `pre_swaps`
