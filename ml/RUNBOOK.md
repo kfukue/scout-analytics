@@ -17,7 +17,9 @@ it warns, without showing the value, and goes on). It stops at the first
 failure and says which step failed; when a command inside a step failed, it
 also shows the last 20 lines of that command's output to paste. It always
 deletes `$ML/data/calls.csv` when it exits, also on an error or Ctrl+C. It
-does not run the step 3 queries and does not start `serve.py`.
+does not run the step 3 queries and does not start `serve.py`. After the
+export it reads the CSV's header line (column names only) and warns when
+`trades_24h` is missing (step 3b).
 
 Do not pull `main` into the deployed checkout for this: that changes the code
 the listener runs (and its next restart applies the new schema). Instead take
@@ -108,7 +110,7 @@ cd "$ML/src/ml"
 "$ML/venv/bin/python" -m pytest tests -q -p no:cacheprovider
 ```
 
-Expected: `72 passed` (one deprecation warning from fastapi is fine).
+Expected: `109 passed` (one deprecation warning from fastapi is fine).
 
 ## 3. Read-only checks before the export (optional, psql or pgAdmin)
 
@@ -179,6 +181,67 @@ Query (e) keeps the few extreme outcomes (above 100,000 %) that the training
 drops, so its rates can differ slightly from the report's. None of these
 queries has been run against a database yet (checked by reading only).
 
+### 3b. `trades_24h` in the view (once, before the first training that uses it)
+
+The "dead after the call" rule needs the `trades_24h` column of
+`scout_call_dataset_v` (added in `scoutanalytics.sql` on 9 October 2026).
+The export below runs with `SCOUT_DB_AUTO_MIGRATE=false`, so it does not add
+the column. Two ways, the first preferred:
+
+1. Deploy: getting the new view onto the server is a deploy decision, made
+   by the owner. It normally happens when the branch is merged and deployed:
+   pull `main` in the server checkout and restart the Go processes; every
+   start (any mode) applies the whole `scoutanalytics.sql` unless
+   `SCOUT_DB_AUTO_MIGRATE=false` (default `true`), and the new view comes
+   with it. Training itself never pulls `main` into the deployed checkout
+   (see the top of this runbook).
+2. By hand, the views only (nothing else from the file; no table or tracking
+   row is touched): take the block from `-- Training dataset: one row per call`
+   to the end of `CREATE VIEW scout_call_predictions_v` from the `origin/main`
+   copy and run it in one transaction:
+
+   ```bash
+   sed -n '/^-- Training dataset: one row per call/,/^WHERE pr.bucket IS NOT NULL;/p' \
+       "$ML/src/scoutanalytics.sql" > "$ML/views.sql"
+   grep -c '^DROP VIEW\|^CREATE VIEW' "$ML/views.sql"   # must print 4
+   # then, connected to the listener's database as its user (do not paste the password anywhere):
+   #   psql <connection> -1 -v ON_ERROR_STOP=1 -f "$ML/views.sql"
+   # or paste the file into pgAdmin's query tool between BEGIN; and COMMIT;
+   ```
+
+   A hand-applied view lasts only until the next start of an older deployed
+   program: its own `scoutanalytics.sql` recreates the views without the column.
+
+Until then training runs with the plain collapse labels, prints a WARNING and
+says so in the report ("dead-after-the-call rule SKIPPED").
+
+`trades_24h` relies on the 1d horizon being named `1d` (`SCOUT_PERF_HORIZONS`,
+default `1h,1d,3d,7d,30d`): if the report shows the dead rule on but 0 dead calls
+("0 of 0 calls with a known `trades_24h`"), check that setting.
+
+Read-only check after it is applied (paste the result with the report):
+
+```sql
+-- f) trades_24h: how many first calls have it, and how many are dead (< 50)
+SELECT date_trunc('week', message_date)::date AS week,
+       count(*) FILTER (WHERE entry_price_source LIKE 'onchain-%') AS onchain,
+       count(trades_24h) AS has_trades_24h,
+       count(*) FILTER (WHERE trades_24h < 50) AS dead,
+       count(*) FILTER (WHERE trades_24h < 50 AND dex ILIKE '%uniswap%v4%') AS dead_uniswap_v4
+FROM scout_call_dataset_v
+WHERE post_kind IS DISTINCT FROM 'update' AND tracking_status IS DISTINCT FROM 'repeat'
+GROUP BY 1 ORDER BY 1;
+-- expected: many dead "Uniswap V4" calls in the weeks of 21 and 28 Sep; e.g.
+SELECT call_id, dex, trades_24h, ret_late_1d FROM scout_call_dataset_v WHERE call_id IN (504, 578, 664);
+
+-- g) posted DEX names, to extend DEX_FAMILY_RULES in ml/scout_ml/config.py
+SELECT lower(trim(dex)) AS dex, count(*) AS calls, min(message_date)::date AS first,
+       max(message_date)::date AS last
+FROM scout_call_dataset_v
+WHERE post_kind IS DISTINCT FROM 'update' AND dex IS NOT NULL
+GROUP BY 1 ORDER BY 2 DESC;
+```
+
 ## 4. Export the dataset
 
 Run with the deployed code, from a directory that contains the listener's
@@ -210,7 +273,9 @@ time "$ML/venv/bin/python" train.py --csv "$ML/data/calls.csv" --out "$ML/models
 ```
 
 It prints one line per bucket (`PASS`, `FAIL (see report.md)` or
-`skipped: ...`) and `wrote .../models/<version>`. Exit code 0 even when gates
+`skipped: ...`) and `wrote .../models/<version>`. A line `WARNING: the data has
+no trades_24h column` means step 3b has not been done yet (the training is
+still valid, with the plain collapse labels). Exit code 0 even when gates
 fail. Random seed: fixed (`random_state=7` in `scout_ml/config.py`), so a
 rerun on the same CSV gives the same numbers.
 
@@ -252,7 +317,10 @@ From the top:
      95% interval and the runner counts; with ~70 calls in the top 10% the
      interval is wide, so read a lift near 2 with care);
    - collapses removed >= 40%: skipping the 30% with the highest collapse
-     score avoids at least 40% of the collapses;
+     score avoids at least 40% of the collapses. Always counted on the plain
+     collapse label, also when the model was trained on collapse OR dead; the
+     "bad outcomes removed incl. dead" row under it is information only, not
+     a gate;
    - beats buy-all in every week: in every evaluated walk-forward week, the
      top 10% earned more on average than buying every call.
 2. **Data and exclusions**: one line per reason a row was left out (update
@@ -283,6 +351,11 @@ with the "positive rate (usable)" column of each bucket's Class balance table
 
 - collapses removed >= 40% by skipping 30% of calls is impossible when the
   collapse rate is above 75% (at most 30% / rate of the collapses can be removed);
+  the gate counts plain collapses, so compare with the plain collapse rate: with
+  the dead rule on, the "positive rate (usable)" of the collapse label includes
+  dead calls, so use the "collapse rate (plain)" column of the bucket's "Dead
+  after the call" table instead (it also shows the rate with dead calls, and
+  the "bad outcomes removed incl. dead" figure, which is not a gate);
 - top-10% lift >= 2 is impossible when the runner rate is above 50% (the lift
   is at most 1 / rate).
 

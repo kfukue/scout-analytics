@@ -40,16 +40,17 @@ def test_derived_features_and_usd_only_volumes():
     base = {"mcap_usd": 200.0, "liq_usd": 50.0, "called_at_mcap_usd": 100.0,
             "live_buys_elite_usd": 10.0, "live_buys_good_usd": 15.0,
             "pre_buys_5m": 3, "pre_sells_5m": 1, "pre_buy_vol_5m": 30.0, "pre_sell_vol_5m": 10.0,
-            "message_date": "2026-10-02T15:30:00Z", "dex": "raydium"}
+            "message_date": "2026-10-02T15:30:00Z", "dex": "Uniswap V4"}
     X = build_features([{**base, "pre_vol_unit": "usd"}, {**base, "pre_vol_unit": "SOL"},
-                        {"liq_usd": 5.0, "mcap_usd": 0, "dex": "never_seen"}], {"dex": ["raydium"]})
+                        {"liq_usd": 5.0, "mcap_usd": 0, "dex": "never_seen"}],
+                       {"dex_family": ["uniswap_v4"]})
     a, b, c = X.iloc[0], X.iloc[1], X.iloc[2]
     assert (a.liq_to_mcap, a.live_usd_to_liq, a.live_usd_to_mcap, a.mcap_vs_called) == (0.25, 0.5, 0.125, 2.0)
     assert a.pre_buy_sell_ratio_5m == 2.0 and a.pre_buy_vol_share_5m == 0.75
-    assert (a.hour_utc, a.weekday_utc, a.dex) == (15.0, 4.0, 0.0)   # 2026-10-02 is a Friday
+    assert (a.hour_utc, a.weekday_utc, a.dex_family) == (15.0, 4.0, 0.0)   # 2026-10-02 is a Friday
     assert np.isnan(b.pre_buy_vol_5m) and np.isnan(b.pre_buy_vol_share_5m)
     assert b.pre_buy_sell_ratio_5m == 2.0                            # counts are unit-free
-    assert np.isnan(c.liq_to_mcap) and np.isnan(c.dex) and np.isnan(c.hour_utc)
+    assert np.isnan(c.liq_to_mcap) and np.isnan(c.dex_family) and np.isnan(c.hour_utc)
 
 
 def test_single_json_row_matches_batch_row(synthetic_df):
@@ -75,9 +76,10 @@ def test_tracker_discoveries_are_forbidden(col):
 
 
 def test_post_fields_known_at_the_call_stay_allowed():
-    for col in ("launchpad", "dex", "quote_asset", "liq_usd", "mcap_usd"):
+    for col in ("launchpad", "dex", "dex_family", "quote_asset", "liq_usd", "mcap_usd"):
         assert not C.is_forbidden(col), col
-    assert "launchpad" in C.FEATURES and "dex" in C.FEATURES
+    assert "launchpad" in C.FEATURES and "dex_family" in C.FEATURES
+    assert ("dex" in C.FEATURES) == C.USE_RAW_DEX
 
 
 def test_feature_list_excludes_columns_constant_for_first_calls(synthetic_df):
@@ -91,24 +93,66 @@ def test_feature_list_excludes_columns_constant_for_first_calls(synthetic_df):
 
 
 def test_categories_match_without_regard_to_case_and_whitespace():
-    rows = [{"dex": "Raydium"}, {"dex": " raydium "}, {"dex": "RAYDIUM"}, {"dex": "raydium"},
-            {"dex": "PumpSwap"}, {"dex": "never_seen"}, {"dex": "  "}, {"dex": None}]
-    levels = learn_cat_levels(pd.DataFrame([{"dex": "RayDium "}] * 20 + [{"dex": "pumpswap"}] * 20))
-    assert levels["dex"] == ["pumpswap", "raydium"]           # stored normalised
+    rows = [{"launchpad": "Raydium"}, {"launchpad": " raydium "}, {"launchpad": "RAYDIUM"},
+            {"launchpad": "raydium"}, {"launchpad": "PumpSwap"}, {"launchpad": "never_seen"},
+            {"launchpad": "  "}, {"launchpad": None}]
+    levels = learn_cat_levels(pd.DataFrame([{"launchpad": "RayDium "}] * 20
+                                           + [{"launchpad": "pumpswap"}] * 20))
+    assert levels["launchpad"] == ["pumpswap", "raydium"]     # stored normalised
     X = build_features(rows, levels)
-    assert X["dex"].tolist()[:5] == [1.0, 1.0, 1.0, 1.0, 0.0]
-    assert X["dex"][5:].isna().all()                          # unseen / empty -> missing
-    # an old flat meta.json (exact_levels) keeps its case-sensitive matching: no skew
-    old = build_features(rows, {"dex": ["PumpSwap", "Raydium", "raydium"]}, exact_levels=True)
+    assert X["launchpad"].tolist()[:5] == [1.0, 1.0, 1.0, 1.0, 0.0]
+    assert X["launchpad"][5:].isna().all()                    # unseen / empty -> missing
+    # an old flat meta.json (exact_levels) keeps its case-sensitive matching: no skew;
+    # raw `dex` is still encoded for a model whose feature list has it
+    old_rows = [{"dex": r["launchpad"]} for r in rows]
+    old = build_features(old_rows, {"dex": ["PumpSwap", "Raydium", "raydium"]}, columns=["dex"],
+                         exact_levels=True)
     assert old["dex"][[0, 1, 3, 4]].tolist() == [1.0, 2.0, 2.0, 0.0]
     assert old["dex"][[2, 5, 6, 7]].isna().all()                # 'RAYDIUM' is no old level
 
 
 def test_levels_counted_case_insensitively_against_the_minimum():
     """10 'Meteora' + 10 'meteora' are one level with 20 rows (MIN_CATEGORY_COUNT)."""
-    df = pd.DataFrame({"dex": ["Meteora"] * 10 + ["meteora "] * 10 + ["x"] * 19})
+    df = pd.DataFrame({"launchpad": ["Meteora"] * 10 + ["meteora "] * 10 + ["x"] * 19})
     assert C.MIN_CATEGORY_COUNT == 20
-    assert learn_cat_levels(df)["dex"] == ["meteora"]
+    assert learn_cat_levels(df)["launchpad"] == ["meteora"]
+
+
+@pytest.mark.parametrize("name, family", [
+    ("Pons", "pons"), ("Pons V2", "pons"), ("PONS v2", "pons"), (" pons-v2 ", "pons"),
+    ("Uniswap V4", "uniswap_v4"), ("uniswap_v4", "uniswap_v4"), ("UniswapV4", "uniswap_v4"),
+    ("uniswap-v3", "uniswap_v3"), ("Uniswap V2", "uniswap_v2"), ("UNISWAP", "uniswap"),
+    ("Longxyz", "longxyz"), ("Pools Trade Instant", "other"), ("O1 Rwa", "other"),
+    ("never_seen", "other"), ("", None), ("   ", None), (None, None)])
+def test_dex_family_rules_ignore_case_and_separators(name, family):
+    from scout_ml.features import dex_family_of
+    assert dex_family_of(name) == family
+    X = build_features([{"dex": name}], {"dex_family": ["other", "pons", "uniswap_v4"]})
+    want = {"other": 0.0, "pons": 1.0, "uniswap_v4": 2.0}.get(family)
+    assert (np.isnan(X["dex_family"][0]) if want is None else X["dex_family"][0] == want)
+
+
+def test_dex_family_rules_come_from_config_first_match_wins(monkeypatch):
+    from scout_ml.features import dex_family_of
+    monkeypatch.setattr(C, "DEX_FAMILY_RULES", (("uniswap", "any_uniswap"), ("uniswapv4", "v4")))
+    assert dex_family_of("Uniswap V4") == "any_uniswap"
+    monkeypatch.setattr(C, "DEX_FAMILY_OTHER", "misc")
+    assert dex_family_of("Pons") == "misc"
+
+
+def test_dex_family_levels_are_learned_like_other_categories():
+    df = pd.DataFrame({"dex": ["Pons"] * 12 + ["Pons V2"] * 12 + ["Uniswap V4"] * 19 + [None] * 30})
+    assert learn_cat_levels(df)["dex_family"] == ["pons"]    # 24 Pons rows; 19 v4 < 20
+
+
+@pytest.mark.parametrize("col", ["trades_24h", "trades_7d", "trades_anything_added_later"])
+def test_trading_after_the_call_is_never_a_feature(col, synthetic_df):
+    assert C.is_forbidden(col) and col not in C.FEATURES
+    with pytest.raises(ValueError, match="forbidden"):
+        assert_no_leakage(["liq_usd", col])
+    with pytest.raises(ValueError, match="forbidden"):
+        build_features(synthetic_df.head(5), {}, columns=C.FEATURES[:3] + [col])
+    assert not C.is_forbidden("pre_swaps_60m")             # trading BEFORE the call stays allowed
 
 
 def test_old_model_feature_list_with_removed_columns_still_builds():

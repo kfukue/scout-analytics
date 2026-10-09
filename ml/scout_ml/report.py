@@ -1,7 +1,8 @@
 """Render report.md from the results dict produced by train.py."""
 import math
 
-from .config import (BUCKETS, GATES, KFOLD_MIN_FOLDS, LABELS, LIFT_CI_Z, MAX_OUTCOME_PCT,
+from .config import (BUCKETS, CALIB_RECENT_DAYS, DEAD_COLUMN,
+                     DEAD_TRADES_24H, GATES, KFOLD_MIN_FOLDS, LABELS, LIFT_CI_Z, MAX_OUTCOME_PCT,
                      SIM_MAX_RET_PCT, SKIP_FRAC, TOP_FRAC, UNUSED_VIEW_COLUMNS)
 
 LIFT_METHOD = (f"Lift interval: approximate 95% (z = {LIFT_CI_Z:g}) Wilson score interval of the "
@@ -32,6 +33,66 @@ def split_line(s, horizon_days) -> str:
                 f"{horizon_days:g} days of a held-out fold purged; calibration fitted out of fold).\n")
     return (f"Split: train {s['n_train']} rows (before {s['t1']}), validation {s['n_val']}, "
             f"test {s['n_test']} (from {s['t2']}); {drops}.\n")
+
+
+def dead_line(d) -> str:
+    """The data-section line on the dead-after-the-call rule."""
+    policy = d.get("dead_policy", "off")
+    head = (f"- dead after the call ({DEAD_COLUMN} < {DEAD_TRADES_24H}; kept in the data): "
+            f"{d.get('dead', 0)} of {d.get('trades_24h_known', 0)} calls with a known {DEAD_COLUMN}")
+    if policy == "on":
+        return head + "; collapse label = collapse OR dead (every bucket; NULL keeps the plain label)"
+    if policy == "missing":
+        return (f"- **WARNING: dead-after-the-call rule SKIPPED: the data has no {DEAD_COLUMN} "
+                "column** (the view on the server predates it; apply scoutanalytics.sql, see "
+                "RUNBOOK.md). Collapse labels are the plain ones.")
+    return head + "; rule switched off (DEAD_IS_COLLAPSE = False): plain collapse labels"
+
+
+def dead_table(dead, trading) -> str:
+    rows = [[part, v["rows"], v["dead"], v["dead_collapse"], v["collapse_rate_plain"],
+             v["collapse_rate_with_dead"]] for part, v in dead.items()]
+    head = table(["part", "calls", "dead", "dead and already a collapse",
+                  "collapse rate (plain)", "collapse rate (collapse OR dead)"], rows)
+    if "collapse_removed_with_dead" not in trading:   # rule off: trained on the plain label
+        return (head + f"Collapses removed on test by the collapse scores: "
+                f"{fmt(trading.get('collapse_removed'))} of plain collapses (the gate; the dead "
+                f"rule is off, the model was trained on the plain label).\n")
+    return (head
+            + f"Collapses removed on test by the collapse scores (model trained on collapse OR "
+            f"dead): {fmt(trading.get('collapse_removed'))} of plain collapses (the gate); bad "
+            f"outcomes removed incl. dead: {fmt(trading.get('collapse_removed_with_dead'))} "
+            f"(information only, not a gate).\n")
+
+
+def calib_line(m) -> str:
+    c = m.get("calib")
+    if not c:
+        return ""
+    if c["used"] != "recent":
+        used = f"all {c['rows_all']} held-out rows (fallback: {c['note']})"
+    elif c["rows_recent"] == c["rows_all"]:
+        used = (f"all {c['rows_all']} held-out rows: they span less than CALIB_RECENT_DAYS = "
+                f"{CALIB_RECENT_DAYS} days, so this is the same calibration as before")
+    else:
+        used = (f"the {c['rows_recent']} held-out rows from {c['from']:%Y-%m-%d %H:%M} (the last "
+                f"{CALIB_RECENT_DAYS} days; {c['pos_recent']} positives / {c['neg_recent']} negatives)")
+    return (f"Platt calibration fitted on {used}. Held-out rows in all: {c['rows_all']}, "
+            f"spanning {c['span_days_all']:.1f} days. Brier on test: {fmt(m['lightgbm']['brier'])} "
+            f"(this calibration) vs {fmt(m.get('brier_all_rows'))} (calibrated on all held-out "
+            "rows, as before). Deciles are by rank, so 'observed' is the same for both.\n")
+
+
+def calib_table(m) -> str:
+    before = {c["decile"]: c["mean_pred"] for c in m.get("calibration_all_rows") or []}
+    if not before:
+        return table(["decile", "n", "mean predicted", "observed"],
+                     [[c["decile"], c["n"], c["mean_pred"], c["observed"]]
+                      for c in m["calibration"]])
+    return table(["decile", "n", "mean predicted (recent calibration)",
+                  "mean predicted (all held-out rows)", "observed"],
+                 [[c["decile"], c["n"], c["mean_pred"], before.get(c["decile"]), c["observed"]]
+                  for c in m["calibration"]])
 
 
 def fmt(v, digits=3) -> str:
@@ -68,6 +129,7 @@ def render(res: dict) -> str:
            f"- excluded, price_unit not 'usd': {d['not_usd']}",
            f"- excluded, extreme outcome (a label/simulation outcome above {MAX_OUTCOME_PCT:,.0f} %; "
            f"bogus pool data): {d.get('extreme', 0)}",
+           dead_line(d),
            f"- rows left before per-bucket outcome availability: {d['eligible']}\n",
            table(["bucket", "not labelled yet (horizon not due or no data; not a negative)", "usable rows"],
                  [[b, d["eligible"] - r["usable"], r["usable"]] for b, r in res["buckets"].items()]),
@@ -77,9 +139,11 @@ def render(res: dict) -> str:
     for b, r in res["buckets"].items():
         cfg = BUCKETS[b]
         out.append(f"## Bucket `{b}` ({cfg['horizon_days']}d horizon)\n")
+        dead_on = d.get("dead_policy") == "on"
         out.append("Labels (net of tax): " + "; ".join(
             f"{lab} = {cfg[lab][0]} {cfg[lab][1]} {cfg[lab][2]:g}%"
             + (" OR rugged" if lab == "collapse" and cfg["collapse_or_rugged"] else "")
+            + (f" OR dead ({DEAD_COLUMN} < {DEAD_TRADES_24H})" if lab == "collapse" and dead_on else "")
             for lab in LABELS) + "\n")
         if r.get("skipped"):
             out.append(f"**SKIPPED:** {r['skipped']}\n")
@@ -115,31 +179,41 @@ def render(res: dict) -> str:
             ["  95% interval of that lift; runners top/calls top of runners/calls",
              f"{lift_ci(t)}; {lift_counts(t)}", "", ""],
             [f"collapses removed by skipping top {SKIP_FRAC:.0%} collapse score",
-             t["collapse_removed"], f">= {GATES['min_collapse_removed']:g}", g["collapse_ok"]],
-            ["simulation beats buy-everything in every walk-forward week",
-             f"{g['windows_beating']}/{g['windows_evaluated']}", "all", g["walk_forward_ok"]]]))
+             t["collapse_removed"], f">= {GATES['min_collapse_removed']:g}", g["collapse_ok"]]]
+            + ([["  bad outcomes removed incl. dead (collapse OR dead; information, not a gate)",
+                 t["collapse_removed_with_dead"], "", ""]]
+               if "collapse_removed_with_dead" in t else [])
+            + [["simulation beats buy-everything in every walk-forward week",
+                f"{g['windows_beating']}/{g['windows_evaluated']}", "all", g["walk_forward_ok"]]]))
         out.append(f"Money simulation on test (mean net {cfg['ret_col']}, %): top {TOP_FRAC:.0%} "
                    f"by runner score = {fmt(t['sim_top_mean'], 1)} over {t['sim_n_top']} calls; "
                    f"all calls = {fmt(t['sim_all_mean'], 1)} (each call's net return capped at "
                    f"+{SIM_MAX_RET_PCT:,.0f} %).\n")
         out.append(LIFT_METHOD + "\n")
+        if r.get("dead") and d.get("dead_policy") != "missing":
+            out.append(f"### Dead after the call ({DEAD_COLUMN} < {DEAD_TRADES_24H})\n")
+            out.append(dead_table(r["dead"], t))
         out.append(f"**Bucket result: {'PASS' if g['passed'] else 'FAIL'}**\n")
         out.append("### Walk-forward (expanding weekly windows)\n")
+        wd = "collapse_removed_with_dead" in t   # dead rule on: one information column more
         out.append(table(["week", "from", "train n", "test n", "runner AUC", "top lift",
-                          "lift 95% interval", "runners top/n of all/n", "collapses removed",
-                          "top mean %", "all mean %", "beats all"],
+                          "lift 95% interval", "runners top/n of all/n", "collapses removed"]
+                         + (["incl. dead (info, not a gate)"] if wd else [])
+                         + ["top mean %", "all mean %", "beats all"],
                          [[w["week"], w["start"], w["n_train"], w["n_test"]]
-                          + (["skipped: " + w["skipped"]] + [""] * 7 if w.get("skipped") else
+                          + (["skipped: " + w["skipped"]] + [""] * (8 if wd else 7)
+                             if w.get("skipped") else
                              [w["runner_auc"], w["top_lift"], lift_ci(w), lift_counts(w),
-                              w["collapse_removed"],
-                              fmt(w["sim_top_mean"], 1), fmt(w["sim_all_mean"], 1),
-                              w["sim_beats_all"]]) for w in r["walk_forward"]]))
+                              w["collapse_removed"]]
+                             + ([w.get("collapse_removed_with_dead")] if wd else [])
+                             + [fmt(w["sim_top_mean"], 1), fmt(w["sim_all_mean"], 1),
+                                w["sim_beats_all"]]) for w in r["walk_forward"]]))
         for lab, m in r["labels"].items():
             if m.get("skipped"):
                 continue
             out.append(f"### `{lab}`: calibration by decile (test) and top features (gain)\n")
-            out.append(table(["decile", "n", "mean predicted", "observed"],
-                             [[c["decile"], c["n"], c["mean_pred"], c["observed"]]
-                              for c in m["calibration"]]))
+            if m.get("calib"):
+                out.append(calib_line(m))
+            out.append(calib_table(m))
             out.append(table(["feature", "gain share"], m["importance"]))
     return "\n".join(out)

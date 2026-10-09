@@ -28,12 +28,29 @@ NO_POOL_STATUSES = ("no_pool", "gave_up")  # calls we could never have traded
 REPEAT_STATUS = "repeat"  # a later call of a token: the tracker follows the first call only
 UPDATE_KIND = "update"  # post_kind of a "$TOKEN hit 3X ..." post about an earlier call: not a call
 
+# --- "Dead after the call" ---------------------------------------------------
+# trades_24h (view column, an OUTCOME): price events in the pool during the 24 h
+# after the call (5-minute candles; on a v2 pool every Sync counts, which includes
+# liquidity added or removed). A call with fewer than DEAD_TRADES_24H is "dead":
+# bought, then nobody traded it. Dead calls stay in the data (they were real
+# buys). With DEAD_IS_COLLAPSE the collapse label of EVERY bucket becomes
+# "collapse OR dead"; a row whose trades_24h is NULL (not priced on-chain, or
+# its first 24 h not scanned yet) keeps the plain collapse label. Set
+# DEAD_IS_COLLAPSE = False to train on the plain collapse label again.
+# The gates do not change: "collapses removed" (GATES) is always measured on
+# the plain collapse label; the share of collapse OR dead removed is reported
+# next to it as information only.
+DEAD_COLUMN = "trades_24h"
+DEAD_TRADES_24H = 50
+DEAD_IS_COLLAPSE = True
+
 # --- Columns of scout_call_dataset_v, in view order ------------------------
 _WINDOWS = ("5m", "15m", "60m")
 HORIZONS = ("1h", "1d", "3d", "7d", "30d")
 IDENTITY = ["call_id", "message_id", "message_date", "contract_address",
             "call_status", "token_symbol"]
-CATEGORICAL = ["dex", "launchpad", "quote_asset", "perceptor_verdict"]
+# View columns that are categorical model inputs (or, for `dex`, the source of one).
+CATEGORICAL_VIEW = ["dex", "launchpad", "quote_asset", "perceptor_verdict"]
 PRE_VOL = [f"pre_{s}_vol_{w}" for s in ("buy", "sell") for w in _WINDOWS]
 # Numeric columns of the view, in view order (builds VIEW_COLUMNS below).
 VIEW_NUMERIC = (
@@ -60,11 +77,15 @@ BOOKKEEPING = ["tracking_status", "pool_address", "pool_dex", "entry_price_usd",
                "entry_late_price_usd", "current_liquidity_usd", "rugged"]
 # latest_* columns the view exports (latest_trade_at is not exported).
 LATEST_VIEW = ["latest_price_usd", "latest_return_pct", "latest_checked_at"]
+# Outcomes the view appends after latest_* (known only after the call): never
+# features, never label thresholds in percent (trades_24h is a count).
+AFTER_CALL_VIEW = ["trades_24h"]
 # Exactly the columns of scout_call_dataset_v (scoutanalytics.sql), in order;
 # tests/test_view_columns.py compares this list with the SQL.
 VIEW_COLUMNS = (["call_id", "message_id", "message_date", "contract_address", "call_status",
                  "post_kind", "token_symbol", "token_name", "dex", "launchpad"] + VIEW_NUMERIC
-                + ["pre_vol_unit", "perceptor_verdict"] + BOOKKEEPING + OUTCOMES + LATEST_VIEW)
+                + ["pre_vol_unit", "perceptor_verdict"] + BOOKKEEPING + OUTCOMES + LATEST_VIEW
+                + AFTER_CALL_VIEW)
 
 # --- Leakage guard ---------------------------------------------------------
 # Outcomes and bookkeeping are only known after the post; ids are not signal.
@@ -82,8 +103,10 @@ TRACKER_DISCOVERY = ["rugged", "current_liquidity_usd", "current_price_usd",
                      "pool_created_at"]
 FORBIDDEN_COLUMNS = (set(BOOKKEEPING) - {"quote_asset"} | set(IDENTITY)
                      | {"pre_vol_unit", "token_name", "post_kind"} | set(LATEST)
-                     | set(TRACKER_DISCOVERY))
-FORBIDDEN_PREFIXES = ("ret_", "max_gain_", "max_dd_", "latest_", "current_", "pool_")
+                     | set(TRACKER_DISCOVERY) | set(AFTER_CALL_VIEW))
+# trades_*: trading counted AFTER the call (trades_24h, any later trades_7d ...).
+# Trading before the call is pre_* and stays allowed.
+FORBIDDEN_PREFIXES = ("ret_", "max_gain_", "max_dd_", "latest_", "current_", "pool_", "trades_")
 
 # --- Extreme outcomes ------------------------------------------------------
 # A drained or broken pool can give absurd outcomes (e.g. +3.9e47 %). A row
@@ -99,11 +122,39 @@ MAX_OUTCOME_PCT = 1e5
 # own. Labels are not affected. +1000 % = 11x.
 SIM_MAX_RET_PCT = 1000.0
 
+# --- DEX families -------------------------------------------------------------
+# The posted DEX name (`dex`, known at the call) has about 50 values, many
+# short-lived ("Pons" until mid-August, then "Pons V2"). `dex_family` groups
+# them: the name is lower-cased and every space, "_", "-", "." and "/" removed
+# ("Uniswap V4", "uniswap_v4", "UniswapV4" -> "uniswapv4"); the FIRST rule whose
+# prefix it starts with gives the family. A name no rule matches is "other";
+# an empty / NULL name stays missing. Edit the table to add a family (put more
+# specific prefixes before shorter ones). Like every categorical, the family
+# levels a model uses are learned from its training rows only (a family seen
+# fewer than MIN_CATEGORY_COUNT times there is treated as missing).
+DEX_FAMILY_RULES = (
+    ("pons", "pons"),              # "Pons", "Pons V2" (Pons launchpad; bonding curve, then v4)
+    ("uniswapv2", "uniswap_v2"),
+    ("uniswapv3", "uniswap_v3"),
+    ("uniswapv4", "uniswap_v4"),
+    ("uniswap", "uniswap"),        # Uniswap without a version
+    ("longxyz", "longxyz"),
+)
+DEX_FAMILY_OTHER = "other"
+# Raw `dex` as a model input next to `dex_family` (see ml/README.md, "DEX families").
+USE_RAW_DEX = False
+
 # --- Derived features (built in features.build_features) -------------------
 DERIVED = (["liq_to_mcap", "live_usd_to_liq", "live_usd_to_mcap", "mcap_vs_called"]
            + [f"pre_buy_sell_ratio_{w}" for w in _WINDOWS]
            + [f"pre_buy_vol_share_{w}" for w in _WINDOWS]
            + ["hour_utc", "weekday_utc"])
+DERIVED_CATEGORICAL = ["dex_family"]
+# Every categorical build_features can encode (a model saved before a change
+# may still list one that is no longer configured, e.g. raw `dex`).
+ALL_CATEGORICAL = CATEGORICAL_VIEW + DERIVED_CATEGORICAL
+# The categorical model inputs of new models.
+CATEGORICAL = [c for c in CATEGORICAL_VIEW if USE_RAW_DEX or c != "dex"] + DERIVED_CATEGORICAL
 FEATURES = NUMERIC_RAW + DERIVED + CATEGORICAL
 NUMERIC_FEATURES = NUMERIC_RAW + DERIVED
 # Signed, bounded or already-small columns are standardised as is by the
@@ -152,6 +203,17 @@ MIN_WINDOW_TEST_ROWS = 50              # walk-forward weeks smaller than this ar
 TOP_FRAC = 0.10                        # "buy the top 10% by runner score"
 SKIP_FRAC = 0.30                       # "skip the 30% with highest collapse score"
 GATES = {"min_top_lift": 2.0, "min_collapse_removed": 0.40}
+
+# --- Calibration on recent weeks --------------------------------------------
+# The base rates drift week to week, so the Platt calibration is fitted on the
+# most recent held-out rows only: the validation rows (short/3day) or the
+# out-of-fold rows (medium/long) posted in the last CALIB_RECENT_DAYS days
+# before the newest of them. Never on rows the model was fitted on. Fallback
+# to all held-out rows (the earlier behaviour) when the recent rows have fewer
+# than CALIB_MIN_CLASS_ROWS of either class or the fit would invert the
+# ranking (slope <= 0). Ranking metrics (lift, collapses removed) do not change.
+CALIB_RECENT_DAYS = 14
+CALIB_MIN_CLASS_ROWS = 20
 N_REF_QUANTILES = 101
 
 # --- LightGBM: deliberately small/regularised for ~10k rows ----------------

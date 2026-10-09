@@ -45,7 +45,8 @@ def test_view_columns_match_the_sql_view():
 def test_every_view_column_is_a_feature_or_forbidden():
     """No view column may slip in unclassified: either a raw model input, or
     refused by the leakage guard (outcomes, tracker discovery, ids, display)."""
-    inputs = set(C.NUMERIC_RAW) | set(C.CATEGORICAL) | {"message_date"}  # date -> hour/weekday
+    # date -> hour/weekday; dex -> dex_family (and itself when USE_RAW_DEX)
+    inputs = set(C.NUMERIC_RAW) | set(C.CATEGORICAL_VIEW) | {"message_date"}
     unused = set(C.UNUSED_VIEW_COLUMNS)  # known at the call, but constant for first calls
     for c in C.VIEW_COLUMNS:
         if c == "message_date":
@@ -53,8 +54,18 @@ def test_every_view_column_is_a_feature_or_forbidden():
         assert (c in inputs) + C.is_forbidden(c) + (c in unused) == 1, c
     for c in ("post_kind", "token_name", "latest_price_usd", "latest_return_pct",
               "latest_checked_at", "rugged", "tracking_status", "entry_price_source",
-              "pool_dex", "price_unit", "current_liquidity_usd"):
+              "pool_dex", "price_unit", "current_liquidity_usd", "trades_24h"):
         assert C.is_forbidden(c), c
+
+
+def test_trades_24h_is_the_last_view_column_and_an_outcome():
+    """Appended at the end of the view (CREATE OR REPLACE VIEW stays valid), never a
+    feature, never read by a feature or a percent cap."""
+    from scout_ml.labels import outcome_columns
+    assert C.VIEW_COLUMNS[-1] == "trades_24h" == C.DEAD_COLUMN
+    assert "trades_24h" in C.AFTER_CALL_VIEW and "trades_24h" in C.FORBIDDEN_COLUMNS
+    assert "trades_24h" not in C.FEATURES and "trades_24h" not in C.NUMERIC_RAW
+    assert "trades_24h" not in outcome_columns()           # a count, not a percent outcome
 
 
 def test_unused_columns_stay_in_the_view_but_are_no_features():
