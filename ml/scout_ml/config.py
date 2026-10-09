@@ -1,5 +1,6 @@
 """Everything a human may want to tune lives here: buckets, label thresholds,
 feature lists, forbidden (leaky) columns, model settings and pass gates."""
+from contextlib import contextmanager
 
 # --- Label definitions -----------------------------------------------------
 # Each label is (outcome column, comparison, threshold in percent). The outcome
@@ -132,17 +133,43 @@ SIM_MAX_RET_PCT = 1000.0
 # specific prefixes before shorter ones). Like every categorical, the family
 # levels a model uses are learned from its training rows only (a family seen
 # fewer than MIN_CATEGORY_COUNT times there is treated as missing).
+# Built from the posted names of 28 Jul - 8 Oct 2026 (RUNBOOK.md query (g)).
+# Names with fewer than about 30 calls in all (virtuals, pair fund, noxa,
+# noxafi, stonkbroker, bags, lemonswap, trench, orbofi, ...) get no family of
+# their own: they are "other". A family is still subject to MIN_CATEGORY_COUNT
+# in each training part (a family rarer than that there is treated as missing).
 DEX_FAMILY_RULES = (
     ("pons", "pons"),              # "Pons", "Pons V2" (Pons launchpad; bonding curve, then v4)
     ("uniswapv2", "uniswap_v2"),
     ("uniswapv3", "uniswap_v3"),
     ("uniswapv4", "uniswap_v4"),
-    ("uniswap", "uniswap"),        # Uniswap without a version
+    ("uniswap", "uniswap"),        # Uniswap without a version (none posted so far)
     ("longxyz", "longxyz"),
+    ("pools", "pools"),            # "Pools Trade Instant", "Pools Fun", "Pools Trade CCA"
+    ("bankr", "bankr"),
+    ("o1", "o1"),                  # "O1 Rwa", "O1" (not "Orbofi": "or..." does not start with "o1")
+    ("letscash", "letscash"),
+    ("varo", "varo"),
+    ("flap", "flap"),              # "Flap", "Flap Stocks", "Flap Pve"
+    ("sushi", "sushi"),            # "Sushiswap", "Sushi"
+    ("lunch", "lunch"),            # "Lunch Pair V4", "Lunch Pair V3", "Lunch V3"
 )
 DEX_FAMILY_OTHER = "other"
-# Raw `dex` as a model input next to `dex_family` (see ml/README.md, "DEX families").
-USE_RAW_DEX = False
+# Which DEX inputs a new model gets (see ml/README.md, "DEX families"):
+# "family" = dex_family only (default), "raw" = raw `dex` only (the inputs of
+# models trained before dex_family), "both" = raw `dex` and dex_family.
+DEX_INPUTS = "family"
+DEX_INPUT_CHOICES = ("family", "raw", "both")
+
+# --- "Runners must be tradeable" (off by default; a --variants row) ------------
+# With RUNNER_NEEDS_TRADES = True the runner label of every bucket also needs
+# trades_24h >= RUNNER_MIN_TRADES_24H, so a jump in a pool nobody traded (e.g.
+# 52 price events and +219 % at 1 d) is not a runner. A NULL trades_24h (not
+# priced on-chain, or not scanned yet) keeps the plain runner label. Only the
+# label (and so the lift / runner counts) changes: the money simulation still
+# uses every call. trades_24h stays an outcome, never a feature.
+RUNNER_NEEDS_TRADES = False
+RUNNER_MIN_TRADES_24H = 100
 
 # --- Derived features (built in features.build_features) -------------------
 DERIVED = (["liq_to_mcap", "live_usd_to_liq", "live_usd_to_mcap", "mcap_vs_called"]
@@ -153,8 +180,18 @@ DERIVED_CATEGORICAL = ["dex_family"]
 # Every categorical build_features can encode (a model saved before a change
 # may still list one that is no longer configured, e.g. raw `dex`).
 ALL_CATEGORICAL = CATEGORICAL_VIEW + DERIVED_CATEGORICAL
-# The categorical model inputs of new models.
-CATEGORICAL = [c for c in CATEGORICAL_VIEW if USE_RAW_DEX or c != "dex"] + DERIVED_CATEGORICAL
+
+
+def categorical_inputs(dex_inputs: str) -> list:
+    """The categorical model inputs for a DEX_INPUTS setting."""
+    if dex_inputs not in DEX_INPUT_CHOICES:
+        raise ValueError(f"DEX_INPUTS must be one of {DEX_INPUT_CHOICES}, not {dex_inputs!r}")
+    raw = [c for c in CATEGORICAL_VIEW if dex_inputs != "family" or c != "dex"]
+    return raw + (DERIVED_CATEGORICAL if dex_inputs != "raw" else [])
+
+
+# The categorical model inputs of new models (rebuilt by `overrides`).
+CATEGORICAL = categorical_inputs(DEX_INPUTS)
 FEATURES = NUMERIC_RAW + DERIVED + CATEGORICAL
 NUMERIC_FEATURES = NUMERIC_RAW + DERIVED
 # Signed, bounded or already-small columns are standardised as is by the
@@ -229,7 +266,49 @@ FALLBACK_ROUNDS = 150  # used when the validation part / k-fold cannot drive ear
 # the runner rate of all calls in the same part (treated as fixed).
 LIFT_CI_Z = 1.96
 
+# --- Variant comparison (train.py --variants) --------------------------------
+# Each variant changes exactly ONE knob from the configured (baseline) values
+# above. They are trained and reported only: never saved, never served, never
+# the gates of the saved model (that is always the baseline). "baseline" reuses
+# the results of the saved model. Knobs: VARIANT_KNOBS.
+VARIANT_KNOBS = ("DEAD_IS_COLLAPSE", "DEAD_TRADES_24H", "DEX_INPUTS", "RUNNER_NEEDS_TRADES")
+VARIANTS = {
+    "baseline": {},
+    "dead rule off": {"DEAD_IS_COLLAPSE": False},
+    "dead threshold 100": {"DEAD_TRADES_24H": 100},
+    "raw dex instead of dex_family": {"DEX_INPUTS": "raw"},
+    "raw dex + dex_family": {"DEX_INPUTS": "both"},
+    "runners must be tradeable": {"RUNNER_NEEDS_TRADES": True},
+}
+# Variants that only differ from the baseline through trades_24h: not applicable
+# when the export has no trades_24h column.
+TRADES_VARIANTS = ("dead rule off", "dead threshold 100", "runners must be tradeable")
+
 
 def is_forbidden(col: str) -> bool:
     """True if `col` is an outcome/bookkeeping/identity column."""
     return col in FORBIDDEN_COLUMNS or col.startswith(FORBIDDEN_PREFIXES)
+
+
+def variant_settings(name: str) -> dict:
+    """The knob values of variant `name` (baseline values for the knobs it does not change)."""
+    g = globals()
+    return {**{k: g[k] for k in VARIANT_KNOBS}, **VARIANTS[name]}
+
+
+@contextmanager
+def overrides(**knobs):
+    """Temporarily set VARIANT_KNOBS (and rebuild CATEGORICAL / FEATURES from
+    DEX_INPUTS); everything is restored on exit, also after an error."""
+    g = globals()
+    bad = sorted(set(knobs) - set(VARIANT_KNOBS))
+    if bad:
+        raise ValueError(f"not a variant knob: {bad}")
+    saved = {k: g[k] for k in (*VARIANT_KNOBS, "CATEGORICAL", "FEATURES")}
+    try:
+        g.update(knobs)
+        g["CATEGORICAL"] = categorical_inputs(g["DEX_INPUTS"])
+        g["FEATURES"] = NUMERIC_RAW + DERIVED + g["CATEGORICAL"]
+        yield
+    finally:
+        g.update(saved)

@@ -79,7 +79,7 @@ def test_post_fields_known_at_the_call_stay_allowed():
     for col in ("launchpad", "dex", "dex_family", "quote_asset", "liq_usd", "mcap_usd"):
         assert not C.is_forbidden(col), col
     assert "launchpad" in C.FEATURES and "dex_family" in C.FEATURES
-    assert ("dex" in C.FEATURES) == C.USE_RAW_DEX
+    assert C.DEX_INPUTS == "family" and "dex" not in C.FEATURES
 
 
 def test_feature_list_excludes_columns_constant_for_first_calls(synthetic_df):
@@ -122,7 +122,7 @@ def test_levels_counted_case_insensitively_against_the_minimum():
     ("Pons", "pons"), ("Pons V2", "pons"), ("PONS v2", "pons"), (" pons-v2 ", "pons"),
     ("Uniswap V4", "uniswap_v4"), ("uniswap_v4", "uniswap_v4"), ("UniswapV4", "uniswap_v4"),
     ("uniswap-v3", "uniswap_v3"), ("Uniswap V2", "uniswap_v2"), ("UNISWAP", "uniswap"),
-    ("Longxyz", "longxyz"), ("Pools Trade Instant", "other"), ("O1 Rwa", "other"),
+    ("Longxyz", "longxyz"), ("Pools Trade Instant", "pools"), ("O1 Rwa", "o1"),
     ("never_seen", "other"), ("", None), ("   ", None), (None, None)])
 def test_dex_family_rules_ignore_case_and_separators(name, family):
     from scout_ml.features import dex_family_of
@@ -161,3 +161,35 @@ def test_old_model_feature_list_with_removed_columns_still_builds():
     X = build_features({"prior_calls": 0, "mcap_usd": 1.0}, {}, columns=cols)
     assert list(X.columns) == cols and X["prior_calls"][0] == 0.0
     assert np.isnan(X["secs_since_prev_call"][0])
+
+
+# The owner's posted DEX names (RUNBOOK.md query (g), 28 Jul - 8 Oct 2026; lower-cased,
+# as the query prints them) and the family each must get.
+OWNER_DEX_NAMES = {
+    "pons v2": "pons", "uniswap v4": "uniswap_v4", "longxyz": "longxyz",
+    "uniswap v3": "uniswap_v3", "pons": "pons", "pools trade instant": "pools",
+    "bankr": "bankr", "o1 rwa": "o1", "letscash": "letscash", "varo": "varo", "flap": "flap",
+    "sushiswap": "sushi", "lunch pair v4": "lunch", "uniswap v2": "uniswap_v2",
+    "sushi": "sushi", "virtuals v2": "other", "pair fund": "other", "flap stocks": "flap",
+    "pools fun": "pools", "noxa": "other", "bags": "other", "lunch pair v3": "lunch",
+    "stonkbroker": "other", "lemonswap": "other", "trench": "other", "coinbarrel": "other",
+    "pools trade cca": "pools", "stonkbroker v2": "other", "o1": "o1", "orbofi": "other",
+    "bowfun": "other", "clanker": "other", "flap pve": "flap", "lunch v3": "lunch",
+    "nasdank v3": "other", "noxafi": "other", "arenatrade": "other", "pmav": "other",
+    "klik": "other", "livo": "other", "realfun": "other", "robinfun": "other",
+    "dyorfun v3": "other", "dontblink": "other", "up": "other"}
+
+
+def test_owner_dex_list_maps_to_the_agreed_families():
+    from scout_ml.features import dex_family_of
+    assert len(OWNER_DEX_NAMES) == 45
+    got = {name: dex_family_of(name) for name in OWNER_DEX_NAMES}
+    assert got == OWNER_DEX_NAMES
+    # the same names as posted (any case / separators) give the same family
+    for name, family in OWNER_DEX_NAMES.items():
+        assert dex_family_of(name.title().replace(" ", "_")) == family, name
+    assert dex_family_of("orbofi") == "other" and dex_family_of("O1") == "o1"
+    assert dex_family_of("noxa") == dex_family_of("noxafi") == "other"
+    # every configured family is reached by some posted name, except plain "uniswap"
+    families = {f for _, f in C.DEX_FAMILY_RULES}
+    assert families - set(got.values()) == {"uniswap"}

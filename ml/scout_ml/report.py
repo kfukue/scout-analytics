@@ -1,9 +1,14 @@
 """Render report.md from the results dict produced by train.py."""
 import math
 
+from . import config as C
 from .config import (BUCKETS, CALIB_RECENT_DAYS, DEAD_COLUMN,
-                     DEAD_TRADES_24H, GATES, KFOLD_MIN_FOLDS, LABELS, LIFT_CI_Z, MAX_OUTCOME_PCT,
+                     GATES, KFOLD_MIN_FOLDS, LABELS, LIFT_CI_Z, MAX_OUTCOME_PCT,
                      SIM_MAX_RET_PCT, SKIP_FRAC, TOP_FRAC, UNUSED_VIEW_COLUMNS)
+
+# DEAD_TRADES_24H and RUNNER_MIN_TRADES_24H are read from config (C.) when a
+# report is rendered, not bound at import, so the text always shows the
+# current values.
 
 LIFT_METHOD = (f"Lift interval: approximate 95% (z = {LIFT_CI_Z:g}) Wilson score interval of the "
                f"runner rate in the top {TOP_FRAC:.0%}, divided by the runner rate of all calls "
@@ -38,7 +43,7 @@ def split_line(s, horizon_days) -> str:
 def dead_line(d) -> str:
     """The data-section line on the dead-after-the-call rule."""
     policy = d.get("dead_policy", "off")
-    head = (f"- dead after the call ({DEAD_COLUMN} < {DEAD_TRADES_24H}; kept in the data): "
+    head = (f"- dead after the call ({DEAD_COLUMN} < {C.DEAD_TRADES_24H}; kept in the data): "
             f"{d.get('dead', 0)} of {d.get('trades_24h_known', 0)} calls with a known {DEAD_COLUMN}")
     if policy == "on":
         return head + "; collapse label = collapse OR dead (every bucket; NULL keeps the plain label)"
@@ -47,6 +52,15 @@ def dead_line(d) -> str:
                 "column** (the view on the server predates it; apply scoutanalytics.sql, see "
                 "RUNBOOK.md). Collapse labels are the plain ones.")
     return head + "; rule switched off (DEAD_IS_COLLAPSE = False): plain collapse labels"
+
+
+def plain_auc_line(r) -> str:
+    """Collapse ROC AUC on the plain label (comparable with reports before the dead rule)."""
+    a = r.get("collapse_auc_plain")
+    if not a:
+        return ""
+    return (f"Collapse ROC AUC on the plain collapse label (test): LightGBM {fmt(a['lightgbm'])}, "
+            f"logistic {fmt(a['logistic'])}.\n")
 
 
 def dead_table(dead, trading) -> str:
@@ -121,6 +135,8 @@ def render(res: dict) -> str:
                       f"{fmt(r['gates']['walk_forward_ok'])} ({r['gates']['windows_beating']}"
                       f"/{r['gates']['windows_evaluated']} weeks)"])
                   for b, r in res["buckets"].items()]),
+           ("The saved model and these gates are the baseline configuration. Variant comparison "
+            "(report only): see the last section.\n" if res.get("variants") else ""),
            "## Data and exclusions\n",
            f"- rows read: {d['rows']} ({d['first_date']} to {d['last_date']})",
            f"- excluded, update post (not a call): {d.get('update', 0)}",
@@ -140,10 +156,13 @@ def render(res: dict) -> str:
         cfg = BUCKETS[b]
         out.append(f"## Bucket `{b}` ({cfg['horizon_days']}d horizon)\n")
         dead_on = d.get("dead_policy") == "on"
+        tradeable = d.get("runner_min_trades_24h")
         out.append("Labels (net of tax): " + "; ".join(
             f"{lab} = {cfg[lab][0]} {cfg[lab][1]} {cfg[lab][2]:g}%"
+            + (f" AND {DEAD_COLUMN} >= {tradeable} (NULL keeps the label)"
+               if lab == "runner" and tradeable else "")
             + (" OR rugged" if lab == "collapse" and cfg["collapse_or_rugged"] else "")
-            + (f" OR dead ({DEAD_COLUMN} < {DEAD_TRADES_24H})" if lab == "collapse" and dead_on else "")
+            + (f" OR dead ({DEAD_COLUMN} < {C.DEAD_TRADES_24H})" if lab == "collapse" and dead_on else "")
             for lab in LABELS) + "\n")
         if r.get("skipped"):
             out.append(f"**SKIPPED:** {r['skipped']}\n")
@@ -191,8 +210,9 @@ def render(res: dict) -> str:
                    f"+{SIM_MAX_RET_PCT:,.0f} %).\n")
         out.append(LIFT_METHOD + "\n")
         if r.get("dead") and d.get("dead_policy") != "missing":
-            out.append(f"### Dead after the call ({DEAD_COLUMN} < {DEAD_TRADES_24H})\n")
+            out.append(f"### Dead after the call ({DEAD_COLUMN} < {C.DEAD_TRADES_24H})\n")
             out.append(dead_table(r["dead"], t))
+            out.append(plain_auc_line(r))
         out.append(f"**Bucket result: {'PASS' if g['passed'] else 'FAIL'}**\n")
         out.append("### Walk-forward (expanding weekly windows)\n")
         wd = "collapse_removed_with_dead" in t   # dead rule on: one information column more
@@ -216,4 +236,85 @@ def render(res: dict) -> str:
                 out.append(calib_line(m))
             out.append(calib_table(m))
             out.append(table(["feature", "gain share"], m["importance"]))
+    if res.get("variants"):
+        out.append(variants_section(res["variants"], res["buckets"]))
+    return "\n".join(out)
+
+
+VARIANT_NOTE = (
+    "Each variant changes exactly one setting of the baseline (the saved model) and is trained "
+    "on the same rows, splits and seed. Variants are report only: not saved, not served, and "
+    "their gate result is not the verdict above. **All variants are compared on the same test "
+    "part, so choosing the best one by these numbers alone risks fitting the test period; prefer "
+    "a variant that also wins in the walk-forward weeks** (weeks beating buy-all, walk-forward "
+    "mean lift and mean collapses removed).")
+
+
+def variant_read() -> str:
+    """How to read the variant tables (thresholds read at render time)."""
+    return (
+        "How to read: lift and runner AUC are measured on each variant's own runner label, so for "
+        f"\"runners must be tradeable\" (runner also needs {DEAD_COLUMN} >= {C.RUNNER_MIN_TRADES_24H}) "
+        "they use a different yardstick (see its runner rate); its money simulation still uses every "
+        "call. \"Collapses removed\" (the gate) and \"collapse AUC, plain label\" are measured on "
+        "the plain collapse label in every variant and are comparable; \"collapse AUC, trained "
+        "label\" uses the label each variant trained on (collapse OR dead, or plain with the dead "
+        "rule off). The logistic baseline uses numeric inputs only, so its numbers do not change "
+        "between the DEX variants. Sim = mean net return (%) of the top 10% by runner score vs all "
+        "calls of the test part.")
+
+
+def variant_error(exc: BaseException) -> str:
+    """'error: <Type>: <first line>' (short, safe in a markdown table cell)."""
+    msg = (str(exc).strip().splitlines() or [""])[0]
+    text = f"{type(exc).__name__}: {msg}" if msg else type(exc).__name__
+    if len(text) > 150:
+        text = text[:147] + "..."
+    return "error: " + text.replace("|", "/")
+
+
+def _pair(a, b) -> str:
+    return f"{fmt(a)} / {fmt(b)}"
+
+
+def variant_table(variants: dict, bucket: str) -> str:
+    rows = []
+    for name, v in variants.items():
+        changes = ", ".join(f"{k} = {val}" for k, val in v["changes"].items()) or "(as configured)"
+        if v.get("error"):
+            rows.append([name, changes, v["error"]] + [""] * 10)
+            continue
+        s = (v.get("buckets") or {}).get(bucket)
+        if v.get("not_applicable") or s is None or s.get("skipped"):
+            why = v.get("not_applicable") or (s or {}).get("skipped") or "not trained"
+            rows.append([name, changes, f"n/a: {why}"] + [""] * 10)
+            continue
+        rows.append([
+            name, changes, s["runner_rate_test"],
+            f"{fmt(s['top_lift'], 2)} [{fmt(s['top_lift_lo'], 2)}, {fmt(s['top_lift_hi'], 2)}]",
+            _pair(s["runner_auc_lightgbm"], s["runner_auc_logistic"]),
+            _pair(s["collapse_auc_plain_lightgbm"], s["collapse_auc_plain_logistic"]),
+            _pair(s["collapse_auc_trained_lightgbm"], s["collapse_auc_trained_logistic"]),
+            s["collapse_removed"],
+            f"{s['windows_beating']}/{s['windows_evaluated']}",
+            fmt(s["wf_mean_lift"], 2), s["wf_mean_collapse_removed"],
+            f"{fmt(s['sim_top_mean'], 1)} vs {fmt(s['sim_all_mean'], 1)}",
+            "PASS" if s["passed"] else "FAIL"])
+    return table(["variant", "change", "runner rate (test)", "runner lift top 10% [95%]",
+                  "runner AUC LightGBM / logistic", "collapse AUC, plain label: LightGBM / logistic",
+                  "collapse AUC, trained label: LightGBM / logistic",
+                  "collapses removed (plain; gate)", "weeks beating buy-all",
+                  "walk-forward mean lift", "walk-forward mean collapses removed",
+                  "sim top 10% vs all (%)", "gates"], rows)
+
+
+def variants_section(variants: dict, buckets: dict) -> str:
+    out = ["## Variant comparison (report only; not saved, not served)\n", VARIANT_NOTE + "\n",
+           variant_read() + "\n"]
+    times = [f"{n}: {v['seconds']:.0f} s" for n, v in variants.items() if v.get("seconds") is not None]
+    if times:
+        out.append("Training time per variant: " + "; ".join(times) + ".\n")
+    for b in buckets:
+        out.append(f"### Bucket `{b}`\n")
+        out.append(variant_table(variants, b))
     return "\n".join(out)

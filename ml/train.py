@@ -2,11 +2,13 @@
 
     python train.py --csv calls.csv --out models/
     python train.py --dsn postgres://user:pass@host/db --out models/
+    python train.py --csv calls.csv --out models/ --variants   # plus the variant comparison
 """
 import argparse
 import json
 import math
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -19,7 +21,7 @@ from scout_ml.features import build_features, dex_family_rules, learn_cat_levels
 from scout_ml.labels import build_labels, dead_policy
 from scout_ml.model import (apply_calibrator, best_rounds, fit_baseline, fit_lgbm, fit_platt,
                             fit_platt_recent, predict, usable_holdout)
-from scout_ml.report import render
+from scout_ml.report import render, variant_error
 from scout_ml import validate as V
 
 
@@ -76,7 +78,8 @@ def _calibrate_recent(fitted, info, raw, y, dates):
 
 
 def _finish_label(info, fitted, X, y, tr, te, out_dir, bucket, label):
-    """Test metrics, importance and the saved model for a fitted label."""
+    """Test metrics, importance and the saved model for a fitted label
+    (`out_dir` None: a --variants run, nothing is saved)."""
     if fitted["note"]:
         info["messages"].append(fitted["note"])
     p_test = predict(fitted, X[te])
@@ -87,15 +90,16 @@ def _finish_label(info, fitted, X, y, tr, te, out_dir, bucket, label):
         info["brier_all_rows"] = V.model_metrics(y[te], p_all)["brier"]
     gain = fitted["model"].booster_.feature_importance("gain")
     order = np.argsort(-gain)[:10]
+    fitted["p_logistic"] = fit_baseline(X[tr], y[tr]).predict_proba(X[te][C.NUMERIC_FEATURES])[:, 1]
     info.update(
         lightgbm=V.model_metrics(y[te], p_test),
-        logistic=V.model_metrics(y[te], fit_baseline(X[tr], y[tr]).predict_proba(
-            X[te][C.NUMERIC_FEATURES])[:, 1]),
+        logistic=V.model_metrics(y[te], fitted["p_logistic"]),
         calibration=V.calibration_table(y[te], p_test),
         rounds=best_rounds(fitted),
         importance=[[X.columns[i], float(gain[i] / max(gain.sum(), 1e-12))] for i in order])
-    joblib.dump({"model": fitted["model"], "calibrator": fitted["calibrator"]},
-                out_dir / f"{bucket}_{label}.joblib")
+    if out_dir is not None:
+        joblib.dump({"model": fitted["model"], "calibrator": fitted["calibrator"]},
+                    out_dir / f"{bucket}_{label}.joblib")
     return info, fitted, p_test
 
 
@@ -235,7 +239,8 @@ def _dead_stats(L, b, use, te):
 
 
 def _train_bucket(b, df, L, out_dir, dead_on=False):
-    """Returns (results, runner reference quantiles or None, category levels or None)."""
+    """Returns (results, runner reference quantiles or None, category levels or None).
+    `out_dir` None: nothing is saved (a --variants run)."""
     cfg = C.BUCKETS[b]
     use = L[f"usable_{b}"].to_numpy()
     res = {"usable": int(use.sum())}
@@ -273,7 +278,7 @@ def _train_bucket(b, df, L, out_dir, dead_on=False):
     levels = learn_cat_levels(rows[tr])
     X = build_features(rows, levels)
     folds = _kfold_matrices(rows, dates, tokens, tr, h) if forward else None
-    res["labels"], scores, rounds = {}, {}, {}
+    res["labels"], scores, rounds, logistic = {}, {}, {}, {}
     for lab in C.LABELS:
         if forward:
             out = _train_label_kfold(X, Y[lab], split, folds, lab, out_dir, b, dates)
@@ -282,6 +287,7 @@ def _train_bucket(b, df, L, out_dir, dead_on=False):
         res["labels"][lab], fitted, scores[lab] = out
         if fitted is not None:
             rounds[lab] = res["labels"][lab]["rounds"]
+            logistic[lab] = fitted["p_logistic"]
     if "runner" not in rounds:
         res["skipped"] = res["labels"]["runner"]["skipped"]
         return res, None, None
@@ -290,6 +296,11 @@ def _train_bucket(b, df, L, out_dir, dead_on=False):
     res["trading"] = collapse_check(Y["runner"][te], scores["runner"], y_plain[te],
                                     Y["collapse"][te], scores["collapse"], net_ret[te], dead_on)
     res["dead"] = _dead_stats(L, b, use, te)
+    # collapse ROC AUC on the PLAIN label, comparable whatever label the model was trained on
+    if "collapse" in rounds:
+        res["collapse_auc_plain"] = {
+            "lightgbm": V.model_metrics(y_plain[te], scores["collapse"])["roc_auc"],
+            "logistic": V.model_metrics(y_plain[te], logistic["collapse"])["roc_auc"]}
     res["walk_forward"] = _walk_forward(rows, Y, y_plain, net_ret, dates, tokens, h, rounds,
                                         dead_on)
     res["gates"] = V.gates(res["trading"], res["walk_forward"])
@@ -297,8 +308,82 @@ def _train_bucket(b, df, L, out_dir, dead_on=False):
     return res, reference.tolist(), levels
 
 
-def train(df: pd.DataFrame, out_root, version: str | None = None) -> Path:
-    """Run the whole pipeline on raw view rows; returns the version directory."""
+def variant_summary(r: dict) -> dict:
+    """The comparison numbers of one bucket of one variant (see report.variant_table)."""
+    if r.get("skipped"):
+        return {"skipped": r["skipped"]}
+    t, g, labs = r["trading"], r["gates"], r["labels"]
+
+    def auc(lab, model):
+        m = labs.get(lab) or {}
+        return np.nan if m.get("skipped") else m[model]["roc_auc"]
+
+    weeks = [w for w in r["walk_forward"] if not w.get("skipped")]
+    plain = r.get("collapse_auc_plain") or {}
+    return {
+        "runner_rate_test": t["all_pos"] / t["all_n"] if t["all_n"] else np.nan,
+        **{k: t[k] for k in ("top_lift", "top_lift_lo", "top_lift_hi", "top_pos", "top_n",
+                             "all_pos", "all_n", "collapse_removed", "sim_top_mean",
+                             "sim_all_mean")},
+        "runner_auc_lightgbm": auc("runner", "lightgbm"),
+        "runner_auc_logistic": auc("runner", "logistic"),
+        "collapse_auc_plain_lightgbm": plain.get("lightgbm", np.nan),
+        "collapse_auc_plain_logistic": plain.get("logistic", np.nan),
+        "collapse_auc_trained_lightgbm": auc("collapse", "lightgbm"),
+        "collapse_auc_trained_logistic": auc("collapse", "logistic"),
+        "wf_mean_lift": float(np.nanmean([w["top_lift"] for w in weeks]))
+        if weeks and not all(np.isnan(w["top_lift"]) for w in weeks) else np.nan,
+        "wf_mean_collapse_removed": float(np.nanmean([w["collapse_removed"] for w in weeks]))
+        if weeks and not all(np.isnan(w["collapse_removed"]) for w in weeks) else np.nan,
+        "windows_beating": g["windows_beating"], "windows_evaluated": g["windows_evaluated"],
+        "passed": g["passed"]}
+
+
+def run_variants(df: pd.DataFrame, baseline: dict, base_policy: str) -> dict:
+    """Train every C.VARIANTS entry (one knob changed from the configured
+    values) on the same rows and splits; report only, nothing is saved.
+    `baseline`: the bucket results of the saved model, reused for "baseline".
+    `df`: sorted rows as prepared by `train`.
+    A variant that raises is recorded as {"error": "error: <short message>"} and the
+    others still run: the saved baseline must never be lost to a variant."""
+    out = {}
+    attempted = failed = 0
+    for name, knobs in C.VARIANTS.items():
+        entry = {"changes": dict(knobs)}
+        out[name] = entry
+        if not knobs:
+            entry["buckets"] = {b: variant_summary(r) for b, r in baseline.items()}
+            continue
+        if base_policy == "missing" and name in C.TRADES_VARIANTS:
+            entry["not_applicable"] = (f"the data has no {C.DEAD_COLUMN} column, so this "
+                                       "variant equals the baseline")
+            continue
+        t0 = time.time()
+        attempted += 1
+        try:  # around overrides too; its `finally` restores the config after an error
+            with C.overrides(**knobs):
+                policy = dead_policy(df)
+                L = build_labels(df, policy)
+                entry["buckets"] = {
+                    b: variant_summary(_train_bucket(b, df, L, None, policy == "on")[0])
+                    for b in C.BUCKETS}
+        except Exception as exc:  # not BaseException: Ctrl-C still stops the run
+            failed += 1
+            entry.pop("buckets", None)
+            entry["error"] = variant_error(exc)
+            print(f"WARNING: variant {name!r} failed ({entry['error']}); the saved baseline "
+                  "model is not affected, the other variants go on", flush=True)
+        entry["seconds"] = round(time.time() - t0, 1)
+        print(f"[variant] {name}: {entry['seconds']:.0f} s", flush=True)
+    if attempted and failed == attempted:
+        print(f"WARNING: all {attempted} variants failed; report.md has no variant numbers "
+              "(the saved baseline model and its gates are complete and valid)", flush=True)
+    return out
+
+
+def train(df: pd.DataFrame, out_root, version: str | None = None, variants: bool = False) -> Path:
+    """Run the whole pipeline on raw view rows; returns the version directory.
+    `variants`: also train C.VARIANTS for the report (never saved or served)."""
     version = version or datetime.now(timezone.utc).strftime("%Y%m%d-%H%M")
     out_dir = Path(out_root) / version
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -329,6 +414,8 @@ def train(df: pd.DataFrame, out_root, version: str | None = None) -> Path:
         "dead_policy": policy,
         "trades_24h_known": int((eligible & num(df, C.DEAD_COLUMN).notna()).sum()),
         "dead": int((eligible & L["dead"]).sum()),
+        # runner label also needs trades_24h >= this (None: rule off, the default)
+        "runner_min_trades_24h": C.RUNNER_MIN_TRADES_24H if C.RUNNER_NEEDS_TRADES else None,
         # over the rows training can use (repeat calls and update posts have no pool data)
         "coverage": {c: float(blank[c][eligible].notna().mean()) if eligible.any() else 0.0
                      for c in raw_cols}}}
@@ -354,10 +441,19 @@ def train(df: pd.DataFrame, out_root, version: str | None = None) -> Path:
             "calib_recent_days": C.CALIB_RECENT_DAYS,
             "models": models, "runner_reference": reference,
             "data": res["data"], "metrics": res["buckets"]}
-    (out_dir / "meta.json").write_text(json.dumps(_json_safe(meta), indent=1, allow_nan=False))
-    (out_dir / "report.md").write_text(render(res), encoding="utf-8")
+    meta = json.loads(json.dumps(_json_safe(meta), allow_nan=False))  # fixed before any variant runs
+    _write_version(out_dir, meta, res)
     (Path(out_root) / "LATEST").write_text(version + "\n")
+    if variants:  # the saved model is complete above; variants only add to meta.json / report.md
+        res["variants"] = run_variants(df, res["buckets"], policy)
+        meta["variants"] = _json_safe(res["variants"])
+        _write_version(out_dir, meta, res)
     return out_dir
+
+
+def _write_version(out_dir: Path, meta: dict, res: dict) -> None:
+    (out_dir / "meta.json").write_text(json.dumps(meta, indent=1, allow_nan=False))
+    (out_dir / "report.md").write_text(render(res), encoding="utf-8")
 
 
 def main(argv=None) -> int:
@@ -366,9 +462,12 @@ def main(argv=None) -> int:
     src.add_argument("--csv", help="file written by the Go program's -export-dataset")
     src.add_argument("--dsn", help="Postgres DSN; reads scout_call_dataset_v (needs psycopg)")
     ap.add_argument("--out", default="models", help="output root (default: models)")
+    ap.add_argument("--variants", action="store_true",
+                    help="also train the one-change variants of config.VARIANTS and compare them "
+                         "in report.md (report only: the saved model is always the baseline)")
     args = ap.parse_args(argv)
     df = pd.read_csv(args.csv, low_memory=False) if args.csv else read_dsn(args.dsn)
-    out_dir = train(df, args.out)
+    out_dir = train(df, args.out, variants=args.variants)
     print(f"wrote {out_dir} (report: {out_dir / 'report.md'})")
     return 0  # gate failures are reported, not errors
 

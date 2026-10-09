@@ -78,6 +78,14 @@ def dead_after_call(df: pd.DataFrame) -> pd.Series:
     return num(df, C.DEAD_COLUMN) < C.DEAD_TRADES_24H  # NaN compares False
 
 
+def untradeable(df: pd.DataFrame) -> pd.Series:
+    """True where C.RUNNER_NEEDS_TRADES is on and trades_24h is known and below
+    C.RUNNER_MIN_TRADES_24H: such a call is no runner. NULL (or no column) -> False."""
+    if not C.RUNNER_NEEDS_TRADES:
+        return pd.Series(False, index=df.index)
+    return num(df, C.DEAD_COLUMN) < C.RUNNER_MIN_TRADES_24H  # NaN compares False
+
+
 def build_labels(df: pd.DataFrame, policy: str | None = None) -> pd.DataFrame:
     """Per row: `update` (an update post, not a call: never usable), `repeat`
     (not the first call of its token: never usable), `no_pool`, `not_usd`,
@@ -90,6 +98,8 @@ def build_labels(df: pd.DataFrame, policy: str | None = None) -> pd.DataFrame:
     `policy` ("on" / "off" / "missing", default `dead_policy(df)`): with "on",
     `collapse_<b>` = plain collapse OR dead; a row whose trades_24h is NULL
     keeps the plain label. Dead calls stay usable.
+    With C.RUNNER_NEEDS_TRADES the runner label also needs trades_24h >=
+    C.RUNNER_MIN_TRADES_24H (NULL keeps the plain runner label).
 
     A bucket uses a row only once all of that bucket's outcome columns are
     present. The view has an outcome only after its horizon was computed, so a
@@ -106,6 +116,7 @@ def build_labels(df: pd.DataFrame, policy: str | None = None) -> pd.DataFrame:
     rugged = to_bool(df["rugged"]) if "rugged" in df.columns else pd.Series(False, index=df.index)
     policy = policy or dead_policy(df)
     out["dead"] = dead_after_call(df)
+    thin = untradeable(df)
     buy, sell = num(df, "tax_buy_pct"), num(df, "tax_sell_pct")
     for b, cfg in BUCKETS.items():
         needed = {cfg["runner"][0], cfg["collapse"][0], cfg["ret_col"]}
@@ -117,6 +128,8 @@ def build_labels(df: pd.DataFrame, policy: str | None = None) -> pd.DataFrame:
         for label in LABELS:
             col, op, threshold = cfg[label]
             hit = _OPS[op](net_pct(num(df, col), buy, sell), threshold)
+            if label == "runner":
+                hit = hit & ~thin
             if label == "collapse" and cfg["collapse_or_rugged"]:
                 hit = hit | rugged
             if label == "collapse":

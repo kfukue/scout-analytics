@@ -547,6 +547,60 @@ def test_report_shows_dead_calls_and_recent_calibration(trained):
         assert needle in report, needle
 
 
+def test_report_shows_collapse_auc_on_the_plain_label(trained):
+    """The per-bucket line: collapse ROC AUC of the trained collapse scores, measured on
+    the plain collapse label (comparable with reports before the dead rule)."""
+    from scout_ml.report import fmt
+    _, vdir = trained
+    meta = json.loads((vdir / "meta.json").read_text())
+    report = (vdir / "report.md").read_text(encoding="utf-8")
+    differs = 0
+    for b in BUCKET_KEYS:
+        m = meta["metrics"][b]
+        plain = m["collapse_auc_plain"]
+        assert 0 < plain["lightgbm"] < 1 and 0 < plain["logistic"] < 1
+        line = (f"Collapse ROC AUC on the plain collapse label (test): LightGBM "
+                f"{fmt(plain['lightgbm'])}, logistic {fmt(plain['logistic'])}.")
+        assert line in report, (b, [r for r in report.splitlines() if "plain collapse label" in r])
+        # the dead rule is on here: the trained label differs, so must the AUC somewhere
+        differs += plain["lightgbm"] != m["labels"]["collapse"]["lightgbm"]["roc_auc"]
+    assert report.count("Collapse ROC AUC on the plain collapse label (test):") == len(BUCKET_KEYS)
+    assert differs > 0
+
+
+def test_report_runner_label_text_only_when_runners_must_be_tradeable(trained, tmp_path,
+                                                                      monkeypatch):
+    from scout_ml.report import render, variant_read
+    _, vdir = trained
+    meta = json.loads((vdir / "meta.json").read_text())
+    needle = " AND trades_24h >= 100 (NULL keeps the label)"
+    assert meta["data"]["runner_min_trades_24h"] is None          # rule off by default
+    assert "(NULL keeps the label)" not in (vdir / "report.md").read_text(encoding="utf-8")
+    # rule on: a real (short-bucket) run, keeping the results dict it renders
+    monkeypatch.setattr(C, "BUCKETS", {"short": C.BUCKETS["short"]})
+    seen = []
+    monkeypatch.setattr(train_mod, "render", lambda res: seen.append(res) or render(res))
+    with C.overrides(RUNNER_NEEDS_TRADES=True):
+        out = train_mod.train(make_synthetic.make(n=2500, days=60, seed=5), tmp_path, "v")
+    res = seen[-1]
+    assert res["data"]["runner_min_trades_24h"] == 100
+    on = (out / "report.md").read_text(encoding="utf-8")
+    labels = [r for r in on.splitlines() if r.startswith("Labels (net of tax): ")]
+    assert len(labels) == 1
+    runner = labels[0].split("; ")[0]                  # the runner part, not the collapse part
+    assert runner.startswith("Labels (net of tax): runner = ") and runner.endswith(needle), labels
+    assert on.count(needle) == 1
+    off = render({**res, "data": {**res["data"], "runner_min_trades_24h": None}})
+    assert "(NULL keeps the label)" not in off
+    # thresholds are read from config when rendering, not bound at import
+    with C.overrides(DEAD_TRADES_24H=77):
+        text = render(res)
+    assert "OR dead (trades_24h < 77)" in text and "### Dead after the call (trades_24h < 77)" in text
+    assert "OR dead (trades_24h < 77)" not in render(res)
+    monkeypatch.setattr(C, "RUNNER_MIN_TRADES_24H", 77)
+    assert "trades_24h >= 77" in variant_read()
+
+
 def test_missing_trades_24h_skips_the_dead_rule_loudly(synthetic_df, tmp_path, monkeypatch, capsys):
     """An export from a view without trades_24h (server not migrated yet):
     training still runs, with plain collapse labels, and says so."""
@@ -561,6 +615,7 @@ def test_missing_trades_24h_skips_the_dead_rule_loudly(synthetic_df, tmp_path, m
     assert "**WARNING: dead-after-the-call rule SKIPPED" in report
     assert "OR dead" not in report and "### Dead after the call" not in report
     assert "incl. dead" not in report                     # no information figure either
+    assert "Collapse ROC AUC on the plain collapse label" not in report
     t = meta["metrics"]["short"]["trading"]
     assert "collapse_removed_with_dead" not in t and "collapse_removed_plain" not in t
     assert all("collapse_removed_with_dead" not in w for w in meta["metrics"]["short"]["walk_forward"])

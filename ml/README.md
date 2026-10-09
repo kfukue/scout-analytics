@@ -61,6 +61,7 @@ its metrics mean nothing; `--end` sets the time of the newest call).
 
     python train.py --csv calls.csv --out models/
     python train.py --dsn postgres://user:pass@host/db --out models/
+    python train.py --csv calls.csv --out models/ --variants   # plus the variant comparison (below)
 
 Writes `models/<version>/` (version = UTC time, e.g. `20261002-1530`) with
 `<bucket>_<label>.joblib` (LightGBM model + calibrator), `meta.json`,
@@ -164,11 +165,34 @@ then "Pons V2"; "Pools Trade Instant" in August only). `dex_family` groups them
 by the ordered prefix rules in `DEX_FAMILY_RULES` (`scout_ml/config.py`): the
 name is lower-cased and spaces, `_`, `-`, `.` and `/` are removed ("Uniswap
 V4", "uniswap_v4" and "UniswapV4" are all `uniswapv4`), and the first rule
-whose prefix matches gives the family (`pons`, `uniswap_v2`, `uniswap_v3`,
-`uniswap_v4`, `uniswap`, `longxyz`); any other name is `other`, an empty name
+whose prefix matches gives the family; any other name is `other`, an empty name
 is missing. Edit the table to add a family; more specific prefixes go first.
 
-Raw `dex` is no longer a model input (`USE_RAW_DEX = False`): its short-lived
+The rules were built from the owner's list of posted names (28 July to
+8 October 2026, RUNBOOK.md query (g)); `tests/test_features.py` pins that list:
+
+| family | posted names |
+|---|---|
+| `pons` | pons, pons v2 |
+| `uniswap_v4` / `uniswap_v3` / `uniswap_v2` | uniswap v4 / v3 / v2 (`uniswap`: a name without a version; none so far) |
+| `longxyz` | longxyz |
+| `pools` | pools trade instant, pools fun, pools trade cca |
+| `bankr`, `letscash`, `varo` | the name itself |
+| `o1` | o1 rwa, o1 (not orbofi) |
+| `flap` | flap, flap stocks, flap pve |
+| `sushi` | sushiswap, sushi |
+| `lunch` | lunch pair v4, lunch pair v3, lunch v3 |
+| `other` | everything else, e.g. virtuals v2, pair fund, noxa, noxafi, stonkbroker (v2), bags, orbofi, up |
+
+Names with fewer than about 30 calls get no family of their own (they are
+`other`). The existing per-split minimum (`MIN_CATEGORY_COUNT` = 20, applied
+by `learn_cat_levels` to every categorical) still applies to the families: a
+family with fewer than 20 calls in a training part is treated as missing
+there (likely for `flap`, `sushi`, `lunch` in some walk-forward weeks).
+
+Which DEX inputs a model gets is `DEX_INPUTS`: `"family"` (default,
+`dex_family` only), `"raw"` (raw `dex` only, as before `dex_family`) or
+`"both"`. Raw `dex` is no longer a model input by default: its short-lived
 names are levels that vanish (or never reach `MIN_CATEGORY_COUNT`) from one
 period to the next, while a family stays. Experiment on synthetic data with
 drifting names (`python make_synthetic.py --dex-names drifting`: "Pons", then
@@ -186,9 +210,11 @@ With a name that appears only in the test period, raw `dex` loses the signal
 family alone (the trees split on raw `dex` in training). Without such a rename
 the three variants were equal (within 0.006). Synthetic data only shows the
 mechanism; the real effect shows in the next prod report (compare the collapse
-ROC AUC and top features with the previous version; `USE_RAW_DEX = True`
-brings raw `dex` back). With the short rule table most real names fall into
-`other`; extend it first (RUNBOOK.md, query (g)).
+ROC AUC and top features with the previous version; `DEX_INPUTS = "raw"` or
+`"both"` brings raw `dex` back, and `train.py --variants` compares all three
+in one run). (That experiment used the earlier rule table, under which the
+synthetic "Pools Trade Instant" and "O1 Rwa" names were `other`; they are
+now `pools` and `o1`.)
 
 The pool the tracker chose (`entry_price_source` = `onchain-v2/v3/v4/pons`) is
 NOT a feature. It describes the pool at the call block, but it is written by
@@ -211,6 +237,53 @@ calibration as before (the report says so). Calibration does not change the
 ranking, so lift, collapses removed and the gates are unaffected; the report
 shows the test deciles and the Brier score for both calibrations.
 
+### Variant comparison (`--variants`)
+
+    python train.py --csv calls.csv --out models/ --variants
+
+trains, in addition to the normal model, one variant per entry of `VARIANTS`
+(`scout_ml/config.py`), each changing exactly ONE setting of the configured
+baseline:
+
+| variant | change |
+|---|---|
+| baseline | none (the saved model's own numbers; not retrained) |
+| dead rule off | `DEAD_IS_COLLAPSE = False` |
+| dead threshold 100 | `DEAD_TRADES_24H = 100` (instead of 50) |
+| raw dex instead of dex_family | `DEX_INPUTS = "raw"` |
+| raw dex + dex_family | `DEX_INPUTS = "both"` |
+| runners must be tradeable | `RUNNER_NEEDS_TRADES = True`: runner also needs `trades_24h >= RUNNER_MIN_TRADES_24H` (100); NULL keeps the label |
+
+Variants are report only: they are never saved or served, and the saved model,
+its `meta.json` (features, levels, rules) and its gates are always the
+baseline's. Each variant uses the same rows, splits, walk-forward weeks and
+seed. `trades_24h` stays a forbidden input in every variant (it is only used
+for labels). The tradeable rule changes only the runner label (so the lift and
+runner counts); the money simulation still uses every call. Without a
+`trades_24h` column the three trades-based variants are shown as "n/a".
+
+The end of `report.md` has one table per bucket (`meta.json`: `"variants"`):
+runner rate on test, runner lift top 10% with its 95% interval, runner ROC AUC
+(LightGBM / logistic), collapse ROC AUC on the plain label (comparable across
+variants) and on the label each variant trained on, collapses removed (plain,
+the gate), weeks beating buy-all, walk-forward mean lift and mean collapses
+removed, simulation top 10% vs all calls, and the gate result. Lift and runner
+AUC of the tradeable variant use its own (stricter) runner label; compare its
+runner rate. The logistic baseline uses numeric inputs only, so it is the same
+in the DEX variants. All variants are compared on the same test part: picking
+the best by these numbers alone risks fitting the test period, so prefer a
+variant that also wins in the walk-forward weeks. To adopt a variant, change
+the setting in `config.py` and train again (it then becomes the baseline).
+
+A variant that raises an error is recorded as `error: <message>` (in its
+table row and in `meta.json` `"variants"`), a `WARNING` line is printed, the
+other variants still run and `train.py` still exits 0: the baseline is saved
+before any variant starts. If every variant fails, a `WARNING: all N variants
+failed` line says so.
+
+Runtime: about 6 times a normal run (on synthetic data of the fixture's size,
+6,000 calls over 170 days: 25 s without, 2 min 20 s with `--variants`).
+
 ## Read the report
 
 `models/<version>/report.md`, top to bottom:
@@ -231,8 +304,12 @@ shows the test deciles and the Brier score for both calibrations.
    the walk-forward table, calibration by decile, top features. `medium` and
    `long` also show the purged k-fold (folds used, rounds per fold,
    out-of-fold rows used for calibration). Each bucket also has a "Dead after
-   the call" table, and each label's calibration table shows the predictions
-   of the recent-rows calibration next to those of the earlier one.
+   the call" table with the collapse ROC AUC on the plain collapse label
+   (comparable with reports from before the dead rule), and each label's
+   calibration table shows the predictions of the recent-rows calibration
+   next to those of the earlier one.
+4. With `--variants` only: **Variant comparison**, one table per bucket (see
+   "Variant comparison" above).
 
 If LightGBM is not clearly better than the logistic baseline, the data does
 not yet support the more complex model. A bucket is skipped (with the reason
@@ -296,7 +373,7 @@ roll back, write an older version name into `models/LATEST`. Compare the new
     scout_ml/report.py    report.md
     train.py  serve.py  make_synthetic.py  tests/
 
-    python -m pytest tests -q
+    python -m pytest tests -q        # 123 passed, about 2 minutes
 
 `build_features` raises if an outcome or bookkeeping column (anything starting
 with `ret_`, `max_gain_`, `max_dd_`, `trades_`, plus `rugged`, `tracking_status`,
