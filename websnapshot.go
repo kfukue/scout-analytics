@@ -790,6 +790,22 @@ func hashWebRows(rows []ScoutWebRow, updatePosts int, gmgn string) string {
 			buf = append(buf, 0)
 		}
 		optInt(r.Trades24h)
+		// and the values known at the call (the "By factor" tab): the
+		// called-at market cap as sent (the list hashes its own choice
+		// above), the post's metrics and the hour before the call
+		optFlt(webAnaMcap(r))
+		optInt(r.Holders)
+		optInt(r.ProofElite)
+		optInt(r.ProofGood)
+		optInt(r.LiveBuysEliteCount)
+		optInt(r.LiveBuysGoodCount)
+		optFlt(r.LiveBuysEliteUSD)
+		optFlt(r.LiveBuysGoodUSD)
+		optFlt(r.PreBuyVol60)
+		optFlt(r.PreSellVol60)
+		optInt(r.PreSwaps60)
+		optFlt(r.PreChg60)
+		opt(r.PreVolUnit)
 		h.Write(buf)
 	}
 	return hex.EncodeToString(h.Sum(nil)[:12])

@@ -11,6 +11,7 @@ import (
 	"math"
 	"math/rand"
 	"net/http/httptest"
+	"os/exec"
 	"slices"
 	"strings"
 	"testing"
@@ -75,8 +76,57 @@ func withAnalyticsFields(rows []ScoutWebRow, seed int64) []ScoutWebRow {
 			n := 99
 			r.Trades24h = &n // without TradesFinal: must not be sent
 		}
+		withFactors(r, rng)
 	}
 	return rows
+}
+
+func f64p(v float64) *float64 { return &v }
+
+// withFactors fills the values known at the call of a synthetic row: nil
+// (no post metrics, no hour before the call), zeros, ordinary and huge
+// values, and volumes in a quote asset rather than USD.
+func withFactors(r *ScoutWebRow, rng *rand.Rand) {
+	ip := func(max int) *int {
+		n := 0
+		if rng.Intn(4) != 0 {
+			n = rng.Intn(max)
+		}
+		return &n
+	}
+	fp := func(max float64) *float64 {
+		v := 0.0
+		if rng.Intn(4) != 0 {
+			v = math.Exp(rng.Float64()*math.Log(max)) - 1
+		}
+		return &v
+	}
+	if rng.Intn(6) != 0 { // post metrics parsed
+		if rng.Intn(5) != 0 {
+			r.CalledAtMcap = fp(5e7)
+		}
+		if rng.Intn(9) == 0 {
+			v := []float64{0, -5, math.NaN(), math.Inf(1)}[rng.Intn(4)]
+			r.CalledAtMcap = &v // not a market cap: sent as null
+		}
+		r.Holders, r.ProofElite, r.ProofGood = ip(5000), ip(40), ip(80)
+		if rng.Intn(10) == 0 {
+			r.Holders = nil
+		}
+		r.LiveBuysEliteCount, r.LiveBuysGoodCount = ip(12), ip(20)
+		r.LiveBuysEliteUSD, r.LiveBuysGoodUSD = fp(3e4), fp(1e5)
+	}
+	if rng.Intn(3) != 0 { // the hour before the call measured
+		r.PreVolUnit = sp("usd")
+		if rng.Intn(5) == 0 {
+			r.PreVolUnit = sp("VIRT")
+		}
+		r.PreBuyVol60, r.PreSellVol60, r.PreSwaps60 = fp(2e6), fp(2e6), ip(900)
+		if rng.Intn(5) != 0 {
+			v := rng.NormFloat64() * 80
+			r.PreChg60 = &v
+		}
+	}
 }
 
 // TestWebAnalyticsRows: every row of the body carries what the page needs,
@@ -203,6 +253,7 @@ func TestWebAnalyticsRows(t *testing.T) {
 		if n >= 600 && !sawRugPeak {
 			t.Fatal("no rugged call with a peak in the test data")
 		}
+		checkAnaFactors(t, a, raw)
 		// the dictionaries: most frequent first, no empty or unclean names
 		for _, d := range [][]string{a.Dexes, a.Quotes, a.Families} {
 			for _, s := range d {
@@ -210,6 +261,94 @@ func TestWebAnalyticsRows(t *testing.T) {
 					t.Errorf("dictionary entry %q", s)
 				}
 			}
+		}
+	}
+}
+
+// checkAnaFactors: the values known at the call, as each row was read:
+// counts as they are, dollars rounded (3 significant digits from $1,000), the
+// market cap only when positive, volumes only when measured in USD, the
+// price change to 0.1; null for what is missing.
+func checkAnaFactors(t *testing.T, a webAnalyticsJSON, raw []ScoutWebRow) {
+	t.Helper()
+	col := map[string]int{}
+	for i, c := range a.Columns {
+		col[c] = i
+	}
+	usdNum := func(p *float64, positive bool) *float64 {
+		if p == nil || math.IsNaN(*p) || math.IsInf(*p, 0) || *p < 0 || (positive && *p == 0) {
+			return nil
+		}
+		return p
+	}
+	intNum := func(p *int) *float64 {
+		if p == nil {
+			return nil
+		}
+		v := float64(*p)
+		return &v
+	}
+	for i, row := range a.Rows {
+		r := &raw[i]
+		usdVol := r.PreVolUnit != nil && *r.PreVolUnit == "usd"
+		var mcap *float64 // the called-at market cap, of calls priced in USD only
+		if r.PriceUnit != nil && *r.PriceUnit == "usd" {
+			mcap = usdNum(r.CalledAtMcap, true)
+		}
+		vol := func(p *float64) *float64 {
+			if !usdVol {
+				return nil
+			}
+			return usdNum(p, false)
+		}
+		for _, c := range []struct {
+			name string
+			want *float64
+			tol  float64 // relative
+		}{
+			{"mcap", mcap, 0.005},
+			{"holders", intNum(r.Holders), 0},
+			{"proof_elite", intNum(r.ProofElite), 0},
+			{"proof_good", intNum(r.ProofGood), 0},
+			{"buys_elite_n", intNum(r.LiveBuysEliteCount), 0},
+			{"buys_good_n", intNum(r.LiveBuysGoodCount), 0},
+			{"buys_elite_usd", usdNum(r.LiveBuysEliteUSD, false), 0.005},
+			{"buys_good_usd", usdNum(r.LiveBuysGoodUSD, false), 0.005},
+			{"pre_buy_usd", vol(r.PreBuyVol60), 0.005},
+			{"pre_sell_usd", vol(r.PreSellVol60), 0.005},
+			{"pre_swaps", intNum(r.PreSwaps60), 0},
+			{"pre_chg", r.PreChg60, 0},
+		} {
+			got := row[col[c.name]]
+			if c.want == nil {
+				if got != nil {
+					t.Errorf("call %d: %s = %v, want null", r.CallID, c.name, *got)
+				}
+				continue
+			}
+			w := *c.want
+			if got == nil || math.Abs(*got-w) > math.Max(0.5+1e-9, w*c.tol) {
+				t.Errorf("call %d: %s = %v, want %v", r.CallID, c.name, got, w)
+			}
+		}
+	}
+}
+
+func TestAppendAnaUSD(t *testing.T) {
+	f := func(v float64) *float64 { return &v }
+	for _, c := range []struct {
+		in       *float64
+		positive bool
+		want     string
+	}{
+		{nil, false, "null"}, {f(0), false, "0"}, {f(0), true, "null"}, {f(-1), false, "null"},
+		{f(math.NaN()), false, "null"}, {f(math.Inf(1)), false, "null"},
+		{f(0.4), false, "0"}, {f(12.6), false, "13"}, {f(999.4), false, "999"}, {f(999.6), false, "1000"},
+		{f(12345), false, "12300"}, {f(45678.9), true, "45700"}, {f(1234567), false, "1230000"},
+		{f(2.5e18), false, "2.5e+18"},
+	} {
+		if got := string(appendAnaUSD(nil, c.in, c.positive)); got != c.want {
+			t.Errorf("appendAnaUSD(%v, aboveZero %v) = %q, want %q", c.in, c.positive, got, c.want)
 		}
 	}
 }
@@ -293,6 +432,27 @@ func TestWebAnalyticsVersion(t *testing.T) {
 			n := *r.Trades24h + 1
 			r.Trades24h = &n
 		}},
+		{"market cap at call", func(r *ScoutWebRow) bool { return usd(r) && r.CalledAtMcap != nil && *r.CalledAtMcap > 1000 },
+			func(r *ScoutWebRow) { r.CalledAtMcap = f64p(*r.CalledAtMcap * 3) }},
+		{"holders", func(r *ScoutWebRow) bool { return r.Holders != nil }, func(r *ScoutWebRow) { r.Holders = ip(*r.Holders + 1) }},
+		{"elite holders", func(r *ScoutWebRow) bool { return r.ProofElite != nil }, func(r *ScoutWebRow) { r.ProofElite = ip(*r.ProofElite + 1) }},
+		{"good holders", func(r *ScoutWebRow) bool { return r.ProofGood != nil }, func(r *ScoutWebRow) { r.ProofGood = ip(*r.ProofGood + 1) }},
+		{"elite buyers", func(r *ScoutWebRow) bool { return r.LiveBuysEliteCount != nil },
+			func(r *ScoutWebRow) { r.LiveBuysEliteCount = ip(*r.LiveBuysEliteCount + 1) }},
+		{"good buyers", func(r *ScoutWebRow) bool { return r.LiveBuysGoodCount != nil },
+			func(r *ScoutWebRow) { r.LiveBuysGoodCount = ip(*r.LiveBuysGoodCount + 1) }},
+		{"elite buy usd", func(r *ScoutWebRow) bool { return r.LiveBuysEliteUSD != nil },
+			func(r *ScoutWebRow) { r.LiveBuysEliteUSD = f64p(*r.LiveBuysEliteUSD*2 + 5000) }},
+		{"good buy usd", func(r *ScoutWebRow) bool { return r.LiveBuysGoodUSD != nil },
+			func(r *ScoutWebRow) { r.LiveBuysGoodUSD = f64p(*r.LiveBuysGoodUSD*2 + 5000) }},
+		{"pre buy volume", func(r *ScoutWebRow) bool { return r.PreVolUnit != nil && *r.PreVolUnit == "usd" },
+			func(r *ScoutWebRow) { r.PreBuyVol60 = f64p(*r.PreBuyVol60*2 + 5000) }},
+		{"pre sell volume", func(r *ScoutWebRow) bool { return r.PreVolUnit != nil && *r.PreVolUnit == "usd" },
+			func(r *ScoutWebRow) { r.PreSellVol60 = f64p(*r.PreSellVol60*2 + 5000) }},
+		{"volume unit", func(r *ScoutWebRow) bool { return r.PreVolUnit != nil && *r.PreVolUnit == "usd" && *r.PreBuyVol60 > 0 },
+			func(r *ScoutWebRow) { r.PreVolUnit = sp("WETH") }},
+		{"pre swaps", func(r *ScoutWebRow) bool { return r.PreSwaps60 != nil }, func(r *ScoutWebRow) { r.PreSwaps60 = ip(*r.PreSwaps60 + 1) }},
+		{"pre price change", func(r *ScoutWebRow) bool { return r.PreChg60 != nil }, func(r *ScoutWebRow) { r.PreChg60 = f64p(*r.PreChg60 + 3) }},
 		{"rugged call's peak", func(r *ScoutWebRow) bool {
 			return usd(r) && r.Rugged != nil && *r.Rugged && r.HasPerf&peakBit != 0 && !math.IsNaN(r.Perf[1*webPerfPerHorizon+webPerfPeak])
 		}, func(r *ScoutWebRow) { r.Perf[1*webPerfPerHorizon+webPerfPeak] += 1000 }},
@@ -618,19 +778,30 @@ func TestAnalyticsPageFiles(t *testing.T) {
 		}
 		return string(b)
 	}
-	html, js, index := read("analytics.html"), read("analytics.js"), read("index.html")
+	html, index := read("analytics.html"), read("index.html")
 	for _, banned := range []string{"<script>", "<style", " style=", "onclick=", "onload=", "http://", "https://", "//cdn"} {
 		if strings.Contains(html, banned) {
 			t.Errorf("analytics.html contains %q", banned)
 		}
 	}
-	for _, banned := range []string{"innerHTML", "outerHTML", "insertAdjacentHTML", "document.write", "eval(", "new Function", "setAttribute('style'", "http://"} {
-		if strings.Contains(js, banned) {
-			t.Errorf("analytics.js contains %q", banned)
+	js := read("analytics.js")
+	for _, name := range []string{"analytics.js", "analytics-stats.js"} {
+		// the SVG namespace is a name, not a link
+		src := strings.ReplaceAll(read(name), "'http://www.w3.org/2000/svg'", "")
+		for _, banned := range []string{"innerHTML", "outerHTML", "insertAdjacentHTML", "document.write", "eval(", "new Function",
+			"setAttribute('style'", "'style':", ".style.", "DOMParser", "http://", "https://"} {
+			if strings.Contains(src, banned) {
+				t.Errorf("%s contains %q", name, banned)
+			}
 		}
 	}
+	// the calculations load first (deferred scripts run in order)
+	if i, j := strings.Index(html, `<script src="analytics-stats.js" defer></script>`), strings.Index(html, `<script src="analytics.js" defer></script>`); i < 0 || j < 0 || i > j {
+		t.Error("analytics.html must load analytics-stats.js (deferred) before analytics.js")
+	}
 	for _, want := range []string{`<script src="analytics.js" defer></script>`, `href="./"`, "Model insights — coming soon",
-		"First calls only", "late entry", "in USD", "before tax"} {
+		"First calls only", "late entry", "in USD", "before tax", "rounded to 0.1", `role="tablist"`,
+		`id="panel-overview"`, `id="panel-factor"`, `id="panel-peak"`, "capped at +1,000%"} {
 		if !strings.Contains(html, want) {
 			t.Errorf("analytics.html: missing %q", want)
 		}
@@ -642,9 +813,32 @@ func TestAnalyticsPageFiles(t *testing.T) {
 		t.Error("analytics.js does not read /api/analytics with its ETag")
 	}
 	ws := benchWebServer(t, 3)
-	for _, p := range []string{"/analytics.html", "/analytics.js"} {
+	for _, p := range []string{"/analytics.html", "/analytics.js", "/analytics-stats.js"} {
 		if rec := getWeb(ws, p); rec.Code != 200 {
 			t.Errorf("%s: got %d, want 200", p, rec.Code)
 		}
+	}
+}
+
+// TestAnalyticsStatsNode runs the tests of the Analytics page's calculations
+// (frontend/analytics-stats.js, testdata/analytics-stats.test.js) with node,
+// when node is on the PATH (skipped otherwise), and checks every page script
+// for syntax errors (node --check).
+func TestAnalyticsStatsNode(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node is not on the PATH")
+	}
+	for _, f := range []string{"frontend/analytics-stats.js", "frontend/analytics.js", "frontend/app.js"} {
+		if out, err := exec.Command(node, "--check", f).CombinedOutput(); err != nil {
+			t.Errorf("node --check %s: %v: %s", f, err, out)
+		}
+	}
+	out, err := exec.Command(node, "testdata/analytics-stats.test.js").CombinedOutput()
+	if err != nil {
+		t.Fatalf("node testdata/analytics-stats.test.js: %v: %s", err, out)
+	}
+	if !strings.HasPrefix(string(out), "ok: ") {
+		t.Fatalf("node testdata/analytics-stats.test.js: got %q, want \"ok: …\"", out)
 	}
 }

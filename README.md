@@ -1195,7 +1195,11 @@ read on demand (see below).
   below.
 - **The Analytics page** adds to that statement the posted DEX, the price source, the quote
   asset, which windows are stored as `no_data`, the Perceptor verdict at the time of the call
-  and whether the first 24 hours of candles are stored (about +20 ms on 6,000 tokens). The trade
+  and whether the first 24 hours of candles are stored (about +20 ms on 6,000 tokens), and the
+  values known at the call that the "By factor" tab groups by: the post's holders, elite and good
+  holders, elite and good live buys (`scout_call_metrics`) and the hour before the call
+  (`scout_call_precall`, joined by its primary key), with the expressions of
+  `scout_call_dataset_v` (about +15–25 ms on 5,600 synthetic tokens on the test machine). The trade
   counts of the first 24 hours (`scout_call_candles`) are read separately and kept: a refresh
   reads only calls whose count has just become complete (usually none; a few ms), and all of
   them again once an hour (about 0.3 s for 5,600 calls and 1.4 million 5-minute candles on the
@@ -1456,13 +1460,58 @@ other sites):
   a system font stack). `style.css` only; no web fonts or other sites are loaded.
 
 **Analytics page** (`/analytics.html`; "Analytics" in the top bar of the list, "Calls" back).
-Section 1, **Call performance**, is built; section 2, "Model insights", is an empty heading for
-now. Everything on it is **first calls only, late entry (60 s after the post), in USD, before
-tax**, worked out in the browser from one compact feed (`GET /api/analytics`, below), so every
-choice is instant and no request reads the database.
+Section 1, **Call performance**, is built, in three tabs (**Overview**, **By factor**, **Peak vs
+final**); section 2, "Model insights", is an empty heading for now. Everything on it is **first
+calls only, late entry (60 s after the post), in USD, before tax; values rounded to 0.1**,
+worked out in the browser from one compact feed (`GET /api/analytics`, below), so every choice
+is instant and no request reads the database. The charts are SVG drawn by the page's own script
+(`frontend/analytics.js`, no chart library); the pure calculations (mean and median,
+equal-count groups, histogram bands, symmetric-log scale, UTC weeks, "$100 on every call") are
+in `frontend/analytics-stats.js`, tested by `node testdata/analytics-stats.test.js` (no
+dependencies; `go test` runs it when `node` is on the PATH). Only the visible tab is drawn
+(under 0.2 s per tab change on 5,600 calls in headless Edge).
 
-- **Choices:** the window (1h, 1d, 3d, 7d, 30d; 1d by default), **Quiet after the call**
-  (Include / Exclude / Only quiet) and **Period** (Week / Month).
+- **Choices (shared by the tabs):** the window (1h, 1d, 3d, 7d, 30d; 1d by default),
+  **Metric** (return / peak / drawdown: the hour × weekday chart and the "By factor" charts),
+  **Statistic** (median / mean: the same charts), **Quiet after the call** (Include / Exclude /
+  Only quiet), **Period** (Week / Month), **Pool family** and **Verdict at the call** (All or
+  one; they filter every table and chart, except the two fixed lines of "$100 on every call").
+- **Overview tab:** the counts and tables below, and four charts: the **trend** per week (or
+  month: bars = calls; lines = mean and median return and the collapse rate, ≤ −50%); the
+  **outcome mix** per week (stacked shares of the calls with data: rugged, ≤ −50%, −50% to 0%,
+  0% to +100%, ≥ +100%; rugged first, whatever the return); **"$100 on every call"** (running
+  profit or loss in call order, each return **capped at +1,000%**, before tax; lines: all
+  calls and "no red flags" at the call, both following only the quiet choice (not the pool
+  family or verdict choice), and, when a pool family or verdict is chosen, a line for that
+  choice); and the **hour × weekday** heat map (UTC; cell = mean or median, call count on
+  hover; cells under 20 calls grey).
+- **By factor tab:** a factor known at the call: the Perceptor verdict at the call, the
+  **market cap at the call as posted** (the post's "called at" figure; a market cap worked out
+  from the tracker's entry price would need the token supply, which is not stored), elite
+  holders, good holders, holders, elite and good buyers (count), elite and good buys (USD),
+  and the hour before the call (buy volume, sell volume, swaps, price change). Number factors
+  are split into 4, 5 or 10 groups of about equal count (5 by default) over the calls with
+  data for the window and a value; equal values stay in one group (so groups can differ in
+  size); when at least 10% of the values are 0, 0 is its own group, and the values below and
+  above 0 are split separately (no group spans 0), sharing the remaining groups in proportion
+  to their counts, at least one for each side with values and at most one per distinct value
+  (so the total stays 4, 5 or 10 when the values differ enough); labels show the range
+  ("$20k–$45k"), with more digits where a range's ends, or neighbouring groups, would
+  otherwise look equal or overlapping ("$1.25k–$1.26k", not "$1.3k–$1.3k").
+  Per group: a histogram with fixed bands (−100…−75, −75…−50, −50…−25, −25…0, 0…+25,
+  +25…+50, +50…+100, +100…+300, ≥ +300 %; a boundary value goes to the band farther from 0:
+  bands below 0 include their upper end, so 0 is in "−25 to 0", bands above 0 their lower end,
+  and "0 to +25" starts just above 0; same axes for every group) and a table; a scatter plot of every call (x: log
+  scale keeping 0 for amounts and counts, symmetric log for the price change, categories with a
+  fixed jitter for the verdict; y: the metric on a symmetric-log scale; group mean and median
+  lines; hover = call id, time, value and metric); the typical path at 1h → 30d per group
+  ("all calls with data at each point", n per point in the table under it, or "same calls at
+  every point"); and the verdict × pool family grid. Calls without a value are left out (and
+  counted in a note); pre-call volumes measured in the pool's quote asset rather than USD count
+  as no value.
+- **Peak vs final tab:** every call's peak against its return at the window (both symmetric
+  log, a dashed "return = peak" line) and the share of calls with a peak above 0% that gave back
+  more than half of it (return < peak ÷ 2).
 - **Counts** of the selection for the window: calls, with data, not due yet (called less than
   the window ago), due but no data (stored as `no_data`), waiting for the tracker (due, tracked
   in USD, not recorded yet), not tracked / no USD price.
@@ -1473,9 +1522,9 @@ choice is instant and no request reads the database.
   "Week of Mon 3 Aug 2026") or **month**; and the **median return by week (or month) and
   verdict**.
 - **Columns:** Calls, With data (the n of every number in the row; its tooltip says why the
-  others have none), Mean and Median return, Win rate (return > 0), ≥ +100% peak (peak ≥ +100%,
-  over the calls with a peak), Collapse (return ≤ −50%), Median peak, Median drop, Rugged (flagged
-  rugged as of now). Every rate shows its count under it ("120 / 249"). A group with fewer than
+  others have none), Mean and Median return, Mean and Median peak, Mean and Median drop, Win rate
+  (return > 0), ≥ +100% peak (peak ≥ +100%, over the calls with a peak), Collapse (return
+  ≤ −50%), Rugged (flagged rugged as of now). Every rate shows its count under it ("120 / 249"). A group with fewer than
   20 calls with data is greyed out. A legend under the tables explains each column.
   Returns, peaks and drops come rounded to 0.1 (`GET /api/analytics`), and the thresholds
   are applied to the rounded values: +0.04% counts as 0.0% (not a win), −49.96% as −50.0% (a
@@ -1695,12 +1744,15 @@ the list's other fields move, such as latest prices), `If-None-Match` → `304`,
 clients that take it; `503` before the first snapshot.
 
 ```json
-{"format": 1, "horizons": ["1h","1d","3d","7d","30d"], "horizon_seconds": [3600,86400,259200,604800,2592000],
+{"format": 2, "horizons": ["1h","1d","3d","7d","30d"], "horizon_seconds": [3600,86400,259200,604800,2592000],
  "quiet_below": 50, "verdicts": ["clean","caution","red_flags","unknown","none"],
  "families": ["v4","v2","pons","v3","gecko","untracked"], "dexes": ["Uniswap V4","Pons V2","…"], "quotes": ["WETH","USDG"],
  "columns": ["call_id","t","flags","verdict","family","dex","quote","trades_24h","no_data",
-             "ret_1h","peak_1h","dd_1h","ret_1d","peak_1d","dd_1d","…","dd_30d"],
- "rows": [[812, 1790000000, 5, 0, 1, 3, 0, 214, 0, 12.5, 40.1, -3.2, -20, 100, -50, null, null, null, …]]}
+             "ret_1h","peak_1h","dd_1h","ret_1d","peak_1d","dd_1d","…","dd_30d",
+             "mcap","holders","proof_elite","proof_good","buys_elite_n","buys_good_n",
+             "buys_elite_usd","buys_good_usd","pre_buy_usd","pre_sell_usd","pre_swaps","pre_chg"],
+ "rows": [[812, 1790000000, 5, 0, 1, 3, 0, 214, 0, 12.5, 40.1, -3.2, -20, 100, -50, null, null, null, …,
+           45700, 812, 3, 11, 2, 5, 1230, 20000, 15000, 9000, 31, -12.3]]}
 ```
 
 - `t` = the call's time (Unix seconds). `flags`: 1 = priced in USD (only these rows have
@@ -1718,7 +1770,21 @@ clients that take it; `503` before the first snapshot.
   (`t` + its seconds after `X-Snapshot-At`) or not recorded yet.
 - Then, per window: return, peak and worst drop (late entry, USD, %, rounded to 0.1; `null` when
   missing). A rugged call keeps its peak here.
-- Size: about 117 bytes a row, about 39 compressed (6,000 rows: 703 KB, 233 KB gzipped).
+- Then the values known at the call (`null` when missing), read like `scout_call_dataset_v`:
+  `mcap` = `called_at_mcap_usd` of the post, the market cap **as posted** (positive, calls
+  priced in USD only; no fallback to the "Mcap" line; not worked out from the entry price, as
+  the token supply is not stored); `holders`, `proof_elite`, `proof_good`, `buys_elite_n`, `buys_good_n`
+  (`live_buys_*_count`), `buys_elite_usd`, `buys_good_usd` (`live_buys_*_usd`) from
+  `scout_call_metrics` (all `null` without a parsed post); `pre_buy_usd`, `pre_sell_usd`
+  (`buy_vol_60m`, `sell_vol_60m`; `null` unless `vol_unit` is `usd`), `pre_swaps`
+  (`swaps_60m`) and `pre_chg` (`price_chg_60m_pct`, %, 0.1) from `scout_call_precall` (all
+  `null` without a row). Dollar amounts are whole dollars, 3 significant digits from $1,000 up.
+  `format` was 1 before these columns; an open page with the old script says "unexpected
+  format; reload the page".
+- Size: about 158 bytes a row, about 50 compressed (5,600 synthetic rows: 883 KB, 283 KB
+  gzipped; without the factor columns the same rows are 640 KB, 209 KB gzipped; the real data
+  was 117 / 39 bytes a row before, so expect about 160 / 53 now: about 960 KB, 320 KB gzipped
+  for 6,000 rows).
 - The fields behind it are part of the list's snapshot version, so a change to any of them also
   changes the `ETag` of `/api/calls`.
 

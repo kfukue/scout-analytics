@@ -1580,8 +1580,10 @@ const (
 // report before a decline; $1 = salphaDeclinePhrases) and the
 // market caps of the post; and, for the Analytics page, the posted DEX, the
 // price source, the quote asset, which windows are stored as no_data, the
-// verdict at the time of the call and whether the first 24 hours of candles
-// are stored (trades_final; see ScoutWebRow). It reads the
+// verdict at the time of the call, whether the first 24 hours of candles
+// are stored (trades_final; see ScoutWebRow) and the values known at the call
+// that the "By factor" tab groups by (post metrics and the hour before the
+// call, scout_call_precall; the dataset view's expressions). It reads the
 // tables directly (not scout_call_dataset_v, whose per-row lookups the website
 // does not need). Ordered by call id. The first calls are a common table
 // expression (fc), read once and used both for the list and for the verdict
@@ -1597,12 +1599,16 @@ var webRowsSQL = `WITH fc AS ` + webFirstCallsSQL + `
 	m.called_at_mcap_usd::float8, m.mcap_usd::float8, t.entry_price_usd::float8,
 	ptd.verdict, ptd.report_url, ptd.at,
 	NULLIF(btrim(m.dex), ''), t.entry_price_source, NULLIF(t.onchain->>'quote_sym', ''), COALESCE(r.no_data, 0), vac.verdict,
-	(t.entry_price_source LIKE 'onchain-%' AND COALESCE((t.onchain->>'v')::int, 0) >= 2 AND COALESCE(r.has_1d, false)) IS TRUE
+	(t.entry_price_source LIKE 'onchain-%' AND COALESCE((t.onchain->>'v')::int, 0) >= 2 AND COALESCE(r.has_1d, false)) IS TRUE,
+	m.holders, m.proof_elite, m.proof_good, m.live_buys_elite_count, m.live_buys_good_count,
+	m.live_buys_elite_usd::float8, m.live_buys_good_usd::float8,
+	pre.buy_vol_60m::float8, pre.sell_vol_60m::float8, pre.swaps_60m, pre.price_chg_60m_pct::float8, pre.vol_unit
 	FROM fc
 	JOIN scout_calls c ON c.id = fc.id
 	JOIN ` + webCallCountsSQL + ` n ON n.ca = fc.ca
 	LEFT JOIN scout_call_metrics m ON m.call_id = fc.id
 	LEFT JOIN scout_call_tracking t ON t.call_id = fc.id
+	LEFT JOIN scout_call_precall pre ON pre.call_id = fc.id
 	LEFT JOIN (SELECT call_id, ` + webReturnsPivotSQL("") + `,
 		` + webNoDataSQL() + ` AS no_data, bool_or(horizon = '1d') AS has_1d
 		FROM scout_call_returns GROUP BY call_id) r ON r.call_id = fc.id` + webPerceptorJoinSQL + webPerceptorTodayJoinSQL + webSAlphaJoinSQL + webVerdictAtCallJoinSQL + `
@@ -1671,7 +1677,10 @@ func (st *ScoutStore) SelectWebRows(ctx context.Context) ([]ScoutWebRow, int, er
 		dest = append(dest, &r.PerceptorVerd, &r.PerceptorURL, &r.PerceptorID, &r.SAlphaID, &r.CallCount, &r.LastCallDate,
 			&r.LatestReturn, &r.LatestPrice, &r.LatestAt, &r.LatestTradeAt,
 			&r.CalledAtMcap, &r.PostMcap, &r.PostPrice, &r.PerceptorTodayVerd, &r.PerceptorTodayURL, &r.PerceptorTodayAt,
-			&r.PostedDex, &r.EntrySource, &r.QuoteSym, &noData, &r.VerdictAtCall, &r.TradesFinal)
+			&r.PostedDex, &r.EntrySource, &r.QuoteSym, &noData, &r.VerdictAtCall, &r.TradesFinal,
+			&r.Holders, &r.ProofElite, &r.ProofGood, &r.LiveBuysEliteCount, &r.LiveBuysGoodCount,
+			&r.LiveBuysEliteUSD, &r.LiveBuysGoodUSD,
+			&r.PreBuyVol60, &r.PreSellVol60, &r.PreSwaps60, &r.PreChg60, &r.PreVolUnit)
 		if err := rows.Scan(dest...); err != nil {
 			return nil, 0, err
 		}

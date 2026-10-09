@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"io/fs"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -251,4 +253,128 @@ func TestWebAnalyticsDB(t *testing.T) {
 	if nd := *got[e1][8]; nd != 2 {
 		t.Errorf("body: no_data of E %v, want 2", nd)
 	}
+}
+
+// TestWebAnalyticsFactorsDB: the values known at the call that the Analytics
+// page's "By factor" tab groups by come from the load query with the same
+// numbers as scout_call_dataset_v (the ML data): the post's market cap,
+// holders, elite and good holders and live buys, and the hour before the call
+// (volumes, swaps, price change, volume unit). Covers a call with every value,
+// one measured in the quote asset, one without a precall row and one without
+// post metrics.
+func TestWebAnalyticsFactorsDB(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+	if err := st.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	base := time.Date(2026, 8, 10, 12, 0, 0, 0, time.UTC)
+	ret := map[string][3]float64{"1h": {5, 10, -3}}
+	mc := 45678.9
+	full := seedWebCall(t, st, base, webSeed{Msg: 1, CA: "0xf100000000000000000000000000000000000001", PostSym: "A", CalledMC: &mc,
+		Status: TrackDone, Unit: "usd", Entry: 1, Late: 1, Returns: ret})
+	quote := seedWebCall(t, st, base, webSeed{Msg: 2, CA: "0xf200000000000000000000000000000000000002", PostSym: "B",
+		Status: TrackDone, Unit: "usd", Entry: 1, Late: 1, Returns: ret})
+	noPre := seedWebCall(t, st, base, webSeed{Msg: 3, CA: "0xf300000000000000000000000000000000000003", PostSym: "C",
+		Status: TrackDone, Unit: "usd", Entry: 1, Late: 1, Returns: ret})
+	noMetrics := seedWebCall(t, st, base, webSeed{Msg: 4, CA: "0xf400000000000000000000000000000000000004",
+		Status: TrackDone, Unit: "usd", Entry: 1, Late: 1, Returns: ret})
+	metrics := func(id, holders, elite, good, eliteN, goodN int, eliteUSD, goodUSD float64) {
+		t.Helper()
+		if _, err := st.Pool.Exec(ctx, `UPDATE scout_call_metrics SET holders = $2, proof_elite = $3, proof_good = $4,
+			live_buys_elite_count = $5, live_buys_good_count = $6, live_buys_elite_usd = $7, live_buys_good_usd = $8
+			WHERE call_id = $1`, id, holders, elite, good, eliteN, goodN, eliteUSD, goodUSD); err != nil {
+			t.Fatal(err)
+		}
+	}
+	metrics(full, 812, 3, 11, 2, 5, 1234.56, 20000.4)
+	metrics(quote, 40, 0, 0, 0, 0, 0, 0)
+	metrics(noPre, 7, 1, 2, 0, 1, 0, 99.5)
+	chg := -12.34
+	if err := st.UpsertPrecall(ctx, full, &precallStats{WindowS: 3600, VolUnit: "usd", Swaps: [3]int{4, 9, 31},
+		BuyVol: [3]float64{1, 2, 15000.75}, SellVol: [3]float64{1, 2, 9000.25}, PriceChgPct: [3]*float64{nil, nil, &chg}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpsertPrecall(ctx, quote, &precallStats{WindowS: 3600, VolUnit: "VIRT", Swaps: [3]int{0, 0, 3},
+		BuyVol: [3]float64{0, 0, 4.5}, SellVol: [3]float64{0, 0, 1.25}}); err != nil {
+		t.Fatal(err)
+	}
+
+	rows, _, err := st.SelectWebRows(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	byID := map[int]*ScoutWebRow{}
+	for i := range rows {
+		byID[rows[i].CallID] = &rows[i]
+	}
+	type factors struct {
+		Mcap, EliteUSD, GoodUSD, BuyVol, SellVol, Chg *float64
+		Holders, Elite, Good, EliteN, GoodN, Swaps    *int
+		Unit                                          *string
+	}
+	ids := []int{full, quote, noPre, noMetrics}
+	dv, err := st.Pool.Query(ctx, `SELECT call_id, called_at_mcap_usd, live_buys_elite_usd, live_buys_good_usd,
+		pre_buy_vol_60m, pre_sell_vol_60m, pre_price_chg_60m_pct, holders, proof_elite, proof_good,
+		live_buys_elite_count, live_buys_good_count, pre_swaps_60m, pre_vol_unit
+		FROM scout_call_dataset_v WHERE call_id = ANY($1)`, ids)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dv.Close()
+	want := map[int]factors{}
+	for dv.Next() {
+		var id int
+		var f factors
+		if err := dv.Scan(&id, &f.Mcap, &f.EliteUSD, &f.GoodUSD, &f.BuyVol, &f.SellVol, &f.Chg,
+			&f.Holders, &f.Elite, &f.Good, &f.EliteN, &f.GoodN, &f.Swaps, &f.Unit); err != nil {
+			t.Fatal(err)
+		}
+		want[id] = f
+	}
+	if err := dv.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if len(want) != len(ids) {
+		t.Fatalf("dataset view: %d of %d calls", len(want), len(ids))
+	}
+	for _, id := range ids {
+		r := byID[id]
+		if r == nil {
+			t.Fatalf("call %d not listed", id)
+		}
+		got := factors{Mcap: r.CalledAtMcap, EliteUSD: r.LiveBuysEliteUSD, GoodUSD: r.LiveBuysGoodUSD, BuyVol: r.PreBuyVol60,
+			SellVol: r.PreSellVol60, Chg: r.PreChg60, Holders: r.Holders, Elite: r.ProofElite, Good: r.ProofGood,
+			EliteN: r.LiveBuysEliteCount, GoodN: r.LiveBuysGoodCount, Swaps: r.PreSwaps60, Unit: r.PreVolUnit}
+		if !reflect.DeepEqual(got, want[id]) {
+			t.Errorf("call %d: load query %s, want the dataset view's %s", id, dumpFactors(got), dumpFactors(want[id]))
+		}
+	}
+	// spot checks of the cases themselves (not only that both agree)
+	if r := byID[full]; r.PreVolUnit == nil || *r.PreVolUnit != "usd" || r.PreBuyVol60 == nil || *r.PreBuyVol60 != 15000.75 ||
+		r.PreSwaps60 == nil || *r.PreSwaps60 != 31 || r.Holders == nil || *r.Holders != 812 {
+		t.Errorf("full call: unit %v buy %v swaps %v holders %v", r.PreVolUnit, r.PreBuyVol60, r.PreSwaps60, r.Holders)
+	}
+	if r := byID[quote]; r.PreVolUnit == nil || *r.PreVolUnit != "VIRT" || r.PreChg60 != nil {
+		t.Errorf("quote-unit call: unit %v change %v", r.PreVolUnit, r.PreChg60)
+	}
+	if r := byID[noPre]; r.PreVolUnit != nil || r.PreSwaps60 != nil || r.PreBuyVol60 != nil {
+		t.Errorf("call without a precall row: unit %v swaps %v buy %v, want nil", r.PreVolUnit, r.PreSwaps60, r.PreBuyVol60)
+	}
+	if r := byID[noMetrics]; r.Holders != nil || r.LiveBuysEliteCount != nil || r.CalledAtMcap != nil {
+		t.Errorf("call without post metrics: holders %v elite buys %v mcap %v, want nil", r.Holders, r.LiveBuysEliteCount, r.CalledAtMcap)
+	}
+
+	// and as the page gets them
+	snap := mustWebSnapshot(t, rows, 0, nil)
+	a := decodeAnalytics(t, snap.analytics.plain)
+	checkAnaFactors(t, a, rows)
+}
+
+func dumpFactors(f any) string {
+	b, err := json.Marshal(f)
+	if err != nil {
+		return err.Error()
+	}
+	return string(b)
 }
