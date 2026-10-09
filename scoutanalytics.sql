@@ -378,7 +378,9 @@ SELECT cv.call_id, cv.message_id, cv.message_date, cv.contract_address, cv.statu
        r.ret_30d, r.max_gain_30d, r.max_dd_30d, r.ret_late_30d, r.max_gain_late_30d, r.max_dd_late_30d,
        -- return as of the most recent price (an outcome, like the columns above: never a feature)
        t.latest_price_usd::float8 AS latest_price_usd, t.latest_return_pct::float8 AS latest_return_pct,
-       t.latest_checked_at
+       t.latest_checked_at,
+       -- price events in the 24 h after the call (an outcome: never a feature; see tc below)
+       tc.trades_24h
 FROM scout_calls_v cv
 LEFT JOIN scout_call_tracking t ON t.call_id = cv.call_id
 LEFT JOIN scout_call_precall x ON x.call_id = cv.call_id
@@ -397,14 +399,15 @@ LEFT JOIN LATERAL (
     FROM scout_calls c3
     WHERE c3.message_date < cv.message_date AND c3.message_date >= cv.message_date - interval '24 hours'
 ) bz ON true
--- Perceptor verdict: this call's own scan, else the latest earlier scan of the same token.
+-- Perceptor verdict: this call's own scan, else the latest scan of the same token requested at or
+-- before the call (COALESCE: a manual scan has call_id NULL, and DESC puts NULL first).
 -- Live scans only: a rescan (scan_kind 'rescan') is today's verdict, not one known at call time.
 LEFT JOIN LATERAL (
     SELECT i.verdict_level FROM scout_investigations i
     JOIN scout_investigation_tools tt ON tt.id = i.tool_id
     WHERE tt.code = 'perceptor' AND i.status = 'completed' AND i.scan_kind = 'live'
       AND (i.call_id = cv.call_id OR (i.contract_address = cv.contract_address AND i.requested_at <= cv.message_date))
-    ORDER BY (i.call_id = cv.call_id) DESC, i.requested_at DESC LIMIT 1
+    ORDER BY COALESCE(i.call_id = cv.call_id, false) DESC, i.requested_at DESC, i.id DESC LIMIT 1
 ) p ON true
 LEFT JOIN LATERAL (
     SELECT
@@ -439,7 +442,23 @@ LEFT JOIN LATERAL (
       max(max_gain_late_pct)     FILTER (WHERE horizon = '30d')::float8 AS max_gain_late_30d,
       max(max_drawdown_late_pct) FILTER (WHERE horizon = '30d')::float8 AS max_dd_late_30d
     FROM scout_call_returns WHERE call_id = cv.call_id AND status = 'done'
-) r ON true;
+) r ON true
+-- trades_24h: price events (swaps; on a v2 pool every Sync, which includes liquidity
+-- added or removed; on a Pons curve CurveBuy/CurveSell) in the 24 h after the call,
+-- summed over the 5-minute candles (they cover exactly the first 24 h after entry_at;
+-- the trade at the call itself has no candle). NULL unless the call is priced on-chain
+-- and the tracker's current state has scanned through the 1d horizon (its candles are
+-- complete; a re-discovered pool starts over); 0 = scanned, no candle.
+LEFT JOIN LATERAL (
+    SELECT CASE WHEN t.entry_price_source LIKE 'onchain-%'
+                 AND COALESCE((t.onchain->>'v')::int, 0) >= 2  -- older states have no candles
+                 AND (t.onchain->'done'->>'1d') = 'true'
+                 AND now() >= t.entry_at + interval '24 hours'
+                THEN COALESCE(sum(cd.events), 0)::int END AS trades_24h
+    FROM scout_call_candles cd
+    WHERE cd.call_id = cv.call_id AND cd.interval_seconds = 300
+      AND cd.bucket_start < t.entry_at + interval '24 hours'
+) tc ON true;
 
 -- Scores next to what really happened (for a website or a live-accuracy check).
 CREATE VIEW scout_call_predictions_v AS

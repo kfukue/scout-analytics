@@ -154,3 +154,52 @@ def test_cap_comes_from_config(monkeypatch):
     from scout_ml import labels
     monkeypatch.setattr(labels, "MAX_OUTCOME_PCT", 50.0)
     assert build_labels(pd.DataFrame([row(ret_late_7d=60)]))["extreme"][0]
+
+
+def _dead_df():
+    """1d/3d/7d outcomes for: a dead flat call, a dead collapse, a busy flat call,
+    a flat call whose trades_24h is unknown, and one exactly at the threshold."""
+    flat = dict(max_gain_late_1d=5, ret_late_1d=-5, ret_late_3d=-8, ret_late_7d=-10)
+    return pd.DataFrame([
+        row(**flat, trades_24h=12),
+        row(max_gain_late_1d=5, ret_late_1d=-80, ret_late_3d=-80, ret_late_7d=-90, trades_24h=3),
+        row(**flat, trades_24h=400),
+        row(**flat, trades_24h=None),
+        row(**flat, trades_24h=50)])
+
+
+def test_dead_calls_become_collapses_in_every_bucket_and_stay_usable():
+    from scout_ml import config as C
+    from scout_ml.labels import dead_policy
+    df = _dead_df()
+    assert C.DEAD_IS_COLLAPSE and C.DEAD_TRADES_24H == 50 and dead_policy(df) == "on"
+    L = build_labels(df)
+    assert L["dead"].tolist() == [True, True, False, False, False]    # NULL / 50 are not dead
+    for b in ("short", "3day", "medium"):
+        assert L[f"usable_{b}"].all(), b                                 # dead calls stay in the data
+        assert L[f"collapse_plain_{b}"].tolist() == [0, 1, 0, 0, 0], b
+        assert L[f"collapse_{b}"].tolist() == [1, 1, 0, 0, 0], b         # NULL keeps the plain label
+        assert L[f"runner_{b}"].tolist() == [0, 0, 0, 0, 0], b           # runners untouched
+
+
+def test_dead_rule_can_be_switched_off_and_threshold_comes_from_config(monkeypatch):
+    from scout_ml import config as C
+    from scout_ml.labels import dead_policy
+    df = _dead_df()
+    monkeypatch.setattr(C, "DEAD_IS_COLLAPSE", False)
+    assert dead_policy(df) == "off"
+    L = build_labels(df)
+    assert L["collapse_short"].tolist() == L["collapse_plain_short"].tolist() == [0, 1, 0, 0, 0]
+    assert L["dead"].tolist() == [True, True, False, False, False]     # still counted for the report
+    monkeypatch.setattr(C, "DEAD_IS_COLLAPSE", True)
+    monkeypatch.setattr(C, "DEAD_TRADES_24H", 51)
+    assert build_labels(df)["collapse_short"].tolist() == [1, 1, 0, 0, 1]
+
+
+def test_dead_rule_is_skipped_when_the_column_is_missing():
+    from scout_ml.labels import dead_policy
+    df = _dead_df().drop(columns="trades_24h")
+    assert dead_policy(df) == "missing"
+    L = build_labels(df)
+    assert not L["dead"].any()
+    assert L["collapse_short"].tolist() == L["collapse_plain_short"].tolist() == [0, 1, 0, 0, 0]

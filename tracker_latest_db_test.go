@@ -285,18 +285,29 @@ func TestLatestPriceOldCall(t *testing.T) {
 		ltTime(t, row.LatestTradeAt).Sub(*c.Trade).Abs() > time.Second {
 		t.Fatalf("website row %+v", row)
 	}
-	// In the dataset view: the three columns, at the end.
+	// In the dataset view: the three columns, then trades_24h (the last column).
 	var cols []string
+	const wantTail = "latest_price_usd,latest_return_pct,latest_checked_at,trades_24h"
 	if err := st.Pool.QueryRow(ctx, `SELECT array_agg(column_name::text ORDER BY ordinal_position) FROM information_schema.columns
-		WHERE table_name = 'scout_call_dataset_v'`).Scan(&cols); err != nil || len(cols) < 3 ||
-		strings.Join(cols[len(cols)-3:], ",") != "latest_price_usd,latest_return_pct,latest_checked_at" {
-		t.Fatalf("dataset view columns end with %v (%v)", cols, err)
+		WHERE table_name = 'scout_call_dataset_v'`).Scan(&cols); err != nil || len(cols) < 4 ||
+		strings.Join(cols[len(cols)-4:], ",") != wantTail {
+		t.Fatalf("dataset view columns = %v (%v), want them to end with %s", cols, err, wantTail)
 	}
 	var vp, vr float64
 	if err := st.Pool.QueryRow(ctx, `SELECT latest_price_usd, latest_return_pct FROM scout_call_dataset_v WHERE call_id = $1 AND latest_checked_at IS NOT NULL`, id).Scan(&vp, &vr); err != nil ||
 		!ltNear(&vp, 9e-6*ltETH) || !ltNear(&vr, 350) {
 		t.Fatalf("dataset view: %v %v %v", vp, vr, err)
 	}
+	// trades_24h: the 1d horizon is scanned, so the view sums the 5-minute candles
+	// (non-NULL; 0 when there was no trade).
+	var trades *int
+	var candleEvents int
+	if err := st.Pool.QueryRow(ctx, `SELECT trades_24h, (SELECT COALESCE(sum(events), 0)::int FROM scout_call_candles
+		WHERE call_id = $1 AND interval_seconds = 300) FROM scout_call_dataset_v WHERE call_id = $1`, id).Scan(&trades, &candleEvents); err != nil ||
+		trades == nil || *trades != candleEvents {
+		t.Fatalf("dataset view trades_24h of call %d = %v (%v), want %d (its 5-minute candle events)", id, trades, err, candleEvents)
+	}
+	t.Logf("trades_24h = %d", *trades)
 
 	// Not due again until a day has gone by.
 	if res := s.refreshLatest(ctx, false); res.Due != 0 || f.took("eth_getLogs") != 0 {

@@ -196,10 +196,19 @@ def trading_metrics(y_runner, runner_score, y_collapse, collapse_score, net_ret)
         out.update(sim_top_mean=float(ret[top].mean()), sim_all_mean=float(ret.mean()),
                    sim_n_top=int(top.sum()), sim_beats_all=bool(ret[top].mean() > ret.mean()))
     if collapse_score is not None and len(collapse_score):
-        y = np.asarray(y_collapse, dtype=float)
-        if y.sum() > 0:
-            out["collapse_removed"] = float(y[top_mask(collapse_score, SKIP_FRAC)].sum() / y.sum())
+        out["collapse_removed"] = collapse_removed(y_collapse, collapse_score)
     return out
+
+
+def collapse_removed(y_collapse, collapse_score) -> float:
+    """Share of all collapses among the SKIP_FRAC highest collapse scores (NaN
+    without a score or without collapses)."""
+    if collapse_score is None or not len(collapse_score):
+        return np.nan
+    y = np.asarray(y_collapse, dtype=float)
+    if y.sum() <= 0:
+        return np.nan
+    return float(y[top_mask(collapse_score, SKIP_FRAC)].sum() / y.sum())
 
 
 def gates(test: dict, windows: list) -> dict:
