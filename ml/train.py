@@ -17,7 +17,7 @@ import numpy as np
 import pandas as pd
 
 from scout_ml import config as C
-from scout_ml.features import build_features, dex_family_rules, learn_cat_levels, num
+from scout_ml.features import build_features, category, dex_family_rules, learn_cat_levels, num
 from scout_ml.labels import build_labels, dead_policy
 from scout_ml.model import (apply_calibrator, best_rounds, fit_baseline, fit_lgbm, fit_platt,
                             fit_platt_recent, predict, usable_holdout)
@@ -90,7 +90,8 @@ def _finish_label(info, fitted, X, y, tr, te, out_dir, bucket, label):
         info["brier_all_rows"] = V.model_metrics(y[te], p_all)["brier"]
     gain = fitted["model"].booster_.feature_importance("gain")
     order = np.argsort(-gain)[:10]
-    fitted["p_logistic"] = fit_baseline(X[tr], y[tr]).predict_proba(X[te][C.NUMERIC_FEATURES])[:, 1]
+    fitted["baseline"] = fit_baseline(X[tr], y[tr])  # kept in memory only (never saved)
+    fitted["p_logistic"] = fitted["baseline"].predict_proba(X[te][C.NUMERIC_FEATURES])[:, 1]
     info.update(
         lightgbm=V.model_metrics(y[te], p_test),
         logistic=V.model_metrics(y[te], fitted["p_logistic"]),
@@ -169,20 +170,21 @@ def _train_label_kfold(X, y, split, folds, label, out_dir, bucket, dates):
     return _finish_label(info, fitted, X, y, tr, te, out_dir, bucket, label)
 
 
-def collapse_check(y_runner, runner_score, y_plain, y_trained, collapse_score, net_ret,
-                   dead_on: bool) -> dict:
+def collapse_check(y_runner, runner_score, y_plain, y_with_dead, collapse_score, net_ret,
+                   with_dead: bool) -> dict:
     """Trading metrics for one test part. "collapses removed" (the gate) is
     always measured on the PLAIN collapse label `y_plain`, whatever label the
-    collapse model was trained on. With the dead rule on, the share of the
-    trained-on label (collapse OR dead) removed by the same scores is added as
-    `collapse_removed_with_dead`: information only, never a gate."""
+    collapse model was trained on. With `with_dead` (the data has trades_24h),
+    the share of collapse OR dead (`y_with_dead`) removed by the same scores is
+    added as `collapse_removed_with_dead`: information only, never a gate."""
     out = V.trading_metrics(y_runner, runner_score, y_plain, collapse_score, net_ret)
-    if dead_on:
-        out["collapse_removed_with_dead"] = V.collapse_removed(y_trained, collapse_score)
+    if with_dead:
+        out["collapse_removed_with_dead"] = V.collapse_removed(y_with_dead, collapse_score)
     return out
 
 
-def _walk_forward(rows, Y, y_plain, net_ret, dates, tokens, horizon_days, rounds, dead_on):
+def _walk_forward(rows, Y, y_plain, y_with_dead, net_ret, dates, tokens, horizon_days, rounds,
+                  with_dead):
     """Refit per week with the main model's round count; ranking metrics only.
     Category levels are learned from each window's training rows. Collapses
     removed are measured on the plain label `y_plain` (see collapse_check)."""
@@ -202,8 +204,8 @@ def _walk_forward(rows, Y, y_plain, net_ret, dates, tokens, horizon_days, rounds
             row["skipped"] = "too few training rows per class or test rows"
         else:
             row.update(collapse_check(Y["runner"][te], scores["runner"], y_plain[te],
-                                      Y["collapse"][te], scores.get("collapse"), net_ret[te],
-                                      dead_on))
+                                      y_with_dead[te], scores.get("collapse"), net_ret[te],
+                                      with_dead))
             row["runner_auc"] = V.model_metrics(Y["runner"][te], scores["runner"])["roc_auc"]
         out.append(row)
     return out
@@ -238,9 +240,11 @@ def _dead_stats(L, b, use, te):
     return out
 
 
-def _train_bucket(b, df, L, out_dir, dead_on=False):
+def _train_bucket(b, df, L, out_dir, with_dead=False):
     """Returns (results, runner reference quantiles or None, category levels or None).
-    `out_dir` None: nothing is saved (a --variants run)."""
+    `out_dir` None: nothing is saved (a --variants run). `with_dead` (the data
+    has trades_24h): the "Dead after the call" table and the information
+    figures on collapse OR dead, whether or not the dead rule is on."""
     cfg = C.BUCKETS[b]
     use = L[f"usable_{b}"].to_numpy()
     res = {"usable": int(use.sum())}
@@ -293,16 +297,18 @@ def _train_bucket(b, df, L, out_dir, dead_on=False):
         return res, None, None
     # gate on the plain collapse label; collapse OR dead is information only
     y_plain = L[f"collapse_plain_{b}"][use].to_numpy()
+    y_with_dead = np.maximum(y_plain, L["dead"][use].to_numpy().astype(float))  # NULL: plain
     res["trading"] = collapse_check(Y["runner"][te], scores["runner"], y_plain[te],
-                                    Y["collapse"][te], scores["collapse"], net_ret[te], dead_on)
-    res["dead"] = _dead_stats(L, b, use, te)
+                                    y_with_dead[te], scores["collapse"], net_ret[te], with_dead)
+    if with_dead:
+        res["dead"] = _dead_stats(L, b, use, te)
     # collapse ROC AUC on the PLAIN label, comparable whatever label the model was trained on
     if "collapse" in rounds:
         res["collapse_auc_plain"] = {
             "lightgbm": V.model_metrics(y_plain[te], scores["collapse"])["roc_auc"],
             "logistic": V.model_metrics(y_plain[te], logistic["collapse"])["roc_auc"]}
-    res["walk_forward"] = _walk_forward(rows, Y, y_plain, net_ret, dates, tokens, h, rounds,
-                                        dead_on)
+    res["walk_forward"] = _walk_forward(rows, Y, y_plain, y_with_dead, net_ret, dates, tokens, h,
+                                        rounds, with_dead)
     res["gates"] = V.gates(res["trading"], res["walk_forward"])
     reference = np.quantile(scores["runner"], np.linspace(0, 1, C.N_REF_QUANTILES))
     return res, reference.tolist(), levels
@@ -339,11 +345,12 @@ def variant_summary(r: dict) -> dict:
         "passed": g["passed"]}
 
 
-def run_variants(df: pd.DataFrame, baseline: dict, base_policy: str) -> dict:
+def run_variants(df: pd.DataFrame, baseline: dict, has_trades: bool) -> dict:
     """Train every C.VARIANTS entry (one knob changed from the configured
     values) on the same rows and splits; report only, nothing is saved.
     `baseline`: the bucket results of the saved model, reused for "baseline".
-    `df`: sorted rows as prepared by `train`.
+    `df`: sorted rows as prepared by `train`. `has_trades`: the data has the
+    trades_24h column (else the C.TRADES_VARIANTS equal the baseline: n/a).
     A variant that raises is recorded as {"error": "error: <short message>"} and the
     others still run: the saved baseline must never be lost to a variant."""
     out = {}
@@ -354,7 +361,7 @@ def run_variants(df: pd.DataFrame, baseline: dict, base_policy: str) -> dict:
         if not knobs:
             entry["buckets"] = {b: variant_summary(r) for b, r in baseline.items()}
             continue
-        if base_policy == "missing" and name in C.TRADES_VARIANTS:
+        if not has_trades and name in C.TRADES_VARIANTS:
             entry["not_applicable"] = (f"the data has no {C.DEAD_COLUMN} column, so this "
                                        "variant equals the baseline")
             continue
@@ -365,7 +372,7 @@ def run_variants(df: pd.DataFrame, baseline: dict, base_policy: str) -> dict:
                 policy = dead_policy(df)
                 L = build_labels(df, policy)
                 entry["buckets"] = {
-                    b: variant_summary(_train_bucket(b, df, L, None, policy == "on")[0])
+                    b: variant_summary(_train_bucket(b, df, L, None, has_trades)[0])
                     for b in C.BUCKETS}
         except Exception as exc:  # not BaseException: Ctrl-C still stops the run
             failed += 1
@@ -381,6 +388,188 @@ def run_variants(df: pd.DataFrame, baseline: dict, base_policy: str) -> dict:
     return out
 
 
+def _top_stats(y, score) -> list:
+    """Per C.DEAD_SCORE_TOP_FRACS: precision of the top share by score (95% Wilson
+    interval), lift over the base rate (interval: Wilson / base rate, base fixed)
+    and the share of all positives caught by skipping that top share."""
+    y = np.asarray(y, dtype=float)
+    base, total = (float(y.mean()) if len(y) else np.nan), float(y.sum())
+    out = []
+    for frac in C.DEAD_SCORE_TOP_FRACS:
+        top = V.top_mask(score, frac)
+        k, n = int(y[top].sum()), int(top.sum())
+        lo, hi = V.wilson(k, n)
+        prec = k / n if n else np.nan
+        ok = base > 0
+        out.append({"frac": frac, "n_top": n, "dead_top": k, "precision": prec,
+                    "precision_lo": lo, "precision_hi": hi,
+                    "lift": prec / base if ok else np.nan,
+                    "lift_lo": lo / base if ok else np.nan, "lift_hi": hi / base if ok else np.nan,
+                    "caught": k / total if total > 0 else np.nan})
+    return out
+
+
+def _logistic_coefs(baseline) -> list:
+    """[feature, coefficient, input scale] of the logistic baseline, largest |coef|
+    first (C.DEAD_SCORE_N_COEF). Coefficients are per standard deviation of the
+    standardised input: log1p(x) for skewed columns, x as is for the others."""
+    names = list(C.LOG1P_FEATURES) + [c for c in C.NUMERIC_FEATURES if c not in C.LOG1P_FEATURES]
+    coef = baseline[-1].coef_.ravel()
+    if len(coef) != len(names):   # never expected (keep_empty_features); do not mislabel
+        raise ValueError(f"{len(coef)} logistic coefficients for {len(names)} inputs")
+    order = np.argsort(-np.abs(coef), kind="stable")[:C.DEAD_SCORE_N_COEF]
+    return [[names[i], float(coef[i]), "log1p" if names[i] in C.LOG1P_FEATURES else "as is"]
+            for i in order]
+
+
+def _gate_index() -> int:
+    """Position of C.DEAD_SCORE_GATE_FRAC (the "top-10%" share) in
+    C.DEAD_SCORE_TOP_FRACS, looked up by value; raises if it is not there."""
+    for i, f in enumerate(C.DEAD_SCORE_TOP_FRACS):
+        if math.isclose(f, C.DEAD_SCORE_GATE_FRAC):
+            return i
+    raise ValueError(f"DEAD_SCORE_GATE_FRAC {C.DEAD_SCORE_GATE_FRAC} is not in "
+                     f"DEAD_SCORE_TOP_FRACS {C.DEAD_SCORE_TOP_FRACS}")
+
+
+def _dead_waves(dates, y, families=None) -> list:
+    """Dead calls per calendar week (Monday, UTC), most dead first; with
+    `families` (dex_family per row) also the dex_family counts of the dead calls."""
+    week = pd.to_datetime(dates, utc=True).dt.tz_localize(None).dt.to_period("W-SUN").dt.start_time
+    frame = pd.DataFrame({"week": week.to_numpy(), "dead": np.asarray(y, dtype=float)})
+    g = frame.groupby("week")["dead"].agg(["sum", "size"])
+    g = g.sort_values(["sum", "size"], ascending=False, kind="stable")
+    fam = None
+    if families is not None:
+        frame["family"] = pd.Series(families).fillna("(none)").to_numpy()
+        fam = frame[frame["dead"] == 1].groupby("week")["family"].value_counts()
+    out = []
+    for i, r in g.iterrows():
+        w = {"week": i.strftime("%Y-%m-%d"), "dead": int(r["sum"]), "calls": int(r["size"])}
+        if fam is not None:
+            w["dead_families"] = ({str(k): int(v) for k, v in fam.loc[i].items()}
+                                  if i in fam.index.get_level_values(0) else {})
+        out.append(w)
+    return out
+
+
+def _dead_walk_forward(rows, y, dates, tokens, horizon_days, rounds) -> list:
+    """Weekly expanding windows (as for the buckets): LightGBM with the main
+    round count and the logistic baseline refitted per week; ranking only."""
+    gi = _gate_index()
+    out = []
+    for w in V.walk_forward_windows(dates, tokens, horizon_days):
+        tr, te = w["train"], w["test"]
+        n_dead = int(y[te].sum())
+        row = {"week": w["week"], "start": w["start"].strftime("%Y-%m-%d"),
+               "n_train": int(tr.sum()), "n_test": int(te.sum()), "n_dead": n_dead,
+               "few_dead": n_dead < C.DEAD_SCORE_MIN_WEEK_DEAD}
+        if min(y[tr].sum(), (1 - y[tr]).sum()) < C.MIN_CLASS_ROWS or not V.window_ok(te.sum()):
+            row["skipped"] = "too few training rows per class or test rows"
+            out.append(row)
+            continue
+        X = build_features(rows, learn_cat_levels(rows[tr]))
+        p = predict(fit_lgbm(X[tr], y[tr], n_estimators=rounds), X[te])
+        p_log = fit_baseline(X[tr], y[tr]).predict_proba(X[te][C.NUMERIC_FEATURES])[:, 1]
+        base = float(y[te].mean())
+        for name, s in (("lightgbm", p), ("logistic", p_log)):
+            top = _top_stats(y[te], s)
+            row[name] = {"roc_auc": V.model_metrics(y[te], s)["roc_auc"],
+                         "top10_precision": top[gi]["precision"], "top10_lift": top[gi]["lift"],
+                         "caught": {f"{t['frac']:g}": t["caught"] for t in top}}
+        row["base_rate"] = base
+        out.append(row)
+    return out
+
+
+def dead_score(df: pd.DataFrame, L: pd.DataFrame) -> dict:
+    """The separate "dead after the call" score (report only; nothing saved).
+
+    Label: dead = trades_24h < C.DEAD_TRADES_24H; rows with NULL trades_24h are
+    left out (not negatives). Rows and split: the usable rows of
+    C.DEAD_SCORE_SPLIT_BUCKET with its own time split (same function, same rows,
+    so the same boundaries and embargo), then restricted to known trades_24h.
+    Inputs: build_features, i.e. C.FEATURES (trades_24h is forbidden there)."""
+    if C.DEAD_COLUMN not in df.columns:
+        return {"not_applicable": f"the data has no {C.DEAD_COLUMN} column"}
+    b = C.DEAD_SCORE_SPLIT_BUCKET
+    h = C.BUCKETS[b]["horizon_days"]
+    use = L[f"usable_{b}"].to_numpy()
+    rows_b = df[use].reset_index(drop=True)
+    trades = num(rows_b, C.DEAD_COLUMN).to_numpy()
+    known = ~np.isnan(trades)
+    res = {"bucket": b, "threshold": C.DEAD_TRADES_24H, "horizon_days": h,
+           "usable": int(use.sum()), "known": int(known.sum()),
+           "null_excluded": int((~known).sum()), "features": list(C.FEATURES)}
+    if known.sum() < C.MIN_BUCKET_ROWS:
+        res["skipped"] = (f"only {int(known.sum())} {b}-bucket rows with a known "
+                          f"{C.DEAD_COLUMN} (need {C.MIN_BUCKET_ROWS})")
+        return res
+    split_b = V.time_split(rows_b["message_date"], rows_b["contract_address"], h)
+    rows = rows_b[known].reset_index(drop=True)
+    y = (trades[known] < C.DEAD_TRADES_24H).astype(float)
+    split = {k: split_b[k][known] for k in ("train", "val", "test")}
+    res["split"] = {"t1": split_b["t1"].strftime("%Y-%m-%d %H:%M"),
+                    "t2": split_b["t2"].strftime("%Y-%m-%d %H:%M")}
+    res["parts"] = {k: {"n": int(m.sum()), "dead": int(y[m].sum()),
+                        "base_rate": float(y[m].mean()) if m.any() else np.nan}
+                    for k, m in split.items()}
+    dates, tokens = rows["message_date"], rows["contract_address"]
+    res["waves"] = _dead_waves(dates, y, category(rows, "dex_family"))
+    tr, te = split["train"], split["test"]
+    if te.sum() < C.MIN_CLASS_ROWS:
+        res["skipped"] = f"only {int(te.sum())} test rows after the time split"
+        return res
+    X = build_features(rows, learn_cat_levels(rows[tr]))
+    info, fitted, p_test = _train_label(X, y, split, "dead", None, "dead", dates)
+    res["label"] = info
+    if fitted is None:
+        res["skipped"] = info["skipped"]
+        return res
+    res["top"] = {"lightgbm": _top_stats(y[te], p_test),
+                  "logistic": _top_stats(y[te], fitted["p_logistic"])}
+    res["logistic_coefs"] = _logistic_coefs(fitted["baseline"])
+    res["walk_forward"] = _dead_walk_forward(rows, y, dates, tokens, h, info["rounds"])
+    res["proposal"] = dead_score_proposal(res)
+    return res
+
+
+def dead_score_proposal(res: dict) -> dict:
+    """How this run fares against the PROPOSED gates (never applied): top-10%
+    lift >= C.DEAD_SCORE_PROPOSED_LIFT in the test part, and in more than half of
+    the walk-forward weeks with at least C.DEAD_SCORE_MIN_WEEK_DEAD dead calls."""
+    out = {"min_lift": C.DEAD_SCORE_PROPOSED_LIFT}
+    gi = _gate_index()
+    for model in ("lightgbm", "logistic"):
+        top = res["top"][model][gi]
+        if not math.isclose(top["frac"], C.DEAD_SCORE_GATE_FRAC):
+            raise ValueError(f"top share {top['frac']} where {C.DEAD_SCORE_GATE_FRAC} was expected")
+        lift = top["lift"]
+        weeks = [w for w in res["walk_forward"]
+                 if not w.get("skipped") and not w["few_dead"]]
+        meet = sum(bool(w[model]["top10_lift"] >= C.DEAD_SCORE_PROPOSED_LIFT) for w in weeks)
+        out[model] = {"test_lift": lift,
+                      "test_ok": bool(lift >= C.DEAD_SCORE_PROPOSED_LIFT),
+                      "weeks_meeting": meet, "weeks_judged": len(weeks),
+                      "weeks_ok": bool(weeks) and meet * 2 > len(weeks)}
+        out[model]["would_pass"] = out[model]["test_ok"] and out[model]["weeks_ok"]
+    return out
+
+
+def run_dead_score(df: pd.DataFrame, L: pd.DataFrame) -> dict:
+    """dead_score, never failing the run: an error is recorded as
+    {"error": "error: <short message>"} and a WARNING printed."""
+    t0 = time.time()
+    try:
+        out = dead_score(df, L)
+    except Exception as exc:  # not BaseException: Ctrl-C still stops the run
+        out = {"error": variant_error(exc)}
+        print(f"WARNING: the dead score failed ({out['error']}); the saved models are not "
+              "affected", flush=True)
+    print(f"[dead score] {time.time() - t0:.0f} s", flush=True)
+    return out
+
+
 def train(df: pd.DataFrame, out_root, version: str | None = None, variants: bool = False) -> Path:
     """Run the whole pipeline on raw view rows; returns the version directory.
     `variants`: also train C.VARIANTS for the report (never saved or served)."""
@@ -391,10 +580,16 @@ def train(df: pd.DataFrame, out_root, version: str | None = None, variants: bool
     df["message_date"] = pd.to_datetime(df["message_date"], utc=True, format="ISO8601")
     df = df.sort_values("message_date").reset_index(drop=True)
     policy = dead_policy(df)
+    has_trades = C.DEAD_COLUMN in df.columns
     if policy == "missing":
         print(f"WARNING: the data has no {C.DEAD_COLUMN} column (the view on the server predates "
               "it; apply scoutanalytics.sql, see RUNBOOK.md): the dead-after-the-call rule is "
-              "SKIPPED, collapse labels are the plain ones", flush=True)
+              "SKIPPED, collapse labels are the plain ones, and the separate dead score is n/a",
+              flush=True)
+    elif not has_trades:
+        print(f"WARNING: the data has no {C.DEAD_COLUMN} column (the view on the server predates "
+              "it; apply scoutanalytics.sql, see RUNBOOK.md): the dead-after-the-call table and "
+              "the separate dead score are n/a", flush=True)
     L = build_labels(df, policy)
     call = ~L["update"]  # update posts are not calls: out of training, counted on their own
     first = call & ~L["repeat"]  # later calls of a token: out of training, counted on their own
@@ -412,6 +607,7 @@ def train(df: pd.DataFrame, out_root, version: str | None = None, variants: bool
         "extreme": int(extreme.sum()),
         "eligible": int(eligible.sum()),
         "dead_policy": policy,
+        "trades_24h_present": has_trades,
         "trades_24h_known": int((eligible & num(df, C.DEAD_COLUMN).notna()).sum()),
         "dead": int((eligible & L["dead"]).sum()),
         # runner label also needs trades_24h >= this (None: rule off, the default)
@@ -421,7 +617,7 @@ def train(df: pd.DataFrame, out_root, version: str | None = None, variants: bool
                      for c in raw_cols}}}
     reference, cat_levels = {}, {}  # per trained bucket: learned from its training rows
     for b in C.BUCKETS:
-        res["buckets"][b], ref, levels = _train_bucket(b, df, L, out_dir, policy == "on")
+        res["buckets"][b], ref, levels = _train_bucket(b, df, L, out_dir, has_trades)
         if ref is not None:
             reference[b], cat_levels[b] = ref, levels
         status = res["buckets"][b]
@@ -444,8 +640,19 @@ def train(df: pd.DataFrame, out_root, version: str | None = None, variants: bool
     meta = json.loads(json.dumps(_json_safe(meta), allow_nan=False))  # fixed before any variant runs
     _write_version(out_dir, meta, res)
     (Path(out_root) / "LATEST").write_text(version + "\n")
-    if variants:  # the saved model is complete above; variants only add to meta.json / report.md
-        res["variants"] = run_variants(df, res["buckets"], policy)
+    # The saved model is complete above; the dead score and the variants only add
+    # to meta.json / report.md, and an error in either never fails the run.
+    res["dead_score"] = run_dead_score(df, L)
+    try:  # rendering the section must not fail the run either
+        meta["dead_score"] = _json_safe(res["dead_score"])
+        _write_version(out_dir, meta, res)
+    except Exception as exc:
+        res["dead_score"] = meta["dead_score"] = {"error": variant_error(exc)}
+        print(f"WARNING: the dead score failed ({meta['dead_score']['error']}); the saved "
+              "models are not affected", flush=True)
+        _write_version(out_dir, meta, res)
+    if variants:
+        res["variants"] = run_variants(df, res["buckets"], has_trades)
         meta["variants"] = _json_safe(res["variants"])
         _write_version(out_dir, meta, res)
     return out_dir
