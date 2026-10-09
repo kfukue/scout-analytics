@@ -111,6 +111,13 @@ relevant files, the rules below, and what to report back.
   never call the real nodes.
 - Frontend JS: `node --check`. Website changes: benchmark
   `BenchmarkWebSnapshot` before and after.
+- Headless browser checks: a throwaway `--user-data-dir` in the session
+  scratchpad, and Edge/Chrome started with `--disable-sync --disable-extensions
+  --no-first-run --no-default-browser-check` (plus Edge `--inprivate` if it
+  works headless), so the test profile is never signed into the owner's
+  Microsoft account and never loads his extensions (on 9 October a test
+  profile synced his extensions, a wallet among them). Close the browser by
+  PID and delete the profile directory afterwards. Pass this on to coders.
 - ML: `python -m pytest tests -q` inside `ml/`.
 - Every behaviour change gets a test.
 - Known flaky: `TestLatestPriceInterruptedLeavesRowUntouched` (about 1 in 10);

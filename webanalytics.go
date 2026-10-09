@@ -22,17 +22,19 @@ import (
 )
 
 // ---------------------------------------------------------------------------
-// Analytics page (frontend/analytics.html), section "Call performance": one
-// compact row per first call, built once per snapshot and served as is by GET
-// /api/analytics. The page groups and filters the rows itself (by week or
-// month, Perceptor verdict at the call, pool family, posted DEX, quote asset),
-// so no request does more than send these bytes.
+// Analytics page (frontend/analytics.html), section "Call performance" with
+// its tabs Overview, By factor and Peak vs final: one compact row per first
+// call, built once per snapshot and served as is by GET /api/analytics. The
+// page groups, filters and draws the rows itself (by week or month, Perceptor
+// verdict at the call, pool family, posted DEX, quote asset, and the values
+// known at the call: webAnalyticsFactors), so no request does more than send
+// these bytes.
 // ---------------------------------------------------------------------------
 
 const (
 	// webAnalyticsFormat: the shape of the body (field "format"); raise it
 	// when the columns change, so the page can tell.
-	webAnalyticsFormat = 1
+	webAnalyticsFormat = 2
 	// webQuietTrades: a call with fewer swaps than this in the 24 hours after
 	// it counts as "quiet after the call" on the Analytics page. For Uniswap v2
 	// pools the tracker counts Sync events, which liquidity changes also emit.
@@ -47,15 +49,29 @@ const (
 	webAnalyticsMaxName = 60
 )
 
+// webAnalyticsFactors names the values known at the time of the call that
+// follow the per-window numbers in each row (the "By factor" tab; null when
+// missing): the market cap the post was called at, as posted (USD; for calls priced in
+// USD only, like every number of the page, see webAnaMcap), the holders, the
+// elite and good holders, the elite and good live buys (count, then USD), and
+// the hour of trading before the call: buy and sell volume (USD; null when
+// the hour was measured in the quote asset), swaps, and the price change
+// (percent). Dollar amounts are rounded to whole dollars, and to 3
+// significant digits from $1,000 up; the price change to 0.1.
+var webAnalyticsFactors = []string{"mcap", "holders", "proof_elite", "proof_good",
+	"buys_elite_n", "buys_good_n", "buys_elite_usd", "buys_good_usd",
+	"pre_buy_usd", "pre_sell_usd", "pre_swaps", "pre_chg"}
+
 // webAnalyticsColumns names the values of each row of GET /api/analytics, in
-// order; then come, per window of ScoutWebHorizons, its return, peak and worst
-// drop (late entry, USD, percent; null when missing).
+// order; after the first nine come, per window of ScoutWebHorizons, its
+// return, peak and worst drop (late entry, USD, percent; null when missing),
+// then webAnalyticsFactors.
 var webAnalyticsColumns = func() []string {
 	cols := []string{"call_id", "t", "flags", "verdict", "family", "dex", "quote", "trades_24h", "no_data"}
 	for _, h := range ScoutWebHorizons {
 		cols = append(cols, "ret_"+h, "peak_"+h, "dd_"+h)
 	}
-	return cols
+	return append(cols, webAnalyticsFactors...)
 }()
 
 // Bits of the "flags" column.
@@ -187,6 +203,80 @@ func appendAnaNum(b []byte, v float64) []byte {
 	return strconv.AppendFloat(b, v, 'f', -1, 64)
 }
 
+// appendAnaUSD appends a dollar amount for the page: whole dollars, 3
+// significant digits from $1,000 up (enough to group calls by it, and short);
+// null when missing, negative or not finite (and at 0 when aboveZero).
+func appendAnaUSD(b []byte, p *float64, aboveZero bool) []byte {
+	if p == nil {
+		return append(b, "null"...)
+	}
+	v := *p
+	if math.IsNaN(v) || math.IsInf(v, 0) || v < 0 || (aboveZero && v <= 0) {
+		return append(b, "null"...)
+	}
+	if v >= 1000 {
+		e := math.Pow(10, math.Floor(math.Log10(v))-2)
+		v = math.Round(v/e) * e
+		if v >= 1e15 {
+			return strconv.AppendFloat(b, v, 'g', 3, 64)
+		}
+	}
+	return strconv.AppendFloat(b, math.Round(v), 'f', 0, 64)
+}
+
+// appendAnaInt appends a count, or null.
+func appendAnaInt(b []byte, p *int) []byte {
+	if p == nil {
+		return append(b, "null"...)
+	}
+	return strconv.AppendInt(b, int64(*p), 10)
+}
+
+// webAnaMcap is the "mcap" value of a prepared row: the market cap the post
+// was called at (scout_call_metrics.called_at_mcap_usd, as in the dataset
+// view; no fallback to the "Mcap" line), when positive and the call is priced
+// in USD; else nil. This is the market cap as posted: one worked out from the
+// tracker's entry price would need the token's supply, which is not stored.
+// hashWebRows hashes this value, so a change to it changes the snapshot
+// version (and the ETag).
+func webAnaMcap(r *ScoutWebRow) *float64 {
+	if !r.usd {
+		return nil
+	}
+	return positive(r.CalledAtMcap)
+}
+
+// appendAnaFactors appends the webAnalyticsFactors of a row, each after a comma.
+func appendAnaFactors(out []byte, r *ScoutWebRow) []byte {
+	out = append(out, ',')
+	out = appendAnaUSD(out, webAnaMcap(r), true)
+	for _, p := range [...]*int{r.Holders, r.ProofElite, r.ProofGood, r.LiveBuysEliteCount, r.LiveBuysGoodCount} {
+		out = append(out, ',')
+		out = appendAnaInt(out, p)
+	}
+	out = append(out, ',')
+	out = appendAnaUSD(out, r.LiveBuysEliteUSD, false)
+	out = append(out, ',')
+	out = appendAnaUSD(out, r.LiveBuysGoodUSD, false)
+	// the volumes only when measured in USD (else in the quote asset)
+	usd := r.PreVolUnit != nil && *r.PreVolUnit == "usd"
+	for _, p := range [...]*float64{r.PreBuyVol60, r.PreSellVol60} {
+		out = append(out, ',')
+		if !usd {
+			out = append(out, "null"...)
+			continue
+		}
+		out = appendAnaUSD(out, p, false)
+	}
+	out = append(out, ',')
+	out = appendAnaInt(out, r.PreSwaps60)
+	out = append(out, ',')
+	if r.PreChg60 == nil {
+		return append(out, "null"...)
+	}
+	return appendAnaNum(out, *r.PreChg60)
+}
+
 // webAnalyticsVerdictIndex: the "verdict" column of a row.
 func webAnalyticsVerdictIndex(v *string) int {
 	if v == nil {
@@ -223,7 +313,7 @@ func buildWebAnalytics(rows []ScoutWebRow, prev *webAnalytics) (*webAnalytics, e
 	dexes.freeze()
 	quotes.freeze()
 
-	out := make([]byte, 0, 64+len(rows)*130)
+	out := make([]byte, 0, 64+len(rows)*180)
 	out = append(out, '[')
 	for i := range rows {
 		r := &rows[i]
@@ -277,6 +367,7 @@ func buildWebAnalytics(rows []ScoutWebRow, prev *webAnalytics) (*webAnalytics, e
 			}
 			out = appendAnaNum(out, r.anaPerf[j])
 		}
+		out = appendAnaFactors(out, r)
 		out = append(out, ']')
 	}
 	out = append(out, ']')
