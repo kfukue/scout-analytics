@@ -691,6 +691,17 @@ type webServer struct {
 	// the snapshot does not hold yet are asked for, as part of the same read
 	// as readRows. nil = no texts: the rows then show no report detail.
 	readReports func(context.Context, []int) (map[int]*ScoutWebReport, error)
+	// readTrades reads the swaps in the first 24 hours of the given calls
+	// (ScoutStore.SelectWebTrades24h; tests put a fake in its place) right
+	// after readRows. nil = no counts (all unknown). It is a query of its own
+	// (Pool.Query), outside the read-only transaction of SelectWebRows, so it
+	// can see a slightly later moment. That is safe: it is asked only for rows
+	// with TradesFinal, which needs the 1d result stored, and the tracker
+	// stores a window's candles (UpsertCandles, tracker_onchain.go) before its
+	// result (UpsertReturn via saveHorizonOnchain), each committed on its own;
+	// so a call counted final already has its first 24 hours of candles. A
+	// failed read does not fail the refresh (fillTrades24h).
+	readTrades func(context.Context, []int) (map[int]int, error)
 	// life is the context the reads run under: cancelled when the website
 	// stops, never by a single request (runWeb sets it; Background otherwise).
 	life context.Context
@@ -711,6 +722,14 @@ type webServer struct {
 	errLog    logLimiter
 	failing   bool
 	lastRows  int // rows of the last snapshot (−1 = none yet)
+	// trades: swaps in the first 24 hours by call id, for the calls whose
+	// count is complete (see fillTrades24h); tradesAt: when all of them were
+	// last read; tradesErrLog: the "could not read the trade counts" lines (a
+	// failed count read does not fail the refresh, so errLog, reset by every
+	// refresh that succeeds, cannot limit them)
+	trades       map[int]int
+	tradesAt     time.Time
+	tradesErrLog logLimiter
 
 	// events: the open live-update streams (GET /api/events); every refresh
 	// publishes what changed (events.go)
@@ -730,15 +749,18 @@ type webRefreshCall struct {
 }
 
 // newWebServer builds the site: GET /api/summary, GET /api/calls, GET
-// /api/call, GET /api/events, POST /api/refresh and the page. The API answers
+// /api/call, GET /api/analytics, GET /api/events, POST /api/refresh and the
+// pages. The API answers
 // 503 until refresh has succeeded once.
 func newWebServer(st *ScoutStore, cfg webConfig, static fs.FS) (*webServer, error) {
 	s := &webServer{st: st, cfg: cfg, static: static, mux: http.NewServeMux(), lastRows: -1,
-		errLog: logLimiter{every: webErrorLogEvery}, life: context.Background(), manualWait: webManualRefreshWait,
+		errLog: logLimiter{every: webErrorLogEvery}, tradesErrLog: logLimiter{every: webErrorLogEvery},
+		life: context.Background(), manualWait: webManualRefreshWait,
 		events: newWebEventHub(webEventsMaxClients, webEventsClientBuf), sseHeartbeat: webSSEHeartbeat}
 	if st != nil {
 		s.readRows = st.SelectWebRows
 		s.readReports = st.SelectWebReports
+		s.readTrades = st.SelectWebTrades24h
 	}
 	if cfg.Dir == "" {
 		files, err := loadWebStatic(static)
@@ -750,6 +772,7 @@ func newWebServer(st *ScoutStore, cfg webConfig, static fs.FS) (*webServer, erro
 	s.mux.HandleFunc("/api/summary", s.handleSummary)
 	s.mux.HandleFunc("/api/calls", s.handleCalls)
 	s.mux.HandleFunc("/api/call", s.handleCall)
+	s.mux.HandleFunc("/api/analytics", s.handleAnalytics)
 	s.mux.HandleFunc("/api/events", s.handleEvents)
 	s.mux.HandleFunc(webRefreshPath, s.handleRefresh)
 	s.mux.HandleFunc("/api/", func(w http.ResponseWriter, r *http.Request) {
@@ -836,6 +859,9 @@ func (s *webServer) readSnapshot(ctx context.Context) error {
 	var reports map[int]*webReport
 	if err == nil {
 		reports, err = s.readReportTexts(ctx, rows)
+	}
+	if err == nil {
+		s.fillTrades24h(ctx, rows, start) // never fails the refresh (see there)
 	}
 	if err != nil {
 		s.failing = true

@@ -1,0 +1,123 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<meta name="referrer" content="no-referrer">
+<title>Scout analytics</title>
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="style.css">
+<script src="analytics.js" defer></script>
+</head>
+<body>
+<header class="topbar">
+  <div class="topbar-inner">
+    <h1>Scout analytics</h1>
+    <nav class="topnav" aria-label="Pages">
+      <a href="./">Calls</a>
+      <a href="analytics.html" aria-current="page">Analytics</a>
+    </nav>
+  </div>
+</header>
+<main>
+
+  <section class="panel" aria-labelledby="perf-title">
+    <div class="panel-head">
+      <h2 id="perf-title">Call performance</h2>
+      <div class="panel-tools">
+        <span id="ana-updated" class="muted"></span>
+        <button type="button" id="ana-reload" class="btn btn-quiet">Reload</button>
+      </div>
+    </div>
+    <p class="ana-scope"><strong>First calls only</strong> (one per token), <strong>late entry</strong> (the price 60 seconds after the post), <strong>in USD</strong>, <strong>before tax</strong>.</p>
+
+    <div class="controls ana-controls">
+      <div class="window-pick">
+        <span id="ana-h-label">Window</span>
+        <div id="ana-horizon" class="segmented compact" role="group" aria-labelledby="ana-h-label">
+          <button type="button" data-horizon="1h" aria-pressed="false">1h</button>
+          <button type="button" data-horizon="1d" aria-pressed="true">1d</button>
+          <button type="button" data-horizon="3d" aria-pressed="false">3d</button>
+          <button type="button" data-horizon="7d" aria-pressed="false">7d</button>
+          <button type="button" data-horizon="30d" aria-pressed="false">30d</button>
+        </div>
+      </div>
+      <div class="window-pick">
+        <span id="ana-q-label">Quiet after the call</span>
+        <div id="ana-quiet" class="segmented compact" role="group" aria-labelledby="ana-q-label">
+          <button type="button" data-quiet="all" aria-pressed="true">Include</button>
+          <button type="button" data-quiet="exclude" aria-pressed="false">Exclude</button>
+          <button type="button" data-quiet="only" aria-pressed="false">Only quiet</button>
+        </div>
+      </div>
+      <div class="window-pick">
+        <span id="ana-p-label">Period</span>
+        <div id="ana-period" class="segmented compact" role="group" aria-labelledby="ana-p-label">
+          <button type="button" data-period="week" aria-pressed="true">Week</button>
+          <button type="button" data-period="month" aria-pressed="false">Month</button>
+        </div>
+      </div>
+    </div>
+
+    <p id="ana-msg" class="notice" role="status">Loading…</p>
+    <p id="ana-error" class="notice error" role="alert" hidden></p>
+
+    <div id="ana-body" hidden>
+      <dl id="ana-counts" class="stats"></dl>
+      <p id="ana-counts-note" class="muted small note"></p>
+
+      <h3 class="ana-h" id="t-all">All first calls</h3>
+      <div class="ana-wrap" tabindex="0" role="region" aria-labelledby="t-all"><table id="tbl-all" aria-labelledby="t-all"></table></div>
+
+      <h3 class="ana-h" id="t-verdict">By Perceptor verdict at the time of the call</h3>
+      <div class="ana-wrap" tabindex="0" role="region" aria-labelledby="t-verdict"><table id="tbl-verdict" aria-labelledby="t-verdict"></table></div>
+
+      <h3 class="ana-h" id="t-family">By pool family (the pool the tracker priced the call from)</h3>
+      <div class="ana-wrap" tabindex="0" role="region" aria-labelledby="t-family"><table id="tbl-family" aria-labelledby="t-family"></table></div>
+
+      <h3 class="ana-h" id="t-dex">By DEX named in the post</h3>
+      <div class="ana-wrap" tabindex="0" role="region" aria-labelledby="t-dex"><table id="tbl-dex" aria-labelledby="t-dex"></table></div>
+
+      <h3 class="ana-h" id="t-quote">By quote asset of the pool</h3>
+      <div class="ana-wrap" tabindex="0" role="region" aria-labelledby="t-quote"><table id="tbl-quote" aria-labelledby="t-quote"></table></div>
+
+      <h3 class="ana-h" id="t-period">By week</h3>
+      <div class="ana-wrap" tabindex="0" role="region" aria-labelledby="t-period"><table id="tbl-period" aria-labelledby="t-period"></table></div>
+
+      <h3 class="ana-h" id="t-matrix">Median return by week and Perceptor verdict</h3>
+      <div class="ana-wrap" tabindex="0" role="region" aria-labelledby="t-matrix"><table id="tbl-matrix" aria-labelledby="t-matrix"></table></div>
+    </div>
+
+    <details class="legend" open>
+      <summary>What the columns mean</summary>
+      <dl>
+        <div><dt>Scope</dt><dd>Each token once: its first call (repeat calls and update posts are left out). Returns are measured from the price 60 seconds after the post (late entry), in USD, before any buy or sell tax. Calls tracked in another asset (no USD price) and calls not tracked are counted under Calls but have no numbers.</dd></div>
+        <div><dt>Window</dt><dd>Every number is for the window chosen above (1h, 1d, 3d, 7d or 30d after the call) and counts only the calls that have a recorded return for it.</dd></div>
+        <div><dt>Calls</dt><dd>First calls in the group (after the "Quiet after the call" choice).</dd></div>
+        <div><dt>With data</dt><dd>Of those, the calls with a return for the window: the n of every number in the row. Hover over it to see why the others have none: not due yet (the window has not passed), due but no data (the price source had no trades for it), waiting for the tracker, not tracked, or not priced in USD.</dd></div>
+        <div><dt>Mean, Median</dt><dd>Average and middle return over the window. A few very large winners pull the mean far up; the median is the typical call.</dd></div>
+        <div><dt>Win rate</dt><dd>Share of the calls with data whose return is above 0%. Under each rate: how many of how many calls.</dd></div>
+        <div><dt>≥ +100% peak</dt><dd>Share whose highest price within the window was at least double the entry (peak ≥ +100%), counted over the calls with a peak. A rugged call's peak before the rug counts.</dd></div>
+        <div><dt>Collapse</dt><dd>Share whose return over the window is −50% or worse.</dd></div>
+        <div><dt>Median peak, Median drop</dt><dd>The middle of the highest and of the lowest price within the window, from the entry.</dd></div>
+        <div><dt>Rugged</dt><dd>Calls with data that the tracker has flagged rugged (pool drained) as of now, not as of the window's end. The returns after a rug count as −100%.</dd></div>
+        <div><dt>Perceptor verdict at the call</dt><dd>The verdict of the call's own Perceptor scan, or of the latest earlier scan of the token, made when it was called. Later scans (a repeat call's, or a re-scan long after the call) are never used here, unlike the list's Perceptor column, which shows the token's latest scan. Calls imported from history were not scanned.</dd></div>
+        <div><dt>Pool family</dt><dd>The kind of pool the tracker priced the call from: Uniswap v2, v3, v4 or the Pons launch curve. "GeckoTerminal" = priced from GeckoTerminal candles (no on-chain pool); "Not tracked" = no entry price.</dd></div>
+        <div><dt>DEX in the post</dt><dd>The DEX name the call post gives, as written: the most frequent ones, the rest under "Other". Names change over time (for example "Pons" until mid-August, then "Pons V2").</dd></div>
+        <div><dt>Quiet after the call</dt><dd>A call with fewer than <span id="lg-quiet">50</span> trades in the 24 hours after it (counted from the stored 5-minute candles; for Uniswap v2 pools liquidity changes count too). Rugged calls are never counted as quiet. The count is known only for calls priced from an on-chain pool whose first day the tracker has stored; for the others (GeckoTerminal, untracked, not yet a day old) it is unknown, and "Exclude" keeps them while "Only quiet" leaves them out.</dd></div>
+        <div><dt>Week, Month</dt><dd>By the time of the call in UTC. Weeks run Monday to Sunday ("Week of Mon 3 Aug 2026").</dd></div>
+        <div><dt><span class="ana-few">grey</span></dt><dd>A group with fewer than 20 calls with data: too few for its numbers to mean much.</dd></div>
+        <div><dt>Rounding</dt><dd>Every return, peak and drop is rounded to 0.1% before the thresholds above are applied: a return of +0.04% counts as 0.0% (not a win), −49.96% as −50.0% (a collapse), a peak of +99.96% as +100.0%.</dd></div>
+        <div><dt>–</dt><dd>No call in the group has a value for this number.</dd></div>
+      </dl>
+    </details>
+  </section>
+
+  <section class="panel" aria-labelledby="model-title">
+    <h2 id="model-title">Model insights — coming soon</h2>
+  </section>
+  <noscript><p class="notice">This page needs JavaScript.</p></noscript>
+</main>
+</body>
+</html>

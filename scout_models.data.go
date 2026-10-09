@@ -1543,6 +1543,34 @@ const (
 			EXISTS (SELECT 1 FROM unnest($1::text[]) AS d(phrase) WHERE strpos(lower(i.report_text), d.phrase) > 0),
 			i.requested_at DESC, i.id DESC)`
 	webSAlphaJoinSQL = ` LEFT JOIN ` + webSAlphaSQL + ` sa ON sa.ca = fc.ca`
+	// webVerdictAtCallJoinSQL: the Perceptor verdict known at the time of the
+	// first call (Analytics page), by the rule of scout_call_dataset_v: the
+	// call's own completed live scan, else the latest completed live scan of
+	// the same contract address requested at or before the call. Unlike the
+	// list's verdict (webPerceptorSQL, the token's latest scan from any post,
+	// which can be a later repeat call's) it never looks ahead. The address is
+	// compared exactly, as in the view; the list compares without regard to
+	// letter case. A scan without a call (call_id NULL, a manual -scan) counts
+	// as "not the call's own" (the view's ORDER BY puts its NULL first). Built
+	// as one set (own scans, plus earlier scans of the same address, for every
+	// first call) rather than a lookup per row, which cost about 70 ms per
+	// 6,000 rows. The earlier scans are looked up for first calls only (fc, the
+	// common table expression of webRowsSQL; only those rows are joined), by
+	// the call's own address as stored (c2.contract_address, not fc.ca, which
+	// is lower case).
+	webVerdictAtCallJoinSQL = ` LEFT JOIN (SELECT DISTINCT ON (x.call_id) x.call_id,
+		CASE WHEN x.level IN ('clean', 'caution', 'red_flags') THEN x.level ELSE 'unknown' END AS verdict
+		FROM (SELECT i.call_id, true AS own, i.requested_at, i.id, i.verdict_level AS level
+			FROM scout_investigations i JOIN scout_investigation_tools pit ON pit.id = i.tool_id AND pit.code = 'perceptor'
+			WHERE i.status = 'completed' AND i.scan_kind = 'live' AND i.call_id IS NOT NULL
+		UNION ALL
+		SELECT c2.id, false, i.requested_at, i.id, i.verdict_level
+			FROM fc f2
+			JOIN scout_calls c2 ON c2.id = f2.id
+			JOIN scout_investigations i ON i.contract_address = c2.contract_address AND i.requested_at <= c2.message_date
+			JOIN scout_investigation_tools pit ON pit.id = i.tool_id AND pit.code = 'perceptor'
+			WHERE i.status = 'completed' AND i.scan_kind = 'live' AND i.call_id IS DISTINCT FROM c2.id) x
+		ORDER BY x.call_id, x.own DESC, x.requested_at DESC, x.id DESC) vac ON vac.call_id = fc.id`
 )
 
 // webRowsSQL loads the website's whole list in one statement: each token's
@@ -1550,10 +1578,16 @@ const (
 // results of the five windows, how often the token was called, its latest
 // live Perceptor report and its latest Perceptor re-scan ("Perceptor today"), the id of its latest sAlpha report with text (a real
 // report before a decline; $1 = salphaDeclinePhrases) and the
-// market caps of the post. It reads the
+// market caps of the post; and, for the Analytics page, the posted DEX, the
+// price source, the quote asset, which windows are stored as no_data, the
+// verdict at the time of the call and whether the first 24 hours of candles
+// are stored (trades_final; see ScoutWebRow). It reads the
 // tables directly (not scout_call_dataset_v, whose per-row lookups the website
-// does not need). Ordered by call id.
-var webRowsSQL = `SELECT c.id, c.message_id, c.message_date, c.channel_username, c.contract_address,
+// does not need). Ordered by call id. The first calls are a common table
+// expression (fc), read once and used both for the list and for the verdict
+// at the call (webVerdictAtCallJoinSQL).
+var webRowsSQL = `WITH fc AS ` + webFirstCallsSQL + `
+	SELECT c.id, c.message_id, c.message_date, c.channel_username, c.contract_address,
 	NULLIF(t.token_name, ''), COALESCE(NULLIF(m.token_symbol, ''), NULLIF(t.token_symbol_onchain, '')),
 	t.price_unit, COALESCE(t.entry_late_price_usd, t.entry_price_usd)::float8, t.entry_price_usd IS NOT NULL,
 	t.rugged, t.status,
@@ -1561,19 +1595,23 @@ var webRowsSQL = `SELECT c.id, c.message_id, c.message_date, c.channel_username,
 	p.verdict, p.report_url, p.id, sa.id, n.call_count, n.last_call_date,
 	t.latest_return_pct::float8, t.latest_price_usd::float8, t.latest_checked_at, t.latest_trade_at,
 	m.called_at_mcap_usd::float8, m.mcap_usd::float8, t.entry_price_usd::float8,
-	ptd.verdict, ptd.report_url, ptd.at
-	FROM ` + webFirstCallsSQL + ` fc
+	ptd.verdict, ptd.report_url, ptd.at,
+	NULLIF(btrim(m.dex), ''), t.entry_price_source, NULLIF(t.onchain->>'quote_sym', ''), COALESCE(r.no_data, 0), vac.verdict,
+	(t.entry_price_source LIKE 'onchain-%' AND COALESCE((t.onchain->>'v')::int, 0) >= 2 AND COALESCE(r.has_1d, false)) IS TRUE
+	FROM fc
 	JOIN scout_calls c ON c.id = fc.id
 	JOIN ` + webCallCountsSQL + ` n ON n.ca = fc.ca
 	LEFT JOIN scout_call_metrics m ON m.call_id = fc.id
 	LEFT JOIN scout_call_tracking t ON t.call_id = fc.id
-	LEFT JOIN (SELECT call_id, ` + webReturnsPivotSQL("") + `
-		FROM scout_call_returns WHERE status = 'done' GROUP BY call_id) r ON r.call_id = fc.id` + webPerceptorJoinSQL + webPerceptorTodayJoinSQL + webSAlphaJoinSQL + `
+	LEFT JOIN (SELECT call_id, ` + webReturnsPivotSQL("") + `,
+		` + webNoDataSQL() + ` AS no_data, bool_or(horizon = '1d') AS has_1d
+		FROM scout_call_returns GROUP BY call_id) r ON r.call_id = fc.id` + webPerceptorJoinSQL + webPerceptorTodayJoinSQL + webSAlphaJoinSQL + webVerdictAtCallJoinSQL + `
 	ORDER BY c.id`
 
 // webReturnsPivotSQL lists the 15 result columns (window × return, peak,
 // drawdown; late entry) in the order of ScoutWebRow.Perf: with prefix "" as the
-// aggregates over scout_call_returns, otherwise as the columns of that subquery.
+// aggregates over scout_call_returns (rows with status done only), otherwise
+// as the columns of that subquery.
 func webReturnsPivotSQL(prefix string) string {
 	var cols []string
 	for _, h := range ScoutWebHorizons {
@@ -1583,10 +1621,23 @@ func webReturnsPivotSQL(prefix string) string {
 				cols = append(cols, prefix+name)
 				continue
 			}
-			cols = append(cols, "max("+c[1]+") FILTER (WHERE horizon = '"+h+"')::float8 AS "+name)
+			cols = append(cols, "max("+c[1]+") FILTER (WHERE status = 'done' AND horizon = '"+h+"')::float8 AS "+name)
 		}
 	}
 	return strings.Join(cols, ", ")
+}
+
+// webNoDataSQL is the aggregate over scout_call_returns whose bit h is set
+// when window h of ScoutWebHorizons is stored with status no_data
+// (ScoutWebRow.NoData).
+func webNoDataSQL() string {
+	var b strings.Builder
+	b.WriteString("bit_or(CASE WHEN status = 'no_data' THEN CASE horizon")
+	for i, h := range ScoutWebHorizons {
+		fmt.Fprintf(&b, " WHEN '%s' THEN %d", h, 1<<i)
+	}
+	b.WriteString(" END END)")
+	return b.String()
 }
 
 // SelectWebRows returns every row of the website's list (one per token: its
@@ -1609,6 +1660,7 @@ func (st *ScoutStore) SelectWebRows(ctx context.Context) ([]ScoutWebRow, int, er
 	defer rows.Close()
 	out := []ScoutWebRow{}
 	var perf [len(ScoutWebHorizons) * 3]pgtype.Float8
+	var noData int32
 	for rows.Next() {
 		var r ScoutWebRow
 		dest := []any{&r.CallID, &r.MessageID, &r.MessageDate, &r.ChannelUsername, &r.ContractAddress,
@@ -1618,10 +1670,12 @@ func (st *ScoutStore) SelectWebRows(ctx context.Context) ([]ScoutWebRow, int, er
 		}
 		dest = append(dest, &r.PerceptorVerd, &r.PerceptorURL, &r.PerceptorID, &r.SAlphaID, &r.CallCount, &r.LastCallDate,
 			&r.LatestReturn, &r.LatestPrice, &r.LatestAt, &r.LatestTradeAt,
-			&r.CalledAtMcap, &r.PostMcap, &r.PostPrice, &r.PerceptorTodayVerd, &r.PerceptorTodayURL, &r.PerceptorTodayAt)
+			&r.CalledAtMcap, &r.PostMcap, &r.PostPrice, &r.PerceptorTodayVerd, &r.PerceptorTodayURL, &r.PerceptorTodayAt,
+			&r.PostedDex, &r.EntrySource, &r.QuoteSym, &noData, &r.VerdictAtCall, &r.TradesFinal)
 		if err := rows.Scan(dest...); err != nil {
 			return nil, 0, err
 		}
+		r.NoData = uint8(noData)
 		for i, v := range perf {
 			if v.Valid {
 				r.Perf[i] = v.Float64
@@ -1634,6 +1688,41 @@ func (st *ScoutStore) SelectWebRows(ctx context.Context) ([]ScoutWebRow, int, er
 		return nil, 0, err
 	}
 	return out, updatePosts, nil
+}
+
+// SelectWebTrades24h returns, for each of the given calls, the number of swaps
+// in the first 24 hours after the call: the events of its 5-minute candles
+// (scout_call_candles, interval candleFineS, buckets that start before entry
+// + candleFineSpan). A call without such candles is left out (the caller
+// counts it as 0 when it knows the candles are complete). The count is only
+// complete for calls whose first 24 hours the tracker has stored
+// (ScoutWebRow.TradesFinal); the caller asks for those only.
+func (st *ScoutStore) SelectWebTrades24h(ctx context.Context, ids []int) (map[int]int, error) {
+	out := make(map[int]int, len(ids))
+	if len(ids) == 0 {
+		return out, nil
+	}
+	rows, err := st.Pool.Query(ctx, `SELECT k.call_id, sum(k.events)::int8
+		FROM scout_call_candles k JOIN scout_call_tracking t ON t.call_id = k.call_id
+		WHERE k.call_id = ANY($1) AND k.interval_seconds = $2
+			AND k.bucket_start < t.entry_at + make_interval(secs => $3)
+		GROUP BY k.call_id`, ids, candleFineS, candleFineSpan)
+	if err != nil {
+		return nil, fmt.Errorf("trades in the first 24 hours: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id int
+		var n int64
+		if err := rows.Scan(&id, &n); err != nil {
+			return nil, fmt.Errorf("trades in the first 24 hours: %w", err)
+		}
+		out[id] = int(n)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("trades in the first 24 hours: %w", err)
+	}
+	return out, nil
 }
 
 // webReportReadChars: how much of a text SelectWebReports reads, in characters:
