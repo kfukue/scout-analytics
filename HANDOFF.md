@@ -203,6 +203,35 @@ approved; the Perceptor re-scan is approved with the defaults in section 4;
 `env.tmp` in the session scratchpad was deleted by the owner. Decided
 8 October: long model waits until about 25 December (option a).
 
+Decisions 9 October (owner):
+
+- Price-based market cap at call: approved. A `totalSupply()` read per
+  token on the owner's node, at the entry block while the full node still
+  has state, else latest; stored in `scout_call_tracking.token_supply` /
+  `token_supply_block`. Analytics factor = price at the post × supply
+  ("fully diluted"); no fallback to the posted figure; not an ML feature
+  for now. In progress (coder).
+- sAlpha: stop forwarding declines. Re-ask 6–24 h after the call when the
+  reply was a decline, empty or a timeout (`scan_kind='reask'`, separate
+  from the Perceptor rescan lane, at most 60 a day; the follow-up is
+  delivered as a reply to the original delivery message; never feeds ML).
+  In progress (coder).
+- ML: the dead rule is off by default (the collapse label is plain again);
+  a separate report-only "dead after the call" score. In progress
+  (ml-coder).
+- ML: keep DEX families, not raw DEX names (raw wins only in the test
+  period, not walk-forward). The "tradeable runners" variant: revisit for
+  the 7-day model after more weeks.
+- Multi-source calls (still paused, section 4 item 6): reused
+  Perceptor/sAlpha reports expire after 1 day for all channels. Call
+  Analyser: deliver only the ORIGINAL caller's own post per token (forward
+  the KOL message Call Analyser links to; later callers are recorded and
+  tracked, not delivered; fall back to Call Analyser's repost if the KOL
+  post can't be read). "Diamond" (💎) = elite.
+- Queued: the Analytics Timing tab (section 4 item 7), after the
+  market-cap branch is reviewed. Planning: a public website on GCP (item
+  8).
+
 **Prod settings** (for reference):
 
 - `-track` with `SCOUT_RPC_RPS=300 SCOUT_TRACK_WORKERS=12
@@ -502,6 +531,72 @@ approved; the Perceptor re-scan is approved with the defaults in section 4;
      - Call Analyser delivery: first post per token, or every caller.
    - Phase plan: 0 pin the readers to Scout; 1 Robinhood sources; 2 store
      Base; 3 track Base.
+7. **Analytics Timing tab** (queued; starts after the price-based
+   market-cap branch is reviewed). Results after the call: never model
+   inputs.
+   - What it shows:
+     - time to peak: how long after the call the best price came;
+     - how long it held +100%: when it first reached 2×, total time at or
+       above 2×, when it first fell back below;
+     - time to rug, for rugged calls.
+   - Shown four ways:
+     - distributions in log bands: < 5m, 5–15m, 15–60m, 1–4h, 4–24h,
+       1–3d, 3–7d, 7–30d;
+     - mean and median by group: Perceptor verdict at the call, week/month,
+       elite ("diamond", 💎) and good holders and buyers, holders, DEX
+       family and the other existing factors, with the 4/5/10 equal-count
+       groups;
+     - a "still at 2× after t" curve (Kaplan–Meier, from the first cross)
+       and a "share rugged by t" curve;
+     - all on a new "Timing" tab with the same filters and factor picker.
+   - Data: no timing is stored today (`scout_call_returns` has the peak
+     size, not its time). Computed from stored candles
+     (`scout_call_candles`: 5-minute for the first 24 h, hourly up to the
+     last completed horizon ≤ 30d). No new node calls for peaks/2×, no
+     re-tracking, `onchainStateVersion` unchanged. Resolution: 5 min on
+     day one, 1 h after.
+   - Design (researcher, 9 October):
+     - one pure Go function, used by the tracker (right after each horizon
+       is stored, in `saveHorizonOnchain`) and by a one-off backfill flag
+       (e.g. `-backfill-timing`) from stored candles;
+     - repeat-safe `ADD COLUMN IF NOT EXISTS` on `scout_call_returns`
+       (`peak_late_after_s`, `above_2x_s`, `first_2x_after_s`,
+       `fall_below_2x_after_s`, `timing_at`; in both the INSERT and the
+       `ON CONFLICT` SET of `UpsertReturn`) and on `scout_call_tracking`
+       (`rug_at`, `rug_at_kind`: `event` | `at_call` | `detected`);
+     - the website reads them in the load query (format bump;
+       `hashWebRows`).
+   - Owner decisions (9 October):
+     - "reached 2×" = the price TOUCHED 2× (candle high); time held at 2×
+       is measured on closes, the last close carried across gaps; calls
+       that never reached 2× count as 0 minutes held;
+     - past rug times exact: one `blockTime` lookup per rugged call on the
+       owner's node (a few hundred, once); future rugs: one lookup each
+       (approved);
+     - rugs at the moment of the call and rugs only detected at the end of
+       tracking are shown separately, outside the main histogram;
+     - the timings go into the ML dataset view as OUTCOME columns,
+       forbidden as inputs (add a `timing_` forbidden prefix), so later
+       report-only scores can predict e.g. "fast runner: 2× within 1 h",
+       "early rug: rug within 24 h", "holds 2× ≥ 6 h".
+8. **Public cloud website on GCP** (planning).
+   - Owner decisions (9 October): GCP; the site is public (anyone with the
+     link).
+   - Plan: the prod server exports the website's numbers (built from the
+     existing in-memory snapshot) to GCP when data changes. The public
+     site never connects to Postgres or the node.
+   - Options under study:
+     - (A) Firebase Hosting / Cloud Storage + CDN with JSON files;
+     - (B) Firestore (one doc per call + summary docs, realtime
+       listeners);
+     - (C) both.
+   - Never export: the private delivery group invite link, links into the
+     private group, any secrets. Paid bots' full report text and report
+     links are left out by default (verdict labels are fine) unless the
+     owner decides otherwise.
+   - The infra agent drafts only; the owner creates the GCP resources and
+     approves costs. The service account key stays on the prod server,
+     outside the repo.
 
 Later:
 
