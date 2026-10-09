@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"github.com/gotd/td/tg"
 )
@@ -57,6 +58,11 @@ type ToolSpec struct {
 	// non-progress reply arrives (and, if DoneRe is set, one that matches it).
 	ProgressRe *regexp.Regexp // "Scanning…", "Analyzing…" placeholders
 	DoneRe     *regexp.Regexp // optional: the final report must match (text or links)
+	// NeedsText: only a reply with visible text (a letter or digit) completes
+	// the report; a reply with media and no text (sAlpha sends a photo first
+	// and its text report later) is kept and forwarded but does not complete
+	// it. If no text arrives before MaxWait, the result is a timeout.
+	NeedsText bool
 }
 
 const defaultProgressPattern = `(?i)^[\W_]*(scanning|analy[sz]ing|researching|checking|processing|loading|fetching|working on|investigating|please wait|one moment|generating|looking up|searching|running)\b`
@@ -88,7 +94,10 @@ var builtinTools = map[string]ToolSpec{
 	"salpha": {Code: "salpha", Name: "sAlpha", Bot: "salpha_research_bot", Command: "{ca}",
 		Parser: parserText, Gate: false, Attach: true,
 		Timeout: 90 * time.Second, Settle: 15 * time.Second, MaxWait: 300 * time.Second,
-		MaxRetries: 3},
+		MaxRetries: 3,
+		// sAlpha sends a photo (no caption) first and its text report later,
+		// often after more than the settle time: wait for the text.
+		NeedsText: true},
 }
 
 func envBool(key string, def bool) bool {
@@ -140,6 +149,7 @@ func loadTools() ([]ToolSpec, error) {
 		t.Settle = envDur(p+"SETTLE", t.Settle)
 		t.MaxWait = envDur(p+"MAX_WAIT", t.MaxWait)
 		t.MinInterval = envDur(p+"MIN_INTERVAL", t.MinInterval)
+		t.NeedsText = envBool(p+"NEEDS_TEXT", t.NeedsText)
 		if v := os.Getenv(p + "MAX_RETRIES"); v != "" {
 			n, err := strconv.Atoi(v)
 			if err != nil || n < 0 {
@@ -435,6 +445,10 @@ func (r *toolRunner) investigate(ctx context.Context, send sendFunc, ca string) 
 				return finish(investigationCompleted, nil)
 			}
 			if got {
+				if media := r.textlessMedia(all); media != nil {
+					return finish(investigationTimeout, fmt.Errorf("@%s sent only media (%s) and no report text within %s",
+						r.spec.Bot, strings.Join(media, ", "), r.spec.MaxWait))
+				}
 				last := ""
 				if n := len(all); n > 0 {
 					last = strings.TrimSpace(all[n-1].Message)
@@ -479,12 +493,16 @@ func hasReportMedia(m *tg.Message) bool {
 	}
 }
 
-// isComplete: at least one non-placeholder reply, matching DoneRe when set.
+// isComplete: at least one non-placeholder reply, matching DoneRe when set,
+// and with visible text when the tool NeedsText.
 // A rate-limit notice also counts as complete (it's handled by the retry logic).
 func (r *toolRunner) isComplete(msgs []*tg.Message) bool {
 	for _, m := range msgs {
 		if r.isProgress(m) {
 			continue
+		}
+		if r.spec.NeedsText && !hasVisibleText(m.Message) {
+			continue // e.g. sAlpha's photo before its text report
 		}
 		if r.spec.RateLimitRe != nil && len(m.Message) <= 600 && r.spec.RateLimitRe.MatchString(m.Message) {
 			return true
@@ -494,6 +512,35 @@ func (r *toolRunner) isComplete(msgs []*tg.Message) bool {
 		}
 	}
 	return false
+}
+
+// hasVisibleText reports whether text has a letter or digit: white space and
+// invisible characters (zero-width space, word joiner, …) alone are no text.
+func hasVisibleText(text string) bool {
+	return strings.IndexFunc(text, func(c rune) bool { return unicode.IsLetter(c) || unicode.IsDigit(c) }) >= 0
+}
+
+// textlessMedia returns the media types (TL names, e.g. "messageMediaPhoto")
+// of the non-placeholder replies when the tool NeedsText and none of them has
+// visible text; otherwise nil. It explains a timeout of a tool that sent only
+// media.
+func (r *toolRunner) textlessMedia(msgs []*tg.Message) []string {
+	if !r.spec.NeedsText {
+		return nil
+	}
+	var media []string
+	for _, m := range msgs {
+		if r.isProgress(m) {
+			continue
+		}
+		if hasVisibleText(m.Message) {
+			return nil
+		}
+		if m.Media != nil {
+			media = append(media, m.Media.TypeName())
+		}
+	}
+	return media
 }
 
 // reportMessages drops placeholder replies ("Scanning…", loading stickers) so

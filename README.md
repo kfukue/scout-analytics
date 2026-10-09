@@ -854,6 +854,7 @@ Per-tool overrides, `SCOUT_TOOL_<CODE>_…` (defaults shown):
 | `_MAX_WAIT` | 180s | 300s | hard cap per attempt (incl. time spent on "Scanning…") |
 | `_DONE_REGEX` | verdict / perceptor.info link | none | the final report must match this (text or links); `none` to disable |
 | `_PROGRESS_REGEX` | built-in | built-in | placeholder replies to ignore ("Scanning…", "Analyzing…") |
+| `_NEEDS_TEXT` | false | true | only a reply with text (a letter or digit) finishes the report; a photo/media-only reply is kept but does not |
 | `_MIN_INTERVAL` | 2m5s | 0 | minimum gap between two requests to that bot (pacing) |
 | `_MAX_RETRIES` | 3 | 3 | retries after a "try again in N s" reply |
 | `_RATE_LIMIT_BUFFER` | 3s | 3s | extra wait on top of the bot's countdown |
@@ -869,6 +870,29 @@ the settle timer only starts once a real report is there. For Perceptor, "real" 
 it contains the verdict or the perceptor.info link. Placeholders are not stored or
 forwarded. If the report never finishes within `_MAX_WAIT`, the result is `timeout`,
 with the last placeholder in the error.
+
+**sAlpha** sends a photo (no caption) first and its text report later, often more than
+the 15 s settle time later. With `_NEEDS_TEXT=true` (sAlpha's default) a reply without
+text (photo, document or any other media, or invisible characters only) does not finish the
+report: the settle timer starts only when a text reply arrives (the report, or a decline
+such as "There is not enough public information to write a report on this token."). The
+media reply is kept: its id is stored with the text's and it is forwarded with the report.
+If no text arrives within `_MAX_WAIT` (300 s), the result is `timeout` (not forwarded,
+"no report (timeout)" in the header), with the media types in the error, e.g.
+`@salpha_research_bot sent only media (messageMediaPhoto) and no report text within 5m0s`.
+The CA's delivery waits for this (it waits for every tool), so a media-only reply holds
+the live queue for up to `_MAX_WAIT`. Before this rule, an sAlpha result could complete on
+a reply without text and be stored with empty text.
+
+`scout_investigations.details.replies` lists every stored reply (placeholders excluded):
+`message_id`; `date`, when Telegram dated it (unix seconds); `edit_date`, when it was last
+edited (unix seconds, left out when never edited); `reply_to_msg_id`, the message it
+replies to (left out when it replies to none); `media`, its media type
+(`"messageMediaPhoto"`, `""` for none); and `text_len`, its text length in characters.
+The dates give sAlpha's gap between its photo and its text (to tune `_MAX_WAIT`), and
+`reply_to_msg_id` shows whether a reply names the request it answers (a late reply could
+otherwise be taken for the next CA's). `details.media` lists media of any type (not only
+photos and documents).
 
 ### Rate limits
 
@@ -1368,11 +1392,16 @@ other sites):
     report**: the latest reply that has text is shown, whichever post of the token it was made
     for, and "No sAlpha report" when there is none. A reply that failed, timed out or was
     rate-limited never counts. **A reply that declines** ("Not enough public signals to
-    generate a report for this token.", "Too little liquidity or trading activity to research
-    yet."; the phrase list is `salphaDeclinePhrases` in `websnapshot.go`, matched anywhere in
-    the text, upper/lower case ignored) **is not a report either**: an older real report is
-    shown instead, however old; when the token has none, the panel says "sAlpha did not
-    generate a report" with the reason and time in grey.
+    generate a report for this token.", "There is not enough public information to write a
+    report on this token.", "Too little liquidity or trading activity to research yet."; the
+    phrase list is `salphaDeclinePhrases` in `websnapshot.go`: "not enough public" and "too
+    little liquidity", matched anywhere in the text, upper/lower case ignored) **is not a
+    report either**: an older real report is shown instead, however old; when the token has
+    none, the panel says "sAlpha did not generate a report" with the reason and time in grey.
+    Only a short reply counts as a decline: its text, with white space trimmed at both ends,
+    has at most 300 characters (`salphaDeclineMaxLen`). A longer reply is a real report even
+    when a risk line says "too little liquidity to exit". The website query and the Go check
+    use the same phrases, limit and trimming, also for rows stored before this rule.
   - A text longer than 32 KB is cut there and marked "Cut at 32 KB."; a long one scrolls
     inside the panel. The panel is never wider than the visible part of the table box, also on
     a phone while the table is scrolled sideways.

@@ -277,20 +277,39 @@ func newWebReport(r *ScoutWebReport) *webReport {
 	return w
 }
 
-// salphaDeclinePhrases: sAlpha replies that contain one of these (compared
-// without regard to letter case) decline to report on the token, e.g. "Not
-// enough public signals to generate a report for this token." They are not
-// reports: the row shows no "sA" badge, the detail says that sAlpha did not
-// generate a report, and an older real report is preferred
-// (ScoutStore.SelectWebRows passes this list to its query). Lower case only.
+// salphaDeclinePhrases: short sAlpha replies (see salphaDeclineMaxLen) that
+// contain one of these (compared without regard to letter case) decline to
+// report on the token, e.g. "Not enough public signals to generate a report
+// for this token.", "There is not enough public information to write a report
+// on this token." or "Too little liquidity or trading activity to research
+// yet." The phrases are kept short so that rewordings still match.
+//
+// Such replies are not reports: the row shows no "sA" badge, the detail says
+// that sAlpha did not generate a report, and an older real report is
+// preferred (ScoutStore.SelectWebRows passes this list, salphaDeclineMaxLen
+// and salphaDeclineTrim to its query). Lower case only.
 var salphaDeclinePhrases = []string{
-	"not enough public signals to generate a report",
-	"too little liquidity or trading activity to research yet",
+	"not enough public",
+	"too little liquidity",
 }
+
+// salphaDeclineMaxLen: a reply counts as a decline only when its text,
+// trimmed (salphaDeclineTrim), has at most this many characters. A real
+// report is longer and may mention a phrase in a risk line ("too little
+// liquidity to exit"). The query of SelectWebRows applies the same limit.
+const salphaDeclineMaxLen = 300
+
+// salphaDeclineTrim: the white space trimmed before the length is compared,
+// the same set in Go and in SQL (btrim).
+const salphaDeclineTrim = " \t\n\v\f\r"
 
 // salphaDeclined reports whether an sAlpha reply only declines to report.
 func salphaDeclined(text string) bool {
-	t := strings.ToLower(text)
+	t := strings.Trim(text, salphaDeclineTrim)
+	if utf8.RuneCountInString(t) > salphaDeclineMaxLen {
+		return false
+	}
+	t = strings.ToLower(t)
 	for _, p := range salphaDeclinePhrases {
 		if strings.Contains(t, p) {
 			return true

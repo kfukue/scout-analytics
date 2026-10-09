@@ -35,6 +35,7 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	"unicode/utf8"
 
 	"github.com/gotd/td/telegram"
 	"github.com/gotd/td/telegram/auth"
@@ -1189,7 +1190,10 @@ func (s *scanner) recordDelivery(j job, header string, investigationIDs []int, s
 }
 
 // replyDetails captures non-text parts of the bot's replies (files, photos,
-// buttons) as JSON for scout_investigations.details.
+// other media, buttons) as JSON for scout_investigations.details, plus one
+// entry per reply (its time, edit time, the message it replies to, its media
+// type, "" for none, and its text length) so a report with empty text, the
+// gap between sAlpha's photo and its text, and late replies can be diagnosed.
 func replyDetails(msgs []*tg.Message, attempts int, rateLimitWaits []int) []byte {
 	type media struct {
 		MessageID int    `json:"message_id"`
@@ -1202,14 +1206,38 @@ func replyDetails(msgs []*tg.Message, attempts int, rateLimitWaits []int) []byte
 		Text      string `json:"text"`
 		URL       string `json:"url,omitempty"`
 	}
+	type reply struct {
+		MessageID    int    `json:"message_id"`
+		Date         int    `json:"date"`                      // unix seconds, as Telegram sends it
+		EditDate     int    `json:"edit_date,omitempty"`       // unix seconds; 0 = never edited
+		ReplyToMsgID int    `json:"reply_to_msg_id,omitempty"` // the message it replies to; 0 = none
+		Media        string `json:"media"`                     // TL type, e.g. "messageMediaPhoto"; "" = none
+		TextLen      int    `json:"text_len"`                  // characters of text (caption included)
+	}
 	var d struct {
 		Attempts       int      `json:"attempts,omitempty"`
 		RateLimitWaits []int    `json:"rate_limit_waits_s,omitempty"`
+		Replies        []reply  `json:"replies,omitempty"`
 		Media          []media  `json:"media,omitempty"`
 		Buttons        []button `json:"buttons,omitempty"`
 	}
 	d.Attempts, d.RateLimitWaits = attempts, rateLimitWaits
 	for _, m := range msgs {
+		rp := reply{MessageID: m.ID, Date: m.Date, TextLen: utf8.RuneCountInString(m.Message)}
+		if m.Media != nil {
+			rp.Media = m.Media.TypeName()
+		}
+		if ed, ok := m.GetEditDate(); ok {
+			rp.EditDate = ed
+		}
+		if rt, ok := m.GetReplyTo(); ok {
+			if h, ok := rt.(*tg.MessageReplyHeader); ok {
+				if id, ok := h.GetReplyToMsgID(); ok {
+					rp.ReplyToMsgID = id
+				}
+			}
+		}
+		d.Replies = append(d.Replies, rp)
 		switch md := m.Media.(type) {
 		case *tg.MessageMediaPhoto:
 			d.Media = append(d.Media, media{MessageID: m.ID, Type: "photo"})
@@ -1224,6 +1252,10 @@ func replyDetails(msgs []*tg.Message, attempts int, rateLimitWaits []int) []byte
 				}
 			}
 			d.Media = append(d.Media, x)
+		case nil, *tg.MessageMediaWebPage:
+			// no media, or a link preview (its URL is in report_urls)
+		default:
+			d.Media = append(d.Media, media{MessageID: m.ID, Type: md.TypeName()})
 		}
 		if kb, ok := m.ReplyMarkup.(*tg.ReplyInlineMarkup); ok {
 			for _, row := range kb.Rows {
