@@ -19,6 +19,9 @@
 #   --skip-install   do not run pip install (for re-runs; the venv must exist)
 #   --binary PATH    export with a built binary instead of `go run .`
 #                    (a relative PATH is taken from the directory you start in)
+#   --variants       also train the one-change variants (train.py --variants) and
+#                    compare them at the end of report.md; report only, the saved
+#                    model is the baseline. About 6 times the train time.
 #   -h, --help       show this help
 #
 # It never connects to the database itself, never prints .env (it only counts
@@ -36,10 +39,12 @@ usage() {  # the header comment above, up to the first non-comment line
 
 SKIP_INSTALL=0
 BINARY=""
+TRAIN_ARGS=()   # extra train.py arguments
 while [ $# -gt 0 ]; do
     case "$1" in
         -h|--help) usage; exit 0 ;;
         --skip-install) SKIP_INSTALL=1; shift ;;
+        --variants) TRAIN_ARGS+=(--variants); shift ;;
         --binary)
             [ $# -ge 2 ] || { echo "run_training.sh: --binary needs a path" >&2; exit 2; }
             BINARY="$2"; shift 2 ;;
@@ -336,7 +341,8 @@ echo "== Step 5: train"
 cd "$ML/src/ml"
 TIMEFORMAT='train time: real %1Rs  user %1Us  sys %1Ss'
 t0=$(date +%s)
-time run_logged step5-train "$VENV_PY" train.py --csv "$CSV" --out "$ML/models"
+# ${A[@]+"${A[@]}"}: an empty array under set -u on bash before 4.4
+time run_logged step5-train "$VENV_PY" train.py --csv "$CSV" --out "$ML/models" ${TRAIN_ARGS[@]+"${TRAIN_ARGS[@]}"}
 t1=$(date +%s)
 TRAIN_SECONDS=$((t1 - t0))
 

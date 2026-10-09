@@ -11,7 +11,7 @@ deliveries in any case.
 
 ## Quick way: one script
 
-`ml/run_training.sh` runs steps 1, 2, 4, 5 and 6 below in one go, with the
+`ml/run_training.sh` runs steps 1, 2, 4, 5 (with `--variants`: 5b instead of 5) and 6 below in one go, with the
 same commands and flags, plus the step 9 check (`SCOUT_MODEL_URL` in `.env`:
 it warns, without showing the value, and goes on). It stops at the first
 failure and says which step failed; when a command inside a step failed, it
@@ -32,6 +32,7 @@ git fetch origin main && mkdir -p ~/scout-ml \
   && REPO="$PWD" ML=~/scout-ml bash ~/scout-ml/run_training.sh
 # weekly re-runs, venv already installed:          ... bash ~/scout-ml/run_training.sh --skip-install
 # export with a built binary instead of go run:    ... bash ~/scout-ml/run_training.sh --binary ./scoutanalytics
+# with the variant comparison (5b instead of 5):    ... bash ~/scout-ml/run_training.sh --skip-install --variants
 ```
 
 Write `ML=~/scout-ml` without quotes (or `ML="$HOME/scout-ml"`): the script
@@ -102,7 +103,7 @@ python3 -m venv "$ML/venv"
 If the server only has Python 3.10, stop here and tell the product manager
 (not tested on 3.10).
 
-Check the install with the test suite (synthetic data only, about 45 s;
+Check the install with the test suite (synthetic data only, about 2 minutes;
 `-p no:cacheprovider` keeps it from writing a cache into the worktree):
 
 ```bash
@@ -110,7 +111,7 @@ cd "$ML/src/ml"
 "$ML/venv/bin/python" -m pytest tests -q -p no:cacheprovider
 ```
 
-Expected: `109 passed` (one deprecation warning from fastapi is fine).
+Expected: `123 passed` (one deprecation warning from fastapi is fine).
 
 ## 3. Read-only checks before the export (optional, psql or pgAdmin)
 
@@ -292,6 +293,56 @@ Files written, in `$ML/models/<version>/` (version = UTC time, e.g.
 | `<bucket>_runner.joblib`, `<bucket>_collapse.joblib` | trained models, only for buckets that trained |
 
 `$ML/models/LATEST` holds the newest version name.
+
+### 5b. Variant comparison (optional, when the product manager asks for it)
+
+Run 5b **instead of** step 5, not after it: it already trains and saves the
+normal model and writes `LATEST`. Running both trains the baseline twice and
+moves `LATEST` to the second version. The normal way is the script, as in
+"Quick way" above with `--variants` added (it runs steps 1, 2, 4, 5b and 6;
+the fresh copy of the script matters: an older copy rejects `--variants`):
+
+```bash
+cd /path/to/scout-analytics                # the deployed checkout (REPO), with .env
+git fetch origin main && mkdir -p ~/scout-ml \
+  && git show origin/main:ml/run_training.sh > ~/scout-ml/run_training.sh \
+  && REPO="$PWD" ML=~/scout-ml bash ~/scout-ml/run_training.sh --skip-install --variants
+```
+
+By hand (in place of the step 5 command):
+
+```bash
+cd "$ML/src/ml"
+time "$ML/venv/bin/python" train.py --csv "$ML/data/calls.csv" --out "$ML/models" --variants
+```
+
+It trains the normal model
+exactly as in step 5 (that is the one saved, served and gated), then five
+variants that each change one setting (dead rule off; dead threshold 100;
+raw `dex` instead of `dex_family`; raw `dex` + `dex_family`; runners must have
+`trades_24h >= 100`). The variants are not saved; they only add a section
+"Variant comparison" at the end of `report.md`, one table per bucket, one row
+per variant (the `baseline` row is the saved model). It prints one
+`[variant] <name>: N s` line per variant. Time: about 6 times the train
+time of step 5 (on a desktop PC, synthetic data of 6,000 calls: 25 s without,
+2 min 20 s with `--variants`); memory as in step 5. The model, `meta.json`,
+`report.md` and `LATEST` are written before the variants start, so stopping
+during the variants still leaves the normal result. A variant that crashes
+does not fail the run: it prints `WARNING: variant '<name>' failed (error:
+...)`, its row in the table and its `meta.json` entry say `error: <message>`,
+the other variants go on, and the run still ends with exit code 0 (if every
+variant fails it also prints `WARNING: all N variants failed`). Paste such a
+warning to the product manager; the saved model is not affected.
+
+How to read the table: compare each row with `baseline`. "collapses removed
+(plain; gate)" and "collapse AUC, plain label" are comparable across all rows.
+The `runners must be tradeable` row measures lift on its own stricter runner
+label (look at its "runner rate (test)"); its money simulation still uses every
+call. Every row is judged on the same test part, so a variant that is better
+there only may just fit that period: prefer one that is also better in the
+walk-forward columns (weeks beating buy-all, walk-forward mean lift and mean
+collapses removed). Paste the whole report as in step 8; the product manager
+decides whether a setting changes.
 
 ## 6. Delete the CSV
 
