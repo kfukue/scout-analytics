@@ -13,6 +13,9 @@ For each holding bucket there are two yes/no models:
 | `medium` | return at 7d >= +50% | return at 7d <= -70% |
 | `long`   | return at 30d > 0 | return at 30d <= -90% or rugged |
 
+Every collapse label is also set for a call that was dead after the call
+(fewer than 50 trades in the 24 h after it; see "Dead after the call" below).
+
 Outcomes are the `*_late_*` columns (entry 60 s after the post), reduced by
 buy and sell tax. Thresholds, feature lists and pass gates are in
 `scout_ml/config.py`. The view's `latest_*` columns (price and return as of the
@@ -21,12 +24,15 @@ features, and the leakage guard refuses any column whose name starts with `lates
 The same holds for what the tracker discovers after the call: `rugged`,
 `current_liquidity_usd`, `current_price_usd`, `entry_price_source` and the
 pool it found (`pool_dex`, `pool_address`, ...; any `current_*` or `pool_*`
-column). The post's own `dex` and `launchpad` are known at the call and stay
-features. Their levels (and `quote_asset`, `perceptor_verdict`) are matched
+column). So is `trades_24h` (trading in the 24 h after the call; any
+`trades_*` column). The post's own `dex` and `launchpad` are known at the call:
+`launchpad` is a feature, `dex` is grouped into `dex_family` (see "DEX
+families" below). Their levels (and `quote_asset`, `perceptor_verdict`) are matched
 without regard to case and surrounding spaces, and are learned from the
 training rows of each split only; a level not seen there is treated as missing.
 An older model whose `meta.json` has one flat set of levels is still served
-with the exact, case-sensitive matching it was trained with.
+with the exact, case-sensitive matching it was trained with, and a model whose
+feature list has raw `dex` (trained before `dex_family`) is still served with it.
 `prior_calls` and `secs_since_prev_call` stay in the view but are not features:
 training uses first calls only, where they are always 0 and NULL
 (`UNUSED_VIEW_COLUMNS` in `scout_ml/config.py`).
@@ -116,6 +122,95 @@ kept. In the money simulation each call's net return counts at most
 buy-everything" alone; labels are not affected. Both caps are in
 `scout_ml/config.py`.
 
+### Dead after the call
+
+`trades_24h` (view column, an outcome) is the number of price events in the
+pool during the 24 h after the call: the sum of `events` over the call's
+5-minute candles (`scout_call_candles`, `interval_seconds = 300`; the trade at
+the call itself has no candle). It is NULL when the call is not priced on-chain
+(`entry_price_source` not `onchain-*`) or the tracker has not yet scanned
+through its 1d horizon (then the candles are incomplete), and 0 when it was
+scanned and no candle exists. Caveat: on a Uniswap v2 pool every `Sync` event
+counts, which includes liquidity added or removed, not only swaps; on a v3/v4
+pool it counts swaps, on a Pons curve `CurveBuy`/`CurveSell`.
+
+A call with `trades_24h < DEAD_TRADES_24H` (50) is "dead": bought, then nobody
+traded it (e.g. about 230 "Uniswap V4" calls from 21 Sep to about 2 Oct 2026,
+flat price, which counted as safe non-collapses). Dead calls stay in the data.
+With `DEAD_IS_COLLAPSE = True` (the default, `scout_ml/config.py`) the collapse
+label of every bucket is "collapse OR dead"; a call whose `trades_24h` is NULL
+keeps the plain collapse label. Set it to `False` to train on the plain label.
+The report says how many calls are dead, how many of them were collapses
+anyway, and the collapse rate with and without them.
+
+The gates are unchanged by the dead rule: "collapses removed >= 40%"
+(`collapse_ok`, the walk-forward "collapses removed" column) is always
+measured on the PLAIN collapse label (`collapse_plain_<b>`), scored by the
+collapse model trained on collapse OR dead. Next to it the report shows "bad
+outcomes removed incl. dead" (the share of collapse OR dead calls among the
+same skipped 30%; `meta.json`: `trading.collapse_removed_with_dead`, and an
+extra walk-forward column). That figure is information only, never a gate:
+dead calls are probably easy to spot and would inflate it. With the rule off
+or `trades_24h` missing, the figure and column are absent.
+
+If the export has no `trades_24h` column (the view on the server predates it),
+training still runs with the plain collapse labels, prints a WARNING and says
+so at the top of the report (`meta.json`: `"dead": {"policy": "missing"}`).
+
+### DEX families
+
+There are about 50 posted DEX names, many short-lived ("Pons" until mid-August,
+then "Pons V2"; "Pools Trade Instant" in August only). `dex_family` groups them
+by the ordered prefix rules in `DEX_FAMILY_RULES` (`scout_ml/config.py`): the
+name is lower-cased and spaces, `_`, `-`, `.` and `/` are removed ("Uniswap
+V4", "uniswap_v4" and "UniswapV4" are all `uniswapv4`), and the first rule
+whose prefix matches gives the family (`pons`, `uniswap_v2`, `uniswap_v3`,
+`uniswap_v4`, `uniswap`, `longxyz`); any other name is `other`, an empty name
+is missing. Edit the table to add a family; more specific prefixes go first.
+
+Raw `dex` is no longer a model input (`USE_RAW_DEX = False`): its short-lived
+names are levels that vanish (or never reach `MIN_CATEGORY_COUNT`) from one
+period to the next, while a family stays. Experiment on synthetic data with
+drifting names (`python make_synthetic.py --dex-names drifting`: "Pons", then
+"Pons V2", then "Pons V3" only in the newest ~12% of calls; Pons planted as
+collapse-prone; 5 seeds, LightGBM seed 7), mean test collapse ROC AUC:
+
+| bucket | dex only (before) | dex + dex_family | dex_family only |
+|---|---|---|---|
+| short  | 0.688 | 0.718 | 0.731 |
+| 3day   | 0.693 | 0.696 | 0.712 |
+| medium | 0.719 | 0.722 | 0.725 |
+
+With a name that appears only in the test period, raw `dex` loses the signal
+(the new name is no level) and keeping it next to the family is worse than the
+family alone (the trees split on raw `dex` in training). Without such a rename
+the three variants were equal (within 0.006). Synthetic data only shows the
+mechanism; the real effect shows in the next prod report (compare the collapse
+ROC AUC and top features with the previous version; `USE_RAW_DEX = True`
+brings raw `dex` back). With the short rule table most real names fall into
+`other`; extend it first (RUNBOOK.md, query (g)).
+
+The pool the tracker chose (`entry_price_source` = `onchain-v2/v3/v4/pons`) is
+NOT a feature. It describes the pool at the call block, but it is written by
+the tracker after the call; when a call is scored at delivery, its row does not
+have it yet (the listener's live pre-call pass discovers the pool but does not
+store its kind), so the model would see it in training and never when serving.
+It needs a Go change (store the pool kind with the pre-call stats) first.
+
+### Calibration on recent weeks
+
+The base rates drift week to week (the short collapse rate fell from about
+0.65 to 0.45 in late September), so the Platt calibration is fitted on the
+most recent held-out rows only: the validation rows (`short`, `3day`) or the
+out-of-fold rows (`medium`, `long`) posted within `CALIB_RECENT_DAYS` (14) days
+of the newest of them, never on rows the model was fitted on. With fewer than
+`CALIB_MIN_CLASS_ROWS` (20) of a class there, or a fit that would invert the
+ranking, it falls back to all held-out rows (as before). The validation part
+of `short`/`3day` usually spans less than 14 days, so for them this is the same
+calibration as before (the report says so). Calibration does not change the
+ranking, so lift, collapses removed and the gates are unaffected; the report
+shows the test deciles and the Brier score for both calibrations.
+
 ## Read the report
 
 `models/<version>/report.md`, top to bottom:
@@ -135,7 +230,9 @@ buy-everything" alone; labels are not affected. Both caps are in
    baseline (ROC AUC, PR AUC, Brier), the gate values, the money simulation,
    the walk-forward table, calibration by decile, top features. `medium` and
    `long` also show the purged k-fold (folds used, rounds per fold,
-   out-of-fold rows used for calibration).
+   out-of-fold rows used for calibration). Each bucket also has a "Dead after
+   the call" table, and each label's calibration table shows the predictions
+   of the recent-rows calibration next to those of the earlier one.
 
 If LightGBM is not clearly better than the logistic baseline, the data does
 not yet support the more complex model. A bucket is skipped (with the reason
@@ -202,5 +299,5 @@ roll back, write an older version name into `models/LATEST`. Compare the new
     python -m pytest tests -q
 
 `build_features` raises if an outcome or bookkeeping column (anything starting
-with `ret_`, `max_gain_`, `max_dd_`, plus `rugged`, `tracking_status`, ...)
-would become a model input.
+with `ret_`, `max_gain_`, `max_dd_`, `trades_`, plus `rugged`, `tracking_status`,
+`trades_24h`, ...) would become a model input.

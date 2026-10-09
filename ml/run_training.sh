@@ -321,6 +321,13 @@ else
 fi
 [ -s "$CSV" ] || die "the export finished but $CSV is missing or empty"
 echo "CSV has $(wc -l < "$CSV" | tr -d ' ') lines (header included; not shown)"
+# column names only (the header line), never a data row
+CSV_HEADER="$(head -n 1 "$CSV" | tr -d '\r')"
+case ",${CSV_HEADER}," in
+    *,trades_24h,*) echo "OK: the export has trades_24h (dead-after-the-call rule on)" ;;
+    *) echo "WARNING: the export has no trades_24h column: the view predates it, so training uses the plain" >&2
+       echo "         collapse labels (RUNBOOK.md step 3b). Training continues." >&2 ;;
+esac
 
 # ---------------------------------------------------------------------------
 STEP="5 (train)"; LOG=""

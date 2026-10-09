@@ -4,6 +4,7 @@ import operator
 import numpy as np
 import pandas as pd
 
+from . import config as C
 from .config import BUCKETS, LABELS, MAX_OUTCOME_PCT, NO_POOL_STATUSES, REPEAT_STATUS, UPDATE_KIND
 from .features import num, text
 
@@ -63,12 +64,32 @@ def repeat_call(df: pd.DataFrame, update: pd.Series) -> pd.Series:
     return rep | later.reindex(df.index, fill_value=False)
 
 
-def build_labels(df: pd.DataFrame) -> pd.DataFrame:
+def dead_policy(df: pd.DataFrame) -> str:
+    """How the "dead after the call" rule applies to `df`: "on", "off" (config
+    C.DEAD_IS_COLLAPSE), or "missing" (switched on, but the export has no
+    C.DEAD_COLUMN column: the view on the server predates it)."""
+    if not C.DEAD_IS_COLLAPSE:
+        return "off"
+    return "on" if C.DEAD_COLUMN in df.columns else "missing"
+
+
+def dead_after_call(df: pd.DataFrame) -> pd.Series:
+    """True where trades_24h is known and below C.DEAD_TRADES_24H (NULL -> False)."""
+    return num(df, C.DEAD_COLUMN) < C.DEAD_TRADES_24H  # NaN compares False
+
+
+def build_labels(df: pd.DataFrame, policy: str | None = None) -> pd.DataFrame:
     """Per row: `update` (an update post, not a call: never usable), `repeat`
     (not the first call of its token: never usable), `no_pool`, `not_usd`,
-    `extreme` (an outcome above MAX_OUTCOME_PCT: never usable), and for each
-    bucket `usable_<b>`, `runner_<b>`, `collapse_<b>` (NaN where unusable) and
-    `net_ret_<b>`.
+    `extreme` (an outcome above MAX_OUTCOME_PCT: never usable), `dead` (fewer
+    than C.DEAD_TRADES_24H price events in the 24 h after the call; False when
+    unknown), and for each bucket `usable_<b>`, `runner_<b>`, `collapse_<b>`
+    (NaN where unusable), `collapse_plain_<b>` (the collapse label without the
+    dead rule) and `net_ret_<b>`.
+
+    `policy` ("on" / "off" / "missing", default `dead_policy(df)`): with "on",
+    `collapse_<b>` = plain collapse OR dead; a row whose trades_24h is NULL
+    keeps the plain label. Dead calls stay usable.
 
     A bucket uses a row only once all of that bucket's outcome columns are
     present. The view has an outcome only after its horizon was computed, so a
@@ -83,6 +104,8 @@ def build_labels(df: pd.DataFrame) -> pd.DataFrame:
     out["not_usd"] = text(df, "price_unit") != "usd"
     out["extreme"] = extreme_outcome(df)
     rugged = to_bool(df["rugged"]) if "rugged" in df.columns else pd.Series(False, index=df.index)
+    policy = policy or dead_policy(df)
+    out["dead"] = dead_after_call(df)
     buy, sell = num(df, "tax_buy_pct"), num(df, "tax_sell_pct")
     for b, cfg in BUCKETS.items():
         needed = {cfg["runner"][0], cfg["collapse"][0], cfg["ret_col"]}
@@ -96,6 +119,10 @@ def build_labels(df: pd.DataFrame) -> pd.DataFrame:
             hit = _OPS[op](net_pct(num(df, col), buy, sell), threshold)
             if label == "collapse" and cfg["collapse_or_rugged"]:
                 hit = hit | rugged
+            if label == "collapse":
+                out[f"collapse_plain_{b}"] = hit.astype(float).where(usable)
+                if policy == "on":
+                    hit = hit | out["dead"]
             out[f"{label}_{b}"] = hit.astype(float).where(usable)
         out[f"net_ret_{b}"] = net_pct(num(df, cfg["ret_col"]), buy, sell).where(usable)
     return out
