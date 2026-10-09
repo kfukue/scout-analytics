@@ -318,6 +318,28 @@ type ScoutWebRow struct {
 	PostMcap     *float64
 	PostPrice    *float64
 
+	// For the Analytics page only (GET /api/analytics; not in the list's rows):
+	// PostedDex is the DEX named in the post (scout_call_metrics.dex);
+	// EntrySource is scout_call_tracking.entry_price_source (onchain-v2 |
+	// onchain-v3 | onchain-v4 | onchain-pons, or minute | hour for
+	// GeckoTerminal; nil when untracked); QuoteSym is the pool's quote asset
+	// (onchain->>'quote_sym'). NoData has bit h set when window h of
+	// ScoutWebHorizons is stored as no_data (its numbers are then missing,
+	// although the window is due). VerdictAtCall is the Perceptor verdict known
+	// at the time of this call (the call's own live scan, else the token's latest
+	// live scan made before it; the dataset view's rule), never a later repeat
+	// call's or a re-scan's. TradesFinal says the tracker has stored the 5-minute
+	// candles of the first 24 hours (on-chain source, state version 2 or later,
+	// the 1d window stored); only then is Trades24h, the swaps counted in them,
+	// known. The website fills Trades24h itself (webServer.fillTrades24h).
+	PostedDex     *string
+	EntrySource   *string
+	QuoteSym      *string
+	NoData        uint8
+	VerdictAtCall *string // clean | caution | red_flags | unknown
+	TradesFinal   bool
+	Trades24h     *int
+
 	// worked out by the website when it builds its snapshot (websnapshot.go)
 	usd     bool  // priced in USD: only then are the numbers shown
 	verdict uint8 // webBucket…: where the Perceptor filter puts the token
@@ -332,6 +354,11 @@ type ScoutWebRow struct {
 	callMcap   *float64
 	latestMcap *float64
 	mcapVals   [2]float64
+	// anaHas and anaPerf: HasPerf and Perf as read, for USD-priced rows only
+	// (0 otherwise), kept before the list's rules hide the peak of a rugged
+	// call; the Analytics page counts a rugged call's peak.
+	anaHas  uint16
+	anaPerf [15]float64
 }
 
 // ScoutWebCall is one row of the website's call list as sent to the page:
