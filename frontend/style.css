@@ -558,7 +558,7 @@ tbody tr.call-row.fresh { background: var(--b-blue-bg); }
 .ana-wrap table { width: 100%; }
 .ana-wrap thead th { position: static; }
 .ana-wrap th.tok { position: sticky; left: 0; z-index: 1; background: var(--subtle); }
-.ana-wrap tbody th.tok { background: var(--surface); font-weight: 600; white-space: normal; min-width: 12ch; max-width: 28ch; overflow-wrap: anywhere; }
+.ana-wrap tbody th.tok { background: var(--surface); font-weight: 600; white-space: normal; min-width: 12ch; max-width: 28ch; overflow-wrap: break-word; }
 .ana-wrap tbody tr:hover > th.tok { background: var(--row-hover); }
 .ana-wrap td { vertical-align: top; }
 .ana-rate { display: block; }
@@ -569,6 +569,110 @@ tr.ana-few > *, tr.ana-few .pos, tr.ana-few .neg, td.ana-few, td.ana-few .pos, t
 tr.ana-few > th.tok { font-style: italic; font-weight: 500; }
 .legend .ana-few { color: var(--muted); font-style: italic; }
 #ana-counts { margin-top: 4px; }
+/* Analytics page charts (analytics.js draws them as SVG). Every colour is a
+   class here, so the CSP needs no style attribute and dark mode follows the
+   variables. --c0 … --c9: the groups of a factor; --hm-*: the heat scale of
+   the hour × weekday chart and the verdict × pool family grid. */
+:root {
+  --c0: #0b6fb0; --c1: #b86e00; --c2: #00805e; --c3: #b0458f; --c4: #c2410c;
+  --c5: #3b82c4; --c6: #7a5c12; --c7: #6a3d9a; --c8: #4d4d4d; --c9: #b2182b;
+  --hm-n3: #ffa8a8; --hm-n2: #ffc9c9; --hm-n1: #ffe3e3; --hm-z: #f1f3f5;
+  --hm-p1: #d3f9d8; --hm-p2: #b2f2bb; --hm-p3: #8ce99a; --hm-few: #f8f9fa; --hm-text: #000000;
+  --mix-0: #6b0f0f; --mix-1: #e03131; --mix-2: #ffa8a8; --mix-3: #8ce99a; --mix-4: #2b8a3e;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --c0: #56b4e9; --c1: #f0b840; --c2: #33c39a; --c3: #e0a0c8; --c4: #ff8a50;
+    --c5: #8fd0f5; --c6: #d9b765; --c7: #b39ddb; --c8: #bdbdbd; --c9: #ef8a8a;
+    --hm-n3: #8f2a2a; --hm-n2: #6b2a2c; --hm-n1: #4a2a2d; --hm-z: #373a40;
+    --hm-p1: #26392c; --hm-p2: #2b5a37; --hm-p3: #2f7a43; --hm-few: #303236; --hm-text: #ffffff;
+    --mix-0: #ff6b6b; --mix-1: #c92a2a; --mix-2: #5c2326; --mix-3: #2b5a37; --mix-4: #69db7c;
+  }
+}
+.ana-tabs { display: flex; gap: 4px; margin: 12px 0 0; border-bottom: 1px solid var(--border); overflow-x: auto; }
+.ana-tabs button {
+  height: 36px; padding: 0 14px; font-weight: 600; color: var(--muted); white-space: nowrap;
+  background: transparent; border: 0; border-bottom: 2px solid transparent; cursor: pointer;
+}
+.ana-tabs button:hover { color: var(--text); }
+.ana-tabs button[aria-selected="true"] { color: var(--accent-text); border-bottom-color: var(--accent); }
+.ana-tabs button:focus-visible { outline-offset: -2px; }
+.ana-panel { padding-top: 4px; }
+.ana-select {
+  height: 30px; max-width: 100%; padding: 0 8px; font: inherit; font-size: 13px; color: var(--text);
+  background: var(--surface); border: 1px solid var(--border-input); border-radius: 4px;
+}
+.ana-select:focus-visible { outline-offset: 0; }
+.ana-sub { margin: 4px 0 8px; }
+.chart { position: relative; width: 100%; min-height: 40px; }
+.chart svg { display: block; width: 100%; height: auto; overflow: visible; }
+.chart text { font-size: 11px; fill: var(--muted); }
+.chart .t-strong { fill: var(--text-2); font-weight: 600; }
+.chart .axis { stroke: var(--border-input); stroke-width: 1; }
+.chart .grid { stroke: var(--border); stroke-width: 1; }
+.chart .zero-line { stroke: var(--muted); stroke-width: 1; stroke-dasharray: 3 3; }
+.chart .ref-line { fill: none; stroke: var(--muted); stroke-width: 1.5; stroke-dasharray: 5 4; }
+.chart .hit { fill: transparent; }
+.chart .hit:hover { fill: var(--row-hover); fill-opacity: .6; }
+.chart .bar-count { fill: var(--accent); fill-opacity: .35; }
+.chart .ln { fill: none; stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
+.chart .ln-thin { stroke-width: 1.5; }
+.chart .ln-dash { stroke-dasharray: 6 4; }
+.chart .ln-mean { stroke: var(--c1); }
+.chart .ln-median { stroke: var(--c0); }
+.chart .ln-collapse { stroke: var(--neg); }
+.chart .dot-mean { fill: var(--c1); }
+.chart .dot-median { fill: var(--c0); }
+.chart .dot-collapse { fill: var(--neg); }
+.chart .few { fill: var(--surface); stroke: var(--muted); stroke-width: 1.5; }
+.chart g.few-bar > rect { fill-opacity: .35; }
+.chart .pt { fill-opacity: .55; }
+.chart .pt:hover { fill-opacity: 1; stroke: var(--text); stroke-width: 1; }
+.chart .pt-gave { fill: var(--neg); }
+.chart .pt-kept { fill: var(--c0); }
+.chart .hm-cell { stroke: var(--surface); stroke-width: 1; }
+.chart .hm-label { fill: var(--hm-text); font-size: 10px; pointer-events: none; }
+.chart .hm-label.hm-few-t { fill: var(--muted); }
+.chart .hist-bar { fill: var(--accent); fill-opacity: .7; }
+.chart .hist-bar:hover { fill-opacity: 1; }
+.c0 { --c: var(--c0); } .c1 { --c: var(--c1); } .c2 { --c: var(--c2); } .c3 { --c: var(--c3); } .c4 { --c: var(--c4); }
+.c5 { --c: var(--c5); } .c6 { --c: var(--c6); } .c7 { --c: var(--c7); } .c8 { --c: var(--c8); } .c9 { --c: var(--c9); }
+.chart .cs { stroke: var(--c); }
+.chart .cf { fill: var(--c); }
+.chart .cf.few { fill: var(--surface); stroke: var(--c); }
+.hm-n3 { --c: var(--hm-n3); fill: var(--hm-n3); background: var(--hm-n3); } .hm-n2 { --c: var(--hm-n2); fill: var(--hm-n2); background: var(--hm-n2); }
+.hm-n1 { --c: var(--hm-n1); fill: var(--hm-n1); background: var(--hm-n1); } .hm-z { --c: var(--hm-z); fill: var(--hm-z); background: var(--hm-z); }
+.hm-p1 { --c: var(--hm-p1); fill: var(--hm-p1); background: var(--hm-p1); } .hm-p2 { --c: var(--hm-p2); fill: var(--hm-p2); background: var(--hm-p2); }
+.hm-p3 { --c: var(--hm-p3); fill: var(--hm-p3); background: var(--hm-p3); } .hm-few { --c: var(--hm-few); fill: var(--hm-few); background: var(--hm-few); }
+.mix-0 { --c: var(--mix-0); fill: var(--mix-0); background: var(--mix-0); } .mix-1 { --c: var(--mix-1); fill: var(--mix-1); background: var(--mix-1); }
+.mix-2 { --c: var(--mix-2); fill: var(--mix-2); background: var(--mix-2); } .mix-3 { --c: var(--mix-3); fill: var(--mix-3); background: var(--mix-3); }
+.mix-4 { --c: var(--mix-4); fill: var(--mix-4); background: var(--mix-4); }
+td.hm-n3, td.hm-n2, td.hm-n1, td.hm-z, td.hm-p1, td.hm-p2, td.hm-p3,
+td.hm-n3 .pos, td.hm-n3 .neg, td.hm-n2 .pos, td.hm-n2 .neg, td.hm-n1 .pos, td.hm-n1 .neg, td.hm-z .pos, td.hm-z .neg,
+td.hm-p1 .pos, td.hm-p1 .neg, td.hm-p2 .pos, td.hm-p2 .neg, td.hm-p3 .pos, td.hm-p3 .neg,
+td.hm-n3 .ana-n, td.hm-n2 .ana-n, td.hm-n1 .ana-n, td.hm-z .ana-n, td.hm-p1 .ana-n, td.hm-p2 .ana-n, td.hm-p3 .ana-n { color: var(--hm-text); }
+/* legends of the charts: a swatch and a label per series */
+.ana-key { display: flex; flex-wrap: wrap; gap: 4px 14px; margin: 6px 0 0; padding: 0; list-style: none; font-size: 12px; color: var(--text-2); }
+.ana-key li { display: inline-flex; align-items: center; gap: 6px; }
+.sw { display: inline-block; width: 12px; height: 12px; border-radius: 2px; background: var(--c, var(--muted)); box-shadow: inset 0 0 0 1px var(--border-input); }
+.sw.sw-line { height: 3px; border-radius: 2px; box-shadow: none; }
+.sw.sw-dash { height: 0; background: transparent; box-shadow: none; border-top: 3px dashed var(--c, var(--muted)); }
+.sw.sw-mean { --c: var(--c1); } .sw.sw-median { --c: var(--c0); } .sw.sw-collapse { --c: var(--neg); }
+.sw.sw-bar { --c: var(--accent); opacity: .5; }
+.sw.sw-gave { --c: var(--neg); border-radius: 50%; } .sw.sw-kept { --c: var(--c0); border-radius: 50%; }
+.ana-big { margin: 8px 0; font-size: 15px; }
+.ana-big strong { font-size: 24px; font-variant-numeric: tabular-nums; }
+.ana-multiples { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 12px; }
+.ana-multiple { border: 1px solid var(--border); border-radius: 4px; padding: 6px 8px 2px; min-width: 0; }
+.ana-multiple h4 { margin: 0 0 2px; font-size: 13px; font-weight: 600; overflow-wrap: anywhere; }
+.ana-multiple.is-few h4 { color: var(--muted); font-style: italic; font-weight: 500; }
+.ana-multiple.is-few .hist-bar { fill: var(--muted); }
+.ana-figure { margin: 0; }
+.ana-figure figcaption { margin-top: 4px; }
+@media (max-width: 520px) {
+  .ana-tabs button { padding: 0 10px; }
+  .ana-multiples { grid-template-columns: 1fr; }
+}
 @media (max-width: 520px) {
   .topnav a { padding: 6px 8px; }
   .ana-wrap tbody th.tok { min-width: 10ch; max-width: 16ch; }

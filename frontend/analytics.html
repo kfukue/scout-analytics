@@ -8,6 +8,7 @@
 <title>Scout analytics</title>
 <link rel="icon" href="favicon.svg" type="image/svg+xml">
 <link rel="stylesheet" href="style.css">
+<script src="analytics-stats.js" defer></script>
 <script src="analytics.js" defer></script>
 </head>
 <body>
@@ -30,7 +31,7 @@
         <button type="button" id="ana-reload" class="btn btn-quiet">Reload</button>
       </div>
     </div>
-    <p class="ana-scope"><strong>First calls only</strong> (one per token), <strong>late entry</strong> (the price 60 seconds after the post), <strong>in USD</strong>, <strong>before tax</strong>.</p>
+    <p class="ana-scope"><strong>First calls only</strong> (one per token), <strong>late entry</strong> (the price 60 seconds after the post), <strong>in USD</strong>, <strong>before tax</strong>; values rounded to 0.1.</p>
 
     <div class="controls ana-controls">
       <div class="window-pick">
@@ -41,6 +42,21 @@
           <button type="button" data-horizon="3d" aria-pressed="false">3d</button>
           <button type="button" data-horizon="7d" aria-pressed="false">7d</button>
           <button type="button" data-horizon="30d" aria-pressed="false">30d</button>
+        </div>
+      </div>
+      <div class="window-pick" data-tabs="overview factor">
+        <span id="ana-m-label">Metric</span>
+        <div id="ana-metric" class="segmented compact" role="group" aria-labelledby="ana-m-label">
+          <button type="button" data-metric="ret" aria-pressed="true">Return</button>
+          <button type="button" data-metric="peak" aria-pressed="false">Peak</button>
+          <button type="button" data-metric="dd" aria-pressed="false">Drawdown</button>
+        </div>
+      </div>
+      <div class="window-pick" data-tabs="overview factor">
+        <span id="ana-s-label">Statistic</span>
+        <div id="ana-stat" class="segmented compact" role="group" aria-labelledby="ana-s-label">
+          <button type="button" data-stat="median" aria-pressed="true">Median</button>
+          <button type="button" data-stat="mean" aria-pressed="false">Mean</button>
         </div>
       </div>
       <div class="window-pick">
@@ -58,14 +74,62 @@
           <button type="button" data-period="month" aria-pressed="false">Month</button>
         </div>
       </div>
+      <div class="window-pick">
+        <label for="ana-family">Pool family</label>
+        <select id="ana-family" class="ana-select"><option value="all">All</option></select>
+      </div>
+      <div class="window-pick">
+        <label for="ana-verdict">Verdict at the call</label>
+        <select id="ana-verdict" class="ana-select"><option value="all">All</option></select>
+      </div>
     </div>
 
     <p id="ana-msg" class="notice" role="status">Loading…</p>
     <p id="ana-error" class="notice error" role="alert" hidden></p>
 
     <div id="ana-body" hidden>
+      <div class="ana-tabs" role="tablist" aria-label="Views">
+        <button type="button" role="tab" id="tab-overview" data-tab="overview" aria-controls="panel-overview" aria-selected="true">Overview</button>
+        <button type="button" role="tab" id="tab-factor" data-tab="factor" aria-controls="panel-factor" aria-selected="false" tabindex="-1">By factor</button>
+        <button type="button" role="tab" id="tab-peak" data-tab="peak" aria-controls="panel-peak" aria-selected="false" tabindex="-1">Peak vs final</button>
+      </div>
+
+      <div id="panel-overview" class="ana-panel" role="tabpanel" aria-labelledby="tab-overview">
       <dl id="ana-counts" class="stats"></dl>
       <p id="ana-counts-note" class="muted small note"></p>
+
+      <h3 class="ana-h" id="h-trend">Trend by week</h3>
+      <figure class="ana-figure">
+        <div id="ch-trend" class="chart"></div>
+        <ul class="ana-key">
+          <li><span class="sw sw-bar"></span>Calls</li>
+          <li><span class="sw sw-line sw-collapse"></span>Collapse rate (≤ −50%, right axis)</li>
+          <li><span class="sw sw-line sw-mean"></span>Mean return</li>
+          <li><span class="sw sw-line sw-median"></span>Median return</li>
+        </ul>
+        <figcaption id="cap-trend" class="muted small"></figcaption>
+      </figure>
+
+      <h3 class="ana-h" id="h-mix">Outcome mix by week</h3>
+      <figure class="ana-figure">
+        <div id="ch-mix" class="chart"></div>
+        <ul id="key-mix" class="ana-key"></ul>
+        <figcaption id="cap-mix" class="muted small"></figcaption>
+      </figure>
+
+      <h3 class="ana-h" id="h-pl">$100 on every call</h3>
+      <figure class="ana-figure">
+        <div id="ch-pl" class="chart"></div>
+        <ul id="key-pl" class="ana-key"></ul>
+        <figcaption id="cap-pl" class="muted small"></figcaption>
+      </figure>
+
+      <h3 class="ana-h" id="h-heat">By hour and weekday of the call (UTC)</h3>
+      <figure class="ana-figure">
+        <div id="ch-heat" class="chart"></div>
+        <ul id="key-heat" class="ana-key"></ul>
+        <figcaption id="cap-heat" class="muted small"></figcaption>
+      </figure>
 
       <h3 class="ana-h" id="t-all">All first calls</h3>
       <div class="ana-wrap" tabindex="0" role="region" aria-labelledby="t-all"><table id="tbl-all" aria-labelledby="t-all"></table></div>
@@ -85,8 +149,74 @@
       <h3 class="ana-h" id="t-period">By week</h3>
       <div class="ana-wrap" tabindex="0" role="region" aria-labelledby="t-period"><table id="tbl-period" aria-labelledby="t-period"></table></div>
 
-      <h3 class="ana-h" id="t-matrix">Median return by week and Perceptor verdict</h3>
+      <h3 class="ana-h" id="t-matrix">Median (and mean) return by week and Perceptor verdict</h3>
       <div class="ana-wrap" tabindex="0" role="region" aria-labelledby="t-matrix"><table id="tbl-matrix" aria-labelledby="t-matrix"></table></div>
+      </div>
+
+      <div id="panel-factor" class="ana-panel" role="tabpanel" aria-labelledby="tab-factor" hidden>
+        <div class="controls ana-controls ana-sub">
+          <div class="window-pick">
+            <label for="ana-factor">Factor (known at the call)</label>
+            <select id="ana-factor" class="ana-select"></select>
+          </div>
+          <div class="window-pick" id="ana-k-box">
+            <span id="ana-k-label">Groups</span>
+            <div id="ana-k" class="segmented compact" role="group" aria-labelledby="ana-k-label">
+              <button type="button" data-k="4" aria-pressed="false">4</button>
+              <button type="button" data-k="5" aria-pressed="true">5</button>
+              <button type="button" data-k="10" aria-pressed="false">10</button>
+            </div>
+          </div>
+        </div>
+        <p id="factor-note" class="muted small"></p>
+
+        <h3 class="ana-h" id="h-hist">Distribution per group</h3>
+        <div id="ch-hist" class="ana-multiples"></div>
+        <p id="cap-hist" class="muted small note"></p>
+
+        <h3 class="ana-h" id="t-factor">Per group</h3>
+        <div class="ana-wrap" tabindex="0" role="region" aria-labelledby="t-factor"><table id="tbl-factor" aria-labelledby="t-factor"></table></div>
+
+        <h3 class="ana-h" id="h-scatter">Each call</h3>
+        <figure class="ana-figure">
+          <div id="ch-scatter" class="chart"></div>
+          <ul id="key-scatter" class="ana-key"></ul>
+          <figcaption id="cap-scatter" class="muted small"></figcaption>
+        </figure>
+
+        <h3 class="ana-h" id="h-path">Typical path after the call</h3>
+        <div class="controls ana-sub">
+          <div class="window-pick">
+            <span id="ana-path-label">Calls</span>
+            <div id="ana-path" class="segmented compact" role="group" aria-labelledby="ana-path-label">
+              <button type="button" data-path="all" aria-pressed="true">All with data at each point</button>
+              <button type="button" data-path="same" aria-pressed="false">Same calls at every point</button>
+            </div>
+          </div>
+        </div>
+        <figure class="ana-figure">
+          <div id="ch-path" class="chart"></div>
+          <ul id="key-path" class="ana-key"></ul>
+          <figcaption id="cap-path" class="muted small"></figcaption>
+        </figure>
+        <div class="ana-wrap" tabindex="0" role="region" aria-labelledby="h-path"><table id="tbl-path" aria-labelledby="h-path"></table></div>
+
+        <h3 class="ana-h" id="t-grid">Perceptor verdict at the call × pool family</h3>
+        <div class="ana-wrap" tabindex="0" role="region" aria-labelledby="t-grid"><table id="tbl-grid" aria-labelledby="t-grid"></table></div>
+      </div>
+
+      <div id="panel-peak" class="ana-panel" role="tabpanel" aria-labelledby="tab-peak" hidden>
+        <p id="peak-big" class="ana-big"></p>
+        <figure class="ana-figure">
+          <div id="ch-peak" class="chart"></div>
+          <ul class="ana-key">
+            <li><span class="sw sw-gave"></span>Gave back more than half of the peak</li>
+            <li><span class="sw sw-kept"></span>Kept at least half (or no peak above 0%)</li>
+            <li><span class="sw sw-dash"></span>Return = peak</li>
+          </ul>
+          <figcaption id="cap-peak" class="muted small"></figcaption>
+        </figure>
+      </div>
     </div>
 
     <details class="legend" open>
@@ -96,11 +226,10 @@
         <div><dt>Window</dt><dd>Every number is for the window chosen above (1h, 1d, 3d, 7d or 30d after the call) and counts only the calls that have a recorded return for it.</dd></div>
         <div><dt>Calls</dt><dd>First calls in the group (after the "Quiet after the call" choice).</dd></div>
         <div><dt>With data</dt><dd>Of those, the calls with a return for the window: the n of every number in the row. Hover over it to see why the others have none: not due yet (the window has not passed), due but no data (the price source had no trades for it), waiting for the tracker, not tracked, or not priced in USD.</dd></div>
-        <div><dt>Mean, Median</dt><dd>Average and middle return over the window. A few very large winners pull the mean far up; the median is the typical call.</dd></div>
+        <div><dt>Mean, Median</dt><dd>Average and middle over the window: of the return, of the peak (the highest price within the window, from the entry) and of the drop (the lowest). A few very large winners pull the mean far up; the median is the typical call.</dd></div>
         <div><dt>Win rate</dt><dd>Share of the calls with data whose return is above 0%. Under each rate: how many of how many calls.</dd></div>
         <div><dt>≥ +100% peak</dt><dd>Share whose highest price within the window was at least double the entry (peak ≥ +100%), counted over the calls with a peak. A rugged call's peak before the rug counts.</dd></div>
         <div><dt>Collapse</dt><dd>Share whose return over the window is −50% or worse.</dd></div>
-        <div><dt>Median peak, Median drop</dt><dd>The middle of the highest and of the lowest price within the window, from the entry.</dd></div>
         <div><dt>Rugged</dt><dd>Calls with data that the tracker has flagged rugged (pool drained) as of now, not as of the window's end. The returns after a rug count as −100%.</dd></div>
         <div><dt>Perceptor verdict at the call</dt><dd>The verdict of the call's own Perceptor scan, or of the latest earlier scan of the token, made when it was called. Later scans (a repeat call's, or a re-scan long after the call) are never used here, unlike the list's Perceptor column, which shows the token's latest scan. Calls imported from history were not scanned.</dd></div>
         <div><dt>Pool family</dt><dd>The kind of pool the tracker priced the call from: Uniswap v2, v3, v4 or the Pons launch curve. "GeckoTerminal" = priced from GeckoTerminal candles (no on-chain pool); "Not tracked" = no entry price.</dd></div>
@@ -108,6 +237,17 @@
         <div><dt>Quiet after the call</dt><dd>A call with fewer than <span id="lg-quiet">50</span> trades in the 24 hours after it (counted from the stored 5-minute candles; for Uniswap v2 pools liquidity changes count too). Rugged calls are never counted as quiet. The count is known only for calls priced from an on-chain pool whose first day the tracker has stored; for the others (GeckoTerminal, untracked, not yet a day old) it is unknown, and "Exclude" keeps them while "Only quiet" leaves them out.</dd></div>
         <div><dt>Week, Month</dt><dd>By the time of the call in UTC. Weeks run Monday to Sunday ("Week of Mon 3 Aug 2026").</dd></div>
         <div><dt><span class="ana-few">grey</span></dt><dd>A group with fewer than 20 calls with data: too few for its numbers to mean much.</dd></div>
+        <div><dt>Metric, Statistic</dt><dd>What the hour × weekday chart and the "By factor" charts show: the return at the end of the window, the peak (highest price within it) or the drawdown (lowest price within it), each from the entry; and whether a cell or a line is the mean or the median. The trend, outcome mix and "$100 on every call" charts always use the return.</dd></div>
+        <div><dt>Pool family, Verdict at the call</dt><dd>Show only the calls of one pool family or of one Perceptor verdict at the call. They apply to every table and chart, except "$100 on every call": its "All calls" and "No red flags at the call" lines ignore both (they follow only the quiet choice), and it adds a line for the chosen pool family and verdict.</dd></div>
+        <div><dt>Trend</dt><dd>Per week (or month): bars = first calls; lines = mean and median return of the calls with data, and the collapse rate (share with a return of −50% or worse; right axis). Hover over a week for its numbers. Weeks with fewer than 20 calls with data have hollow points.</dd></div>
+        <div><dt>Outcome mix</dt><dd>Shares of the calls with data per week (or month), by the return at the window: rugged (flagged rugged by the tracker, whatever the return), −50% or worse, above −50% up to 0%, above 0% to below +100%, +100% or more.</dd></div>
+        <div><dt>$100 on every call</dt><dd>The running profit or loss if $100 had gone into every call with data, in the order of the calls, and come out at the end of the window: each call adds its return in dollars, <strong>capped at +1,000%</strong> (+$1,000), so one huge winner does not hide the rest; before tax and fees. Lines: all calls and the calls with no red flags at the time of the call (both follow the quiet choice only, not the pool family or verdict choice), and, when a pool family or verdict is chosen, the calls of that choice (when only "No red flags" is chosen, that line is already drawn).</dd></div>
+        <div><dt>Hour × weekday</dt><dd>When the call was posted (UTC). Each cell: the mean or median of the metric over the calls with data posted in that hour of that weekday; hover for the number of calls. Cells with fewer than 20 calls with data are grey.</dd></div>
+        <div><dt>By factor</dt><dd>Values known at the time of the call: the Perceptor verdict; the market cap at the call as posted (the post's "called at" figure, not worked out from the price); the holders, elite holders and good holders the post counts; the elite and good live buys it lists (count and dollars); and the hour of trading before the call, measured on the chain (buy and sell volume in USD, swaps, price change). Number factors are split into groups of about the same number of calls (4, 5 or 10), over the calls with data for the window that have a value; equal values stay in one group, so groups can differ in size; when at least 10% of the values are 0, 0 is a group of its own and the values below and above 0 are split separately (so no group spans 0), sharing the other groups by their number of calls, at least one group for each side that has values (so there are still 4, 5 or 10 groups in total when the values differ enough). Calls without a value are left out. Pre-call volumes are shown only for calls whose hour was measured in USD (some were measured in the pool's quote asset).</dd></div>
+        <div><dt>Distribution bands</dt><dd>A value on a boundary goes to the band farther from 0: a band below 0 includes its upper end (−50 is in "−75 to −50", 0 itself in "−25 to 0"), a band above 0 its lower end (+25 is in "+25 to +50"), and "0 to +25" starts just above 0. So the two lowest bands are the collapses, the bands above 0 the wins, and the two highest the calls at +100% or more. Each bar is a share of its group; all groups use the same axes.</dd></div>
+        <div><dt>Scales</dt><dd>Returns, peaks and drops are drawn on a symmetric log scale (−100%, −50%, 0, +100%, +1,000% …), so a few huge winners do not flatten the rest. Dollar amounts and counts are drawn on a log scale that keeps 0.</dd></div>
+        <div><dt>Typical path</dt><dd>The mean or median of the metric at 1h, 1d, 3d, 7d and 30d after the call, per group. "All with data at each point" uses every call with data at that point (n changes from point to point: the table under the chart gives it); "Same calls at every point" uses only the calls with data at all five.</dd></div>
+        <div><dt>Peak vs final</dt><dd>Each call with data: its peak within the window against its return at the end of it. A call "gave back more than half" when its peak was above 0% and its return is less than half of the peak.</dd></div>
         <div><dt>Rounding</dt><dd>Every return, peak and drop is rounded to 0.1% before the thresholds above are applied: a return of +0.04% counts as 0.0% (not a win), −49.96% as −50.0% (a collapse), a peak of +99.96% as +100.0%.</dd></div>
         <div><dt>–</dt><dd>No call in the group has a value for this number.</dd></div>
       </dl>
