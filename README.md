@@ -1193,6 +1193,16 @@ read on demand (see below).
   texts of those reports are read by a second, small query **only for report ids the website
   does not hold yet** (none when no report arrived since the last read); see the row detail
   below.
+- **The Analytics page** adds to that statement the posted DEX, the price source, the quote
+  asset, which windows are stored as `no_data`, the Perceptor verdict at the time of the call
+  and whether the first 24 hours of candles are stored (about +20 ms on 6,000 tokens). The trade
+  counts of the first 24 hours (`scout_call_candles`) are read separately and kept: a refresh
+  reads only calls whose count has just become complete (usually none; a few ms), and all of
+  them again once an hour (about 0.3 s for 5,600 calls and 1.4 million 5-minute candles on the
+  test machine), in case a call was tracked again. If that read fails, the refresh still
+  succeeds: the counts already held stay (and are shown), calls not counted yet show as
+  unknown, the failure is logged at most once a minute (`webErrorLogEvery`), and the next
+  refresh tries again.
 - **Memory**: about 1 KB per token for the snapshot (about 10 MB for 12,000 tokens, about
   90 MB for 100,000; the five window returns in every row added about 110 bytes a token), on top of the program itself; while a refresh runs, the rows just read
   are in memory next to it for a moment. The whole process measured 40–55 MB with 12,000
@@ -1445,6 +1455,49 @@ other sites):
   follows the owner's design reference (cards with a light border, a top bar, pill badges,
   a system font stack). `style.css` only; no web fonts or other sites are loaded.
 
+**Analytics page** (`/analytics.html`; "Analytics" in the top bar of the list, "Calls" back).
+Section 1, **Call performance**, is built; section 2, "Model insights", is an empty heading for
+now. Everything on it is **first calls only, late entry (60 s after the post), in USD, before
+tax**, worked out in the browser from one compact feed (`GET /api/analytics`, below), so every
+choice is instant and no request reads the database.
+
+- **Choices:** the window (1h, 1d, 3d, 7d, 30d; 1d by default), **Quiet after the call**
+  (Include / Exclude / Only quiet) and **Period** (Week / Month).
+- **Counts** of the selection for the window: calls, with data, not due yet (called less than
+  the window ago), due but no data (stored as `no_data`), waiting for the tracker (due, tracked
+  in USD, not recorded yet), not tracked / no USD price.
+- **Tables**, each with the same columns: all first calls; by **Perceptor verdict at the
+  call**; by **pool family** (the pool the tracker priced the call from: Uniswap v2, v3, v4,
+  Pons launch curve, GeckoTerminal, not tracked); by **DEX named in the post** (the 12 most
+  frequent names, the rest as "Other"); by **quote asset**; by **week** (UTC, Monday to Sunday,
+  "Week of Mon 3 Aug 2026") or **month**; and the **median return by week (or month) and
+  verdict**.
+- **Columns:** Calls, With data (the n of every number in the row; its tooltip says why the
+  others have none), Mean and Median return, Win rate (return > 0), ≥ +100% peak (peak ≥ +100%,
+  over the calls with a peak), Collapse (return ≤ −50%), Median peak, Median drop, Rugged (flagged
+  rugged as of now). Every rate shows its count under it ("120 / 249"). A group with fewer than
+  20 calls with data is greyed out. A legend under the tables explains each column.
+  Returns, peaks and drops come rounded to 0.1 (`GET /api/analytics`), and the thresholds
+  are applied to the rounded values: +0.04% counts as 0.0% (not a win), −49.96% as −50.0% (a
+  collapse), a peak of +99.96% as +100.0%. The legend says so too.
+- **Rugged calls:** their returns after the rug count as −100% (as stored), and, unlike the
+  list (which shows no peak for them), their peak before the rug counts.
+- **Verdict at the call** is not the list's Perceptor column: it is the call's own live
+  Perceptor scan, else the latest live scan of the same address made before the call (the rule
+  of `scout_call_dataset_v`). A repeat call's later scan, a re-scan ("Perceptor today") or a
+  scan made after the call never count. Calls imported from history show as "Not scanned".
+- **Quiet after the call** = fewer than 50 trades (`webQuietTrades` in `webanalytics.go`) in the
+  24 hours after the call, and not rugged. Trades = the events of the call's 5-minute candles
+  (`scout_call_candles`, the first 24 hours). For Uniswap v2 pools the tracker counts `Sync`
+  events, which liquidity adds and removals also emit, so a v2 count can be a little high. The
+  count is **known only** for calls priced from an on-chain pool (`entry_price_source`
+  `onchain-*`, state version 2 or later) whose 1d window the tracker has stored; a call without
+  candles then counts 0. For the others (GeckoTerminal-priced, untracked, younger than a day or
+  not tracked that far yet) it is unknown: "Exclude" keeps them, "Only quiet" leaves them out.
+- The page asks again every minute while it is visible (`If-None-Match`: a `304` while nothing
+  changed); "Reload" asks at once. When a request fails it says so and the time of the data
+  still shown.
+
 **Token names.** The tracker reads each token's own `name()` and `symbol()` from its contract
 and stores them in `scout_call_tracking.token_name` / `token_symbol_onchain` (on-chain price
 source only). After every tracker cycle (`-track`, `-track-once`, or the listener's built-in
@@ -1633,6 +1686,41 @@ one listed call (`call_id` of a row of `/api/calls`), from memory:
   are let go. A request never reads the database. If that query fails, the whole refresh counts
   as failed and the snapshot before stays. A report that cannot be read at that moment is left
   out of the row until the next refresh.
+
+`GET /api/analytics` — the feed of the Analytics page: one compact row per first call, built
+once with each snapshot (encoded and gzip-compressed then, not per request), from memory. No
+parameters (any → `400`); `ETag` (weak, a hash of the body, so it stays the same while only
+the list's other fields move, such as latest prices), `If-None-Match` → `304`,
+`Cache-Control: no-cache`, `X-Snapshot-At` (the page counts "not due yet" from it), gzip for
+clients that take it; `503` before the first snapshot.
+
+```json
+{"format": 1, "horizons": ["1h","1d","3d","7d","30d"], "horizon_seconds": [3600,86400,259200,604800,2592000],
+ "quiet_below": 50, "verdicts": ["clean","caution","red_flags","unknown","none"],
+ "families": ["v4","v2","pons","v3","gecko","untracked"], "dexes": ["Uniswap V4","Pons V2","…"], "quotes": ["WETH","USDG"],
+ "columns": ["call_id","t","flags","verdict","family","dex","quote","trades_24h","no_data",
+             "ret_1h","peak_1h","dd_1h","ret_1d","peak_1d","dd_1d","…","dd_30d"],
+ "rows": [[812, 1790000000, 5, 0, 1, 3, 0, 214, 0, 12.5, 40.1, -3.2, -20, 100, -50, null, null, null, …]]}
+```
+
+- `t` = the call's time (Unix seconds). `flags`: 1 = priced in USD (only these rows have
+  numbers), 2 = rugged (as of now), 4 = tracked (has an entry price).
+- `verdict`, `family`, `dex`, `quote` are indexes into `verdicts`, `families`, `dexes`,
+  `quotes` (`-1` = none). `verdict` = the Perceptor verdict at the call (see the Analytics
+  page; `none` = no live scan at the time). `family` = `entry_price_source` without `onchain-`
+  (v2, v3, v4, pons), `gecko` for GeckoTerminal candles, `untracked` without one. `dex` = the
+  DEX named in the post (`scout_call_metrics.dex`, spaces trimmed, at most 60 characters);
+  `quote` = the pool's quote asset (`scout_call_tracking.onchain->>'quote_sym'`). The
+  dictionaries list the most frequent first.
+- `trades_24h` = swaps in the first 24 hours (see "Quiet after the call"), `null` when unknown.
+- `no_data`: bit *i* set = window *i* of `horizons` is stored with status `no_data` (due, but
+  the price source had nothing for it). A window with no value and no bit is either not due yet
+  (`t` + its seconds after `X-Snapshot-At`) or not recorded yet.
+- Then, per window: return, peak and worst drop (late entry, USD, %, rounded to 0.1; `null` when
+  missing). A rugged call keeps its peak here.
+- Size: about 117 bytes a row, about 39 compressed (6,000 rows: 703 KB, 233 KB gzipped).
+- The fields behind it are part of the list's snapshot version, so a change to any of them also
+  changes the `ETag` of `/api/calls`.
 
 `GET /api/events` — live updates as a stream of
 [Server-Sent Events](https://html.spec.whatwg.org/multipage/server-sent-events.html)

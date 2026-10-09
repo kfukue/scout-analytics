@@ -1090,6 +1090,16 @@ func BenchmarkWebSnapshot(b *testing.B) {
 	}
 	ws.snap.Store(snap)
 	b.Run("http/summary", func(b *testing.B) { serve(b, httptest.NewRequest("GET", "/api/summary", nil), 200) })
+	b.Run("http/analytics_gzip", func(b *testing.B) {
+		req := httptest.NewRequest("GET", "/api/analytics", nil)
+		req.Header.Set("Accept-Encoding", "gzip")
+		serve(b, req, 200)
+	})
+	b.Run("http/analytics_not_modified", func(b *testing.B) {
+		req := httptest.NewRequest("GET", "/api/analytics", nil)
+		req.Header.Set("If-None-Match", snap.analytics.etag)
+		serve(b, req, 304)
+	})
 	b.Run("http/not_modified", func(b *testing.B) {
 		rec := httptest.NewRecorder()
 		ws.ServeHTTP(rec, httptest.NewRequest("GET", "/api/calls?q=pe&verdict=clean&sort=peak", nil))
@@ -1125,6 +1135,33 @@ func BenchmarkWebSnapshot(b *testing.B) {
 			b.StartTimer()
 			if s := mustWebSnapshot(b, rows, 600, nil); s.n != n {
 				b.Fatal("rows")
+			}
+		}
+	})
+	// a refresh in which only the list changed (e.g. a latest price): the
+	// Analytics body is encoded and hashed again but taken over as it was
+	b.Run("build_list_change", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			b.StopTimer()
+			rows := cloneWebRows(raw)
+			rows[0].TokenName = sp("Renamed")
+			b.StartTimer()
+			if s := mustWebSnapshot(b, rows, 600, snap); s.analytics != snap.analytics {
+				b.Fatal("analytics body not taken over")
+			}
+		}
+	})
+	// a refresh in which an Analytics field changed: encoded and compressed again
+	b.Run("build_analytics_change", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			b.StopTimer()
+			rows := cloneWebRows(raw)
+			rows[0].PostedDex = sp("New DEX")
+			b.StartTimer()
+			if s := mustWebSnapshot(b, rows, 600, snap); s.analytics == snap.analytics {
+				b.Fatal("analytics body not rebuilt")
 			}
 		}
 	})

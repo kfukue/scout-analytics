@@ -187,6 +187,9 @@ type webSnapshot struct {
 	// ran (Unix nanoseconds, 0 = none). Only webSnapshotEvents reads them.
 	todayVerd []uint8
 	todayAt   []int64
+	// analytics: the body of GET /api/analytics, encoded (and compressed)
+	// once when the snapshot is built (webanalytics.go)
+	analytics *webAnalytics
 }
 
 // webTodayVerdict codes a "Perceptor today" verdict for webSnapshot.todayVerd:
@@ -489,6 +492,22 @@ func newWebSnapshot(rows []ScoutWebRow, updatePosts int, prev *webSnapshot, cfg 
 			}
 		}
 
+		// The Analytics page keeps the numbers as read (USD-priced calls only),
+		// including a rugged call's peak, which the list hides below.
+		r.anaHas, r.anaPerf = 0, [webPerfPerRow]float64{}
+		if r.usd {
+			r.anaHas = r.HasPerf
+			for j := range r.Perf {
+				if r.anaHas&(1<<j) != 0 {
+					r.anaPerf[j] = r.Perf[j]
+				}
+			}
+		}
+		// Trades in the first 24 hours are only known once those candles are
+		// stored.
+		if !r.TradesFinal {
+			r.Trades24h = nil
+		}
 		// Performance is shown in USD only: the numbers of other calls are not
 		// there at all (and so sort last).
 		if !r.usd {
@@ -636,6 +655,15 @@ func newWebSnapshot(rows []ScoutWebRow, updatePosts int, prev *webSnapshot, cfg 
 	// give back what the two growing blocks reserved beyond their content
 	s.rowJSON, s.search = trimBlock(s.rowJSON), trimBlock(s.search)
 	s.buildOrders(rows)
+	var prevAna *webAnalytics
+	if prev != nil {
+		prevAna = prev.analytics
+	}
+	ana, err := buildWebAnalytics(rows, prevAna)
+	if err != nil {
+		return nil, fmt.Errorf("analytics: %w", err)
+	}
+	s.analytics = ana
 	return s, nil
 }
 
@@ -744,6 +772,24 @@ func hashWebRows(rows []ScoutWebRow, updatePosts int, gmgn string) string {
 		// sAlpha one declines is in the flags above)
 		optInt(r.PerceptorID)
 		optInt(r.SAlphaID)
+		// the Analytics page's fields (GET /api/analytics): the numbers as
+		// read (with a rugged call's peak), the DEX, price source, quote asset,
+		// no_data windows, verdict at the call and trades in the first 24 hours
+		buf = binary.LittleEndian.AppendUint16(buf, r.anaHas)
+		for _, v := range r.anaPerf {
+			flt(v)
+		}
+		opt(r.PostedDex)
+		opt(r.EntrySource)
+		opt(r.QuoteSym)
+		buf = append(buf, r.NoData)
+		opt(r.VerdictAtCall)
+		if r.TradesFinal {
+			buf = append(buf, 1)
+		} else {
+			buf = append(buf, 0)
+		}
+		optInt(r.Trades24h)
 		h.Write(buf)
 	}
 	return hex.EncodeToString(h.Sum(nil)[:12])
