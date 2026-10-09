@@ -93,7 +93,12 @@ a:hover { text-decoration: underline; }
 
 /* Top bar: like the reference's header (64px, a hairline under it) */
 .topbar { background: var(--surface); border-bottom: 1px solid var(--topbar-border); }
-.topbar-inner { max-width: 1400px; height: 64px; margin: 0 auto; padding: 0 16px; display: flex; align-items: center; }
+.topbar-inner { max-width: 1400px; height: 64px; margin: 0 auto; padding: 0 16px; display: flex; align-items: center; gap: 16px; }
+/* Links between the pages (Calls, Analytics) at the right of the top bar */
+.topnav { margin-left: auto; display: flex; gap: 4px; }
+.topnav a { padding: 6px 10px; border-radius: 4px; font-weight: 600; color: var(--text-2); }
+.topnav a:hover { background: var(--subtle); text-decoration: none; }
+.topnav a[aria-current="page"] { color: var(--accent-text); background: var(--b-blue-bg); }
 
 /* Cards */
 .panel {
@@ -535,6 +540,39 @@ tbody tr.call-row.fresh { background: var(--b-blue-bg); }
   cursor: pointer;
 }
 .live-note-close:hover { color: var(--text); border-color: var(--border-input); }
+
+/* Analytics page (analytics.html): the scope line, the choices, and one
+   small table per split; the group column stays in view when a table
+   scrolls sideways on a narrow screen. */
+.ana-scope { margin: 8px 0 12px; color: var(--text-2); }
+.ana-controls { margin: 4px 0 8px; }
+.ana-h { font-size: 14px; font-weight: 700; margin: 20px 0 8px; }
+.ana-wrap {
+  overflow-x: auto;
+  max-width: 100%;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  isolation: isolate;
+}
+.ana-wrap table { width: 100%; }
+.ana-wrap thead th { position: static; }
+.ana-wrap th.tok { position: sticky; left: 0; z-index: 1; background: var(--subtle); }
+.ana-wrap tbody th.tok { background: var(--surface); font-weight: 600; white-space: normal; min-width: 12ch; max-width: 28ch; overflow-wrap: anywhere; }
+.ana-wrap tbody tr:hover > th.tok { background: var(--row-hover); }
+.ana-wrap td { vertical-align: top; }
+.ana-rate { display: block; }
+.ana-n { display: block; color: var(--muted); font-size: 11px; line-height: 1.2; }
+.zero { color: var(--text-2); }
+/* a group with fewer than 20 calls with data: greyed out (and said so in its title) */
+tr.ana-few > *, tr.ana-few .pos, tr.ana-few .neg, td.ana-few, td.ana-few .pos, td.ana-few .neg { color: var(--muted); }
+tr.ana-few > th.tok { font-style: italic; font-weight: 500; }
+.legend .ana-few { color: var(--muted); font-style: italic; }
+#ana-counts { margin-top: 4px; }
+@media (max-width: 520px) {
+  .topnav a { padding: 6px 8px; }
+  .ana-wrap tbody th.tok { min-width: 10ch; max-width: 16ch; }
+}
 @media (max-width: 520px) {
   .live-notices { right: 8px; bottom: 8px; width: calc(100vw - 16px); }
   /* a phone shows the two newest; more would cover the table */

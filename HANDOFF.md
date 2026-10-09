@@ -417,20 +417,33 @@ approved; the Perceptor re-scan is approved with the defaults in section 4;
      - the pilot size and the server folder;
      - the look-back cap for old tokens (7 days?).
    - No coder work until the owner approves.
-5. **Analytics page** (planning approved in principle 8 October; build
-   after the "Perceptor today" label is committed).
-   - A separate page with a summary, a by-Perceptor-verdict table and a
-     by-week table, also split by DEX family.
-   - One compact per-call feed from the snapshot (no per-request DB
-     query), aggregated in the browser.
-   - Medians first; horizons not yet due shown as n/total; rugged = −100%;
-     realistic (late) entry.
-   - Defaults the PM chose until the owner answers his five questions
-     (section 3, action 7):
-     - weeks Monday–Sunday UTC;
-     - returns before tax (matching the list);
-     - tables first, charts (ECharts) in phase 2;
-     - the 1d horizon by default.
+5. **Analytics page**: two sections on a separate page (`/analytics.html`,
+   linked from the list's top bar and back).
+   - **Section 1, "Call performance": built 8 October, uncommitted on
+     `work/2026-10-09-analytics-page`** (coder; not reviewed or deployed yet).
+     - `GET /api/analytics`: one compact row per first call, built once per
+       snapshot (pre-encoded, pre-gzipped, ETag = hash of the body, 304);
+       the browser groups and filters it. No new table or schema change; the
+       load query gained the posted DEX, `entry_price_source`, the quote
+       asset, a per-window `no_data` bit, the Perceptor verdict at the time of
+       the call (the dataset view's rule, live scans only) and a "first 24 h
+       of candles stored" flag. Trades in the first 24 h come from
+       `scout_call_candles` (5-minute candles), read once and cached; only
+       newly complete calls are read per refresh, all of them hourly.
+     - Page: window 1h–30d (1d default); "Quiet after the call" (< 50 trades
+       in 24 h, not rugged) include / exclude / only; tables overall, by
+       verdict at the call, pool family (v2/v3/v4/pons/GeckoTerminal), posted
+       DEX (top 12 + other), quote asset, week (Mon–Sun UTC) or month, and
+       week × verdict medians. Calls, with data, mean, median, win rate,
+       ≥ +100% peak, collapse, median peak / drop, rugged; n under every rate;
+       groups under 20 calls greyed. First calls, late entry, USD, before
+       tax. Rugged calls keep their pre-rug peak here (the list hides it).
+     - Defaults the PM chose (owner may change): weeks Mon–Sun UTC, returns
+       before tax, tables only (charts later with ECharts), 1d default.
+   - **Section 2, "Model insights": next** (now only an empty "coming soon"
+     heading). Plan: show the model report from the training run's
+     `meta.json`, read from a folder set by a new `SCOUT_ML_DIR` setting;
+     per-call scores later, and only out-of-sample ones.
 
 Later:
 
