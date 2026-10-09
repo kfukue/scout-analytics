@@ -287,6 +287,16 @@ func TestWebAnalyticsFactorsDB(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	// the token supply (whole tokens) and the price at the post: full has
+	// both; quote was looked up without a usable supply; the others not yet
+	if _, err := st.Pool.Exec(ctx, `UPDATE scout_call_tracking SET entry_price_usd = 0.25, token_supply = 2000000, token_supply_block = 77
+		WHERE call_id = $1`, full); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.Pool.Exec(ctx, `UPDATE scout_call_tracking SET token_supply = NULL, token_supply_block = 78
+		WHERE call_id = $1`, quote); err != nil {
+		t.Fatal(err)
+	}
 	metrics(full, 812, 3, 11, 2, 5, 1234.56, 20000.4)
 	metrics(quote, 40, 0, 0, 0, 0, 0, 0)
 	metrics(noPre, 7, 1, 2, 0, 1, 0, 99.5)
@@ -369,6 +379,33 @@ func TestWebAnalyticsFactorsDB(t *testing.T) {
 	snap := mustWebSnapshot(t, rows, 0, nil)
 	a := decodeAnalytics(t, snap.analytics.plain)
 	checkAnaFactors(t, a, rows)
+
+	// The page's market cap at the call is price at the post × the token
+	// supply (2,000,000 tokens at $0.25 = $500,000), not the posted $45,678.9;
+	// a call whose supply was looked up but is NULL, and one not looked up
+	// yet, have none (no fallback to the posted figure).
+	mcapCol := -1
+	for i, c := range a.Columns {
+		if c == "mcap" {
+			mcapCol = i
+		}
+	}
+	if mcapCol < 0 {
+		t.Fatal("no mcap column")
+	}
+	for i := range rows {
+		got := a.Rows[i][mcapCol]
+		switch rows[i].CallID {
+		case full:
+			if got == nil || *got != 500000 {
+				t.Errorf("call %d (supply 2e6, price 0.25, posted 45678.9): mcap %v, want 500000", full, dumpFactors(got))
+			}
+		case quote, noPre, noMetrics:
+			if got != nil {
+				t.Errorf("call %d (no supply): mcap %v, want null", rows[i].CallID, *got)
+			}
+		}
+	}
 }
 
 func dumpFactors(f any) string {

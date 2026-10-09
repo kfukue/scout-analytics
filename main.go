@@ -396,6 +396,9 @@ type scanner struct {
 	latestMu    sync.Mutex
 	latestRetry map[int]time.Time // latest-price pass: call id → not before (after a failed refresh)
 
+	supplyMu      sync.Mutex
+	supplyStrikes map[string]int // supply pass: lower-case contract → passes its lookup got a JSON-RPC error while the node otherwise answered
+
 	postMu      sync.Mutex
 	handled     map[string]bool // "msgID|ca" (and "msgID" for CA-less posts) already processed
 	pending     map[int]bool    // scout_calls ids in s.queue or being processed (guarded by postMu)
@@ -1697,6 +1700,7 @@ func main() {
 			}
 			s.logTrackingStatus(context.Background(), total)
 			s.fillTokenNames(ctx)
+			s.fillTokenSupply(ctx)
 			s.refreshLatest(ctx, false) // one pass: up to SCOUT_LATEST_BATCH latest prices
 			fmt.Printf("processed %d call(s)\n", total)
 		case *trackOnly:

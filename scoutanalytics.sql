@@ -330,6 +330,16 @@ CREATE INDEX IF NOT EXISTS scout_calls_lower_ca_first_idx ON scout_calls (lower(
 ALTER TABLE scout_call_tracking ADD COLUMN IF NOT EXISTS token_name           TEXT;
 ALTER TABLE scout_call_tracking ADD COLUMN IF NOT EXISTS token_symbol_onchain TEXT;
 
+-- Token supply read from the token contract (totalSupply() / 10^decimals(), in
+-- whole tokens), for the Analytics page's price-based market cap at the call.
+-- Read at the call's entry block when the node still has that state, else at the
+-- latest block. token_supply_block: the block it was read at (NULL = not looked
+-- up yet; 0 = nothing read: not an EVM address, or given up after the node
+-- kept answering this token with an error); token_supply NULL with a block
+-- = the contract gave no usable supply (not asked again).
+ALTER TABLE scout_call_tracking ADD COLUMN IF NOT EXISTS token_supply       NUMERIC;
+ALTER TABLE scout_call_tracking ADD COLUMN IF NOT EXISTS token_supply_block BIGINT;
+
 -- Latest price of a tracked first call (on-chain source), kept up to date by the
 -- tracker's latest-price pass: about every 15 minutes for calls under 30 days
 -- old, once a day for older ones. NULL = not read yet.

@@ -240,6 +240,7 @@ var (
 	selSlot0       = selectorOf("slot0()")
 	selBalanceOf   = selectorOf("balanceOf(address)")
 	selLatestRound = selectorOf("latestRoundData()")
+	selTotalSupply = selectorOf("totalSupply()")
 
 	// Chainlink: proxies don't emit events; the underlying aggregator(s) do.
 	topicAnswerUpdated = topicOf("AnswerUpdated(int256,uint256,uint256)")
@@ -445,6 +446,50 @@ func (c *rpcClient) readTokenText(ctx context.Context, addr, selector string, ma
 		return "", isNoSuchValue(err)
 	}
 	return cleanTokenText(decodeString(b), max), true
+}
+
+// maxSupplyDecimals: a token that reports more decimals than this has no
+// usable supply (the supply fill pass stores none); ERC-20 tokens use 18 or
+// fewer.
+const maxSupplyDecimals = 36
+
+// tokenSupply returns a token's raw totalSupply() at a block (0 = latest), not
+// divided by its decimals. A revert or an empty answer is an error for which
+// isNoSuchValue is true; a node that did not answer gives another error.
+func (c *rpcClient) tokenSupply(ctx context.Context, addr string, block uint64) (*big.Int, error) {
+	b, err := c.ethCall(ctx, addr, selTotalSupply, block)
+	if err != nil {
+		return nil, fmt.Errorf("totalSupply(%s): %w", addr, err)
+	}
+	return word(b, 0), nil
+}
+
+// tokenSupplyDecimals returns a token's decimals() (latest block) for the
+// supply fill pass; ok is false when the token reports more than
+// maxSupplyDecimals (no usable supply). It reads the word itself rather than
+// through tokenInfo, so a huge value cannot wrap around, and a token not seen
+// before costs one request, not three.
+func (c *rpcClient) tokenSupplyDecimals(ctx context.Context, addr string) (dec int, ok bool, err error) {
+	b, err := c.ethCall(ctx, addr, selDecimals, 0)
+	if err != nil {
+		return 0, false, fmt.Errorf("decimals(%s): %w", addr, err)
+	}
+	w := word(b, 0)
+	if w.Cmp(big.NewInt(maxSupplyDecimals)) > 0 {
+		return 0, false, nil
+	}
+	return int(w.Int64()), true, nil
+}
+
+// wholeTokens returns raw / 10^decimals as an exact decimal string (no
+// trailing zeros after the point, no point for a whole number).
+func wholeTokens(raw *big.Int, decimals int) string {
+	r := new(big.Rat).SetFrac(raw, new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(decimals)), nil))
+	s := r.FloatString(decimals)
+	if strings.Contains(s, ".") {
+		s = strings.TrimRight(strings.TrimRight(s, "0"), ".")
+	}
+	return s
 }
 
 // tokenLabel returns the token's own name and symbol (cached; two eth_calls for
@@ -2740,6 +2785,78 @@ func (o *onchainSource) hasStateAt(ctx context.Context, block uint64) (bool, err
 		return false, nil
 	}
 	return false, fmt.Errorf("eth_getBalance at block %d: %w", block, err)
+}
+
+// tokenSupplyRead is what the supply fill pass stores for a token: the supply
+// in whole tokens (an exact decimal string; nil = the contract gave none, or
+// no usable decimals) and the block it was read at; AtEntry says that block is
+// the call's entry block (else it is the head when the latest state was read).
+// NoStateAtEntry says the node had no state at the entry block (so neither at
+// any older block): the pass then skips the entry-block try for older tokens.
+type tokenSupplyRead struct {
+	Supply         *string
+	Block          uint64
+	AtEntry        bool
+	NoStateAtEntry bool
+}
+
+// tokenSupplyAt reads a token's supply (totalSupply() / 10^decimals()) at the
+// call's entry block (when tryEntry and the block is known), else at the
+// latest block, recording the head block from head (read once per pass by
+// the caller). A totalSupply() that fails at the entry block with a JSON-RPC
+// answer is told apart by probing the state at that block (hasStateAt): the
+// node has it → the contract reverted (no supply, block = entry block); it
+// does not (a full node, or one that keeps only recent state) → the latest
+// supply is read and NoStateAtEntry is set. It never touches o.noState: the
+// price reads decide that flag on their own, so a supply read of an old token
+// cannot move them to event logs. Any error is a node that did not answer:
+// try again later.
+func (o *onchainSource) tokenSupplyAt(ctx context.Context, ca string, entryBlock uint64, tryEntry bool, head func(context.Context) (uint64, error)) (tokenSupplyRead, error) {
+	dec, decOK, err := o.rpc.tokenSupplyDecimals(ctx, ca)
+	if err != nil && !isNoSuchValue(err) {
+		return tokenSupplyRead{}, err
+	}
+	decOK = decOK && err == nil
+	value := func(raw *big.Int) *string {
+		if !decOK || raw == nil {
+			return nil
+		}
+		s := wholeTokens(raw, dec)
+		return &s
+	}
+	noStateAtEntry := false
+	if decOK && entryBlock > 0 && tryEntry {
+		raw, err := o.rpc.tokenSupply(ctx, ca, entryBlock)
+		if err == nil {
+			return tokenSupplyRead{Supply: value(raw), Block: entryBlock, AtEntry: true}, nil
+		}
+		if !isNoSuchValue(err) {
+			return tokenSupplyRead{}, err
+		}
+		has, perr := o.hasStateAt(ctx, entryBlock)
+		if perr != nil {
+			return tokenSupplyRead{}, perr
+		}
+		if has { // the node has the state: the contract itself gave no supply
+			return tokenSupplyRead{Block: entryBlock, AtEntry: true}, nil
+		}
+		noStateAtEntry = true
+	}
+	hb, err := head(ctx)
+	if err != nil {
+		return tokenSupplyRead{}, fmt.Errorf("head block: %w", err)
+	}
+	if !decOK {
+		return tokenSupplyRead{Block: hb, NoStateAtEntry: noStateAtEntry}, nil
+	}
+	raw, err := o.rpc.tokenSupply(ctx, ca, 0)
+	if err != nil {
+		if !isNoSuchValue(err) {
+			return tokenSupplyRead{}, err
+		}
+		return tokenSupplyRead{Block: hb, NoStateAtEntry: noStateAtEntry}, nil
+	}
+	return tokenSupplyRead{Supply: value(raw), Block: hb, NoStateAtEntry: noStateAtEntry}, nil
 }
 
 func init() {

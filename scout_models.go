@@ -359,6 +359,12 @@ type ScoutWebRow struct {
 	PreSwaps60         *int
 	PreChg60           *float64
 	PreVolUnit         *string
+	// TokenSupply is the token's supply in whole tokens read from the chain
+	// by the tracker (scout_call_tracking.token_supply: at the entry block
+	// when the node still had that state, else a later latest block); nil
+	// when not read or none. With PostPrice it gives the Analytics page's
+	// market cap at the call (webAnaMcap). Not an ML feature.
+	TokenSupply *float64
 
 	// worked out by the website when it builds its snapshot (websnapshot.go)
 	usd     bool  // priced in USD: only then are the numbers shown

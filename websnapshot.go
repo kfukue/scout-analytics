@@ -810,8 +810,9 @@ func hashWebRows(rows []ScoutWebRow, updatePosts int, gmgn string) string {
 		}
 		optInt(r.Trades24h)
 		// and the values known at the call (the "By factor" tab): the
-		// called-at market cap as sent (the list hashes its own choice
-		// above), the post's metrics and the hour before the call
+		// price-based market cap at the call as sent (price at the post ×
+		// token supply; the list hashes its own posted figure above), the
+		// post's metrics and the hour before the call
 		optFlt(webAnaMcap(r))
 		optInt(r.Holders)
 		optInt(r.ProofElite)
