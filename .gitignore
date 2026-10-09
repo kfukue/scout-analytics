@@ -20,3 +20,8 @@ __pycache__/
 
 # Model reports copied from the server (not committed)
 /ml-results/
+
+# Local Claude Code files (not committed)
+/.claude/worktrees/
+/.claude/commands.txt
+/commands.txt
