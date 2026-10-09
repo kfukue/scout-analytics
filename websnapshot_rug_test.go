@@ -7,17 +7,33 @@ import (
 	"testing"
 )
 
-// TestSAlphaDeclined: the phrases of a reply that declines to report are found
-// in any letter case and with text around them; real reports are not.
+// TestSAlphaDeclined: the phrases of a short reply that declines to report
+// are found in any letter case and with text around them; real reports are
+// not, also a long one that mentions a phrase in a risk line.
 func TestSAlphaDeclined(t *testing.T) {
+	// a real report of more than salphaDeclineMaxLen characters with a risk line
+	longReport := "Summary: meme token on Base, launched 3 h ago. " + strings.Repeat("Holders grow steadily; dev wallet holds 2%. ", 6) +
+		"Risks: too little liquidity to exit large positions; not enough public information on the team."
+	if n := len([]rune(longReport)); n <= salphaDeclineMaxLen {
+		t.Fatalf("longReport has %d characters, want more than %d", n, salphaDeclineMaxLen)
+	}
+	atLimit := "Too little liquidity to research." + strings.Repeat(".", salphaDeclineMaxLen-len("Too little liquidity to research."))
+	padded := strings.Repeat(" \n", 400) + "Not enough public signals to generate a report for this token." + strings.Repeat("\r\n\t", 100)
 	for _, tc := range []struct {
 		text string
 		want bool
 	}{
+		{longReport, false},
+		{atLimit, true},
+		{atLimit + ".", false},
+		{padded, true}, // white space around a decline does not count
 		{"Not enough public signals to generate a report for this token.", true},
 		{"  NOT ENOUGH PUBLIC SIGNALS TO GENERATE A REPORT for this token\n", true},
 		{"Too little liquidity or trading activity to research yet.", true},
 		{"too little liquidity or trading activity to research yet", true},
+		{"There is not enough public information to write a report on this token.", true},
+		{"Not enough public data yet.", true},
+		{"Too little liquidity to research.", true},
 		{"Strong community traction; dev wallet sold 2%.", false},
 		{"Not enough liquidity yet, but 3 smart wallets bought.", false},
 		{"", false},

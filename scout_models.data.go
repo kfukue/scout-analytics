@@ -1533,14 +1533,17 @@ const (
 	// same rule, among those whose report_text has something other than white
 	// space (about half of sAlpha's replies are empty: they count as no report,
 	// so an older one with text is taken instead). A reply that only declines
-	// ("Not enough public signals …": its text contains one of the phrases of
-	// $1, lower case, see salphaDeclinePhrases) is taken only when the token
-	// has no real report: any real report, however old, comes first.
+	// ("Not enough public signals …": its text, trimmed of the characters of
+	// $3, has at most $2 characters and contains one of the phrases of $1,
+	// lower case; see salphaDeclinePhrases, salphaDeclineMaxLen and
+	// salphaDeclineTrim, the same rule as salphaDeclined) is taken only when
+	// the token has no real report: any real report, however old, comes first.
 	webSAlphaSQL = `(SELECT DISTINCT ON (lower(i.contract_address)) lower(i.contract_address) AS ca, i.id
 		FROM scout_investigations i JOIN scout_investigation_tools sat ON sat.id = i.tool_id AND sat.code = 'salpha'
 		WHERE i.status = 'completed' AND i.scan_kind = 'live' AND i.report_text ~ '[^[:space:]]'
 		ORDER BY lower(i.contract_address),
-			EXISTS (SELECT 1 FROM unnest($1::text[]) AS d(phrase) WHERE strpos(lower(i.report_text), d.phrase) > 0),
+			(char_length(btrim(i.report_text, $3::text)) <= $2::int
+				AND EXISTS (SELECT 1 FROM unnest($1::text[]) AS d(phrase) WHERE strpos(lower(i.report_text), d.phrase) > 0)),
 			i.requested_at DESC, i.id DESC)`
 	webSAlphaJoinSQL = ` LEFT JOIN ` + webSAlphaSQL + ` sa ON sa.ca = fc.ca`
 	// webVerdictAtCallJoinSQL: the Perceptor verdict known at the time of the
@@ -1577,7 +1580,8 @@ const (
 // first call with its tracking row (and its latest price), the late-entry
 // results of the five windows, how often the token was called, its latest
 // live Perceptor report and its latest Perceptor re-scan ("Perceptor today"), the id of its latest sAlpha report with text (a real
-// report before a decline; $1 = salphaDeclinePhrases) and the
+// report before a decline; $1, $2, $3 = salphaDeclinePhrases, salphaDeclineMaxLen,
+// salphaDeclineTrim) and the
 // market caps of the post; and, for the Analytics page, the posted DEX, the
 // price source, the quote asset, which windows are stored as no_data, the
 // verdict at the time of the call, whether the first 24 hours of candles
@@ -1659,7 +1663,7 @@ func (st *ScoutStore) SelectWebRows(ctx context.Context) ([]ScoutWebRow, int, er
 	if err := tx.QueryRow(ctx, `SELECT count(*) FROM scout_calls WHERE post_kind = 'update'`).Scan(&updatePosts); err != nil {
 		return nil, 0, err
 	}
-	rows, err := tx.Query(ctx, webRowsSQL, salphaDeclinePhrases)
+	rows, err := tx.Query(ctx, webRowsSQL, salphaDeclinePhrases, salphaDeclineMaxLen, salphaDeclineTrim)
 	if err != nil {
 		return nil, 0, err
 	}
