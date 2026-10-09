@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"io/fs"
 	"math"
@@ -115,6 +116,13 @@ func withFactors(r *ScoutWebRow, rng *rand.Rand) {
 		}
 		r.LiveBuysEliteCount, r.LiveBuysGoodCount = ip(12), ip(20)
 		r.LiveBuysEliteUSD, r.LiveBuysGoodUSD = fp(3e4), fp(1e5)
+	}
+	if rng.Intn(5) != 0 { // the token supply read from the chain
+		r.TokenSupply = f64p(math.Exp(rng.Float64() * math.Log(1e12)))
+		if rng.Intn(9) == 0 {
+			v := []float64{0, -5, math.NaN(), math.Inf(1), 1e30}[rng.Intn(5)]
+			r.TokenSupply = &v // no market cap: sent as null (1e30: above webAnaMaxMcap)
+		}
 	}
 	if rng.Intn(3) != 0 { // the hour before the call measured
 		r.PreVolUnit = sp("usd")
@@ -291,9 +299,13 @@ func checkAnaFactors(t *testing.T, a webAnalyticsJSON, raw []ScoutWebRow) {
 	for i, row := range a.Rows {
 		r := &raw[i]
 		usdVol := r.PreVolUnit != nil && *r.PreVolUnit == "usd"
-		var mcap *float64 // the called-at market cap, of calls priced in USD only
-		if r.PriceUnit != nil && *r.PriceUnit == "usd" {
-			mcap = usdNum(r.CalledAtMcap, true)
+		// the price-based market cap (price at the post × token supply), of
+		// calls priced in USD only; never the posted figure
+		var mcap *float64
+		if p, s := usdNum(r.PostPrice, true), usdNum(r.TokenSupply, true); r.PriceUnit != nil && *r.PriceUnit == "usd" && p != nil && s != nil {
+			if v := *p * *s; v <= 1e13 && !math.IsInf(v, 0) {
+				mcap = &v
+			}
 		}
 		vol := func(p *float64) *float64 {
 			if !usdVol {
@@ -411,6 +423,18 @@ func TestWebAnalyticsVersion(t *testing.T) {
 		return -1
 	}
 	usd := func(r *ScoutWebRow) bool { return r.PriceUnit != nil && *r.PriceUnit == "usd" }
+	// mcapIn: the row (as read, not prepared) has a price-based market cap
+	// well inside the range sent
+	mcapIn := func(r *ScoutWebRow) bool {
+		c := *r
+		c.usd = usd(r)
+		m := webAnaMcap(&c)
+		return m != nil && *m > 1000 && *m < 1e12
+	}
+	// noSupply: a USD-priced row with a price at the post but no supply yet
+	noSupply := func(r *ScoutWebRow) bool {
+		return usd(r) && positive(r.PostPrice) != nil && *r.PostPrice < 1e3 && r.TokenSupply == nil
+	}
 	peakBit := uint16(1 << (1*webPerfPerHorizon + webPerfPeak)) // the 1d peak
 	cases := []struct {
 		name   string
@@ -432,8 +456,9 @@ func TestWebAnalyticsVersion(t *testing.T) {
 			n := *r.Trades24h + 1
 			r.Trades24h = &n
 		}},
-		{"market cap at call", func(r *ScoutWebRow) bool { return usd(r) && r.CalledAtMcap != nil && *r.CalledAtMcap > 1000 },
-			func(r *ScoutWebRow) { r.CalledAtMcap = f64p(*r.CalledAtMcap * 3) }},
+		{"token supply", mcapIn, func(r *ScoutWebRow) { r.TokenSupply = f64p(*r.TokenSupply * 3) }},
+		{"price at the post (market cap at call)", mcapIn, func(r *ScoutWebRow) { r.PostPrice = f64p(*r.PostPrice * 3) }},
+		{"supply read", noSupply, func(r *ScoutWebRow) { r.TokenSupply = f64p(1e6) }},
 		{"holders", func(r *ScoutWebRow) bool { return r.Holders != nil }, func(r *ScoutWebRow) { r.Holders = ip(*r.Holders + 1) }},
 		{"elite holders", func(r *ScoutWebRow) bool { return r.ProofElite != nil }, func(r *ScoutWebRow) { r.ProofElite = ip(*r.ProofElite + 1) }},
 		{"good holders", func(r *ScoutWebRow) bool { return r.ProofGood != nil }, func(r *ScoutWebRow) { r.ProofGood = ip(*r.ProofGood + 1) }},
@@ -490,6 +515,9 @@ func TestWebAnalyticsEndpoint(t *testing.T) {
 		h.Get("X-Snapshot-At") != snap.loadedAt.Format(time.RFC3339) || h.Get("Content-Encoding") != "" ||
 		!strings.Contains(h.Get("Vary"), "Accept-Encoding") {
 		t.Fatalf("headers %v", h)
+	}
+	if etag := h.Get("ETag"); !strings.HasSuffix(etag, `-a3"`) {
+		t.Errorf("analytics ETag %s, want the format suffix -a3\"", etag)
 	}
 	plain := rec.Body.Bytes()
 	if !bytes.Equal(plain, snap.analytics.plain) {
@@ -812,6 +840,20 @@ func TestAnalyticsPageFiles(t *testing.T) {
 	if !strings.Contains(js, "'api/analytics'") || !strings.Contains(js, "If-None-Match") {
 		t.Error("analytics.js does not read /api/analytics with its ETag")
 	}
+	// The page understands the body's format: 3 since "mcap" became the
+	// price-based market cap (price at the post × token supply).
+	if webAnalyticsFormat != 3 {
+		t.Errorf("webAnalyticsFormat = %d, want 3", webAnalyticsFormat)
+	}
+	if want := fmt.Sprintf("var FORMAT = %d;", webAnalyticsFormat); !strings.Contains(js, want) {
+		t.Errorf("analytics.js: missing %q (the page must understand the server's format)", want)
+	}
+	if want := "label: 'Market cap at call (price × supply, fully diluted)'"; !strings.Contains(js, want) {
+		t.Errorf("analytics.js: missing %q", want)
+	}
+	if !strings.Contains(html, "price at the post × the token's total supply read from the chain") {
+		t.Error("analytics.html: the By factor help does not explain the market cap at the call")
+	}
 	ws := benchWebServer(t, 3)
 	for _, p := range []string{"/analytics.html", "/analytics.js", "/analytics-stats.js"} {
 		if rec := getWeb(ws, p); rec.Code != 200 {
@@ -840,5 +882,45 @@ func TestAnalyticsStatsNode(t *testing.T) {
 	}
 	if !strings.HasPrefix(string(out), "ok: ") {
 		t.Fatalf("node testdata/analytics-stats.test.js: got %q, want \"ok: …\"", out)
+	}
+}
+
+// TestWebAnaMcap: the Analytics page's market cap at the call is the price at
+// the post × the token supply, for USD-priced calls with both inputs positive
+// and finite and a product of at most webAnaMaxMcap; never the posted figure.
+func TestWebAnaMcap(t *testing.T) {
+	nan, inf := math.NaN(), math.Inf(1)
+	posted := 123456.0
+	for _, c := range []struct {
+		name          string
+		usd           bool
+		price, supply *float64
+		want          *float64
+	}{
+		{"positive", true, f64p(0.0005), f64p(1e9), f64p(5e5)},
+		{"exact cap", true, f64p(10), f64p(1e12), f64p(1e13)},
+		{"not priced in USD", false, f64p(0.0005), f64p(1e9), nil},
+		{"no supply", true, f64p(0.0005), nil, nil},
+		{"no price", true, nil, f64p(1e9), nil},
+		{"zero supply", true, f64p(0.0005), f64p(0), nil},
+		{"zero price", true, f64p(0), f64p(1e9), nil},
+		{"negative supply", true, f64p(0.0005), f64p(-1), nil},
+		{"NaN supply", true, f64p(0.0005), &nan, nil},
+		{"Inf supply", true, f64p(0.0005), &inf, nil},
+		{"NaN price", true, &nan, f64p(1e9), nil},
+		{"Inf price", true, &inf, f64p(1e9), nil},
+		{"above the cap", true, f64p(10.01), f64p(1e12), nil},
+		{"product overflows", true, f64p(1e200), f64p(1e200), nil},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			r := &ScoutWebRow{usd: c.usd, PostPrice: c.price, TokenSupply: c.supply, CalledAtMcap: &posted, PostMcap: &posted}
+			got := webAnaMcap(r)
+			switch {
+			case c.want == nil && got != nil:
+				t.Errorf("webAnaMcap(usd %v, price %v, supply %v) = %v, want nil", c.usd, dumpFactors(c.price), dumpFactors(c.supply), *got)
+			case c.want != nil && (got == nil || math.Abs(*got-*c.want) > 1e-9**c.want):
+				t.Errorf("webAnaMcap(usd %v, price %v, supply %v) = %v, want %v", c.usd, dumpFactors(c.price), dumpFactors(c.supply), dumpFactors(got), *c.want)
+			}
+		})
 	}
 }

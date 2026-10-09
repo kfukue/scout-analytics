@@ -33,8 +33,10 @@ import (
 
 const (
 	// webAnalyticsFormat: the shape of the body (field "format"); raise it
-	// when the columns change, so the page can tell.
-	webAnalyticsFormat = 2
+	// when the columns change (or what one means), so the page can tell.
+	// 3: "mcap" is the price-based market cap at the call (webAnaMcap), no
+	// longer the market cap as posted.
+	webAnalyticsFormat = 3
 	// webQuietTrades: a call with fewer swaps than this in the 24 hours after
 	// it counts as "quiet after the call" on the Analytics page. For Uniswap v2
 	// pools the tracker counts Sync events, which liquidity changes also emit.
@@ -51,8 +53,9 @@ const (
 
 // webAnalyticsFactors names the values known at the time of the call that
 // follow the per-window numbers in each row (the "By factor" tab; null when
-// missing): the market cap the post was called at, as posted (USD; for calls priced in
-// USD only, like every number of the page, see webAnaMcap), the holders, the
+// missing): the market cap at the call, price at the post × token supply read
+// from the chain, fully diluted (USD; for calls priced in USD only, like every
+// number of the page, see webAnaMcap), the holders, the
 // elite and good holders, the elite and good live buys (count, then USD), and
 // the hour of trading before the call: buy and sell volume (USD; null when
 // the hour was measured in the quote asset), swaps, and the price change
@@ -232,18 +235,32 @@ func appendAnaInt(b []byte, p *int) []byte {
 	return strconv.AppendInt(b, int64(*p), 10)
 }
 
-// webAnaMcap is the "mcap" value of a prepared row: the market cap the post
-// was called at (scout_call_metrics.called_at_mcap_usd, as in the dataset
-// view; no fallback to the "Mcap" line), when positive and the call is priced
-// in USD; else nil. This is the market cap as posted: one worked out from the
-// tracker's entry price would need the token's supply, which is not stored.
-// hashWebRows hashes this value, so a change to it changes the snapshot
-// version (and the ETag).
+// webAnaMaxMcap: a price-based market cap above this (USD) is not believable
+// (a broken price or supply) and is sent as null.
+const webAnaMaxMcap = 1e13
+
+// webAnaMcap is the "mcap" value of a prepared row: the market cap at the
+// call worked out from the price, PostPrice (scout_call_tracking.entry_price_usd,
+// the pool price at the post, already in USD; not the late entry) × TokenSupply
+// (the total supply read from the chain, so fully diluted: a Pons curve token
+// counts its unsold curve supply), when the call is priced in USD and both are
+// positive and finite and the product is at most webAnaMaxMcap; else nil.
+// There is no fallback to the market cap of the post (the list's "Call MC",
+// setWebMcaps, keeps that one). hashWebRows hashes this value, so a change to
+// it changes the snapshot version (and the ETag).
 func webAnaMcap(r *ScoutWebRow) *float64 {
 	if !r.usd {
 		return nil
 	}
-	return positive(r.CalledAtMcap)
+	price, supply := positive(r.PostPrice), positive(r.TokenSupply)
+	if price == nil || supply == nil {
+		return nil
+	}
+	v := *price * *supply
+	if !(v > 0 && v <= webAnaMaxMcap) { // also false for NaN and +Inf
+		return nil
+	}
+	return &v
 }
 
 // appendAnaFactors appends the webAnalyticsFactors of a row, each after a comma.
