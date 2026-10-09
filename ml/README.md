@@ -13,8 +13,10 @@ For each holding bucket there are two yes/no models:
 | `medium` | return at 7d >= +50% | return at 7d <= -70% |
 | `long`   | return at 30d > 0 | return at 30d <= -90% or rugged |
 
-Every collapse label is also set for a call that was dead after the call
-(fewer than 50 trades in the 24 h after it; see "Dead after the call" below).
+Calls that were dead after the call (fewer than 50 trades in the 24 h after
+it) are reported per bucket and get their own report-only score; they are not
+collapses unless `DEAD_IS_COLLAPSE` is switched on (off by default; see "Dead
+after the call" below).
 
 Outcomes are the `*_late_*` columns (entry 60 s after the post), reduced by
 buy and sell tax. Thresholds, feature lists and pass gates are in
@@ -138,25 +140,78 @@ pool it counts swaps, on a Pons curve `CurveBuy`/`CurveSell`.
 A call with `trades_24h < DEAD_TRADES_24H` (50) is "dead": bought, then nobody
 traded it (e.g. about 230 "Uniswap V4" calls from 21 Sep to about 2 Oct 2026,
 flat price, which counted as safe non-collapses). Dead calls stay in the data.
-With `DEAD_IS_COLLAPSE = True` (the default, `scout_ml/config.py`) the collapse
-label of every bucket is "collapse OR dead"; a call whose `trades_24h` is NULL
-keeps the plain collapse label. Set it to `False` to train on the plain label.
-The report says how many calls are dead, how many of them were collapses
-anyway, and the collapse rate with and without them.
+
+The dead rule (`DEAD_IS_COLLAPSE`, `scout_ml/config.py`) is **off by default**
+(since report 20261009-1904: with it off the collapse ROC AUC on the plain
+label was higher in every bucket, e.g. short 0.792 vs 0.771, and collapses
+removed about equal). With `DEAD_IS_COLLAPSE = True` the collapse label of
+every bucket is "collapse OR dead"; a call whose `trades_24h` is NULL keeps
+the plain collapse label. `DEAD_TRADES_24H` (50) changes the collapse labels
+only while the rule is on; it still sets the dead label of the report
+tables and of the separate dead score. Each bucket's "Dead after the call"
+table says how many calls are dead, how many of them were collapses anyway,
+and the collapse rate with and without them.
 
 The gates are unchanged by the dead rule: "collapses removed >= 40%"
 (`collapse_ok`, the walk-forward "collapses removed" column) is always
-measured on the PLAIN collapse label (`collapse_plain_<b>`), scored by the
-collapse model trained on collapse OR dead. Next to it the report shows "bad
+measured on the PLAIN collapse label (`collapse_plain_<b>`), whatever label
+the collapse model was trained on. Next to it the report shows "bad
 outcomes removed incl. dead" (the share of collapse OR dead calls among the
 same skipped 30%; `meta.json`: `trading.collapse_removed_with_dead`, and an
-extra walk-forward column). That figure is information only, never a gate:
-dead calls are probably easy to spot and would inflate it. With the rule off
-or `trades_24h` missing, the figure and column are absent.
+extra walk-forward column), with the rule on or off. That figure is
+information only, never a gate: dead calls are probably easy to spot and
+would inflate it. Without a `trades_24h` column the figure, the column and
+the "Dead after the call" table are absent.
 
 If the export has no `trades_24h` column (the view on the server predates it),
 training still runs with the plain collapse labels, prints a WARNING and says
-so at the top of the report (`meta.json`: `"dead": {"policy": "missing"}`).
+so in the data section of the report ("dead after the call: n/a"; with the
+rule switched on: "dead-after-the-call rule SKIPPED", `meta.json`:
+`"dead": {"policy": "missing"}`); the separate dead score is "n/a".
+
+### Dead after the call: separate score (report only)
+
+Every run also trains one extra model for the label dead = `trades_24h < 50`,
+to see whether dead calls can be told apart at the moment of the post. It is
+**report only: not saved, not served, no gates** (`meta.json`:
+`"dead_score"`; not in `"models"`). Settings: `DEAD_SCORE_*` in
+`scout_ml/config.py`.
+
+- Rows: the usable rows of the `short` bucket whose `trades_24h` is known;
+  rows with NULL `trades_24h` are left out (never negatives).
+- Split: the short bucket's own time split (train 70% / validation 15% /
+  test 15%, 1-day embargo), restricted to those rows. Trained once, not per
+  bucket.
+- Inputs: the same features as the saved models (`build_features`);
+  `trades_24h` is the label only and stays a forbidden input.
+- LightGBM (early stopping and Platt calibration on the validation part, as
+  for the other labels) and the logistic baseline.
+
+The section "Dead after the call: separate score" near the end of
+`report.md` shows: the base rate per part; test ROC AUC, PR AUC and Brier
+for both models; for the 10% and 30% of calls with the highest dead score
+the precision (share dead, 95% Wilson interval), the lift over the test base
+rate and the share of all dead calls caught by skipping them; calibration by
+decile; what drives the score (LightGBM gain, and the largest logistic
+coefficients per standard deviation of the standardised input, log1p for
+skewed columns, positive = more likely dead); a weekly walk-forward table
+(AUC for both models, top-10% precision, dead calls caught, dead calls per
+week; weeks with fewer than 5 dead calls are marked "too few to judge"); and
+the weeks with the most dead calls. When the two weeks with the most dead
+calls hold more than half of them (`DEAD_WAVE_SHARE`), the report says they
+came in a few waves and names the most common `dex_family` among those dead
+calls. As of the 9 Oct 2026 data most dead calls came in two waves (late Sep
+2026, mostly "Uniswap V4"), so the test part and the walk-forward numbers
+depend on those weeks.
+
+The section ends with **proposed** gates (not applied; nothing passes or
+fails on them): top-10% precision >= 3x the base rate in the test part, and
+in more than half of the walk-forward weeks with at least 5 dead calls; it
+says how each model fares. Whether a dead score may ever be used is for the
+product manager to decide. An error in this section prints a `WARNING`,
+records `"dead_score": {"error": ...}` and does not fail the run (the saved
+models are written before it starts); without a `trades_24h` column the
+section says "n/a".
 
 ### DEX families
 
@@ -248,8 +303,7 @@ baseline:
 | variant | change |
 |---|---|
 | baseline | none (the saved model's own numbers; not retrained) |
-| dead rule off | `DEAD_IS_COLLAPSE = False` |
-| dead threshold 100 | `DEAD_TRADES_24H = 100` (instead of 50) |
+| dead rule on (collapse OR dead) | `DEAD_IS_COLLAPSE = True` |
 | raw dex instead of dex_family | `DEX_INPUTS = "raw"` |
 | raw dex + dex_family | `DEX_INPUTS = "both"` |
 | runners must be tradeable | `RUNNER_NEEDS_TRADES = True`: runner also needs `trades_24h >= RUNNER_MIN_TRADES_24H` (100); NULL keeps the label |
@@ -260,7 +314,11 @@ baseline's. Each variant uses the same rows, splits, walk-forward weeks and
 seed. `trades_24h` stays a forbidden input in every variant (it is only used
 for labels). The tradeable rule changes only the runner label (so the lift and
 runner counts); the money simulation still uses every call. Without a
-`trades_24h` column the three trades-based variants are shown as "n/a".
+`trades_24h` column the two trades-based variants are shown as "n/a".
+The earlier "dead threshold 100" variant (`DEAD_TRADES_24H = 100`) was
+dropped: the threshold only changes the labels while the dead rule is on, so
+with the rule off (the baseline) it would equal the baseline; in report
+20261009-1904 (rule on) it was worse than 50 in every bucket.
 
 The end of `report.md` has one table per bucket (`meta.json`: `"variants"`):
 runner rate on test, runner lift top 10% with its 95% interval, runner ROC AUC
@@ -281,8 +339,9 @@ other variants still run and `train.py` still exits 0: the baseline is saved
 before any variant starts. If every variant fails, a `WARNING: all N variants
 failed` line says so.
 
-Runtime: about 6 times a normal run (on synthetic data of the fixture's size,
-6,000 calls over 170 days: 25 s without, 2 min 20 s with `--variants`).
+Runtime: about 4 to 5 times a normal run (on synthetic data of the fixture's
+size, 6,000 calls over 170 days: about 30 s without, including about 2 s for
+the dead score, and about 2 min with `--variants`).
 
 ## Read the report
 
@@ -308,7 +367,9 @@ Runtime: about 6 times a normal run (on synthetic data of the fixture's size,
    (comparable with reports from before the dead rule), and each label's
    calibration table shows the predictions of the recent-rows calibration
    next to those of the earlier one.
-4. With `--variants` only: **Variant comparison**, one table per bucket (see
+4. **Dead after the call: separate score** (report only; see "Dead after the
+   call: separate score" above).
+5. With `--variants` only: **Variant comparison**, one table per bucket (see
    "Variant comparison" above).
 
 If LightGBM is not clearly better than the logistic baseline, the data does
@@ -373,7 +434,7 @@ roll back, write an older version name into `models/LATEST`. Compare the new
     scout_ml/report.py    report.md
     train.py  serve.py  make_synthetic.py  tests/
 
-    python -m pytest tests -q        # 123 passed, about 2 minutes
+    python -m pytest tests -q        # 138 passed, about 2.5 minutes
 
 `build_features` raises if an outcome or bookkeeping column (anything starting
 with `ret_`, `max_gain_`, `max_dd_`, `trades_`, plus `rugged`, `tracking_status`,

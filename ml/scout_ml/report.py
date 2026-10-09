@@ -51,7 +51,13 @@ def dead_line(d) -> str:
         return (f"- **WARNING: dead-after-the-call rule SKIPPED: the data has no {DEAD_COLUMN} "
                 "column** (the view on the server predates it; apply scoutanalytics.sql, see "
                 "RUNBOOK.md). Collapse labels are the plain ones.")
-    return head + "; rule switched off (DEAD_IS_COLLAPSE = False): plain collapse labels"
+    if not d.get("trades_24h_present", True):
+        return (f"- dead after the call: n/a, the data has no {DEAD_COLUMN} column (the view on "
+                "the server predates it; apply scoutanalytics.sql, see RUNBOOK.md). The dead "
+                "rule is off anyway: plain collapse labels.")
+    return (head + "; dead rule off (DEAD_IS_COLLAPSE = False, the default): plain collapse "
+            "labels; dead calls are shown per bucket and scored separately at the end "
+            "(report only)")
 
 
 def plain_auc_line(r) -> str:
@@ -63,20 +69,19 @@ def plain_auc_line(r) -> str:
             f"logistic {fmt(a['logistic'])}.\n")
 
 
-def dead_table(dead, trading) -> str:
+def dead_table(dead, trading, dead_on: bool) -> str:
     rows = [[part, v["rows"], v["dead"], v["dead_collapse"], v["collapse_rate_plain"],
              v["collapse_rate_with_dead"]] for part, v in dead.items()]
     head = table(["part", "calls", "dead", "dead and already a collapse",
                   "collapse rate (plain)", "collapse rate (collapse OR dead)"], rows)
-    if "collapse_removed_with_dead" not in trading:   # rule off: trained on the plain label
-        return (head + f"Collapses removed on test by the collapse scores: "
-                f"{fmt(trading.get('collapse_removed'))} of plain collapses (the gate; the dead "
-                f"rule is off, the model was trained on the plain label).\n")
-    return (head
-            + f"Collapses removed on test by the collapse scores (model trained on collapse OR "
-            f"dead): {fmt(trading.get('collapse_removed'))} of plain collapses (the gate); bad "
-            f"outcomes removed incl. dead: {fmt(trading.get('collapse_removed_with_dead'))} "
-            f"(information only, not a gate).\n")
+    trained = ("model trained on collapse OR dead" if dead_on else
+               "the dead rule is off, the model was trained on the plain label")
+    text = (f"Collapses removed on test by the collapse scores ({trained}): "
+            f"{fmt(trading.get('collapse_removed'))} of plain collapses (the gate)")
+    if "collapse_removed_with_dead" not in trading:
+        return head + text + ".\n"
+    return (head + text + f"; bad outcomes removed incl. dead: "
+            f"{fmt(trading.get('collapse_removed_with_dead'))} (information only, not a gate).\n")
 
 
 def calib_line(m) -> str:
@@ -211,7 +216,7 @@ def render(res: dict) -> str:
         out.append(LIFT_METHOD + "\n")
         if r.get("dead") and d.get("dead_policy") != "missing":
             out.append(f"### Dead after the call ({DEAD_COLUMN} < {C.DEAD_TRADES_24H})\n")
-            out.append(dead_table(r["dead"], t))
+            out.append(dead_table(r["dead"], t, dead_on))
             out.append(plain_auc_line(r))
         out.append(f"**Bucket result: {'PASS' if g['passed'] else 'FAIL'}**\n")
         out.append("### Walk-forward (expanding weekly windows)\n")
@@ -236,9 +241,146 @@ def render(res: dict) -> str:
                 out.append(calib_line(m))
             out.append(calib_table(m))
             out.append(table(["feature", "gain share"], m["importance"]))
+    if "dead_score" in res:
+        out.append(dead_score_section(res["dead_score"]))
     if res.get("variants"):
         out.append(variants_section(res["variants"], res["buckets"]))
     return "\n".join(out)
+
+
+DEAD_SCORE_TITLE = "## Dead after the call: separate score (report only; not saved, not served)\n"
+
+
+def _pct_ci(v, lo, hi) -> str:
+    return f"{fmt(v)} [{fmt(lo)}, {fmt(hi)}]"
+
+
+def dead_score_section(ds: dict) -> str:
+    """The separate dead-after-the-call score (see train.dead_score)."""
+    out = [DEAD_SCORE_TITLE]
+    if ds.get("error"):
+        return "\n".join(out + [f"**Not computed: {ds['error']}.** The saved models, their "
+                                "gates and everything above are not affected.\n"])
+    if ds.get("not_applicable"):
+        return "\n".join(out + [f"n/a: {ds['not_applicable']} (the view on the server predates "
+                                "it; apply scoutanalytics.sql, see RUNBOOK.md).\n"])
+    b, thr = ds["bucket"], ds["threshold"]
+    out.append(
+        f"Label: dead = {DEAD_COLUMN} < {thr} (fewer than {thr} price events in the 24 h after "
+        f"the call). Rows: the usable rows of the `{b}` bucket with a known {DEAD_COLUMN} "
+        f"({ds['known']} of {ds['usable']}; {ds['null_excluded']} with NULL {DEAD_COLUMN} left "
+        f"out, not counted as negatives). Inputs: the same features as the saved models "
+        f"({DEAD_COLUMN} is the label only, never an input). Split: the `{b}` bucket's time "
+        f"split (train before {ds['split']['t1']}, validation, test from {ds['split']['t2']}; "
+        f"{ds['horizon_days']:g}-day embargo) restricted to those rows. Trained once, not per "
+        "bucket. **Not saved, not served, no gates.**\n"
+        if ds.get("split") else
+        f"Label: dead = {DEAD_COLUMN} < {thr}; rows: {ds['known']} of {ds['usable']} usable "
+        f"`{b}` rows have a known {DEAD_COLUMN}.\n")
+    if ds.get("parts"):
+        out.append(table(["part", "calls", "dead", "base rate"],
+                         [[k, v["n"], v["dead"], v["base_rate"]] for k, v in ds["parts"].items()]))
+    if ds.get("waves"):
+        out.append(waves_line(ds["waves"]))
+    if ds.get("skipped"):
+        out.append(f"**SKIPPED:** {ds['skipped']}\n")
+        return "\n".join(out)
+    m = ds["label"]
+    out.append("### Test metrics\n")
+    out.append(table(["model", "n", "base rate", "ROC AUC", "PR AUC", "Brier"],
+                     [[name, m[name]["n"], m[name]["base_rate"], m[name]["roc_auc"],
+                       m[name]["pr_auc"], m[name]["brier"]] for name in ("lightgbm", "logistic")]))
+    if m.get("messages"):
+        out.append("Notes: " + "; ".join(m["messages"]) + "\n")
+    out.append("### Skipping the calls with the highest dead score (test part)\n")
+    out.append(table(["model", "top share skipped", "calls", "dead among them",
+                      "precision [95% Wilson]", "lift over base rate [95%]",
+                      "share of all dead calls caught"],
+                     [[name, f"{t['frac']:.0%}", t["n_top"], t["dead_top"],
+                       _pct_ci(t["precision"], t["precision_lo"], t["precision_hi"]),
+                       f"{fmt(t['lift'], 2)} [{fmt(t['lift_lo'], 2)}, {fmt(t['lift_hi'], 2)}]",
+                       t["caught"]] for name in ("lightgbm", "logistic")
+                      for t in ds["top"][name]]))
+    out.append("Precision = share of dead calls among the skipped ones; lift = precision / base "
+               "rate of the test part (interval: the Wilson interval divided by the base rate, "
+               "treated as fixed).\n")
+    out.append("### Calibration by decile (test, LightGBM)\n")
+    if m.get("calib"):
+        out.append(calib_line(m))
+    out.append(calib_table(m))
+    out.append("### What drives the score\n")
+    out.append(table(["feature (LightGBM)", "gain share"], m["importance"]))
+    out.append(table(["feature (logistic)", "coefficient", "input"],
+                     [[n, c, s] for n, c, s in ds["logistic_coefs"]]))
+    out.append("Logistic coefficients are per standard deviation of the standardised input "
+               "(log1p(x) for skewed columns, x as is for the others; missing values median-"
+               "imputed); positive = more likely dead. Only numeric inputs.\n")
+    out.append(dead_walk_forward_table(ds["walk_forward"]))
+    out.append(proposal_text(ds["proposal"]))
+    return "\n".join(out)
+
+
+def waves_line(waves: list) -> str:
+    """The weeks with the most dead calls; the "few waves" caveat only when the
+    C.DEAD_WAVE_TOP_WEEKS top weeks hold more than C.DEAD_WAVE_SHARE of them."""
+    total = sum(w["dead"] for w in waves)
+    top = waves[:C.DEAD_WAVE_TOP_WEEKS]
+    k = sum(w["dead"] for w in top)
+    weeks = "; ".join(f"week of {w['week']}: {w['dead']} of {w['calls']} calls" for w in top)
+    share = k / total if total else 0.0
+    head = (f"Dead calls by week: the {len(top)} weeks with the most hold {k} of {total} "
+            f"({share:.0%}; {weeks}). ")
+    if total and share > C.DEAD_WAVE_SHARE:
+        fam = {}
+        for w in top:
+            for f, n in w.get("dead_families", {}).items():
+                fam[f] = fam.get(f, 0) + n
+        named = ""
+        if fam:
+            f, n = sorted(fam.items(), key=lambda kv: (-kv[1], kv[0]))[0]
+            named = f"; most common dex_family among them: \"{f}\", {n} of {k}"
+        return (head + f"**Most dead calls came in a few waves (more than "
+                f"{C.DEAD_WAVE_SHARE:.0%} in {len(top)} weeks{named}), so the test part and the "
+                "walk-forward numbers depend on those weeks; a score that recognises one wave "
+                "need not recognise the next.**\n")
+    return (head + f"Dead calls are spread over the weeks (the top {len(top)} hold no more "
+            f"than {C.DEAD_WAVE_SHARE:.0%} of them).\n")
+
+
+def dead_walk_forward_table(weeks: list) -> str:
+    rows = []
+    for w in weeks:
+        mark = f"< {C.DEAD_SCORE_MIN_WEEK_DEAD} dead: too few to judge" if w["few_dead"] else ""
+        head = [w["week"], w["start"], w["n_train"], w["n_test"], w["n_dead"]]
+        if w.get("skipped"):
+            rows.append(head + ["skipped: " + w["skipped"]] + [""] * 6 + [mark])
+            continue
+        lg, lo = w["lightgbm"], w["logistic"]
+        caught = [lg["caught"].get(f"{f:g}") for f in C.DEAD_SCORE_TOP_FRACS]
+        rows.append(head + [lg["roc_auc"], lo["roc_auc"], w["base_rate"], lg["top10_precision"],
+                            lo["top10_precision"], " / ".join(fmt(c) for c in caught), mark])
+    fr = " / ".join(f"{f:.0%}" for f in C.DEAD_SCORE_TOP_FRACS)
+    gf = f"{C.DEAD_SCORE_GATE_FRAC:.0%}"
+    return ("### Walk-forward (expanding weekly windows)\n\n"
+            + table(["week", "from", "train n", "test n", "dead n", "AUC LightGBM",
+                     "AUC logistic", "base rate", f"top-{gf} precision LightGBM",
+                     f"top-{gf} precision logistic", f"dead caught, skipping top {fr} (LightGBM)",
+                     "note"], rows))
+
+
+def proposal_text(p: dict) -> str:
+    lift = p["min_lift"]
+    lines = [f"**Proposed gates (a proposal for the product manager, NOT applied; nothing here "
+             f"passes or fails):** top-{C.DEAD_SCORE_GATE_FRAC:.0%} precision >= {lift:g}x the "
+             f"base rate in the test part, "
+             f"and in more than half of the walk-forward weeks with at least "
+             f"{C.DEAD_SCORE_MIN_WEEK_DEAD} dead calls. On this run:\n"]
+    for model in ("lightgbm", "logistic"):
+        q = p[model]
+        lines.append(f"- {model}: test lift {fmt(q['test_lift'], 2)} ({'meets' if q['test_ok'] else 'below'} "
+                     f"{lift:g}); weeks meeting it {q['weeks_meeting']}/{q['weeks_judged']}; "
+                     f"would {'pass' if q['would_pass'] else 'not pass'} the proposal")
+    return "\n".join(lines) + "\n"
 
 
 VARIANT_NOTE = (
@@ -258,8 +400,8 @@ def variant_read() -> str:
         "they use a different yardstick (see its runner rate); its money simulation still uses every "
         "call. \"Collapses removed\" (the gate) and \"collapse AUC, plain label\" are measured on "
         "the plain collapse label in every variant and are comparable; \"collapse AUC, trained "
-        "label\" uses the label each variant trained on (collapse OR dead, or plain with the dead "
-        "rule off). The logistic baseline uses numeric inputs only, so its numbers do not change "
+        "label\" uses the label each variant trained on (plain, or collapse OR dead with the dead "
+        "rule on). The logistic baseline uses numeric inputs only, so its numbers do not change "
         "between the DEX variants. Sim = mean net return (%) of the top 10% by runner score vs all "
         "calls of the test part.")
 

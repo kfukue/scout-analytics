@@ -215,7 +215,9 @@ def test_too_little_data_is_reported_not_raised(tmp_path):
     assert meta["models"] == [] and not list(vdir.glob("*.joblib"))
     assert all("usable rows (need 300)" in m["skipped"] for m in meta["metrics"].values())
     assert meta["category_levels"] == {} and meta["runner_reference"] == {}
-    assert (vdir / "report.md").read_text(encoding="utf-8").count("**SKIPPED:**") == 4
+    report = (vdir / "report.md").read_text(encoding="utf-8")
+    assert report.count("**SKIPPED:**") == 5                    # 4 buckets and the dead score
+    assert "short-bucket rows with a known trades_24h (need 300)" in meta["dead_score"]["skipped"]
 
 
 def test_collapse_gate_uses_plain_label_when_dead_rule_is_on():
@@ -231,14 +233,14 @@ def test_collapse_gate_uses_plain_label_when_dead_rule_is_on():
     trained_on = np.maximum(plain, dead)            # collapse OR dead: 6 of 10 skipped: 0.6
     y_run = (score >= 18).astype(float)
     ret = np.where(y_run == 1, 100.0, -10.0)
-    t = train_mod.collapse_check(y_run, score, plain, trained_on, score, ret, dead_on=True)
+    t = train_mod.collapse_check(y_run, score, plain, trained_on, score, ret, with_dead=True)
     assert t["collapse_removed"] == pytest.approx(0.2)
     assert t["collapse_removed_with_dead"] == pytest.approx(0.6)
     assert t["collapse_removed_with_dead"] >= C.GATES["min_collapse_removed"] > t["collapse_removed"]
     g = V.gates(t, [{"sim_beats_all": True}])
     assert g["collapse_ok"] is False and g["lift_ok"] and not g["passed"]
     # rule off (or trades_24h missing): plain == trained-on label, no extra figure
-    off = train_mod.collapse_check(y_run, score, plain, plain, score, ret, dead_on=False)
+    off = train_mod.collapse_check(y_run, score, plain, plain, score, ret, with_dead=False)
     assert "collapse_removed_with_dead" not in off
     assert off == V.trading_metrics(y_run, score, plain, score, ret)
 
@@ -258,13 +260,15 @@ def test_rare_label_is_skipped_with_message(synthetic_df, tmp_path, monkeypatch)
     assert meta["metrics"]["3day"]["gates"]["collapse_ok"] is False
     report = (vdir / "report.md").read_text(encoding="utf-8")
     assert "model skipped" in report
-    # dead rule off: no with-dead figure anywhere, the gate is the plain label as before
-    for needle in ("collapse OR dead;", "incl. dead", "model trained on collapse OR dead"):
+    # dead rule off: the gate is the plain label; the with-dead figure stays as information
+    for needle in ("collapse label = collapse OR dead", "model trained on collapse OR dead",
+                   "OR dead (trades_24h"):
         assert needle not in report, needle
     assert "the dead rule is off, the model was trained on the plain label" in report
-    for b in ("short", "3day"):
-        t = meta["metrics"][b].get("trading", {})
-        assert "collapse_removed_with_dead" not in t and "collapse_removed_plain" not in t
+    assert "bad outcomes removed incl. dead: " in report
+    t = meta["metrics"]["3day"]["trading"]
+    assert "collapse_removed_plain" not in t and "collapse_removed_with_dead" in t
+    assert t["collapse_removed_with_dead"] is None            # no collapse model: n/a
 
 
 def test_long_is_skipped_until_its_30d_data_has_matured(synthetic_df, tmp_path, monkeypatch):
@@ -350,6 +354,8 @@ def test_levels_rounds_and_calibration_never_see_the_test_part(synthetic_df, tmp
     monkeypatch.setattr(train_mod, "fit_lgbm", fit)
     monkeypatch.setattr(train_mod, "_walk_forward", wf)
     monkeypatch.setattr(V, "walk_forward_windows", windows)
+    # the saved models only (the report-only dead score has its own test in test_dead_score.py)
+    monkeypatch.setattr(train_mod, "dead_score", lambda df, L: {"not_applicable": "off here"})
     from scout_ml.labels import build_labels
     sorted_df = df.assign(message_date=when).sort_values("message_date").reset_index(drop=True)
     L = build_labels(sorted_df)
@@ -508,8 +514,9 @@ def test_old_flat_meta_still_serves_with_exact_levels(trained, synthetic_df, tmp
 def test_report_shows_dead_calls_and_recent_calibration(trained):
     _, vdir = trained
     meta = json.loads((vdir / "meta.json").read_text())
-    assert meta["dead"] == {"policy": "on", "column": "trades_24h", "max_trades_24h": 50}
-    assert meta["data"]["dead_policy"] == "on" and meta["data"]["dead"] > 0
+    assert meta["dead"] == {"policy": "off", "column": "trades_24h", "max_trades_24h": 50}
+    assert meta["data"]["dead_policy"] == "off" and meta["data"]["dead"] > 0
+    assert meta["data"]["trades_24h_present"] is True
     assert 0 < meta["data"]["trades_24h_known"] <= meta["data"]["eligible"]
     assert meta["calib_recent_days"] == C.CALIB_RECENT_DAYS
     for b in BUCKET_KEYS:
@@ -535,9 +542,13 @@ def test_report_shows_dead_calls_and_recent_calibration(trained):
             assert [c["observed"] for c in before] == [c["observed"] for c in after]
             assert info["brier_all_rows"] >= 0
     report = (vdir / "report.md").read_text(encoding="utf-8")
+    for needle in ("collapse label = collapse OR dead", "OR dead (trades_24h < 50)",
+                   "model trained on collapse OR dead"):
+        assert needle not in report, needle                       # the dead rule is off
     for needle in ("- dead after the call (trades_24h < 50; kept in the data): ",
-                   "collapse label = collapse OR dead", "OR dead (trades_24h < 50)",
+                   "dead rule off (DEAD_IS_COLLAPSE = False, the default): plain collapse labels",
                    "### Dead after the call (trades_24h < 50)", "dead and already a collapse",
+                   "(the dead rule is off, the model was trained on the plain label)",
                    "of plain collapses (the gate); bad outcomes removed incl. dead: ",
                    "(information only, not a gate)",
                    "bad outcomes removed incl. dead (collapse OR dead; information, not a gate)",
@@ -554,7 +565,6 @@ def test_report_shows_collapse_auc_on_the_plain_label(trained):
     _, vdir = trained
     meta = json.loads((vdir / "meta.json").read_text())
     report = (vdir / "report.md").read_text(encoding="utf-8")
-    differs = 0
     for b in BUCKET_KEYS:
         m = meta["metrics"][b]
         plain = m["collapse_auc_plain"]
@@ -562,10 +572,10 @@ def test_report_shows_collapse_auc_on_the_plain_label(trained):
         line = (f"Collapse ROC AUC on the plain collapse label (test): LightGBM "
                 f"{fmt(plain['lightgbm'])}, logistic {fmt(plain['logistic'])}.")
         assert line in report, (b, [r for r in report.splitlines() if "plain collapse label" in r])
-        # the dead rule is on here: the trained label differs, so must the AUC somewhere
-        differs += plain["lightgbm"] != m["labels"]["collapse"]["lightgbm"]["roc_auc"]
+        # the dead rule is off (default): trained on the plain label, so the same AUC
+        assert plain["lightgbm"] == m["labels"]["collapse"]["lightgbm"]["roc_auc"]
+        assert plain["logistic"] == m["labels"]["collapse"]["logistic"]["roc_auc"]
     assert report.count("Collapse ROC AUC on the plain collapse label (test):") == len(BUCKET_KEYS)
-    assert differs > 0
 
 
 def test_report_runner_label_text_only_when_runners_must_be_tradeable(trained, tmp_path,
@@ -595,8 +605,12 @@ def test_report_runner_label_text_only_when_runners_must_be_tradeable(trained, t
     # thresholds are read from config when rendering, not bound at import
     with C.overrides(DEAD_TRADES_24H=77):
         text = render(res)
-    assert "OR dead (trades_24h < 77)" in text and "### Dead after the call (trades_24h < 77)" in text
-    assert "OR dead (trades_24h < 77)" not in render(res)
+    assert "### Dead after the call (trades_24h < 77)" in text and "(trades_24h < 77; kept" in text
+    assert "trades_24h < 77" not in render(res)
+    on = {**res, "data": {**res["data"], "dead_policy": "on"}}
+    with C.overrides(DEAD_TRADES_24H=77):
+        assert "OR dead (trades_24h < 77)" in render(on)
+    assert "OR dead (trades_24h < 50)" in render(on)
     monkeypatch.setattr(C, "RUNNER_MIN_TRADES_24H", 77)
     assert "trades_24h >= 77" in variant_read()
 
@@ -606,11 +620,13 @@ def test_missing_trades_24h_skips_the_dead_rule_loudly(synthetic_df, tmp_path, m
     training still runs, with plain collapse labels, and says so."""
     from scout_ml.labels import build_labels
     monkeypatch.setattr(C, "BUCKETS", {"short": C.BUCKETS["short"]})
+    monkeypatch.setattr(C, "DEAD_IS_COLLAPSE", True)       # the rule switched on
     df = synthetic_df.drop(columns="trades_24h")
     vdir = train_mod.train(df, tmp_path, version="v")
     assert "WARNING: the data has no trades_24h column" in capsys.readouterr().out
     meta = json.loads((vdir / "meta.json").read_text())
     assert meta["dead"]["policy"] == "missing" and meta["data"]["dead"] == 0
+    assert meta["dead_score"] == {"not_applicable": "the data has no trades_24h column"}
     report = (vdir / "report.md").read_text(encoding="utf-8")
     assert "**WARNING: dead-after-the-call rule SKIPPED" in report
     assert "OR dead" not in report and "### Dead after the call" not in report

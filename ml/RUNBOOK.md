@@ -111,7 +111,7 @@ cd "$ML/src/ml"
 "$ML/venv/bin/python" -m pytest tests -q -p no:cacheprovider
 ```
 
-Expected: `123 passed` (one deprecation warning from fastapi is fine).
+Expected: `138 passed` (one deprecation warning from fastapi is fine).
 
 ## 3. Read-only checks before the export (optional, psql or pgAdmin)
 
@@ -184,7 +184,8 @@ queries has been run against a database yet (checked by reading only).
 
 ### 3b. `trades_24h` in the view (once, before the first training that uses it)
 
-The "dead after the call" rule needs the `trades_24h` column of
+The "dead after the call" tables, the separate dead score and the dead rule
+(off by default) need the `trades_24h` column of
 `scout_call_dataset_v` (added in `scoutanalytics.sql` on 9 October 2026).
 The export below runs with `SCOUT_DB_AUTO_MIGRATE=false`, so it does not add
 the column. Two ways, the first preferred:
@@ -214,11 +215,12 @@ the column. Two ways, the first preferred:
    program: its own `scoutanalytics.sql` recreates the views without the column.
 
 Until then training runs with the plain collapse labels, prints a WARNING and
-says so in the report ("dead-after-the-call rule SKIPPED").
+says so in the report ("dead after the call: n/a", or "dead-after-the-call
+rule SKIPPED" if the rule was switched on); the dead score section says "n/a".
 
 `trades_24h` relies on the 1d horizon being named `1d` (`SCOUT_PERF_HORIZONS`,
-default `1h,1d,3d,7d,30d`): if the report shows the dead rule on but 0 dead calls
-("0 of 0 calls with a known `trades_24h`"), check that setting.
+default `1h,1d,3d,7d,30d`): if the report shows 0 dead calls ("0 of 0 calls
+with a known `trades_24h`"), check that setting.
 
 Read-only check after it is applied (paste the result with the report):
 
@@ -276,7 +278,10 @@ time "$ML/venv/bin/python" train.py --csv "$ML/data/calls.csv" --out "$ML/models
 It prints one line per bucket (`PASS`, `FAIL (see report.md)` or
 `skipped: ...`) and `wrote .../models/<version>`. A line `WARNING: the data has
 no trades_24h column` means step 3b has not been done yet (the training is
-still valid, with the plain collapse labels). Exit code 0 even when gates
+still valid, with the plain collapse labels). After the buckets it trains
+the report-only dead score and prints `[dead score] N s` (a few seconds); a
+line `WARNING: the dead score failed (...)` means only that report section is
+missing: the saved models are not affected. Exit code 0 even when gates
 fail. Random seed: fixed (`random_state=7` in `scout_ml/config.py`), so a
 rerun on the same CSV gives the same numbers.
 
@@ -317,15 +322,17 @@ time "$ML/venv/bin/python" train.py --csv "$ML/data/calls.csv" --out "$ML/models
 ```
 
 It trains the normal model
-exactly as in step 5 (that is the one saved, served and gated), then five
-variants that each change one setting (dead rule off; dead threshold 100;
+exactly as in step 5 (that is the one saved, served and gated), then four
+variants that each change one setting (dead rule on, i.e. collapse OR dead;
 raw `dex` instead of `dex_family`; raw `dex` + `dex_family`; runners must have
-`trades_24h >= 100`). The variants are not saved; they only add a section
+`trades_24h >= 100`). The "dead rule off" and "dead threshold 100" rows of
+earlier reports are gone: the rule is now off in the baseline, and the
+threshold only matters with the rule on. The variants are not saved; they only add a section
 "Variant comparison" at the end of `report.md`, one table per bucket, one row
 per variant (the `baseline` row is the saved model). It prints one
-`[variant] <name>: N s` line per variant. Time: about 6 times the train
-time of step 5 (on a desktop PC, synthetic data of 6,000 calls: 25 s without,
-2 min 20 s with `--variants`); memory as in step 5. The model, `meta.json`,
+`[variant] <name>: N s` line per variant. Time: about 4 to 5 times the train
+time of step 5 (on a desktop PC, synthetic data of 6,000 calls: about 30 s
+without, about 2 min with `--variants`); memory as in step 5. The model, `meta.json`,
 `report.md` and `LATEST` are written before the variants start, so stopping
 during the variants still leaves the normal result. A variant that crashes
 does not fail the run: it prints `WARNING: variant '<name>' failed (error:
@@ -383,6 +390,25 @@ From the top:
    `medium` and `long` the purged k-fold inside train (rounds, calibration),
    test metrics (LightGBM vs the logistic baseline), the gate table, the
    money simulation, the walk-forward table, calibration and top features.
+4. **Dead after the call: separate score (report only; not saved, not
+   served)**: one extra model (LightGBM and logistic) for "dead" =
+   `trades_24h < 50`, on the short bucket's rows and split, NULL
+   `trades_24h` left out. Read, in order: the base rate per part (train /
+   val / test); test ROC AUC and PR AUC of both models (0.5 = no better than
+   chance); the "Skipping the calls with the highest dead score" table:
+   precision = share of dead calls among the top 10% / 30%, with its 95%
+   interval, and lift = precision / test base rate (lift 3 = three times as
+   many dead calls as overall), and the share of all dead calls caught; then
+   what drives the score; then the weekly walk-forward table, where weeks
+   marked "< 5 dead: too few to judge" should be ignored. As of the 9 Oct
+   2026 data most dead calls came in two waves (late Sep, "Uniswap V4"); the
+   report says so when it is still true ("Most dead calls came in a few
+   waves"): good numbers driven by one wave may not hold for the next. The closing "Proposed gates" lines are a proposal only
+   (nothing passes or fails on them). If the section says `Not computed:
+   error: ...` (and the run printed `WARNING: the dead score failed`), paste
+   that line; the saved models are not affected. Never act on this score:
+   it is not served.
+5. With `--variants` only: **Variant comparison** (step 5b).
 
 What to expect from the October 2026 data (calls from late July 2026):
 
@@ -402,7 +428,8 @@ with the "positive rate (usable)" column of each bucket's Class balance table
 
 - collapses removed >= 40% by skipping 30% of calls is impossible when the
   collapse rate is above 75% (at most 30% / rate of the collapses can be removed);
-  the gate counts plain collapses, so compare with the plain collapse rate: with
+  the gate counts plain collapses, so compare with the plain collapse rate (the
+  dead rule is off by default, then the two are the same): with
   the dead rule on, the "positive rate (usable)" of the collapse label includes
   dead calls, so use the "collapse rate (plain)" column of the bucket's "Dead
   after the call" table instead (it also shows the rate with dead calls, and

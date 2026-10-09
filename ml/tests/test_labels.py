@@ -168,11 +168,23 @@ def _dead_df():
         row(**flat, trades_24h=50)])
 
 
-def test_dead_calls_become_collapses_in_every_bucket_and_stay_usable():
+def test_dead_rule_is_off_by_default_and_dead_is_still_flagged():
     from scout_ml import config as C
     from scout_ml.labels import dead_policy
     df = _dead_df()
-    assert C.DEAD_IS_COLLAPSE and C.DEAD_TRADES_24H == 50 and dead_policy(df) == "on"
+    assert C.DEAD_IS_COLLAPSE is False and C.DEAD_TRADES_24H == 50 and dead_policy(df) == "off"
+    L = build_labels(df)
+    assert L["dead"].tolist() == [True, True, False, False, False]    # NULL / 50 are not dead
+    for b in ("short", "3day", "medium"):
+        assert L[f"collapse_{b}"].tolist() == L[f"collapse_plain_{b}"].tolist() == [0, 1, 0, 0, 0]
+
+
+def test_dead_calls_become_collapses_in_every_bucket_and_stay_usable(monkeypatch):
+    from scout_ml import config as C
+    from scout_ml.labels import dead_policy
+    monkeypatch.setattr(C, "DEAD_IS_COLLAPSE", True)
+    df = _dead_df()
+    assert dead_policy(df) == "on"
     L = build_labels(df)
     assert L["dead"].tolist() == [True, True, False, False, False]    # NULL / 50 are not dead
     for b in ("short", "3day", "medium"):
@@ -196,9 +208,12 @@ def test_dead_rule_can_be_switched_off_and_threshold_comes_from_config(monkeypat
     assert build_labels(df)["collapse_short"].tolist() == [1, 1, 0, 0, 1]
 
 
-def test_dead_rule_is_skipped_when_the_column_is_missing():
+def test_dead_rule_is_skipped_when_the_column_is_missing(monkeypatch):
+    from scout_ml import config as C
     from scout_ml.labels import dead_policy
     df = _dead_df().drop(columns="trades_24h")
+    assert dead_policy(df) == "off"                       # rule off (default): nothing to skip
+    monkeypatch.setattr(C, "DEAD_IS_COLLAPSE", True)
     assert dead_policy(df) == "missing"
     L = build_labels(df)
     assert not L["dead"].any()
