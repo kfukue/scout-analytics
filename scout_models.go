@@ -273,7 +273,7 @@ var ScoutWebHorizons = [5]string{"1h", "1d", "3d", "7d", "30d"}
 // that investigation's id. SAlphaID is the token's latest completed sAlpha
 // investigation whose report_text is not empty (nor only white space), nil
 // when there is none; a reply that only declines to report (see
-// salphaDeclinePhrases) is chosen only when the token has no real report. The texts of both are read separately, by id
+// salphaDeclined) is chosen only when the token has no real report. The texts of both are read separately, by id
 // (ScoutStore.SelectWebReports).
 type ScoutWebRow struct {
 	CallID          int
