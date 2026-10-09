@@ -83,7 +83,7 @@ func (s *scanner) trackCycle(ctx context.Context, batch int) (more bool) {
 }
 
 // cycle is one round of the tracker: up to batch horizon checks that are due,
-// the status line, token names, then a latest-price pass. more says the
+// the status line, token names and supplies, then a latest-price pass. more says the
 // horizon batch was full, so more of that work is waiting. It returns once
 // everything is handed out: calls still running finish on their workers.
 func (r *trackRun) cycle(ctx context.Context, batch int) (more bool) {
@@ -100,6 +100,7 @@ func (r *trackRun) cycle(ctx context.Context, batch int) (more bool) {
 	}
 	s.logTrackingStatusRunning(ctx, int(r.horizonDone.Swap(0)), r.horizonBusy())
 	s.fillTokenNames(ctx)
+	s.fillTokenSupply(ctx)
 	// Latest prices come after the horizon work of the cycle. While a full
 	// horizon batch says more of that is waiting, only calls younger than 30
 	// days are refreshed; the older ones wait for a quieter cycle.
@@ -552,6 +553,185 @@ func (s *scanner) fillTokenNames(ctx context.Context) int {
 		log.Printf("token names: looked up %d token(s) (%d with a name, %d without), %d call(s) updated", tokens, named, tokens-named, rows)
 	}
 	return tokens
+}
+
+// tokenSupplyBatch is how many distinct tokens one supply fill pass looks up.
+const tokenSupplyBatch = 200
+
+// tokenSupplyMaxStrikes: a token whose supply lookup gets a JSON-RPC error
+// that looks like a busy node (e.g. a revert text with "limit" or "rate" in
+// it) in this many passes in which the node otherwise answered (a later token,
+// or a liveness request at the end of the pass, also when two failures in a
+// row ended it), with no success in between, is given up: NULL supply at
+// block 0, not asked again. Counted in memory; tokens with strikes are tried
+// last in the next pass, so they cannot hold up the others.
+const tokenSupplyMaxStrikes = 3
+
+// fillTokenSupply stores the token supply (totalSupply() / 10^decimals(), in
+// whole tokens) of tokens whose calls have an entry price but no supply lookup
+// yet, for the Analytics page's market cap at the call (price at the post ×
+// supply). Read at the first call's entry block while the node has that
+// state, else at the latest block (tokenSupplyAt); once a token's entry block
+// has no state, older entry blocks are not tried again in the same pass, and
+// the head block is read at most once per pass. Repeat calls of a token
+// already looked up are copied in the database first. It touches only
+// token_supply and token_supply_block: tracking status, schedule and the
+// on-chain state are left alone, so no call is tracked again because of it,
+// and it never changes how prices are read (o.noState). A token without a
+// usable supply gets NULL with the block set and is not asked again. A token
+// the node does not answer for is skipped; two in a row end the pass (the
+// node is busy) and the rest waits for the next pass, where tokens with
+// strikes (tokenSupplyMaxStrikes) come last. Returns the tokens looked up.
+func (s *scanner) fillTokenSupply(ctx context.Context) int {
+	if s.db == nil || !s.pc.Enabled || s.pc.Source != "onchain" || s.onchain == nil || ctx.Err() != nil {
+		return 0
+	}
+	copied, err := s.db.CopyKnownTokenSupply(ctx)
+	if err != nil {
+		log.Printf("token supply: %v", err)
+		return 0
+	}
+	targets, err := s.db.ContractsMissingTokenSupply(ctx, tokenSupplyBatch)
+	if err != nil {
+		log.Printf("token supply: %v", err)
+		return 0
+	}
+	targets = s.struckLast(targets)
+	var head uint64 // read once per pass, when a token is first read at latest
+	headOnce := func(ctx context.Context) (uint64, error) {
+		if head != 0 {
+			return head, nil
+		}
+		h, err := s.onchain.rpc.blockNumber(ctx)
+		if err != nil {
+			return 0, err
+		}
+		head = h
+		return h, nil
+	}
+	var noStateUpTo uint64       // the newest entry block found without state: older ones have none either
+	var pending, struck []string // tokens the node answered with an error; struck once a later token is answered
+	tokens, atEntry, atLatest, rows, fails := 0, 0, 0, copied, 0
+	for _, t := range targets {
+		if ctx.Err() != nil {
+			break
+		}
+		var r tokenSupplyRead // not an EVM address: no supply, block 0 (not asked again)
+		if evmAddrRe.MatchString(t.CA) {
+			r, err = s.onchain.tokenSupplyAt(ctx, t.CA, t.EntryBlock, t.EntryBlock > noStateUpTo, headOnce)
+			if err != nil {
+				if ctx.Err() != nil {
+					break
+				}
+				var re *rpcError
+				if errors.As(err, &re) { // an answer, not a lost connection: may be the token itself
+					pending = append(pending, t.CA)
+				}
+				if fails++; fails >= 2 {
+					log.Printf("token supply: the node did not answer for %s (%v) — the rest is tried again on the next pass", t.CA, err)
+					break
+				}
+				log.Printf("token supply: the node did not answer for %s (%v) — skipped this pass", t.CA, err)
+				continue
+			}
+			fails = 0
+			struck, pending = append(struck, pending...), nil
+			if r.NoStateAtEntry {
+				noStateUpTo = max(noStateUpTo, t.EntryBlock)
+			}
+		}
+		n, err := s.db.SetTokenSupply(ctx, t.CA, r.Supply, r.Block)
+		if err != nil {
+			log.Printf("token supply: %v", err)
+			break
+		}
+		s.clearSupplyStrike(t.CA)
+		tokens++
+		rows += n
+		switch {
+		case r.Supply == nil:
+		case r.AtEntry:
+			atEntry++
+		default:
+			atLatest++
+		}
+	}
+	// Tokens that failed with no token answered after them (the last ones of
+	// the pass, the only ones, or the two that ended it): struck when a fresh
+	// request shows the node answering (eth_getBalance at latest: not cached,
+	// unlike the head). After a database error too: the probe still decides
+	// for the tokens that failed before it.
+	if len(pending) > 0 && ctx.Err() == nil {
+		var bal string
+		if err := s.onchain.rpc.call(ctx, &bal, "eth_getBalance", zeroAddr, "latest"); err == nil {
+			struck = append(struck, pending...)
+		}
+	}
+	gaveUp := 0
+	for _, ca := range struck {
+		if ctx.Err() != nil || !s.supplyStrike(ca) {
+			continue
+		}
+		n, err := s.db.SetTokenSupply(ctx, ca, nil, 0)
+		if err != nil {
+			log.Printf("token supply: %v", err)
+			continue
+		}
+		s.clearSupplyStrike(ca)
+		log.Printf("token supply: %s gave an error in %d passes in which the node otherwise answered — given up (no supply, block 0)", ca, tokenSupplyMaxStrikes)
+		gaveUp++
+		rows += n
+	}
+	if tokens > 0 || copied > 0 || gaveUp > 0 {
+		log.Printf("token supply: looked up %d token(s) (at entry block: %d, at latest: %d, none: %d), %d given up, %d call(s) updated",
+			tokens, atEntry, atLatest, tokens-atEntry-atLatest, gaveUp, rows)
+	}
+	return tokens
+}
+
+// supplyStrike counts one more pass in which ca's supply lookup got an error
+// while the node otherwise answered; true once it reaches tokenSupplyMaxStrikes.
+func (s *scanner) supplyStrike(ca string) bool {
+	s.supplyMu.Lock()
+	defer s.supplyMu.Unlock()
+	if s.supplyStrikes == nil {
+		s.supplyStrikes = map[string]int{}
+	}
+	k := strings.ToLower(ca)
+	s.supplyStrikes[k]++
+	return s.supplyStrikes[k] >= tokenSupplyMaxStrikes
+}
+
+// struckLast returns targets with the tokens that have strikes moved to the
+// end (order otherwise kept), so tokens that keep failing cannot hold up the
+// others: the pass ends after two failures in a row.
+func (s *scanner) struckLast(targets []supplyTarget) []supplyTarget {
+	s.supplyMu.Lock()
+	struck := make(map[string]bool, len(s.supplyStrikes))
+	for k, n := range s.supplyStrikes {
+		struck[k] = n > 0
+	}
+	s.supplyMu.Unlock()
+	if len(struck) == 0 {
+		return targets
+	}
+	out := make([]supplyTarget, 0, len(targets))
+	var tail []supplyTarget
+	for _, t := range targets {
+		if struck[strings.ToLower(t.CA)] {
+			tail = append(tail, t)
+			continue
+		}
+		out = append(out, t)
+	}
+	return append(out, tail...)
+}
+
+// clearSupplyStrike forgets ca's strikes (its supply was stored).
+func (s *scanner) clearSupplyStrike(ca string) {
+	s.supplyMu.Lock()
+	defer s.supplyMu.Unlock()
+	delete(s.supplyStrikes, strings.ToLower(ca))
 }
 
 // evmAddrRe matches exactly one EVM address.

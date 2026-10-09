@@ -1248,6 +1248,75 @@ func (st *ScoutStore) SetTokenName(ctx context.Context, ca, name, symbol string)
 	return int(tag.RowsAffected()), err
 }
 
+// supplyTarget is a token whose supply is not looked up yet: its contract
+// address and the entry block of its earliest call (by post time) that has an
+// entry price and a usable entry block (0 = none of its calls has one, e.g.
+// all priced by GeckoTerminal: the supply is read at the latest block).
+type supplyTarget struct {
+	CA         string
+	EntryBlock uint64
+}
+
+// ContractsMissingTokenSupply returns up to limit distinct tokens that have a
+// tracking row with an entry price but no supply lookup yet
+// (token_supply_block IS NULL), newest calls first.
+func (st *ScoutStore) ContractsMissingTokenSupply(ctx context.Context, limit int) ([]supplyTarget, error) {
+	rows, err := st.Pool.Query(ctx, `SELECT min(t.contract_address),
+		COALESCE((array_agg(CASE WHEN t.onchain->>'entry_block' ~ '^[0-9]{1,18}$' THEN (t.onchain->>'entry_block')::bigint END
+			ORDER BY c.message_date, c.id) FILTER (WHERE t.onchain->>'entry_block' ~ '^[1-9][0-9]{0,17}$'))[1], 0)
+		FROM scout_call_tracking t JOIN scout_calls c ON c.id = t.call_id
+		WHERE t.token_supply_block IS NULL AND t.entry_price_usd IS NOT NULL
+		GROUP BY lower(t.contract_address)
+		ORDER BY max(t.call_id) DESC LIMIT $1`, limit)
+	if err != nil {
+		return nil, fmt.Errorf("tokens missing a supply: %w", err)
+	}
+	defer rows.Close()
+	var out []supplyTarget
+	for rows.Next() {
+		var t supplyTarget
+		var block int64
+		if err := rows.Scan(&t.CA, &block); err != nil {
+			return nil, fmt.Errorf("tokens missing a supply: %w", err)
+		}
+		t.EntryBlock = uint64(max(block, 0))
+		out = append(out, t)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("tokens missing a supply: %w", err)
+	}
+	return out, nil
+}
+
+// CopyKnownTokenSupply fills the supply of calls whose token was already looked
+// up for another call (the first call's lookup, a NULL supply included).
+// Touches only token_supply and token_supply_block. Returns the rows filled.
+func (st *ScoutStore) CopyKnownTokenSupply(ctx context.Context) (int, error) {
+	tag, err := st.Pool.Exec(ctx, `UPDATE scout_call_tracking t
+		SET token_supply = k.token_supply, token_supply_block = k.token_supply_block
+		FROM (SELECT DISTINCT ON (lower(contract_address)) lower(contract_address) AS ca, token_supply, token_supply_block
+		      FROM scout_call_tracking WHERE token_supply_block IS NOT NULL
+		      ORDER BY lower(contract_address), call_id) k
+		WHERE t.token_supply_block IS NULL AND lower(t.contract_address) = k.ca`)
+	if err != nil {
+		return 0, fmt.Errorf("copy known token supplies: %w", err)
+	}
+	return int(tag.RowsAffected()), nil
+}
+
+// SetTokenSupply stores a token's supply in whole tokens (an exact decimal
+// string; nil = the contract gave none) and the block it was read at on every
+// call of that contract. Only these two columns change: status, schedule,
+// on-chain state and updated_at stay as they are. Returns the rows updated.
+func (st *ScoutStore) SetTokenSupply(ctx context.Context, ca string, supply *string, block uint64) (int, error) {
+	tag, err := st.Pool.Exec(ctx, `UPDATE scout_call_tracking SET token_supply = $2::text::numeric, token_supply_block = $3
+		WHERE lower(contract_address) = lower($1)`, ca, supply, int64(block))
+	if err != nil {
+		return 0, fmt.Errorf("save token supply of %s: %w", ca, err)
+	}
+	return int(tag.RowsAffected()), nil
+}
+
 // UpsertReturn stores the result for one horizon.
 func (st *ScoutStore) UpsertReturn(ctx context.Context, callID int, h horizon, r horizonResult) error {
 	nz := func(v float64) *float64 {
@@ -1587,7 +1656,9 @@ const (
 // verdict at the time of the call, whether the first 24 hours of candles
 // are stored (trades_final; see ScoutWebRow) and the values known at the call
 // that the "By factor" tab groups by (post metrics and the hour before the
-// call, scout_call_precall; the dataset view's expressions). It reads the
+// call, scout_call_precall; the dataset view's expressions), and the token
+// supply the tracker read from the chain (for the price-based market cap at
+// the call; not in the dataset view). It reads the
 // tables directly (not scout_call_dataset_v, whose per-row lookups the website
 // does not need). Ordered by call id. The first calls are a common table
 // expression (fc), read once and used both for the list and for the verdict
@@ -1606,7 +1677,8 @@ var webRowsSQL = `WITH fc AS ` + webFirstCallsSQL + `
 	(t.entry_price_source LIKE 'onchain-%' AND COALESCE((t.onchain->>'v')::int, 0) >= 2 AND COALESCE(r.has_1d, false)) IS TRUE,
 	m.holders, m.proof_elite, m.proof_good, m.live_buys_elite_count, m.live_buys_good_count,
 	m.live_buys_elite_usd::float8, m.live_buys_good_usd::float8,
-	pre.buy_vol_60m::float8, pre.sell_vol_60m::float8, pre.swaps_60m, pre.price_chg_60m_pct::float8, pre.vol_unit
+	pre.buy_vol_60m::float8, pre.sell_vol_60m::float8, pre.swaps_60m, pre.price_chg_60m_pct::float8, pre.vol_unit,
+	t.token_supply::float8
 	FROM fc
 	JOIN scout_calls c ON c.id = fc.id
 	JOIN ` + webCallCountsSQL + ` n ON n.ca = fc.ca
@@ -1684,7 +1756,8 @@ func (st *ScoutStore) SelectWebRows(ctx context.Context) ([]ScoutWebRow, int, er
 			&r.PostedDex, &r.EntrySource, &r.QuoteSym, &noData, &r.VerdictAtCall, &r.TradesFinal,
 			&r.Holders, &r.ProofElite, &r.ProofGood, &r.LiveBuysEliteCount, &r.LiveBuysGoodCount,
 			&r.LiveBuysEliteUSD, &r.LiveBuysGoodUSD,
-			&r.PreBuyVol60, &r.PreSellVol60, &r.PreSwaps60, &r.PreChg60, &r.PreVolUnit)
+			&r.PreBuyVol60, &r.PreSellVol60, &r.PreSwaps60, &r.PreChg60, &r.PreVolUnit,
+			&r.TokenSupply)
 		if err := rows.Scan(dest...); err != nil {
 			return nil, 0, err
 		}
