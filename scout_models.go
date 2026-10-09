@@ -339,6 +339,26 @@ type ScoutWebRow struct {
 	VerdictAtCall *string // clean | caution | red_flags | unknown
 	TradesFinal   bool
 	Trades24h     *int
+	// Known at the time of the call, for the Analytics page's "By factor"
+	// tab, read with the expressions of scout_call_dataset_v (so they match
+	// the ML data): from the post (scout_call_metrics; all nil without a
+	// parsed post) the holders, the elite and good holders ("proof"), and the
+	// elite and good live buys (count and USD); from the hour of trading
+	// before the call (scout_call_precall; all nil without a row) the buy and
+	// sell volume (in PreVolUnit: usd, or the quote asset's symbol), the swaps
+	// and the price change in percent.
+	Holders            *int
+	ProofElite         *int
+	ProofGood          *int
+	LiveBuysEliteCount *int
+	LiveBuysGoodCount  *int
+	LiveBuysEliteUSD   *float64
+	LiveBuysGoodUSD    *float64
+	PreBuyVol60        *float64
+	PreSellVol60       *float64
+	PreSwaps60         *int
+	PreChg60           *float64
+	PreVolUnit         *string
 
 	// worked out by the website when it builds its snapshot (websnapshot.go)
 	usd     bool  // priced in USD: only then are the numbers shown

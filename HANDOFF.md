@@ -138,9 +138,8 @@ c. **Website readability + `?days=` age filter**: `frontend/*`, `web.go`,
    `websnapshot.go`, `web_db_test.go`, `websnapshot_test.go`, README website
    section. Reviewed.
 
-In progress: the website "Perceptor today" label on
-`work/2026-10-09-perceptor-today-label` (from `main` at 4e7e049; section 4
-item 2).
+Done: the website "Perceptor today" label (section 4 item 2), merged
+(PR #2/#3) and deployed.
 
 ## 3. Prod state and pending owner actions
 
@@ -170,7 +169,8 @@ Deployed 8 October (owner confirmed):
   prices on: … every 1h0m0s for older ones; at most 400 call(s) per cycle".
 - `SCOUT_LATEST_REFRESH_OLD=1h SCOUT_LATEST_BATCH=400` are now in the prod
   `.env`.
-- `SCOUT_RESCAN` is unset: the re-scan lane is off.
+- `SCOUT_RESCAN=on` in prod since 8 October: the re-scan lane runs with
+  the defaults (at most 100 a day, 10 m gap, 30-day max age).
 - Lesson: the first restart picked up a different `.env` file and ran with
   the defaults (24h/200). The tracker reads `.env` from the folder it is
   started in, and a variable already set in the shell wins over the file.
@@ -186,7 +186,7 @@ Pending owner actions:
 
 1. Done 8 October: the first ML training (model 20261008-1852; results in
    section 4 item 1).
-2. Decide the failed-rescan limit: 2 or 3 (section 4 item 2).
+2. Done 8 October: failed-rescan limit decided = 2 (section 4 item 2).
 3. Answer the five early-transaction questions (section 4 item 4).
 4. `.claude/commands.txt`: add to `.gitignore` or delete (below).
 5. Optional: the sizing queries (read-only, in pgAdmin).
@@ -209,7 +209,8 @@ approved; the Perceptor re-scan is approved with the defaults in section 4;
   SCOUT_RPC_PARALLEL=4 SCOUT_RPC_MAX_INFLIGHT=48`, latest-price pass on;
   `SCOUT_LATEST_REFRESH_OLD=1h SCOUT_LATEST_BATCH=400` are in the prod
   `.env` since 8 October (the website's 2 h stale limit assumes them).
-- `SCOUT_RESCAN` unset (lane off) until the label is deployed.
+- `SCOUT_RESCAN=on` since 8 October (defaults: `SCOUT_RESCAN_MAX_PER_DAY=100`,
+  `SCOUT_RESCAN_GAP=10m`, `SCOUT_RESCAN_MAX_AGE=720h` = 30 days).
 - The web port is `SCOUT_WEB_ADDR` in `.env`.
 - Nitro runs with `--execution.rpc.log-history=0` (full log index; a full
   node, not an archive). Keep it, or old ranges slow down again.
@@ -300,9 +301,9 @@ approved; the Perceptor re-scan is approved with the defaults in section 4;
        call" item.
 2. **Perceptor re-scan of first calls without a Perceptor report**
    (approved 8 October with the defaults below). **Backend merged
-   (0a46f28, in PR #1 = 4e7e049) and deployed 8 October, lane off.** The
-   website "Perceptor today" label is in progress on
-   `work/2026-10-09-perceptor-today-label`.
+   (0a46f28, in PR #1 = 4e7e049) and deployed 8 October; the lane is on
+   in prod since 8 October (`SCOUT_RESCAN=on`).** The website "Perceptor
+   today" label is merged (PR #2/#3) and deployed.
    - What it does, backend only:
      - `scan_kind` column on `scout_investigations` (`'live'`/`'rescan'`,
        idempotent `ADD COLUMN IF NOT EXISTS`, default `'live'`) with a
@@ -332,22 +333,22 @@ approved; the Perceptor re-scan is approved with the defaults in section 4;
      `work/2026-10-08-ml-pool-web`), merged as PR #1 (4e7e049), deployed
      8 October with the 8 October work.
    - Prod notes:
-     - Do not set `SCOUT_RESCAN=on` before the website "Perceptor today"
-       label is deployed.
+     - Done: the "Perceptor today" label was deployed, and
+       `SCOUT_RESCAN=on` is set in prod since 8 October.
      - The candidate count: a read-only pgAdmin query (the PM provides
        it).
      - Send the dry run's output to a file (it may be thousands of lines).
      - Rollback caveat: an old binary would read rescan rows as call-time
        verdicts (in DEPLOY.md).
    - Open:
-     - **Owner decision:** drop a call after 2 failed rescans (current
-       `rescanFailedLimit = 2`) or after 3.
+     - **Decided 8 October:** drop a call after 2 failed rescans (as
+       `rescanFailedLimit = 2`; no code change).
      - The daily cap can undercount while database inserts fail (the gap
        still holds).
      - A "Perceptor today" change sends no SSE event in 4e7e049; the label
-       branch adds one (`report` with `tool: perceptor_today`).
-   - Next step on this line: the frontend "Perceptor today" label (`coder`,
-     in progress on `work/2026-10-09-perceptor-today-label`).
+       (merged in PR #2/#3) adds one (`report` with `tool: perceptor_today`).
+   - Done on this line: the frontend "Perceptor today" label, merged
+     (PR #2/#3) and deployed; the lane is on in prod since 8 October.
    - Off by default: `SCOUT_RESCAN=on`. Settings and defaults:
      `SCOUT_RESCAN_MAX_AGE=720h`, `SCOUT_RESCAN_MAX_PER_DAY=100`,
      `SCOUT_RESCAN_GAP=10m`, `SCOUT_RESCAN_IDLE=5m`,
@@ -419,8 +420,7 @@ approved; the Perceptor re-scan is approved with the defaults in section 4;
    - No coder work until the owner approves.
 5. **Analytics page**: two sections on a separate page (`/analytics.html`,
    linked from the list's top bar and back).
-   - **Section 1, "Call performance": built 8 October, uncommitted on
-     `work/2026-10-09-analytics-page`** (coder; not reviewed or deployed yet).
+   - **Section 1, "Call performance": merged (PR #5) and deployed.**
      - `GET /api/analytics`: one compact row per first call, built once per
        snapshot (pre-encoded, pre-gzipped, ETag = hash of the body, 304);
        the browser groups and filters it. No new table or schema change; the
@@ -429,7 +429,9 @@ approved; the Perceptor re-scan is approved with the defaults in section 4;
        the call (the dataset view's rule, live scans only) and a "first 24 h
        of candles stored" flag. Trades in the first 24 h come from
        `scout_call_candles` (5-minute candles), read once and cached; only
-       newly complete calls are read per refresh, all of them hourly.
+       newly complete calls are read per refresh, all of them hourly. A
+       failed trade-count read no longer fails the refresh: the counts held
+       stay, the others show as unknown, and the next refresh asks again.
      - Page: window 1h–30d (1d default); "Quiet after the call" (< 50 trades
        in 24 h, not rugged) include / exclude / only; tables overall, by
        verdict at the call, pool family (v2/v3/v4/pons/GeckoTerminal), posted
@@ -439,11 +441,67 @@ approved; the Perceptor re-scan is approved with the defaults in section 4;
        groups under 20 calls greyed. First calls, late entry, USD, before
        tax. Rugged calls keep their pre-rug peak here (the list hides it).
      - Defaults the PM chose (owner may change): weeks Mon–Sun UTC, returns
-       before tax, tables only (charts later with ECharts), 1d default.
+       before tax, 1d default.
+   - **Chart batch: built 8 October, uncommitted on
+     `work/2026-10-09-analytics-charts`** (coder; reviewed; awaiting
+     commit/PR and deploy). Three tabs over the same feed (`/api/analytics`
+     format 2, which adds per first call the values known at the call:
+     called-at market cap, holders, elite/good holders, elite/good live buys
+     count and USD, and the hour before the call: buy/sell volume in USD,
+     swaps, price change; same expressions as `scout_call_dataset_v`; no
+     schema change).
+     - Overview: weekly (or monthly) trend, outcome mix, "$100 on every
+       call" (returns capped at +1,000%), hour × weekday heat map, and the
+       section-1 tables, now with mean and median of return, peak and drop.
+     - By factor: equal-count groups (4/5/10, zero group when ≥ 10% are 0),
+       per-group histograms with fixed bands, table, scatter (log / symlog),
+       typical path 1h → 30d, verdict × pool family grid.
+     - Peak vs final: peak against return, share that gave back more than
+       half of the peak.
+     - Shared filters: window, metric, mean/median, quiet calls, week/month,
+       pool family, verdict. Charts are hand-built SVG (the PM's task said
+       no chart library), not ECharts as `coder.md` planned.
+     - Review follow-ups (9 October): number factors with a zero group now
+       cut the values below and above 0 separately (no group spans 0;
+       matters for the pre-call price change); "$100 on every call":
+       "All calls" and "No red flags" ignore the pool family and verdict
+       choices (quiet choice only), plus one line for the chosen family /
+       verdict; label and caption fixes.
+     - Market cap factor: the owner chose "market cap at call from the
+       price" (entry price × supply), but the token supply is not stored
+       anywhere, so the page still sends the posted `called_at_mcap_usd`,
+       labelled "Market cap at call (posted)". A price-based one needs a
+       `totalSupply()` read per token (about 4.7k node calls once, then one
+       per new call), stored with the call (optional `onchain` JSON field
+       or a new `scout_call_tracking` column), a backfill pass, and the
+       website load query; owner to decide (details in the coder's report
+       of 9 October).
+     - Needs its own PR from `work/2026-10-09-analytics-charts`: `main`
+       already has PR #6 (merge 0122a98), which merged only the skill
+       commit (c9e9fcc), not this batch.
    - **Section 2, "Model insights": next** (now only an empty "coming soon"
      heading). Plan: show the model report from the training run's
      `meta.json`, read from a folder set by a new `SCOUT_ML_DIR` setting;
      per-call scores later, and only out-of-sample ones.
+6. **Paused: multi-source calls** (other Telegram call channels next to
+   Scout). Nothing to build until the open questions are answered.
+   - Decisions:
+     - all channels in the website list and in the model, with scout-only
+       comparison runs;
+     - other channels' returns from our own node's stored candles;
+     - past calls are stored; whether to track tokens without history is
+       decided after a sizing query;
+     - Perceptor + sAlpha for all channels; a report is reused unless it
+       failed, is missing or unreadable; Scout calls first in the queue;
+     - deliveries to the same group, labelled by channel, with
+       clean,caution.
+   - Open questions:
+     - the age limit for reusing a report;
+     - the channels: @CallAnalyserRobinhood recommended, @hoodchains as a
+       possible baseline;
+     - Call Analyser delivery: first post per token, or every caller.
+   - Phase plan: 0 pin the readers to Scout; 1 Robinhood sources; 2 store
+     Base; 3 track Base.
 
 Later:
 
@@ -462,7 +520,7 @@ Later:
   "Charts").
 - Other launchpads (about 46 unpriced calls); the launchpad query results are
   pending from the owner.
-- Other call sources (Call Analyser channels).
+- Other call sources (Call Analyser channels): paused, section 4 item 6.
 - In-flight scans cut off by a stop end as `failed` and are not requeued.
 - Poison post: a stored-only post with a permanent DB error pauses polling.
 - Resolved: `prior_calls`, `calls_prev_1h` and `calls_prev_24h` counting update
@@ -588,6 +646,13 @@ Later:
 - Page changes: check at 1280px and 390px, light and dark. DOM with
   `textContent` only, and keep the Content-Security-Policy (no inline script or
   style).
+- Headless browser checks: use a throwaway `--user-data-dir` in the session
+  scratchpad and start Edge/Chrome with `--disable-sync --disable-extensions
+  --no-first-run --no-default-browser-check` (plus Edge `--inprivate` if it
+  works headless), so the test profile is never signed into the owner's
+  Microsoft account and never loads his extensions (on 9 October a test
+  profile synced his extensions, a wallet among them). Close the browser by
+  PID and delete the profile directory afterwards.
 - Ops SQL: run A/B/C/D against the throwaway Postgres before handing them over.
 
 ## Deploying
