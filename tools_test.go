@@ -1,6 +1,8 @@
 package main
 
 import (
+	"encoding/json"
+	"maps"
 	"strings"
 	"testing"
 	"time"
@@ -38,6 +40,16 @@ func TestLoadToolsDefaultsAndOverrides(t *testing.T) {
 	}
 	if r := tools[2]; r.Bot != "rug_bot" || !r.Gate || r.Parser != parserText || r.CommandFor("0xA") != "/check 0xA full" {
 		t.Fatalf("rugcheck = %+v", r)
+	}
+
+	if p.NeedsText || !s.NeedsText || tools[2].NeedsText {
+		t.Fatalf("NeedsText: perceptor %v, salpha %v, rugcheck %v; want false, true, false", p.NeedsText, s.NeedsText, tools[2].NeedsText)
+	}
+	t.Setenv("SCOUT_TOOL_SALPHA_NEEDS_TEXT", "false")
+	t.Setenv("SCOUT_TOOL_RUGCHECK_NEEDS_TEXT", "true")
+	if tools, err = loadTools(); err != nil || tools[1].NeedsText || !tools[2].NeedsText {
+		t.Fatalf("NEEDS_TEXT overrides (salpha false, rugcheck true): salpha %v, rugcheck %v, err %v",
+			tools[1].NeedsText, tools[2].NeedsText, err)
 	}
 
 	t.Setenv("SCOUT_TOOLS", "mystery")
@@ -91,6 +103,61 @@ func TestToolResultText(t *testing.T) {
 	r := &toolResult{Replies: []*tg.Message{{ID: 1, Message: "part 1"}, {ID: 2, Message: " "}, {ID: 3, Message: "part 2"}}}
 	if r.ReportText() != "part 1\n\npart 2" || len(r.MessageIDs()) != 3 {
 		t.Fatalf("%q %v", r.ReportText(), r.MessageIDs())
+	}
+}
+
+// TestReplyDetailsMedia: every reply gets an entry with its time, edit time,
+// the message it replies to, its media type and text length (prod call 10424
+// completed with empty text and nothing under "media"), and media of any type,
+// not only photos and documents, is listed.
+func TestReplyDetailsMedia(t *testing.T) {
+	edited := &tg.Message{ID: 5733, Date: 1760000040, Message: "Full Report", Media: &tg.MessageMediaWebPage{}}
+	edited.SetEditDate(1760000055)
+	hdr := &tg.MessageReplyHeader{}
+	hdr.SetReplyToMsgID(4242)
+	edited.SetReplyTo(hdr)
+	noID := &tg.Message{ID: 5734, Date: 1760000041, Message: "né"}
+	noID.SetReplyTo(&tg.MessageReplyHeader{}) // a reply header without a message id
+	msgs := []*tg.Message{
+		{ID: 5731, Date: 1760000000, Media: &tg.MessageMediaUnsupported{}},
+		{ID: 5732, Date: 1760000001, Media: &tg.MessageMediaPhoto{}},
+		edited,
+		noID,
+	}
+	got := replyDetails(msgs, 1, nil)
+	var d struct {
+		Attempts int              `json:"attempts"`
+		Replies  []map[string]any `json:"replies"`
+		Media    []struct {
+			MessageID int    `json:"message_id"`
+			Type      string `json:"type"`
+		} `json:"media"`
+	}
+	if err := json.Unmarshal(got, &d); err != nil {
+		t.Fatalf("replyDetails = %s: %v", got, err)
+	}
+	// numbers decode as float64; absent keys (omitempty) are missing
+	want := []map[string]any{
+		{"message_id": 5731.0, "date": 1760000000.0, "media": "messageMediaUnsupported", "text_len": 0.0},
+		{"message_id": 5732.0, "date": 1760000001.0, "media": "messageMediaPhoto", "text_len": 0.0},
+		{"message_id": 5733.0, "date": 1760000040.0, "edit_date": 1760000055.0, "reply_to_msg_id": 4242.0,
+			"media": "messageMediaWebPage", "text_len": 11.0},
+		{"message_id": 5734.0, "date": 1760000041.0, "media": "", "text_len": 2.0},
+	}
+	if len(d.Replies) != len(want) {
+		t.Fatalf("replyDetails = %s: %d replies, want %d", got, len(d.Replies), len(want))
+	}
+	for i, w := range want {
+		if !maps.Equal(d.Replies[i], w) {
+			t.Errorf("replies[%d] = %v, want %v", i, d.Replies[i], w)
+		}
+	}
+	if len(d.Media) != 2 || d.Media[0].MessageID != 5731 || d.Media[0].Type != "messageMediaUnsupported" ||
+		d.Media[1].MessageID != 5732 || d.Media[1].Type != "photo" {
+		t.Errorf("media = %+v, want 5731 messageMediaUnsupported and 5732 photo", d.Media)
+	}
+	if d.Attempts != 1 {
+		t.Errorf("attempts = %d, want 1", d.Attempts)
 	}
 }
 

@@ -102,12 +102,16 @@ func TestWebDetailSelection(t *testing.T) {
 	inv(invSeed{tool: perc, call: "gamma", ca: caGamma, at: 9 * time.Hour, status: "failed", summary: sp("failed")})
 	// gamma's sAlpha replies only decline: the latest one is shown, as a decline
 	inv(invSeed{tool: salpha, call: "gamma", ca: caGamma, at: 4 * time.Hour, status: done,
-		text: "Too little liquidity or trading activity to research yet."})
+		text: strings.Repeat(" \n", 300) + "Too little liquidity or trading activity to research yet." + strings.Repeat("\t", 300)})
 	gammaDecl := inv(invSeed{tool: salpha, call: "gamma", ca: caGamma, at: 6 * time.Hour, status: done,
 		text: "Not enough public signals to generate a report for this token.", url: sp("https://salpha.example/r/gamma")})
 	// sol: links that are not https are not shown
 	solPerc := inv(invSeed{tool: perc, call: "sol", ca: caSol, at: 6 * time.Hour, status: done, url: sp("http://www.perceptor.info/r/plain")})
-	solSA := inv(invSeed{tool: salpha, call: "sol", ca: caSol, at: 6 * time.Hour, status: done, text: "sol text", url: sp("javascript:alert(1)")})
+	inv(invSeed{tool: salpha, call: "sol", ca: caSol, at: 6 * time.Hour, status: done, text: "sol text", url: sp("javascript:alert(1)")})
+	// … and a newer long real report that mentions a decline phrase in a risk
+	// line: longer than salphaDeclineMaxLen, so it is a report and is shown
+	solLongText := "sol: " + strings.Repeat("holders grow, dev wallet holds 2%. ", 9) + "Risks: too little liquidity to exit large positions."
+	solLong := inv(invSeed{tool: salpha, call: "sol", ca: caSol, at: 7 * time.Hour, status: done, text: solLongText, url: sp("javascript:alert(1)")})
 	// virt: only an empty sAlpha reply, and a rate-limited one with text
 	inv(invSeed{tool: salpha, call: "virt", ca: caVirt, at: 4 * time.Hour, status: done, text: "   "})
 	inv(invSeed{tool: salpha, call: "virt", ca: caVirt, at: 5 * time.Hour, status: "rate_limited", text: "limited"})
@@ -125,7 +129,7 @@ func TestWebDetailSelection(t *testing.T) {
 	}
 	for k, want := range map[string][3]int{ // has sAlpha (0/1), Perceptor id, sAlpha id
 		"alpha": {1, alphaPerc, alphaOld}, "beta": {1, 0, betaNew}, "gamma": {0, gammaPerc, gammaDecl},
-		"sol": {1, solPerc, solSA}, "virt": {0, 0, 0}, "gave": {0, 0, 0},
+		"sol": {1, solPerc, solLong}, "virt": {0, 0, 0}, "gave": {0, 0, 0},
 	} {
 		c, ok := byKey[k]
 		if !ok {
@@ -172,7 +176,7 @@ func TestWebDetailSelection(t *testing.T) {
 		t.Errorf("alpha: salpha %+v, want the older real report %d", d.SAlpha, alphaOld)
 	}
 	d = detail("sol")
-	if d.Perceptor == nil || d.Perceptor.URL != nil || d.SAlpha == nil || d.SAlpha.URL != nil || d.SAlpha.Text != "sol text" {
+	if d.Perceptor == nil || d.Perceptor.URL != nil || d.SAlpha == nil || d.SAlpha.URL != nil || d.SAlpha.Text != solLongText || d.SAlpha.Declined {
 		t.Errorf("sol: %+v %+v", d.Perceptor, d.SAlpha)
 	}
 	if d := detail("virt"); d.Perceptor != nil || d.SAlpha != nil {
@@ -192,7 +196,7 @@ func TestWebDetailSelection(t *testing.T) {
 			seen[id] = true
 		}
 	}
-	for _, id := range []int{betaNew, alphaOld, alphaPerc, gammaPerc, gammaDecl, solPerc, solSA} {
+	for _, id := range []int{betaNew, alphaOld, alphaPerc, gammaPerc, gammaDecl, solPerc, solLong} {
 		if !seen[id] {
 			t.Errorf("text %d never read", id)
 		}
