@@ -6,13 +6,15 @@ from pathlib import Path
 import joblib
 import lightgbm as lgb
 import numpy as np
+import pandas as pd
 from sklearn.compose import ColumnTransformer
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import FunctionTransformer, StandardScaler
 
-from .config import (BUCKETS, CATEGORICAL, EARLY_STOPPING_ROUNDS, FALLBACK_ROUNDS,
+from . import config as C
+from .config import (ALL_CATEGORICAL, BUCKETS, EARLY_STOPPING_ROUNDS, FALLBACK_ROUNDS,
                      LGBM_PARAMS, LOG1P_FEATURES, MIN_CLASS_ROWS, NUMERIC_FEATURES)
 from .features import build_features
 
@@ -54,7 +56,8 @@ def fit_lgbm(X_train, y_train, X_val=None, y_val=None, n_estimators=None):
     model = lgb.LGBMClassifier(**params)
     with warnings.catch_warnings():  # lightgbm >= 4.7 deprecates eval_set; keep 4.0 compatibility
         warnings.filterwarnings("ignore", message=".*eval_set.*")
-        model.fit(X_train, np.asarray(y_train, dtype=int), categorical_feature=CATEGORICAL, **fit_kw)
+        model.fit(X_train, np.asarray(y_train, dtype=int),
+                  categorical_feature=[c for c in X_train.columns if c in ALL_CATEGORICAL], **fit_kw)
     calibrator, note = None, None
     if usable_val:
         calibrator = fit_platt(model.predict(X_val, raw_score=True), y_val)
@@ -76,6 +79,46 @@ def fit_platt(raw, y):
         np.asarray(raw, dtype=float).reshape(-1, 1), np.asarray(y, dtype=int))
 
 
+def platt_slope(calibrator) -> float:
+    return float(calibrator.coef_.ravel()[0])
+
+
+def fit_platt_recent(raw, y, dates) -> tuple:
+    """Platt calibration on the most recent held-out rows.
+
+    `raw`, `y`, `dates`: margins, outcomes and posting dates of held-out rows
+    (validation part, or out-of-fold rows), never rows the model was fitted on.
+    Recent = posted in the C.CALIB_RECENT_DAYS days before the newest of them.
+    Returns (calibrator, info); falls back to all rows when the recent rows have
+    fewer than C.CALIB_MIN_CLASS_ROWS of a class or a non-increasing fit."""
+    raw, y = np.asarray(raw, dtype=float), np.asarray(y, dtype=int)
+    dates = pd.to_datetime(pd.Series(dates).reset_index(drop=True), utc=True)
+    start = dates.max() - pd.Timedelta(days=C.CALIB_RECENT_DAYS)
+    recent = (dates >= start).to_numpy()
+    pos, neg = int(y[recent].sum()), int((1 - y[recent]).sum())
+    info = {"rows_all": int(len(y)), "rows_recent": int(recent.sum()), "pos_recent": pos,
+            "neg_recent": neg, "from": start, "span_days_all": float(
+                (dates.max() - dates.min()).total_seconds() / 86400) if len(dates) else 0.0,
+            "used": "recent", "note": None}
+    if min(pos, neg) >= C.CALIB_MIN_CLASS_ROWS:
+        cal = fit_platt(raw[recent], y[recent])
+        if platt_slope(cal) > 0:
+            return cal, info
+        info["note"] = "recent-rows calibration would invert the ranking (slope <= 0)"
+    else:
+        info["note"] = (f"recent rows have {pos} positives / {neg} negatives "
+                        f"(need {C.CALIB_MIN_CLASS_ROWS} of each)")
+    info["used"] = "all (fallback)"
+    return fit_platt(raw, y), info
+
+
+def apply_calibrator(calibrator, raw) -> np.ndarray:
+    raw = np.asarray(raw, dtype=float)
+    if calibrator is None:
+        return 1.0 / (1.0 + np.exp(-raw))
+    return calibrator.predict_proba(raw.reshape(-1, 1))[:, 1]
+
+
 def best_rounds(fitted: dict) -> int:
     m = fitted["model"]
     return int(m.best_iteration_ or m.n_estimators)
@@ -83,10 +126,7 @@ def best_rounds(fitted: dict) -> int:
 
 def predict(fitted: dict, X) -> np.ndarray:
     """Calibrated probability of the positive class."""
-    raw = fitted["model"].predict(X, raw_score=True)
-    if fitted["calibrator"] is not None:
-        return fitted["calibrator"].predict_proba(raw.reshape(-1, 1))[:, 1]
-    return 1.0 / (1.0 + np.exp(-raw))
+    return apply_calibrator(fitted.get("calibrator"), fitted["model"].predict(X, raw_score=True))
 
 
 def rank_pct(score: float, ref_quantiles) -> float:
@@ -119,12 +159,13 @@ class Bundle:
     @property
     def flat_levels(self) -> bool:
         """Old meta.json layout: one flat set of levels, matched case-sensitively."""
-        return bool(set(self.meta.get("category_levels") or {}) & set(CATEGORICAL))
+        return bool(set(self.meta.get("category_levels") or {}) & set(ALL_CATEGORICAL))
 
     def features(self, row, bucket: str):
         """The feature matrix the bucket's models get for `row` (or rows)."""
         return build_features(row, self.levels(bucket), self.meta["features"],
-                              exact_levels=self.flat_levels)
+                              exact_levels=self.flat_levels,
+                              dex_rules=self.meta.get("dex_family_rules"))
 
     def score(self, row: dict) -> dict:
         """Score one raw view row -> the /score response body. A bucket

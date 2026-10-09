@@ -2,11 +2,13 @@
 
 `build_features` is called by train.py on the whole dataset and by serve.py on
 a single JSON row, so training and serving cannot drift apart."""
+import re
+
 import numpy as np
 import pandas as pd
 
-from .config import (CATEGORICAL, FEATURES, MIN_CATEGORY_COUNT, NUMERIC_RAW,
-                     PRE_VOL, is_forbidden)
+from . import config as C
+from .config import MIN_CATEGORY_COUNT, NUMERIC_RAW, PRE_VOL, is_forbidden
 
 
 def num(df: pd.DataFrame, col: str) -> pd.Series:
@@ -32,8 +34,35 @@ def assert_no_leakage(columns) -> None:
         raise ValueError(f"forbidden columns in feature matrix: {bad}")
 
 
-def category(df: pd.DataFrame, col: str) -> pd.Series:
-    """Categorical column normalised for matching: stripped, lower case; absent/empty -> None."""
+_DEX_SEPARATORS = re.compile(r"[\s_\-./]+")
+
+
+def dex_family_rules() -> dict:
+    """The configured DEX family rules, in the form stored in meta.json."""
+    return {"rules": [list(r) for r in C.DEX_FAMILY_RULES], "other": C.DEX_FAMILY_OTHER}
+
+
+def dex_family_of(name, rules: dict | None = None):
+    """Family of one posted DEX name (None for an empty name). `rules`: as
+    stored in meta.json (serving: the rules the model was trained with);
+    default C.DEX_FAMILY_RULES / C.DEX_FAMILY_OTHER."""
+    if name is None or (isinstance(name, float) and np.isnan(name)):
+        return None
+    key = _DEX_SEPARATORS.sub("", str(name).lower())
+    if not key:
+        return None
+    rules = rules or dex_family_rules()
+    for prefix, family in rules["rules"]:
+        if key.startswith(prefix):
+            return family
+    return rules["other"]
+
+
+def category(df: pd.DataFrame, col: str, dex_rules: dict | None = None) -> pd.Series:
+    """Categorical column normalised for matching: stripped, lower case; absent/empty -> None.
+    `dex_family` is derived from `dex` (see `dex_family_of`)."""
+    if col == "dex_family":
+        return text(df, "dex").map(lambda v: dex_family_of(v, dex_rules), na_action="ignore")
     return text(df, col).str.lower()
 
 
@@ -44,7 +73,7 @@ def learn_cat_levels(df: pd.DataFrame) -> dict:
     test rows would let the later period shape the model. Levels are stored
     normalised (see `category`)."""
     out = {}
-    for c in CATEGORICAL:
+    for c in C.CATEGORICAL:
         counts = category(df, c).value_counts()
         out[c] = sorted(counts[counts >= MIN_CATEGORY_COUNT].index.tolist())
     return out
@@ -55,7 +84,8 @@ def _ratio(a: pd.Series, b: pd.Series) -> pd.Series:
     return (a / b.where(b > 0)).replace([np.inf, -np.inf], np.nan)
 
 
-def build_features(rows, cat_levels: dict, columns=None, exact_levels: bool = False) -> pd.DataFrame:
+def build_features(rows, cat_levels: dict, columns=None, exact_levels: bool = False,
+                   dex_rules: dict | None = None) -> pd.DataFrame:
     """Raw view rows (DataFrame, dict or list of dicts) -> float feature matrix.
 
     Only whitelisted input columns are read, so unknown keys are ignored and
@@ -65,6 +95,8 @@ def build_features(rows, cat_levels: dict, columns=None, exact_levels: bool = Fa
     `exact_levels=True` (serving an old meta.json with one flat set of levels
     only) matches stripped values case-sensitively, as those models were trained.
     `columns` (serving: the list stored in meta.json) fixes the column order.
+    `dex_rules` (serving: the DEX family rules stored in meta.json) maps `dex`
+    to `dex_family` as at training; default: the configured rules.
     """
     if isinstance(rows, dict):
         rows = [rows]
@@ -93,17 +125,20 @@ def build_features(rows, cat_levels: dict, columns=None, exact_levels: bool = Fa
     X["hour_utc"] = when.dt.hour.astype(float)
     X["weekday_utc"] = when.dt.weekday.astype(float)
 
-    for c in CATEGORICAL:
+    columns = list(columns) if columns is not None else C.FEATURES
+    for c in C.ALL_CATEGORICAL:
+        if c not in columns:
+            continue
         if exact_levels:
             # old flat meta.json: levels were learned stripped but case-sensitive, and
             # 'Raydium' / 'raydium' may be two levels; match exactly as they were trained
             codes = {level: i for i, level in enumerate(cat_levels.get(c, []))}
-            X[c] = text(df, c).map(codes).astype(float)
+            raw = category(df, c, dex_rules) if c in C.DERIVED_CATEGORICAL else text(df, c)
+            X[c] = raw.map(codes).astype(float)
         else:
             codes = {str(level).strip().lower(): i for i, level in enumerate(cat_levels.get(c, []))}
-            X[c] = category(df, c).map(codes).astype(float)
+            X[c] = category(df, c, dex_rules).map(codes).astype(float)
 
-    columns = list(columns) if columns is not None else FEATURES
     assert_no_leakage(columns)
     for c in columns:  # e.g. a raw column an older model version still lists (prior_calls)
         if c not in X.columns:

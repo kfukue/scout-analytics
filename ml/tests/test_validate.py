@@ -244,3 +244,64 @@ def test_time_split_counts_embargo_and_token_drops_apart():
     tokens[95] = "0xt5"                                            # a later call of a train token
     s = V.time_split(dates, tokens, 3)
     assert s["n_dropped_token"] == 1 and s["n_dropped_embargo"] == 6
+
+
+def _platt_data(n=600, seed=3, recent_pos_rate=0.3):
+    """Held-out margins over 40 days; the outcome base rate drops in the last 14."""
+    rng = np.random.default_rng(seed)
+    dates = pd.Series(pd.Timestamp("2026-09-01", tz="UTC")
+                      + pd.to_timedelta(np.sort(rng.uniform(0, 40, n)), unit="D"))
+    raw = rng.normal(0, 1, n)
+    recent = (dates >= dates.max() - pd.Timedelta(days=14)).to_numpy()
+    base = np.where(recent, recent_pos_rate, 0.6)
+    y = (rng.random(n) < base * 1.6 / (1 + np.exp(-raw))).astype(int)
+    return raw, y, dates, recent
+
+
+def test_recent_calibration_uses_the_last_days_of_held_out_rows():
+    from scout_ml.model import apply_calibrator, fit_platt, fit_platt_recent
+    raw, y, dates, recent = _platt_data()
+    cal, info = fit_platt_recent(raw, y, dates)
+    assert info["used"] == "recent" and info["note"] is None
+    assert info["rows_recent"] == int(recent.sum()) and info["rows_all"] == len(y)
+    assert info["pos_recent"] + info["neg_recent"] == info["rows_recent"]
+    # the recent fit follows the lower recent base rate; the all-rows fit does not
+    p_recent = apply_calibrator(cal, raw[recent]).mean()
+    p_all = apply_calibrator(fit_platt(raw, y), raw[recent]).mean()
+    assert abs(p_recent - y[recent].mean()) < 0.02 < abs(p_all - y[recent].mean())
+    # monotone: the ranking of the scores is unchanged
+    assert (np.argsort(apply_calibrator(cal, raw), kind="stable")
+            == np.argsort(raw, kind="stable")).all()
+
+
+def test_recent_calibration_falls_back_with_too_few_of_a_class(monkeypatch):
+    from scout_ml import config as C
+    from scout_ml.model import fit_platt, fit_platt_recent
+    raw, y, dates, recent = _platt_data(recent_pos_rate=0.02)
+    pos = int(y[recent].sum())
+    assert pos < C.CALIB_MIN_CLASS_ROWS
+    cal, info = fit_platt_recent(raw, y, dates)
+    assert info["used"] == "all (fallback)" and f"{pos} positives" in info["note"]
+    np.testing.assert_allclose(cal.coef_, fit_platt(raw, y).coef_)
+    monkeypatch.setattr(C, "CALIB_RECENT_DAYS", 1000)      # window from config: everything is recent
+    assert fit_platt_recent(raw, y, dates)[1]["used"] == "recent"
+
+
+def test_recent_calibration_never_inverts_the_ranking(monkeypatch):
+    from scout_ml import config as C
+    from scout_ml.model import fit_platt_recent, platt_slope
+    monkeypatch.setattr(C, "CALIB_RECENT_DAYS", 5)
+    raw, y, dates, _ = _platt_data()
+    recent = (dates >= dates.max() - pd.Timedelta(days=5)).to_numpy()
+    y = y.copy()
+    y[recent] = (raw[recent] < 0).astype(int)                # recent rows: anti-correlated
+    cal, info = fit_platt_recent(raw, y, dates)
+    assert info["used"] == "all (fallback)" and "slope" in info["note"] and platt_slope(cal) > 0
+
+
+def test_collapse_removed_helper_matches_trading_metrics():
+    y = np.array([1, 1, 0, 0, 1, 0, 0, 0, 0, 1])
+    score = np.arange(10, dtype=float)
+    assert V.collapse_removed(y, score) == pytest.approx(
+        V.trading_metrics(None, None, y, score, None)["collapse_removed"])
+    assert np.isnan(V.collapse_removed(np.zeros(10), score)) and np.isnan(V.collapse_removed(y, None))

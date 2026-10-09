@@ -15,10 +15,10 @@ import numpy as np
 import pandas as pd
 
 from scout_ml import config as C
-from scout_ml.features import build_features, learn_cat_levels
-from scout_ml.labels import build_labels
-from scout_ml.model import (best_rounds, fit_baseline, fit_lgbm, fit_platt, predict,
-                            usable_holdout)
+from scout_ml.features import build_features, dex_family_rules, learn_cat_levels, num
+from scout_ml.labels import build_labels, dead_policy
+from scout_ml.model import (apply_calibrator, best_rounds, fit_baseline, fit_lgbm, fit_platt,
+                            fit_platt_recent, predict, usable_holdout)
 from scout_ml.report import render
 from scout_ml import validate as V
 
@@ -65,11 +65,26 @@ def _class_check(y, mask, part_desc):
     return info
 
 
+def _calibrate_recent(fitted, info, raw, y, dates):
+    """Replace the calibrator by one fitted on the most recent held-out rows
+    (`raw`/`y`/`dates`: validation or out-of-fold rows only); the calibrator on
+    all of them (the earlier behaviour) is kept for the report."""
+    fitted["calibrator_all"] = fit_platt(raw, y)
+    fitted["calibrator"], info["calib"] = fit_platt_recent(raw, y, dates)
+    if info["calib"]["note"]:
+        info["messages"].append("calibration on all held-out rows: " + info["calib"]["note"])
+
+
 def _finish_label(info, fitted, X, y, tr, te, out_dir, bucket, label):
     """Test metrics, importance and the saved model for a fitted label."""
     if fitted["note"]:
         info["messages"].append(fitted["note"])
     p_test = predict(fitted, X[te])
+    if fitted.get("calibrator_all") is not None:  # before: calibrated on all held-out rows
+        p_all = apply_calibrator(fitted["calibrator_all"],
+                                 fitted["model"].predict(X[te], raw_score=True))
+        info["calibration_all_rows"] = V.calibration_table(y[te], p_all)
+        info["brier_all_rows"] = V.model_metrics(y[te], p_all)["brier"]
     gain = fitted["model"].booster_.feature_importance("gain")
     order = np.argsort(-gain)[:10]
     info.update(
@@ -84,13 +99,17 @@ def _finish_label(info, fitted, X, y, tr, te, out_dir, bucket, label):
     return info, fitted, p_test
 
 
-def _train_label(X, y, split, label, out_dir, bucket):
-    """short/3day: early stopping + Platt calibration on the validation part."""
+def _train_label(X, y, split, label, out_dir, bucket, dates):
+    """short/3day: early stopping on the validation part, Platt calibration on
+    its most recent rows (C.CALIB_RECENT_DAYS; fallback: all of it)."""
     tr, va, te = split["train"], split["val"], split["test"]
     info = _class_check(y, tr, "earliest 70% minus the embargo")
     if info.get("skipped"):
         return info, None, None
     fitted = fit_lgbm(X[tr], y[tr], X[va], y[va])
+    if fitted["calibrator"] is not None:
+        _calibrate_recent(fitted, info, fitted["model"].predict(X[va], raw_score=True), y[va],
+                          dates[va])
     return _finish_label(info, fitted, X, y, tr, te, out_dir, bucket, label)
 
 
@@ -108,10 +127,11 @@ def _kfold_matrices(rows, dates, tokens, tr, horizon_days):
     return folds
 
 
-def _train_label_kfold(X, y, split, folds, label, out_dir, bucket):
+def _train_label_kfold(X, y, split, folds, label, out_dir, bucket, dates):
     """medium/long: rounds = median best iteration over the usable purged
-    folds; Platt calibration fitted on the out-of-fold margins of fold models
-    refitted with those rounds; final model on the whole train part."""
+    folds; Platt calibration fitted on the most recent out-of-fold margins
+    (C.CALIB_RECENT_DAYS; fallback: all of them) of fold models refitted with
+    those rounds; final model on the whole train part."""
     tr, te = split["train"], split["test"]
     info = _class_check(y, tr, "calls before the test date minus the embargo")
     if info.get("skipped"):
@@ -131,22 +151,37 @@ def _train_label_kfold(X, y, split, folds, label, out_dir, bucket):
         cv["fold_rounds"].append(best_rounds(fit_lgbm(Xf[f["fit"]], y[f["fit"]],
                                                        Xf[f["held"]], y[f["held"]])))
     rounds = int(np.median(cv["fold_rounds"]))
-    raw, obs = [], []
+    raw, obs, when = [], [], []
     for f in usable:
         Xf = f["X"]
         m = fit_lgbm(Xf[f["fit"]], y[f["fit"]], n_estimators=rounds)["model"]
         raw.append(m.predict(Xf[f["held"]], raw_score=True))
         obs.append(y[f["held"]])
-    raw, obs = np.concatenate(raw), np.concatenate(obs)
+        when.append(dates[f["held"]])
+    raw, obs, when = np.concatenate(raw), np.concatenate(obs), pd.concat(when)
     cv["oof_rows"] = int(len(obs))
     fitted = fit_lgbm(X[tr], y[tr], n_estimators=rounds)
-    fitted["calibrator"] = fit_platt(raw, obs)
+    _calibrate_recent(fitted, info, raw, obs, when)
     return _finish_label(info, fitted, X, y, tr, te, out_dir, bucket, label)
 
 
-def _walk_forward(rows, Y, net_ret, dates, tokens, horizon_days, rounds):
+def collapse_check(y_runner, runner_score, y_plain, y_trained, collapse_score, net_ret,
+                   dead_on: bool) -> dict:
+    """Trading metrics for one test part. "collapses removed" (the gate) is
+    always measured on the PLAIN collapse label `y_plain`, whatever label the
+    collapse model was trained on. With the dead rule on, the share of the
+    trained-on label (collapse OR dead) removed by the same scores is added as
+    `collapse_removed_with_dead`: information only, never a gate."""
+    out = V.trading_metrics(y_runner, runner_score, y_plain, collapse_score, net_ret)
+    if dead_on:
+        out["collapse_removed_with_dead"] = V.collapse_removed(y_trained, collapse_score)
+    return out
+
+
+def _walk_forward(rows, Y, y_plain, net_ret, dates, tokens, horizon_days, rounds, dead_on):
     """Refit per week with the main model's round count; ranking metrics only.
-    Category levels are learned from each window's training rows."""
+    Category levels are learned from each window's training rows. Collapses
+    removed are measured on the plain label `y_plain` (see collapse_check)."""
     out = []
     for w in V.walk_forward_windows(dates, tokens, horizon_days):
         tr, te = w["train"], w["test"]
@@ -162,8 +197,9 @@ def _walk_forward(rows, Y, net_ret, dates, tokens, horizon_days, rounds):
         if "runner" not in scores:
             row["skipped"] = "too few training rows per class or test rows"
         else:
-            row.update(V.trading_metrics(Y["runner"][te], scores["runner"], Y["collapse"][te],
-                                         scores.get("collapse"), net_ret[te]))
+            row.update(collapse_check(Y["runner"][te], scores["runner"], y_plain[te],
+                                      Y["collapse"][te], scores.get("collapse"), net_ret[te],
+                                      dead_on))
             row["runner_auc"] = V.model_metrics(Y["runner"][te], scores["runner"])["roc_auc"]
         out.append(row)
     return out
@@ -184,7 +220,21 @@ def maturity_skip(b, dates):
             f"{need['rows']} rows over at least {need['span_days']} days)")
 
 
-def _train_bucket(b, df, L, out_dir):
+def _dead_stats(L, b, use, te):
+    """Dead calls among the bucket's usable rows and its test part, and how
+    many of them are collapses by the plain label anyway."""
+    dead = L["dead"][use].to_numpy()
+    plain = L[f"collapse_plain_{b}"][use].to_numpy() == 1
+    out = {}
+    for part, m in (("usable", np.ones(len(dead), bool)), ("test", te)):
+        out[part] = {"rows": int(m.sum()), "dead": int((dead & m).sum()),
+                     "dead_collapse": int((dead & plain & m).sum()),
+                     "collapse_rate_plain": float(plain[m].mean()) if m.any() else np.nan,
+                     "collapse_rate_with_dead": float((plain | dead)[m].mean()) if m.any() else np.nan}
+    return out
+
+
+def _train_bucket(b, df, L, out_dir, dead_on=False):
     """Returns (results, runner reference quantiles or None, category levels or None)."""
     cfg = C.BUCKETS[b]
     use = L[f"usable_{b}"].to_numpy()
@@ -226,18 +276,22 @@ def _train_bucket(b, df, L, out_dir):
     res["labels"], scores, rounds = {}, {}, {}
     for lab in C.LABELS:
         if forward:
-            out = _train_label_kfold(X, Y[lab], split, folds, lab, out_dir, b)
+            out = _train_label_kfold(X, Y[lab], split, folds, lab, out_dir, b, dates)
         else:
-            out = _train_label(X, Y[lab], split, lab, out_dir, b)
+            out = _train_label(X, Y[lab], split, lab, out_dir, b, dates)
         res["labels"][lab], fitted, scores[lab] = out
         if fitted is not None:
             rounds[lab] = res["labels"][lab]["rounds"]
     if "runner" not in rounds:
         res["skipped"] = res["labels"]["runner"]["skipped"]
         return res, None, None
-    res["trading"] = V.trading_metrics(Y["runner"][te], scores["runner"], Y["collapse"][te],
-                                       scores["collapse"], net_ret[te])
-    res["walk_forward"] = _walk_forward(rows, Y, net_ret, dates, tokens, h, rounds)
+    # gate on the plain collapse label; collapse OR dead is information only
+    y_plain = L[f"collapse_plain_{b}"][use].to_numpy()
+    res["trading"] = collapse_check(Y["runner"][te], scores["runner"], y_plain[te],
+                                    Y["collapse"][te], scores["collapse"], net_ret[te], dead_on)
+    res["dead"] = _dead_stats(L, b, use, te)
+    res["walk_forward"] = _walk_forward(rows, Y, y_plain, net_ret, dates, tokens, h, rounds,
+                                        dead_on)
     res["gates"] = V.gates(res["trading"], res["walk_forward"])
     reference = np.quantile(scores["runner"], np.linspace(0, 1, C.N_REF_QUANTILES))
     return res, reference.tolist(), levels
@@ -251,13 +305,18 @@ def train(df: pd.DataFrame, out_root, version: str | None = None) -> Path:
     df = df.copy()
     df["message_date"] = pd.to_datetime(df["message_date"], utc=True, format="ISO8601")
     df = df.sort_values("message_date").reset_index(drop=True)
-    L = build_labels(df)
+    policy = dead_policy(df)
+    if policy == "missing":
+        print(f"WARNING: the data has no {C.DEAD_COLUMN} column (the view on the server predates "
+              "it; apply scoutanalytics.sql, see RUNBOOK.md): the dead-after-the-call rule is "
+              "SKIPPED, collapse labels are the plain ones", flush=True)
+    L = build_labels(df, policy)
     call = ~L["update"]  # update posts are not calls: out of training, counted on their own
     first = call & ~L["repeat"]  # later calls of a token: out of training, counted on their own
     extreme = first & ~L["no_pool"] & ~L["not_usd"] & L["extreme"]
     eligible = first & ~L["no_pool"] & ~L["not_usd"] & ~L["extreme"]
 
-    raw_cols = C.NUMERIC_RAW + C.CATEGORICAL + ["pre_vol_unit", "message_date"]
+    raw_cols = C.NUMERIC_RAW + C.CATEGORICAL_VIEW + ["pre_vol_unit", "message_date"]
     blank = df.reindex(columns=raw_cols).replace("", np.nan)
     res = {"version": version, "buckets": {}, "data": {
         "rows": len(df), "first_date": df["message_date"].min().strftime("%Y-%m-%d"),
@@ -267,12 +326,15 @@ def train(df: pd.DataFrame, out_root, version: str | None = None) -> Path:
         "not_usd": int((first & ~L["no_pool"] & L["not_usd"]).sum()),
         "extreme": int(extreme.sum()),
         "eligible": int(eligible.sum()),
+        "dead_policy": policy,
+        "trades_24h_known": int((eligible & num(df, C.DEAD_COLUMN).notna()).sum()),
+        "dead": int((eligible & L["dead"]).sum()),
         # over the rows training can use (repeat calls and update posts have no pool data)
         "coverage": {c: float(blank[c][eligible].notna().mean()) if eligible.any() else 0.0
                      for c in raw_cols}}}
     reference, cat_levels = {}, {}  # per trained bucket: learned from its training rows
     for b in C.BUCKETS:
-        res["buckets"][b], ref, levels = _train_bucket(b, df, L, out_dir)
+        res["buckets"][b], ref, levels = _train_bucket(b, df, L, out_dir, policy == "on")
         if ref is not None:
             reference[b], cat_levels[b] = ref, levels
         status = res["buckets"][b]
@@ -286,6 +348,10 @@ def train(df: pd.DataFrame, out_root, version: str | None = None) -> Path:
     meta = {"version": version, "trained_at": datetime.now(timezone.utc).isoformat(),
             "features": list(C.FEATURES), "categorical": C.CATEGORICAL,
             "category_levels": cat_levels, "thresholds": {"buckets": C.BUCKETS, "gates": C.GATES},
+            "dead": {"policy": res["data"]["dead_policy"], "column": C.DEAD_COLUMN,
+                     "max_trades_24h": C.DEAD_TRADES_24H},
+            "dex_family_rules": dex_family_rules(),  # serving maps dex -> family with these
+            "calib_recent_days": C.CALIB_RECENT_DAYS,
             "models": models, "runner_reference": reference,
             "data": res["data"], "metrics": res["buckets"]}
     (out_dir / "meta.json").write_text(json.dumps(_json_safe(meta), indent=1, allow_nan=False))

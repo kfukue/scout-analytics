@@ -10,6 +10,9 @@ import train as train_mod
 from scout_ml import config as C
 
 BUCKET_KEYS = ["short", "3day", "medium", "long"]
+# The feature list of the models trained before dex_family (e.g. 20261008-2228), pinned.
+OLD_CATEGORICAL = ["dex", "launchpad", "quote_asset", "perceptor_verdict"]
+OLD_FEATURES = C.NUMERIC_RAW + C.DERIVED + OLD_CATEGORICAL
 
 
 def test_synthetic_csv_has_exact_view_columns(synthetic_df):
@@ -215,10 +218,36 @@ def test_too_little_data_is_reported_not_raised(tmp_path):
     assert (vdir / "report.md").read_text(encoding="utf-8").count("**SKIPPED:**") == 4
 
 
+def test_collapse_gate_uses_plain_label_when_dead_rule_is_on():
+    """The model is trained on collapse OR dead, but collapse_ok is decided on
+    the plain collapse label; the with-dead share is information only."""
+    from scout_ml import validate as V
+    n = 20
+    score = np.arange(n, dtype=float)               # the top 30% = rows 14..19
+    plain = np.zeros(n)
+    plain[[0, 1, 2, 3, 19]] = 1                     # 1 of 5 plain collapses skipped: 0.2
+    dead = np.zeros(n)
+    dead[14:19] = 1                                 # dead calls are easy: all in the top 30%
+    trained_on = np.maximum(plain, dead)            # collapse OR dead: 6 of 10 skipped: 0.6
+    y_run = (score >= 18).astype(float)
+    ret = np.where(y_run == 1, 100.0, -10.0)
+    t = train_mod.collapse_check(y_run, score, plain, trained_on, score, ret, dead_on=True)
+    assert t["collapse_removed"] == pytest.approx(0.2)
+    assert t["collapse_removed_with_dead"] == pytest.approx(0.6)
+    assert t["collapse_removed_with_dead"] >= C.GATES["min_collapse_removed"] > t["collapse_removed"]
+    g = V.gates(t, [{"sim_beats_all": True}])
+    assert g["collapse_ok"] is False and g["lift_ok"] and not g["passed"]
+    # rule off (or trades_24h missing): plain == trained-on label, no extra figure
+    off = train_mod.collapse_check(y_run, score, plain, plain, score, ret, dead_on=False)
+    assert "collapse_removed_with_dead" not in off
+    assert off == V.trading_metrics(y_run, score, plain, score, ret)
+
+
 def test_rare_label_is_skipped_with_message(synthetic_df, tmp_path, monkeypatch):
     """Fewer than 30 positives in training -> that model is skipped, others still train."""
     monkeypatch.setitem(C.BUCKETS["short"], "runner", ("max_gain_late_1d", ">=", 1e9))
     monkeypatch.setitem(C.BUCKETS["3day"], "collapse", ("ret_late_3d", "<=", -100.0))
+    monkeypatch.setattr(C, "DEAD_IS_COLLAPSE", False)   # dead calls would be collapses
     monkeypatch.setattr(C, "BUCKETS", {k: C.BUCKETS[k] for k in ("short", "3day")})
     vdir = train_mod.train(synthetic_df, tmp_path, version="t")
     meta = json.loads((vdir / "meta.json").read_text())
@@ -227,7 +256,15 @@ def test_rare_label_is_skipped_with_message(synthetic_df, tmp_path, monkeypatch)
     col = meta["metrics"]["3day"]["labels"]["collapse"]
     assert "skipped" in col and any("WARNING: positive rate" in m for m in col["messages"])
     assert meta["metrics"]["3day"]["gates"]["collapse_ok"] is False
-    assert "model skipped" in (vdir / "report.md").read_text(encoding="utf-8")
+    report = (vdir / "report.md").read_text(encoding="utf-8")
+    assert "model skipped" in report
+    # dead rule off: no with-dead figure anywhere, the gate is the plain label as before
+    for needle in ("collapse OR dead;", "incl. dead", "model trained on collapse OR dead"):
+        assert needle not in report, needle
+    assert "the dead rule is off, the model was trained on the plain label" in report
+    for b in ("short", "3day"):
+        t = meta["metrics"][b].get("trading", {})
+        assert "collapse_removed_with_dead" not in t and "collapse_removed_plain" not in t
 
 
 def test_long_is_skipped_until_its_30d_data_has_matured(synthetic_df, tmp_path, monkeypatch):
@@ -275,11 +312,13 @@ def test_levels_rounds_and_calibration_never_see_the_test_part(synthetic_df, tmp
     Walk-forward windows learn levels from exactly their own training rows."""
     import pandas as pd
     from scout_ml import validate as V
+    from scout_ml.features import dex_family_of
     df = synthetic_df.copy()
     when = pd.to_datetime(df["message_date"], utc=True)
     late = (when >= when.max() - pd.Timedelta(days=12)).to_numpy()
-    df.loc[late, "dex"] = "LateDex"                                  # test period only
-    df.loc[df.index[:400], "dex"] = " RAYDIUM "                       # case/space variant
+    assert not (df["dex"].map(dex_family_of) == "uniswap_v4").any()
+    df.loc[late, "dex"] = "Uniswap V4"                               # family in the test period only
+    df.loc[df.index[:400], "dex"] = " UNISWAP-v2 "                    # case/space variant
     every_bucket = dict(C.BUCKETS)
     seen = {"levels": [], "fit": [], "wf_levels": [], "wf_windows": []}
     real_learn, real_fit, real_wf, real_windows = (train_mod.learn_cat_levels, train_mod.fit_lgbm,
@@ -339,8 +378,8 @@ def test_levels_rounds_and_calibration_never_see_the_test_part(synthetic_df, tmp
         for idx in seen["wf_levels"]:
             assert idx in seen["wf_windows"], b
         assert seen["wf_levels"], b
-        levels = meta["category_levels"][b]["dex"]
-        assert "latedex" not in levels and "LateDex" not in levels and "raydium" in levels
+        levels = meta["category_levels"][b]["dex_family"]
+        assert "uniswap_v4" not in levels and "uniswap_v2" in levels
         assert len(levels) == len(set(levels))
 
 
@@ -416,9 +455,9 @@ def test_old_flat_meta_still_serves_with_exact_levels(trained, synthetic_df, tmp
     for p in old.glob("*.joblib"):
         p.unlink()
     meta = json.loads((old / "meta.json").read_text())
-    old_cols = C.FEATURES + ["prior_calls", "secs_since_prev_call"]
-    flat = {c: list(meta["category_levels"]["short"][c]) for c in C.CATEGORICAL}
-    flat["dex"] = sorted(set(flat["dex"]) | {"Raydium"})          # two levels in another case
+    old_cols = OLD_FEATURES + ["prior_calls", "secs_since_prev_call"]
+    flat = {c: list(meta["category_levels"]["short"][c]) for c in OLD_CATEGORICAL if c != "dex"}
+    flat["dex"] = sorted(set(synthetic_df["dex"].dropna()) | {"Raydium"})  # two levels in another case
     assert "raydium" in flat["dex"] and flat["dex"].index("Raydium") != flat["dex"].index("raydium")
     df = synthetic_df.copy()
     df["message_date"] = pd.to_datetime(df["message_date"], utc=True, format="ISO8601")
@@ -457,10 +496,152 @@ def test_old_flat_meta_still_serves_with_exact_levels(trained, synthetic_df, tmp
         _check_shape(body, meta["version"], ["short", "long"])
         assert " · long: up at 30d " in body["line"]
         X_ref = build_features(rec, {}, old_cols)                  # numerics; categoricals by hand
-        for c in C.CATEGORICAL:
+        for c in OLD_CATEGORICAL:
             v = rec.get(c)
             v = v.strip() if isinstance(v, str) else v
             X_ref[c] = float(flat[c].index(v)) if v in flat[c] else np.nan
         for b in body["buckets"]:
             want = round(float(predict(models[f"{b['bucket']}_runner"], X_ref)[0]), 4)
             assert b["runner_prob"] == want, (dex, b)
+
+
+def test_report_shows_dead_calls_and_recent_calibration(trained):
+    _, vdir = trained
+    meta = json.loads((vdir / "meta.json").read_text())
+    assert meta["dead"] == {"policy": "on", "column": "trades_24h", "max_trades_24h": 50}
+    assert meta["data"]["dead_policy"] == "on" and meta["data"]["dead"] > 0
+    assert 0 < meta["data"]["trades_24h_known"] <= meta["data"]["eligible"]
+    assert meta["calib_recent_days"] == C.CALIB_RECENT_DAYS
+    for b in BUCKET_KEYS:
+        m = meta["metrics"][b]
+        dead = m["dead"]
+        for part in ("usable", "test"):
+            assert 0 <= dead[part]["dead_collapse"] <= dead[part]["dead"] <= dead[part]["rows"]
+            assert dead[part]["collapse_rate_with_dead"] >= dead[part]["collapse_rate_plain"]
+        assert dead["usable"]["dead"] > dead["usable"]["dead_collapse"]   # some flat dead calls
+        assert "collapse_removed_plain" not in m["trading"]
+        assert 0 <= m["trading"]["collapse_removed_with_dead"] <= 1        # information only
+        assert m["gates"]["collapse_ok"] == (m["trading"]["collapse_removed"]
+                                             >= C.GATES["min_collapse_removed"])
+        assert any(not w.get("skipped") for w in m["walk_forward"])
+        for w in m["walk_forward"]:
+            if not w.get("skipped"):
+                assert "collapse_removed_with_dead" in w
+        for lab in ("runner", "collapse"):
+            info = m["labels"][lab]
+            assert info["calib"]["rows_recent"] <= info["calib"]["rows_all"]
+            before, after = info["calibration_all_rows"], info["calibration"]
+            # deciles are by rank: the same rows and outcomes, only the predictions move
+            assert [c["observed"] for c in before] == [c["observed"] for c in after]
+            assert info["brier_all_rows"] >= 0
+    report = (vdir / "report.md").read_text(encoding="utf-8")
+    for needle in ("- dead after the call (trades_24h < 50; kept in the data): ",
+                   "collapse label = collapse OR dead", "OR dead (trades_24h < 50)",
+                   "### Dead after the call (trades_24h < 50)", "dead and already a collapse",
+                   "of plain collapses (the gate); bad outcomes removed incl. dead: ",
+                   "(information only, not a gate)",
+                   "bad outcomes removed incl. dead (collapse OR dead; information, not a gate)",
+                   "| incl. dead (info, not a gate) |",
+                   "Platt calibration fitted on", "mean predicted (all held-out rows)",
+                   "(calibrated on all held-out rows, as before)"):
+        assert needle in report, needle
+
+
+def test_missing_trades_24h_skips_the_dead_rule_loudly(synthetic_df, tmp_path, monkeypatch, capsys):
+    """An export from a view without trades_24h (server not migrated yet):
+    training still runs, with plain collapse labels, and says so."""
+    from scout_ml.labels import build_labels
+    monkeypatch.setattr(C, "BUCKETS", {"short": C.BUCKETS["short"]})
+    df = synthetic_df.drop(columns="trades_24h")
+    vdir = train_mod.train(df, tmp_path, version="v")
+    assert "WARNING: the data has no trades_24h column" in capsys.readouterr().out
+    meta = json.loads((vdir / "meta.json").read_text())
+    assert meta["dead"]["policy"] == "missing" and meta["data"]["dead"] == 0
+    report = (vdir / "report.md").read_text(encoding="utf-8")
+    assert "**WARNING: dead-after-the-call rule SKIPPED" in report
+    assert "OR dead" not in report and "### Dead after the call" not in report
+    assert "incl. dead" not in report                     # no information figure either
+    t = meta["metrics"]["short"]["trading"]
+    assert "collapse_removed_with_dead" not in t and "collapse_removed_plain" not in t
+    assert all("collapse_removed_with_dead" not in w for w in meta["metrics"]["short"]["walk_forward"])
+    L = build_labels(df)
+    use = L["usable_short"]
+    assert (L["collapse_short"][use] == L["collapse_plain_short"][use]).all()
+    assert m_rate(meta) == pytest.approx(float(L["collapse_plain_short"][use].mean()))
+
+
+def m_rate(meta):
+    return meta["metrics"]["short"]["labels"]["collapse"]["positive_rate"]
+
+
+def test_current_prod_meta_with_raw_dex_still_scores(trained, synthetic_df, tmp_path, monkeypatch):
+    """A model trained before dex_family (per-bucket, case-insensitive levels with
+    raw `dex` in its feature list, no dex_family) is served as trained: `dex` is
+    encoded as a category (not read as a number), case-insensitively."""
+    import joblib
+    import pandas as pd
+    from scout_ml.features import build_features, learn_cat_levels
+    from scout_ml.labels import build_labels
+    from scout_ml.model import Bundle, fit_lgbm, predict
+    _, vdir = trained
+    old = tmp_path / "prod"
+    shutil.copytree(vdir, old)
+    for p in old.glob("*.joblib"):
+        p.unlink()
+    meta = json.loads((old / "meta.json").read_text())
+    df = synthetic_df.copy()
+    df["message_date"] = pd.to_datetime(df["message_date"], utc=True, format="ISO8601")
+    df = df.sort_values("message_date").reset_index(drop=True)
+    L = build_labels(df)
+    use = L["usable_short"].to_numpy()
+    learned = learn_cat_levels(df[use])
+    levels = {c: learned[c] for c in OLD_CATEGORICAL if c != "dex"}
+    levels["dex"] = sorted(df["dex"][use].str.lower().value_counts().loc[lambda s: s >= 20].index)
+    assert "raydium" in levels["dex"]
+    X = build_features(df[use], levels, OLD_FEATURES)
+    assert X["dex"].notna().mean() > 0.9                         # codes, not NaN from num()
+    fitted = fit_lgbm(X, L["runner_short"][use].to_numpy(), n_estimators=20)
+    joblib.dump({"model": fitted["model"], "calibrator": None}, old / "short_runner.joblib")
+    meta.update(features=OLD_FEATURES, categorical=OLD_CATEGORICAL, models=["short_runner"],
+                category_levels={"short": levels})
+    for k in ("dead", "dex_family_rules", "calib_recent_days"):   # keys the old meta did not have
+        meta.pop(k, None)
+    (old / "meta.json").write_text(json.dumps(meta))
+
+    bundle = Bundle(old)
+    assert not bundle.flat_levels
+    codes = bundle.features([{"dex": v} for v in ("Raydium", " RAYDIUM ", "raydium", "Uniswap V4")],
+                            "short")
+    assert list(codes.columns) == OLD_FEATURES and "dex_family" not in codes.columns
+    ray = float(levels["dex"].index("raydium"))
+    assert codes["dex"][:3].tolist() == [ray] * 3 and np.isnan(codes["dex"][3])
+    (tmp_path / "LATEST").write_text("prod")
+    rec = json.loads(df.iloc[[7]].assign(message_date="2026-09-01T12:00:00Z", dex="Raydium")
+                     .to_json(orient="records"))[0]
+    r = _client(monkeypatch, tmp_path).post("/score", json={"row": rec})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    _check_shape(body, meta["version"], ["short"])
+    want = round(float(predict(fitted, build_features(rec, levels, OLD_FEATURES))[0]), 4)
+    assert body["buckets"][0]["runner_prob"] == want
+
+
+def test_serving_uses_the_dex_family_rules_stored_at_training(trained, synthetic_df, monkeypatch):
+    """Editing DEX_FAMILY_RULES after training must not change what a served
+    model sees: the bundle maps dex -> dex_family with the rules in its meta.json."""
+    from scout_ml.features import build_features
+    from scout_ml.model import Bundle
+    _, vdir = trained
+    meta = json.loads((vdir / "meta.json").read_text())
+    assert meta["dex_family_rules"] == {"rules": [list(r) for r in C.DEX_FAMILY_RULES],
+                                        "other": C.DEX_FAMILY_OTHER}
+    bundle = Bundle(vdir)
+    rec = json.loads(synthetic_df.iloc[[5]].assign(dex="Uniswap_V2").to_json(orient="records"))[0]
+    before = bundle.score(rec)
+    code = bundle.features(rec, "short")["dex_family"][0]
+    assert not np.isnan(code)                                  # uniswap_v2: a trained level
+    monkeypatch.setattr(C, "DEX_FAMILY_RULES", (("uniswap", "uniswap_any"),))
+    assert bundle.features(rec, "short")["dex_family"][0] == code
+    assert bundle.score(rec) == before
+    # without the stored rules the edited table would have changed the input
+    assert np.isnan(build_features(rec, bundle.levels("short"))["dex_family"][0])

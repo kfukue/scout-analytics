@@ -167,6 +167,49 @@ func TestRescanDatasetViewIgnoresRescans(t *testing.T) {
 	}
 }
 
+// A call's own live scan wins over a manual scan (call_id NULL, e.g. -scan)
+// of the same token requested before the call. In Postgres, (NULL = id) is
+// NULL, which DESC puts first: the view must not let the manual scan win. A
+// later repeat call has no scan of its own and takes the latest live scan
+// requested at or before it.
+func TestDatasetViewOwnScanBeatsEarlierManualScan(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+	if err := st.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	perc := mustTool(t, st, "perceptor", "perceptor0xBot", "/scan {ca}", parserPerceptor, true)
+	ca := "0x2222222222222222222222222222222222222222"
+	t0 := time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)
+	seedInvestigation(t, st, perc, nil, ca, t0.Add(-time.Hour), investigationCompleted, ScanKindLive, levelCaution)
+	first := seedRescanCall(t, st, rescanSeed{msg: 1, ca: ca, at: t0, status: CallStatusFailed})
+	seedInvestigation(t, st, perc, &first, ca, t0.Add(time.Minute), investigationCompleted, ScanKindLive, levelRedFlags)
+	repeat := seedRescanCall(t, st, rescanSeed{msg: 2, ca: ca, at: t0.Add(24 * time.Hour), status: CallStatusDuplicate})
+	tests := []struct {
+		name string
+		call int
+		want string
+	}{
+		{"first call, own scan", first, levelRedFlags},
+		{"repeat call, latest earlier scan", repeat, levelRedFlags},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var got *string
+			if err := st.Pool.QueryRow(ctx, `SELECT perceptor_verdict FROM scout_call_dataset_v WHERE call_id = $1`, tt.call).Scan(&got); err != nil {
+				t.Fatalf("call %d: %v", tt.call, err)
+			}
+			gotS := "NULL"
+			if got != nil {
+				gotS = *got
+			}
+			if gotS != tt.want {
+				t.Errorf("call %d: perceptor_verdict = %s, want %s (manual scan %s requested an hour before the call)", tt.call, gotS, tt.want, levelCaution)
+			}
+		})
+	}
+}
+
 // The requeue counts live scans only: a rescan neither makes a stuck call
 // look scanned nor its token look investigated.
 func TestRescanRequeueIgnoresRescans(t *testing.T) {

@@ -3,6 +3,7 @@ end to end without a database.  The numbers are invented; only the column
 layout, missingness pattern and CSV conventions mimic the real export.
 
     python make_synthetic.py --out calls.csv [--calls 6000 --days 70 --seed 7 --end 2026-10-01T00:00:00Z]
+                                             [--dex-names drifting]
 """
 import argparse
 
@@ -16,11 +17,17 @@ STEP_SIGMA = {"1h": 0.30, "1d": 0.75, "3d": 0.55, "7d": 0.55, "30d": 0.80}  # lo
 STEP_DRIFT = {"1h": -0.03, "1d": -0.30, "3d": -0.20, "7d": -0.20, "30d": -0.45}
 INT_COLUMNS = (["call_id", "message_id", "age_seconds", "holders", "proof_elite", "proof_good",
                 "live_buys_elite_count", "live_buys_good_count", "prior_calls",
-                "secs_since_prev_call", "calls_prev_1h", "calls_prev_24h", "pre_first_trade_age_s"]
+                "secs_since_prev_call", "calls_prev_1h", "calls_prev_24h", "pre_first_trade_age_s",
+                "trades_24h"]
                + [f"pre_{k}_{w}" for k in ("swaps", "buys", "sells") for w in ("5m", "15m", "60m")])
 
 
-def make(n: int = 6000, days: float = 70, seed: int = 7, end: str = "2026-10-01T00:00:00Z"):
+def make(n: int = 6000, days: float = 70, seed: int = 7, end: str = "2026-10-01T00:00:00Z",
+         dex_names: str = "plain"):
+    """`dex_names="drifting"` replaces the posted DEX names by real-looking ones
+    that change over time ("Pons", "Pons V2", then "Pons V3" only in the newest
+    calls; short-lived names, case variants), with the Pons family planted as more collapse-prone: for the
+    dex / dex_family experiment. The default leaves every other column as is."""
     rng = np.random.default_rng(seed)
     end = pd.Timestamp(end)
     when = (end - pd.to_timedelta(np.sort(rng.uniform(0, days, n))[::-1], unit="D")).floor("s")
@@ -157,6 +164,36 @@ def make(n: int = 6000, days: float = 70, seed: int = 7, end: str = "2026-10-01T
     blank(rng.random(n) < 0.20, ["tax_buy_pct", "tax_sell_pct"])
     blank(rng.random(n) < 0.30, ["holders"])
     blank(rng.random(n) < 0.10, ["liq_usd", "liq_pct"])
+    # Everything below draws from its own generator, so the columns above stay
+    # exactly as they were for a given seed.
+    extra = np.random.default_rng([seed, 24])
+    frac = 1 - age_days / days                           # 0 = oldest call, 1 = newest
+    # trades_24h: price events in the 24 h after the call. Dead calls (very few
+    # trades) are common among late v4 calls, as in late September 2026; they
+    # get random outcomes, so many of them are not collapses by return alone.
+    dead = extra.random(n) < np.where((frac > 0.7) & (kind == "v4"), 0.35, 0.04)
+    trades = np.where(dead, extra.integers(0, 50, n),
+                      50 + extra.poisson(extra.lognormal(np.log(400), 0.8, n)))
+    known = (d["entry_price_source"].notna().to_numpy() & (age_days >= 1)
+             & (extra.random(n) > 0.03))                 # 3%: first 24 h not scanned yet
+    d["trades_24h"] = pd.Series(np.where(known, trades, np.nan)).astype(object).where(known, None)
+    if dex_names == "drifting":
+        collapse = (pd.to_numeric(d["ret_late_1d"], errors="coerce") <= -50).to_numpy()
+        u = extra.random(n)
+        p_pons = np.where(collapse, 0.45, 0.15)
+        fam = np.where(u < p_pons, "pons", np.where(u < p_pons + 0.35, "v4",
+                       np.where(u < p_pons + 0.50, "v2", "other")))
+        # "Pons", then "Pons V2", then (newest ~12%, the test period) a new name, "Pons V3"
+        pons = np.where(frac < 0.4, "Pons", np.where(frac < 0.88, extra.choice(
+            ["Pons V2", "PONS V2", "pons v2"], n), "Pons V3"))
+        v4 = extra.choice(["Uniswap V4", "uniswap v4", "UniswapV4", "Uniswap_V4"], n)
+        other = np.where((frac >= 0.15) & (frac < 0.35), "Pools Trade Instant",
+                         np.where((frac >= 0.6) & (frac < 0.7), "O1 Rwa",
+                                  extra.choice(["Longxyz", "rare_dex"], n)))
+        d["dex"] = np.select([fam == "pons", fam == "v4", fam == "v2"], [pons, v4, "Uniswap V2"],
+                             other)
+    elif dex_names != "plain":
+        raise ValueError(f"dex_names must be 'plain' or 'drifting', not {dex_names!r}")
     return d[VIEW_COLUMNS]
 
 
@@ -178,6 +215,8 @@ if __name__ == "__main__":
     ap.add_argument("--days", type=float, default=70)
     ap.add_argument("--seed", type=int, default=7)
     ap.add_argument("--end", default="2026-10-01T00:00:00Z", help="time of the newest call (UTC)")
+    ap.add_argument("--dex-names", default="plain", choices=["plain", "drifting"],
+                    help="drifting: real-looking DEX names that change over time")
     a = ap.parse_args()
-    write_csv(make(a.calls, a.days, a.seed, a.end), a.out)
+    write_csv(make(a.calls, a.days, a.seed, a.end, a.dex_names), a.out)
     print(f"wrote {a.out}: {a.calls} synthetic calls over {a.days:g} days")
