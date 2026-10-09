@@ -50,7 +50,11 @@ type fakeBot struct {
 	replies []string // one per request; last one repeats
 	sent    []string
 	sentAt  []time.Time
-	nextID  int
+	// lastSent records r.lastSent as send sees it: the runner's own pacing
+	// stamp. send runs on the runner's goroutine, right after investigate sets
+	// r.lastSent, so reading it here is race-free.
+	lastSent []time.Time
+	nextID   int
 }
 
 func (b *fakeBot) send(ctx context.Context, text string) error {
@@ -58,6 +62,7 @@ func (b *fakeBot) send(ctx context.Context, text string) error {
 	i := len(b.sent)
 	b.sent = append(b.sent, text)
 	b.sentAt = append(b.sentAt, time.Now())
+	b.lastSent = append(b.lastSent, b.r.lastSent)
 	if i >= len(b.replies) {
 		i = len(b.replies) - 1
 	}
@@ -133,8 +138,17 @@ func TestInvestigateWithRetry_Pacing(t *testing.T) {
 	if res := r.investigateWithRetry(context.Background(), bot.send, "0x2"); res.Status != investigationCompleted || res.ReportText() != "$B on-chain check: no red flags found." {
 		t.Fatalf("%s %q", res.Status, res.ReportText())
 	}
-	if gap := bot.sentAt[1].Sub(bot.sentAt[0]); gap < 700*time.Millisecond {
-		t.Fatalf("pacing not applied: %s", gap)
+	// Compare the runner's own lastSent stamps, not sentAt: pacing waits until
+	// MinInterval has passed since lastSent, while sentAt is a second clock
+	// read taken later inside send (after a mutex lock). Under -race and with
+	// Windows timer granularity that offset differs between the two sends, so
+	// the sentAt gap could come out a millisecond short although pacing worked
+	// (seen once: 699ms against 700ms).
+	if len(bot.lastSent) < 2 || bot.lastSent[0].IsZero() || bot.lastSent[1].IsZero() {
+		t.Fatalf("pacing check needs two non-zero lastSent stamps: got %v", bot.lastSent)
+	}
+	if gap := bot.lastSent[1].Sub(bot.lastSent[0]); gap < spec.MinInterval {
+		t.Fatalf("pacing not applied: got gap %s between lastSent stamps %v, want >= %s", gap, bot.lastSent, spec.MinInterval)
 	}
 }
 
