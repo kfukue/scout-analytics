@@ -56,7 +56,9 @@ def test_runner_tradeable_rule_needs_trades_and_null_keeps_the_label():
 def test_each_variant_changes_exactly_one_knob():
     base = {k: getattr(C, k) for k in C.VARIANT_KNOBS}
     assert C.VARIANTS["baseline"] == {}
-    assert len(C.VARIANTS) == 6
+    assert list(C.VARIANTS) == ["baseline", "dead rule on (collapse OR dead)",
+                                "raw dex instead of dex_family", "raw dex + dex_family",
+                                "runners must be tradeable"]
     for name, knobs in C.VARIANTS.items():
         if name == "baseline":
             continue
@@ -65,8 +67,10 @@ def test_each_variant_changes_exactly_one_knob():
         assert k in C.VARIANT_KNOBS and v != base[k], name
         settings = C.variant_settings(name)
         assert [x for x in C.VARIANT_KNOBS if settings[x] != base[x]] == [k], name
-    assert C.VARIANTS["dead threshold 100"] == {"DEAD_TRADES_24H": 100}
-    assert set(C.TRADES_VARIANTS) <= set(C.VARIANTS)
+    assert C.DEAD_IS_COLLAPSE is False                         # the baseline: plain collapse
+    assert C.VARIANTS["dead rule on (collapse OR dead)"] == {"DEAD_IS_COLLAPSE": True}
+    assert not any("DEAD_TRADES_24H" in k for k in C.VARIANTS.values())   # needs the rule on
+    assert set(C.TRADES_VARIANTS) == {"dead rule on (collapse OR dead)", "runners must be tradeable"}
 
 
 def test_overrides_rebuild_features_never_leak_and_restore():
@@ -156,8 +160,12 @@ def test_variant_table_contents(plain_and_variants):
             s = v[name]["buckets"][b]
             assert s["runner_auc_logistic"] == base[b]["runner_auc_logistic"], (name, b)
             assert s["collapse_auc_plain_logistic"] == base[b]["collapse_auc_plain_logistic"]
-        off = v["dead rule off"]["buckets"][b]                # trained on the plain label
-        assert off["collapse_auc_trained_lightgbm"] == off["collapse_auc_plain_lightgbm"]
+        # the baseline (dead rule off) trains on the plain label; the "on" variant on collapse
+        # OR dead, while its plain-label numbers stay comparable
+        assert base[b]["collapse_auc_trained_lightgbm"] == base[b]["collapse_auc_plain_lightgbm"]
+        on = v["dead rule on (collapse OR dead)"]["buckets"][b]
+        assert on["collapse_auc_trained_lightgbm"] != on["collapse_auc_plain_lightgbm"]
+        assert on["runner_auc_lightgbm"] == base[b]["runner_auc_lightgbm"]   # runners untouched
         trd = v["runners must be tradeable"]["buckets"][b]
         assert trd["runner_rate_test"] <= base[b]["runner_rate_test"]
         assert trd["sim_all_mean"] == base[b]["sim_all_mean"]   # simulation still on all calls

@@ -34,16 +34,44 @@ UPDATE_KIND = "update"  # post_kind of a "$TOKEN hit 3X ..." post about an earli
 # after the call (5-minute candles; on a v2 pool every Sync counts, which includes
 # liquidity added or removed). A call with fewer than DEAD_TRADES_24H is "dead":
 # bought, then nobody traded it. Dead calls stay in the data (they were real
-# buys). With DEAD_IS_COLLAPSE the collapse label of EVERY bucket becomes
+# buys). With DEAD_IS_COLLAPSE = True the collapse label of EVERY bucket becomes
 # "collapse OR dead"; a row whose trades_24h is NULL (not priced on-chain, or
-# its first 24 h not scanned yet) keeps the plain collapse label. Set
-# DEAD_IS_COLLAPSE = False to train on the plain collapse label again.
+# its first 24 h not scanned yet) keeps the plain collapse label.
+# Off by default since report 20261009-1904: with the rule off the collapse
+# ROC AUC on the plain label was higher in every bucket and collapses removed
+# about equal (the "dead rule on" row of --variants keeps comparing).
 # The gates do not change: "collapses removed" (GATES) is always measured on
 # the plain collapse label; the share of collapse OR dead removed is reported
-# next to it as information only.
+# next to it as information only (whenever the data has trades_24h).
 DEAD_COLUMN = "trades_24h"
 DEAD_TRADES_24H = 50
-DEAD_IS_COLLAPSE = True
+DEAD_IS_COLLAPSE = False
+
+# --- "Dead after the call": separate score (report only) -----------------------
+# One extra model (LightGBM + logistic baseline) for the label dead =
+# trades_24h < DEAD_TRADES_24H, trained once, not per bucket: the same inputs
+# (FEATURES) and the same time split as the DEAD_SCORE_SPLIT_BUCKET bucket (its
+# usable rows; train / validation / test; embargo = its horizon, 1 day), keeping
+# only the rows whose trades_24h is known (NULL rows are left out, never
+# negatives). Platt calibration on the validation part as for the other labels.
+# Report section and meta.json "dead_score" only: never saved, never served,
+# no gates. Walk-forward weeks with fewer than DEAD_SCORE_MIN_WEEK_DEAD dead
+# calls are marked (too few to judge).
+DEAD_SCORE_SPLIT_BUCKET = "short"
+DEAD_SCORE_TOP_FRACS = (0.10, 0.30)
+DEAD_SCORE_GATE_FRAC = 0.10            # the "top-10%" share; must be in DEAD_SCORE_TOP_FRACS
+DEAD_SCORE_MIN_WEEK_DEAD = 5
+# Report caveat: when the DEAD_WAVE_TOP_WEEKS weeks with the most dead calls
+# hold more than DEAD_WAVE_SHARE of all dead calls, the report says they came
+# in a few waves (and names the most common dex_family among those dead calls).
+DEAD_WAVE_TOP_WEEKS = 2
+DEAD_WAVE_SHARE = 0.5
+DEAD_SCORE_N_COEF = 10                 # largest logistic coefficients shown
+# A PROPOSAL for the product manager, not a gate (nothing passes or fails on
+# it): top-10% precision >= this many times the base rate in the test part,
+# and in more than half of the walk-forward weeks with at least
+# DEAD_SCORE_MIN_WEEK_DEAD dead calls. The report shows how this run fares.
+DEAD_SCORE_PROPOSED_LIFT = 3.0
 
 # --- Columns of scout_call_dataset_v, in view order ------------------------
 _WINDOWS = ("5m", "15m", "60m")
@@ -272,17 +300,18 @@ LIFT_CI_Z = 1.96
 # the gates of the saved model (that is always the baseline). "baseline" reuses
 # the results of the saved model. Knobs: VARIANT_KNOBS.
 VARIANT_KNOBS = ("DEAD_IS_COLLAPSE", "DEAD_TRADES_24H", "DEX_INPUTS", "RUNNER_NEEDS_TRADES")
+# "dead threshold 100" was dropped: DEAD_TRADES_24H only changes the labels
+# while the dead rule is on, so with the rule off it would equal the baseline.
 VARIANTS = {
     "baseline": {},
-    "dead rule off": {"DEAD_IS_COLLAPSE": False},
-    "dead threshold 100": {"DEAD_TRADES_24H": 100},
+    "dead rule on (collapse OR dead)": {"DEAD_IS_COLLAPSE": True},
     "raw dex instead of dex_family": {"DEX_INPUTS": "raw"},
     "raw dex + dex_family": {"DEX_INPUTS": "both"},
     "runners must be tradeable": {"RUNNER_NEEDS_TRADES": True},
 }
 # Variants that only differ from the baseline through trades_24h: not applicable
 # when the export has no trades_24h column.
-TRADES_VARIANTS = ("dead rule off", "dead threshold 100", "runners must be tradeable")
+TRADES_VARIANTS = ("dead rule on (collapse OR dead)", "runners must be tradeable")
 
 
 def is_forbidden(col: str) -> bool:
