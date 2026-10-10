@@ -84,34 +84,87 @@ def dead_table(dead, trading, dead_on: bool) -> str:
             f"{fmt(trading.get('collapse_removed_with_dead'))} (information only, not a gate).\n")
 
 
+RECENT_NA = "n/a (recent window cannot be fitted)"
+
+
+def recent_unfitted(m) -> bool:
+    """True when the recent window could not be fitted on the held-out rows: then
+    there is no recent-window candidate (never the all-rows fallback under that name)."""
+    c = m.get("calib") or {}
+    return c.get("recent_fit", "recent") != "recent"
+
+
 def calib_line(m) -> str:
+    """Which Platt calibration was chosen (recent window or all held-out rows),
+    the held-out comparison that chose it, and the test Brier of both (information)."""
     c = m.get("calib")
     if not c:
         return ""
-    if c["used"] != "recent":
-        used = f"all {c['rows_all']} held-out rows (fallback: {c['note']})"
-    elif c["rows_recent"] == c["rows_all"]:
-        used = (f"all {c['rows_all']} held-out rows: they span less than CALIB_RECENT_DAYS = "
-                f"{CALIB_RECENT_DAYS} days, so this is the same calibration as before")
+    if c["used"] == "recent":
+        used = (f"the recent window: the {c['rows_recent']} held-out rows from "
+                f"{c['from']:%Y-%m-%d %H:%M} (the last {CALIB_RECENT_DAYS} days; "
+                f"{c['pos_recent']} positives / {c['neg_recent']} negatives)")
     else:
-        used = (f"the {c['rows_recent']} held-out rows from {c['from']:%Y-%m-%d %H:%M} (the last "
-                f"{CALIB_RECENT_DAYS} days; {c['pos_recent']} positives / {c['neg_recent']} negatives)")
-    return (f"Platt calibration fitted on {used}. Held-out rows in all: {c['rows_all']}, "
-            f"spanning {c['span_days_all']:.1f} days. Brier on test: {fmt(m['lightgbm']['brier'])} "
-            f"(this calibration) vs {fmt(m.get('brier_all_rows'))} (calibrated on all held-out "
-            "rows, as before). Deciles are by rank, so 'observed' is the same for both.\n")
+        used = f"all {c['rows_all']} held-out rows"
+    ch = c.get("choice")
+    if ch:
+        how = (f"Chosen on held-out rows only (never test rows): both fitted on the earliest "
+               f"{ch['rows_fit']} held-out rows (recent window: {ch['rows_fit_recent']} of them), "
+               f"Brier on the later {ch['rows_eval']} (from {ch['eval_from']:%Y-%m-%d %H:%M}): "
+               f"recent window {fmt(ch['brier_recent'])} vs all held-out rows "
+               f"{fmt(ch['brier_all'])}; the lower wins (equal: all held-out rows).")
+    else:
+        how = f"No comparison: {c['note']}."
+    return (f"Platt calibration: **{'recent window' if c['used'] == 'recent' else 'all held-out rows'}"
+            f"** (fitted on {used}). {how} Held-out rows in all: {c['rows_all']}, spanning "
+            f"{c['span_days_all']:.1f} days. Brier on test (information only, never used to "
+            f"choose): {fmt(m['lightgbm']['brier'])} (chosen); recent window "
+            f"{RECENT_NA if recent_unfitted(m) else fmt(m.get('brier_recent'))}, all held-out "
+            f"rows {fmt(m.get('brier_all_rows'))}. "
+            "Deciles are by rank, so 'observed' is the same for all.\n")
 
 
 def calib_table(m) -> str:
     before = {c["decile"]: c["mean_pred"] for c in m.get("calibration_all_rows") or []}
+    recent = {c["decile"]: c["mean_pred"] for c in m.get("calibration_recent") or []}
     if not before:
         return table(["decile", "n", "mean predicted", "observed"],
                      [[c["decile"], c["n"], c["mean_pred"], c["observed"]]
                       for c in m["calibration"]])
-    return table(["decile", "n", "mean predicted (recent calibration)",
-                  "mean predicted (all held-out rows)", "observed"],
-                 [[c["decile"], c["n"], c["mean_pred"], before.get(c["decile"]), c["observed"]]
-                  for c in m["calibration"]])
+    return table(["decile", "n", "mean predicted (chosen calibration)",
+                  "mean predicted (recent window)", "mean predicted (all held-out rows)",
+                  "observed"],
+                 [[c["decile"], c["n"], c["mean_pred"],
+                   RECENT_NA if recent_unfitted(m) else recent.get(c["decile"]),
+                   before.get(c["decile"]), c["observed"]] for c in m["calibration"]])
+
+
+def wf_rule_line() -> str:
+    """The one-line rule under the gate tables (owner decision, 9 Oct 2026)."""
+    return (f"Walk-forward gate: a week counts toward \"beats buy-all in every week\" only when "
+            f"its training part has at least {C.WF_MIN_TRAIN_ROWS} rows (WF_MIN_TRAIN_ROWS, set "
+            f"on {C.WF_MIN_TRAIN_ROWS_SET_ON}); weeks below are shown, marked \"not counted\".\n")
+
+
+def wf_not_counted_mark() -> str:
+    return f"not counted (train < {C.WF_MIN_TRAIN_ROWS})"
+
+
+def wf_gate_note(w) -> str:
+    """Per walk-forward week: counted toward the gate, or not (train too small)."""
+    if w.get("skipped"):
+        return "-"
+    if not w.get("enough_train", True):
+        return wf_not_counted_mark()
+    return "counted"
+
+
+def wf_cell(g) -> str:
+    """Verdict cell: ok, counted weeks beating / counted, and the weeks not counted."""
+    text = f"{fmt(g['walk_forward_ok'])} ({g['windows_beating']}/{g['windows_evaluated']} weeks"
+    if g.get("windows_not_counted"):
+        text += f"; {g['windows_not_counted']} not counted"
+    return text + ")"
 
 
 def fmt(v, digits=3) -> str:
@@ -136,10 +189,9 @@ def render(res: dict) -> str:
                   "beats buy-all in every week"],
                  [[b, "skipped" if r.get("skipped") else ("PASS" if r["gates"]["passed"] else "FAIL")]
                   + ([""] * 3 if r.get("skipped") else
-                     [r["gates"]["lift_ok"], r["gates"]["collapse_ok"],
-                      f"{fmt(r['gates']['walk_forward_ok'])} ({r['gates']['windows_beating']}"
-                      f"/{r['gates']['windows_evaluated']} weeks)"])
+                     [r["gates"]["lift_ok"], r["gates"]["collapse_ok"], wf_cell(r["gates"])])
                   for b, r in res["buckets"].items()]),
+           wf_rule_line(),
            ("The saved model and these gates are the baseline configuration. Variant comparison "
             "(report only): see the last section.\n" if res.get("variants") else ""),
            "## Data and exclusions\n",
@@ -207,8 +259,11 @@ def render(res: dict) -> str:
             + ([["  bad outcomes removed incl. dead (collapse OR dead; information, not a gate)",
                  t["collapse_removed_with_dead"], "", ""]]
                if "collapse_removed_with_dead" in t else [])
-            + [["simulation beats buy-everything in every walk-forward week",
-                f"{g['windows_beating']}/{g['windows_evaluated']}", "all", g["walk_forward_ok"]]]))
+            + [["simulation beats buy-everything in every counted walk-forward week",
+                f"{g['windows_beating']}/{g['windows_evaluated']}"
+                + (f" ({g['windows_not_counted']} not counted)" if g.get("windows_not_counted")
+                   else ""), "all", g["walk_forward_ok"]]]))
+        out.append(wf_rule_line())
         out.append(f"Money simulation on test (mean net {cfg['ret_col']}, %): top {TOP_FRAC:.0%} "
                    f"by runner score = {fmt(t['sim_top_mean'], 1)} over {t['sim_n_top']} calls; "
                    f"all calls = {fmt(t['sim_all_mean'], 1)} (each call's net return capped at "
@@ -224,7 +279,7 @@ def render(res: dict) -> str:
         out.append(table(["week", "from", "train n", "test n", "runner AUC", "top lift",
                           "lift 95% interval", "runners top/n of all/n", "collapses removed"]
                          + (["incl. dead (info, not a gate)"] if wd else [])
-                         + ["top mean %", "all mean %", "beats all"],
+                         + ["top mean %", "all mean %", "beats all", "gate"],
                          [[w["week"], w["start"], w["n_train"], w["n_test"]]
                           + (["skipped: " + w["skipped"]] + [""] * (8 if wd else 7)
                              if w.get("skipped") else
@@ -232,7 +287,8 @@ def render(res: dict) -> str:
                               w["collapse_removed"]]
                              + ([w.get("collapse_removed_with_dead")] if wd else [])
                              + [fmt(w["sim_top_mean"], 1), fmt(w["sim_all_mean"], 1),
-                                w["sim_beats_all"]]) for w in r["walk_forward"]]))
+                                w["sim_beats_all"]])
+                          + [wf_gate_note(w)] for w in r["walk_forward"]]))
         for lab, m in r["labels"].items():
             if m.get("skipped"):
                 continue
@@ -350,7 +406,10 @@ def waves_line(waves: list) -> str:
 def dead_walk_forward_table(weeks: list) -> str:
     rows = []
     for w in weeks:
-        mark = f"< {C.DEAD_SCORE_MIN_WEEK_DEAD} dead: too few to judge" if w["few_dead"] else ""
+        marks = ([f"< {C.DEAD_SCORE_MIN_WEEK_DEAD} dead: too few to judge"] if w["few_dead"] else [])
+        if not w.get("enough_train", True):
+            marks.append(wf_not_counted_mark())
+        mark = "; ".join(marks)
         head = [w["week"], w["start"], w["n_train"], w["n_test"], w["n_dead"]]
         if w.get("skipped"):
             rows.append(head + ["skipped: " + w["skipped"]] + [""] * 6 + [mark])
@@ -374,7 +433,9 @@ def proposal_text(p: dict) -> str:
              f"passes or fails):** top-{C.DEAD_SCORE_GATE_FRAC:.0%} precision >= {lift:g}x the "
              f"base rate in the test part, "
              f"and in more than half of the walk-forward weeks with at least "
-             f"{C.DEAD_SCORE_MIN_WEEK_DEAD} dead calls. On this run:\n"]
+             f"{C.DEAD_SCORE_MIN_WEEK_DEAD} dead calls and at least "
+             f"{p.get('wf_min_train_rows', C.WF_MIN_TRAIN_ROWS)} training rows (weeks marked "
+             "\"not counted\" are left out, as for the bucket gates). On this run:\n"]
     for model in ("lightgbm", "logistic"):
         q = p[model]
         lines.append(f"- {model}: test lift {fmt(q['test_lift'], 2)} ({'meets' if q['test_ok'] else 'below'} "
@@ -403,7 +464,8 @@ def variant_read() -> str:
         "label\" uses the label each variant trained on (plain, or collapse OR dead with the dead "
         "rule on). The logistic baseline uses numeric inputs only, so its numbers do not change "
         "between the DEX variants. Sim = mean net return (%) of the top 10% by runner score vs all "
-        "calls of the test part.")
+        "calls of the test part. The walk-forward columns use the counted weeks only (training "
+        f"part of at least {C.WF_MIN_TRAIN_ROWS} rows), as the gate does.")
 
 
 def variant_error(exc: BaseException) -> str:
@@ -445,8 +507,9 @@ def variant_table(variants: dict, bucket: str) -> str:
     return table(["variant", "change", "runner rate (test)", "runner lift top 10% [95%]",
                   "runner AUC LightGBM / logistic", "collapse AUC, plain label: LightGBM / logistic",
                   "collapse AUC, trained label: LightGBM / logistic",
-                  "collapses removed (plain; gate)", "weeks beating buy-all",
-                  "walk-forward mean lift", "walk-forward mean collapses removed",
+                  "collapses removed (plain; gate)", "counted weeks beating buy-all",
+                  "walk-forward mean lift (counted weeks)",
+                  "walk-forward mean collapses removed (counted weeks)",
                   "sim top 10% vs all (%)", "gates"], rows)
 
 

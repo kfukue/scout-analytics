@@ -187,6 +187,27 @@ def test_variant_table_contents(plain_and_variants):
     assert "Variant comparison" not in plain_report
 
 
+def test_variant_walk_forward_summary_uses_counted_weeks_only():
+    """The walk-forward means of the variant table leave out the weeks the gate does
+    not count (training part below WF_MIN_TRAIN_ROWS), as the gate does."""
+    from scout_ml import validate as V
+    big, small = C.WF_MIN_TRAIN_ROWS, C.WF_MIN_TRAIN_ROWS - 1
+    weeks = [{"n_train": small, "top_lift": 0.0, "collapse_removed": 0.0, "sim_beats_all": False},
+             {"n_train": big, "top_lift": 3.0, "collapse_removed": 0.6, "sim_beats_all": True},
+             {"n_train": big + 1, "top_lift": 2.0, "collapse_removed": 0.4, "sim_beats_all": True},
+             {"n_train": big, "skipped": "too few"}]
+    trading = {"top_lift": 2.5, "top_lift_lo": 1.5, "top_lift_hi": 3.5, "top_pos": 5, "top_n": 10,
+               "all_pos": 20, "all_n": 100, "collapse_removed": 0.5, "sim_top_mean": 5.0,
+               "sim_all_mean": 1.0}
+    nan = {"roc_auc": np.nan}
+    r = {"trading": trading, "gates": V.gates(trading, weeks), "walk_forward": weeks,
+         "labels": {"runner": {"lightgbm": nan, "logistic": nan},
+                    "collapse": {"lightgbm": nan, "logistic": nan}}}
+    s = train_mod.variant_summary(r)
+    assert s["wf_mean_lift"] == pytest.approx(2.5) and s["wf_mean_collapse_removed"] == pytest.approx(0.5)
+    assert (s["windows_beating"], s["windows_evaluated"]) == (2, 2) and s["passed"]
+
+
 def test_trades_variants_not_applicable_without_trades_24h(small_df, tmp_path, monkeypatch):
     monkeypatch.setattr(C, "VARIANTS", {k: C.VARIANTS[k] for k in ("baseline",) + C.TRADES_VARIANTS})
     calls = []

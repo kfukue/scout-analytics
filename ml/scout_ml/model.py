@@ -112,6 +112,71 @@ def fit_platt_recent(raw, y, dates) -> tuple:
     return fit_platt(raw, y), info
 
 
+def _brier(y, p) -> float:
+    return float(np.mean((np.asarray(p, dtype=float) - np.asarray(y, dtype=float)) ** 2))
+
+
+def choose_platt(raw, y, dates) -> tuple:
+    """Choose the Platt calibration ("recent" window or "all" held-out rows) by
+    an honest comparison on the held-out rows alone, then fit it on all of them.
+
+    `raw`, `y`, `dates`: margins, outcomes and posting dates of HELD-OUT rows
+    (validation part, or out-of-fold rows): never training rows, never test
+    rows. The rows are ordered by time and cut at C.CALIB_CHOICE_FIT_FRAC (rows
+    with the same timestamp stay on one side); both methods are fitted on the
+    earlier part and their Brier score compared on the later part. The lower
+    Brier wins; equal Brier, or any fallback below, gives "all".
+    Returns (calibrator, info); info["used"] is "recent" or "all",
+    info["choice"] has the comparison (or None) and info["note"] the reason
+    when "all" was used without a comparison."""
+    raw, y = np.asarray(raw, dtype=float), np.asarray(y, dtype=int)
+    dates = pd.to_datetime(pd.Series(dates).reset_index(drop=True), utc=True)
+    cal_recent, info = fit_platt_recent(raw, y, dates)
+    info = {**info, "recent_fit": info["used"], "recent_note": info["note"],
+            "used": "all", "note": None, "choice": None}
+
+    def fallback(note):
+        info["note"] = note
+        return fit_platt(raw, y), info
+
+    if info["recent_fit"] != "recent":
+        return fallback(f"the recent window cannot be fitted ({info['recent_note']})")
+    if info["rows_recent"] == info["rows_all"]:
+        return fallback(f"the held-out rows span less than CALIB_RECENT_DAYS = "
+                        f"{C.CALIB_RECENT_DAYS} days, so the recent window is all of them")
+    ordered = dates.sort_values(kind="stable")
+    cut = ordered.iloc[min(int(len(ordered) * C.CALIB_CHOICE_FIT_FRAC), len(ordered) - 1)]
+    early, late = (dates < cut).to_numpy(), (dates >= cut).to_numpy()
+    lpos, lneg = int(y[late].sum()), int((1 - y[late]).sum())
+    choice = {"rows_fit": int(early.sum()), "rows_eval": int(late.sum()), "eval_from": cut,
+              "pos_eval": lpos, "neg_eval": lneg}
+    if min(lpos, lneg) < C.CALIB_MIN_CLASS_ROWS:
+        return fallback(f"too few rows to compare: the later held-out part has {lpos} positives / "
+                        f"{lneg} negatives (need {C.CALIB_MIN_CLASS_ROWS} of each)")
+    e_raw, e_y, e_dates = raw[early], y[early], dates[early]
+    if min(e_y.sum(), len(e_y) - e_y.sum()) < C.CALIB_MIN_CLASS_ROWS:
+        return fallback(f"too few rows to compare: the earlier held-out part has {int(e_y.sum())} "
+                        f"positives / {int(len(e_y) - e_y.sum())} negatives "
+                        f"(need {C.CALIB_MIN_CLASS_ROWS} of each)")
+    e_recent, e_info = fit_platt_recent(e_raw, e_y, e_dates)
+    if e_info["used"] != "recent":
+        return fallback(f"the recent window of the earlier held-out part cannot "
+                        f"be fitted ({e_info['note']})")
+    if e_info["rows_recent"] == e_info["rows_all"]:
+        return fallback(f"the earlier held-out part (the first {C.CALIB_CHOICE_FIT_FRAC:.0%} of "
+                        f"them) spans less than CALIB_RECENT_DAYS = {C.CALIB_RECENT_DAYS} days, so "
+                        "its recent window is all of it")
+    e_all = fit_platt(e_raw, e_y)
+    choice.update(rows_fit_recent=e_info["rows_recent"],
+                  brier_recent=_brier(y[late], apply_calibrator(e_recent, raw[late])),
+                  brier_all=_brier(y[late], apply_calibrator(e_all, raw[late])))
+    info["choice"] = choice
+    if choice["brier_recent"] < choice["brier_all"]:
+        info["used"] = "recent"
+        return cal_recent, info
+    return fit_platt(raw, y), info
+
+
 def apply_calibrator(calibrator, raw) -> np.ndarray:
     raw = np.asarray(raw, dtype=float)
     if calibrator is None:

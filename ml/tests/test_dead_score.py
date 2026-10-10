@@ -79,6 +79,10 @@ def test_dead_score_levels_and_fits_never_see_its_test_part(dead_df, scored, mon
     monkeypatch.setattr(train_mod, "fit_lgbm", lambda Xt, yt, Xv=None, yv=None, n_estimators=None:
                         seen["fit"].append((len(Xt), None if Xv is None else len(Xv)))
                         or real_fit(Xt, yt, Xv, yv, n_estimators))
+    real_choose = train_mod.choose_platt
+    seen["calib"] = []
+    monkeypatch.setattr(train_mod, "choose_platt", lambda raw, y, dates: seen["calib"].append(
+        (len(y), pd.to_datetime(pd.Series(dates), utc=True).max())) or real_choose(raw, y, dates))
     monkeypatch.setattr(train_mod, "_dead_walk_forward", lambda *a: [])
     monkeypatch.setattr(train_mod, "dead_score_proposal", lambda res: {})
     train_mod.dead_score(dead_df, build_labels(dead_df))
@@ -89,6 +93,9 @@ def test_dead_score_levels_and_fits_never_see_its_test_part(dead_df, scored, mon
     assert scored["split"]["t2"] == s["t2"].strftime("%Y-%m-%d %H:%M")
     assert seen["levels"] and all(d < s["t1"] - pd.Timedelta(days=1) for d in seen["levels"])
     assert seen["fit"] == [(scored["parts"]["train"]["n"], scored["parts"]["val"]["n"])]
+    # calibration chosen on the validation rows only (never test rows)
+    assert len(seen["calib"]) == 1 and seen["calib"][0][0] == scored["parts"]["val"]["n"]
+    assert seen["calib"][0][1] < s["t2"]
     assert callable(real_wf)
 
 
@@ -143,11 +150,30 @@ def test_dead_score_results_have_the_expected_fields(scored):
     assert any(not w.get("skipped") for w in weeks)
     for w in weeks:
         assert w["few_dead"] == (w["n_dead"] < C.DEAD_SCORE_MIN_WEEK_DEAD)
+        assert w["enough_train"] == (w["n_train"] >= C.WF_MIN_TRAIN_ROWS)
+        assert w["counted"] == (not w.get("skipped") and w["enough_train"])
     p = scored["proposal"]
     assert p["min_lift"] == C.DEAD_SCORE_PROPOSED_LIFT
+    assert p["wf_min_train_rows"] == C.WF_MIN_TRAIN_ROWS
     for model in ("lightgbm", "logistic"):
         assert p[model]["weeks_judged"] == sum(1 for w in weeks
-                                               if not w.get("skipped") and not w["few_dead"])
+                                               if w["counted"] and not w["few_dead"])
+
+
+def test_dead_score_proposal_leaves_out_weeks_below_the_minimum_train_rows():
+    """A week trained on fewer than WF_MIN_TRAIN_ROWS rows is not judged by the proposal."""
+    big, small = C.WF_MIN_TRAIN_ROWS, C.WF_MIN_TRAIN_ROWS - 1
+    lifted = {"top10_lift": C.DEAD_SCORE_PROPOSED_LIFT + 1}
+    flat = {"top10_lift": 1.0}
+    top = [{"frac": f, "lift": C.DEAD_SCORE_PROPOSED_LIFT + 1} for f in C.DEAD_SCORE_TOP_FRACS]
+    weeks = [{"n_train": small, "few_dead": False, "lightgbm": flat, "logistic": flat},
+             {"n_train": small, "few_dead": False, "lightgbm": flat, "logistic": flat},
+             {"n_train": big, "few_dead": False, "lightgbm": lifted, "logistic": lifted}]
+    p = train_mod.dead_score_proposal({"top": {"lightgbm": top, "logistic": top},
+                                       "walk_forward": weeks})
+    for model in ("lightgbm", "logistic"):
+        assert (p[model]["weeks_meeting"], p[model]["weeks_judged"]) == (1, 1)
+        assert p[model]["weeks_ok"] and p[model]["would_pass"]
 
 
 def _models_and_meta(vdir):

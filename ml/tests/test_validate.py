@@ -2,6 +2,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
+from scout_ml import config as C
 from scout_ml import validate as V
 
 
@@ -97,11 +98,53 @@ def test_trading_metrics_and_gates():
     assert t["top_lift"] == pytest.approx(5.0)          # top 10% = 2 calls, both runners
     assert t["collapse_removed"] == pytest.approx(1.0)  # top 30% = exactly the 6 collapses
     assert t["sim_top_mean"] == 150.0 and t["sim_all_mean"] == pytest.approx(-2.0)
-    assert V.gates(t, [{"sim_beats_all": True}])["passed"]
-    assert not V.gates(t, [{"sim_beats_all": True}, {"sim_beats_all": False}])["passed"]
-    assert not V.gates(t, [{"skipped": "x"}])["passed"]                 # nothing evaluated
+    big = C.WF_MIN_TRAIN_ROWS
+    assert V.gates(t, [{"sim_beats_all": True, "n_train": big}])["passed"]
+    assert not V.gates(t, [{"sim_beats_all": True, "n_train": big},
+                           {"sim_beats_all": False, "n_train": big}])["passed"]
+    assert not V.gates(t, [{"skipped": "x", "n_train": big}])["passed"]  # nothing evaluated
     no_collapse = V.trading_metrics(y_run, score, y_col, None, ret)
-    assert not V.gates(no_collapse, [{"sim_beats_all": True}])["collapse_ok"]
+    assert not V.gates(no_collapse, [{"sim_beats_all": True, "n_train": big}])["collapse_ok"]
+
+
+def _good_test_part():
+    y_run = np.array([1, 1, 0, 0, 0, 0, 0, 0, 0, 0] * 2)
+    y_col = np.array([0, 0, 1, 1, 1, 0, 0, 0, 0, 0] * 2)
+    return V.trading_metrics(y_run, np.where(y_run == 1, 0.9, 0.1), y_col, y_col * 0.8,
+                             np.where(y_run == 1, 150.0, -40.0))
+
+
+def test_walk_forward_weeks_below_the_minimum_train_rows_are_not_counted():
+    """Owner, 9 Oct 2026: a week trained on fewer than WF_MIN_TRAIN_ROWS rows is shown
+    but does not count toward "beats buy-all in every week"."""
+    assert C.WF_MIN_TRAIN_ROWS == 1000
+    t = _good_test_part()
+    weeks = [{"n_train": 530, "sim_beats_all": False},        # e.g. prod medium week 4
+             {"n_train": 1200, "sim_beats_all": True},
+             {"n_train": 1500, "sim_beats_all": True},
+             {"n_train": 300, "skipped": "too few"}]
+    g = V.gates(t, weeks)
+    assert g["walk_forward_ok"] and g["passed"]               # the only failing week is too small
+    assert (g["windows_evaluated"], g["windows_beating"], g["windows_not_counted"]) == (2, 2, 1)
+    assert [V.wf_counted(w) for w in weeks] == [False, True, True, False]
+    assert V.wf_counted({"n_train": 1000, "sim_beats_all": True})          # boundary: >= counts
+    # a failing week above the minimum still fails the gate
+    g = V.gates(t, weeks + [{"n_train": 1600, "sim_beats_all": False}])
+    assert not g["walk_forward_ok"] and (g["windows_evaluated"], g["windows_beating"]) == (3, 2)
+    # every evaluated week below the minimum: nothing counted = fail
+    g = V.gates(t, [{"n_train": 999, "sim_beats_all": True}])
+    assert not g["walk_forward_ok"] and g["windows_evaluated"] == 0 and g["windows_not_counted"] == 1
+    with pytest.raises(KeyError):                             # no silent "counted" without n_train
+        V.gates(t, [{"sim_beats_all": True}])
+
+
+def test_walk_forward_minimum_is_read_from_config(monkeypatch):
+    t = _good_test_part()
+    weeks = [{"n_train": 530, "sim_beats_all": False}, {"n_train": 1200, "sim_beats_all": True}]
+    assert V.gates(t, weeks)["walk_forward_ok"]
+    monkeypatch.setattr(C, "WF_MIN_TRAIN_ROWS", 500)
+    g = V.gates(t, weeks)
+    assert not g["walk_forward_ok"] and g["wf_min_train_rows"] == 500
 
 
 def test_metrics_do_not_crash_on_one_class():
@@ -298,6 +341,125 @@ def test_recent_calibration_never_inverts_the_ranking(monkeypatch):
     cal, info = fit_platt_recent(raw, y, dates)
     assert info["used"] == "all (fallback)" and "slope" in info["note"] and platt_slope(cal) > 0
 
+
+def _held_out(offset, n=1500, days=60, seed=5):
+    """Held-out margins over `days` days; P(y=1) = sigmoid(raw + offset(day))."""
+    rng = np.random.default_rng(seed)
+    day = np.sort(rng.uniform(0, days, n))
+    dates = pd.Series(pd.Timestamp("2026-08-01", tz="UTC") + pd.to_timedelta(day, unit="D"))
+    raw = rng.normal(0, 1, n)
+    y = (rng.random(n) < 1 / (1 + np.exp(-(raw + offset(day))))).astype(int)
+    return raw, y, dates
+
+
+def test_calibration_choice_picks_the_recent_window_when_the_drift_persists():
+    """Base rate falling steadily: the recent window of the earlier held-out rows
+    predicts the later ones better, so "recent" is chosen and fitted on all rows."""
+    from scout_ml.model import choose_platt, fit_platt_recent
+    raw, y, dates = _held_out(lambda d: 1.0 - 3.0 * d / 60)
+    cal, info = choose_platt(raw, y, dates)
+    ch = info["choice"]
+    assert info["used"] == "recent" and info["note"] is None
+    assert ch["brier_recent"] < ch["brier_all"]
+    assert ch["rows_fit"] + ch["rows_eval"] == len(y) and ch["rows_fit_recent"] < ch["rows_fit"]
+    np.testing.assert_allclose(cal.coef_, fit_platt_recent(raw, y, dates)[0].coef_)
+
+
+def test_calibration_choice_picks_all_rows_when_the_recent_window_was_a_blip():
+    """A short dip just before the cut, then back to normal: the all-rows fit of
+    the earlier part predicts the later part better, so "all" is chosen."""
+    from scout_ml.model import choose_platt, fit_platt
+    raw, y, dates = _held_out(lambda d: np.where((d > 17) & (d < 30), -1.8, 0.5))
+    cal, info = choose_platt(raw, y, dates)
+    ch = info["choice"]
+    assert info["used"] == "all" and info["note"] is None
+    assert ch["brier_all"] < ch["brier_recent"]
+    np.testing.assert_allclose(cal.coef_, fit_platt(raw, y).coef_)
+
+
+def test_calibration_choice_uses_only_the_rows_it_is_given():
+    """The choice depends on the held-out rows alone: rows added after them (as
+    a test part would be) are never passed in, and permuting the input order
+    does not change it (the rows are ordered by date inside)."""
+    from scout_ml.model import choose_platt
+    raw, y, dates = _held_out(lambda d: 1.0 - 3.0 * d / 60)
+    _, a = choose_platt(raw, y, dates)
+    perm = np.random.default_rng(0).permutation(len(y))
+    _, b = choose_platt(raw[perm], y[perm], dates[perm].reset_index(drop=True))
+    assert a["used"] == b["used"]
+    assert a["choice"]["brier_recent"] == pytest.approx(b["choice"]["brier_recent"])
+    assert a["choice"]["brier_all"] == pytest.approx(b["choice"]["brier_all"])
+    assert a["choice"]["eval_from"] <= dates.max()
+
+
+def test_calibration_choice_fallbacks(monkeypatch):
+    from scout_ml.model import choose_platt, fit_platt
+    # held-out rows span less than CALIB_RECENT_DAYS: recent window = all rows, no comparison
+    raw, y, dates = _held_out(lambda d: 0.0 * d, n=600, days=10)
+    cal, info = choose_platt(raw, y, dates)
+    assert info["used"] == "all" and info["choice"] is None and "span less than" in info["note"]
+    np.testing.assert_allclose(cal.coef_, fit_platt(raw, y).coef_)
+    # the recent window itself cannot be fitted (too few positives in the last 14 days)
+    raw, y, dates = _held_out(lambda d: np.where(d > 46, -6.0, 0.5), n=1200)
+    cal, info = choose_platt(raw, y, dates)
+    assert info["used"] == "all" and info["choice"] is None
+    assert "recent window cannot be fitted" in info["note"] and "positives" in info["note"]
+    np.testing.assert_allclose(cal.coef_, fit_platt(raw, y).coef_)
+    # too few rows of a class in the later part to compare
+    raw, y, dates = _held_out(lambda d: np.where(d > 30, -7.0, 0.5), n=1200)
+    monkeypatch.setattr(C, "CALIB_RECENT_DAYS", 40)         # the full recent window still fits
+    cal, info = choose_platt(raw, y, dates)
+    assert info["used"] == "all" and info["choice"] is None
+    assert "later held-out part" in info["note"]
+    np.testing.assert_allclose(cal.coef_, fit_platt(raw, y).coef_)
+    # the earlier part spans less than the recent window: nothing to compare
+    raw, y, dates = _held_out(lambda d: 0.0 * d, n=1200, days=24)
+    monkeypatch.setattr(C, "CALIB_RECENT_DAYS", 14)
+    cal, info = choose_platt(raw, y, dates)
+    assert info["used"] == "all" and info["choice"] is None
+    assert "earlier held-out part (the first 50% of them) spans less than" in info["note"]
+    # too few rows of a class in the earlier part (the later part and the full window are fine)
+    raw, y, dates = _held_out(lambda d: np.where(d < 30, -7.0, 0.5), n=1200)
+    cal, info = choose_platt(raw, y, dates)
+    assert info["used"] == "all" and info["choice"] is None
+    assert "earlier held-out part has" in info["note"]
+    np.testing.assert_allclose(cal.coef_, fit_platt(raw, y).coef_)
+
+
+
+def test_recent_window_that_cannot_be_fitted_is_reported_as_na():
+    """No silent all-rows fallback under the "recent window" name: when the recent
+    window cannot be fitted, train keeps no recent candidate and the report line
+    and decile table say "n/a (recent window cannot be fitted)"."""
+    import train as train_mod
+    from scout_ml.model import fit_platt, fit_platt_recent
+    from scout_ml.report import RECENT_NA, calib_line, calib_table
+    raw, y, dates = _held_out(lambda d: np.where(d > 46, -6.0, 0.5), n=1200)
+    fitted, info = {}, {"messages": []}
+    train_mod._calibrate_chosen(fitted, info, raw, y, dates)
+    assert info["calib"]["recent_fit"] != "recent" and info["calib"]["used"] == "all"
+    assert fitted["calibrator_recent"] is None
+    assert fitted["calibrator_all"] is fitted["calibrator"]
+    np.testing.assert_allclose(fitted["calibrator"].coef_, fit_platt(raw, y).coef_)
+    deciles = [{"decile": i, "n": 10, "mean_pred": 0.1 * i, "observed": 0.1 * i}
+               for i in range(1, 11)]
+    m = {"calib": info["calib"], "lightgbm": {"brier": 0.2}, "brier_all_rows": 0.2,
+         "brier_recent": None, "calibration": deciles, "calibration_all_rows": deciles,
+         "calibration_recent": None}
+    assert f"recent window {RECENT_NA}, all held-out rows 0.200" in calib_line(m)
+    rows = calib_table(m).splitlines()[2:]
+    assert len(rows) == 10 and all(f"| {RECENT_NA} |" in r for r in rows)
+    # a fittable recent window: both candidates kept, the chosen one not refitted
+    raw, y, dates = _held_out(lambda d: 1.0 - 3.0 * d / 60)
+    fitted, info = {}, {"messages": []}
+    train_mod._calibrate_chosen(fitted, info, raw, y, dates)
+    assert info["calib"]["used"] == "recent" and fitted["calibrator_recent"] is fitted["calibrator"]
+    np.testing.assert_allclose(fitted["calibrator_recent"].coef_,
+                               fit_platt_recent(raw, y, dates)[0].coef_)
+    np.testing.assert_allclose(fitted["calibrator_all"].coef_, fit_platt(raw, y).coef_)
+    m = {**m, "calib": info["calib"], "brier_recent": 0.19, "calibration_recent": deciles}
+    assert RECENT_NA not in calib_line(m) + calib_table(m)
+    assert "recent window 0.190, all held-out rows 0.200" in calib_line(m)
 
 def test_collapse_removed_helper_matches_trading_metrics():
     y = np.array([1, 1, 0, 0, 1, 0, 0, 0, 0, 1])

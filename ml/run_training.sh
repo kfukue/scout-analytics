@@ -248,7 +248,7 @@ want_head="$(git -C "$REPO" rev-parse origin/main)"
 if grep -q '^MIN_MATURED' "$ML/src/ml/scout_ml/config.py" 2>/dev/null; then
     echo "ml/ is up to date ($(git -C "$ML/src" rev-parse --short HEAD))"
 else
-    die "OLD ml/: $ML/src/ml/scout_ml/config.py has no MIN_MATURED; the fixes of 9 October (long skip, forward split for medium/long) are not on origin/main yet"
+    die "OLD ml/: $ML/src/ml/scout_ml/config.py has no MIN_MATURED; origin/main does not have the current ml/ code (run git fetch origin main in $REPO and retry)"
 fi
 
 # ---------------------------------------------------------------------------
