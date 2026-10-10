@@ -160,8 +160,15 @@ def test_serve_health_and_score_shape(trained, synthetic_df, monkeypatch):
     parts = body["line"].split(" · ")
     assert [p.split(":")[0] for p in parts[1:]] == ["short", "3-day", "medium", "long"]
     short = body["buckets"][0]
-    assert parts[1] == (f"short: runner {short['runner_prob'] * 100:.0f}%, "
-                        f"collapse {short['collapse_prob'] * 100:.0f}%")
+    # the line formats the unrounded probability p (f"{p * 100:.0f}%"), runner_prob is p
+    # rounded to 4 decimals: p lies in [prob - 0.00005, prob + 0.00005], and the same
+    # (monotonic) formatting of both ends must bracket the printed percent exactly
+    import re
+    got = re.fullmatch(r"short: runner (\d+)%, collapse (\d+)%", parts[1])
+    assert got, parts[1]
+    for pct, prob in zip(got.groups(), (short["runner_prob"], short["collapse_prob"])):
+        lo, hi = (int(f"{(prob + d) * 100:.0f}") for d in (-0.00005, 0.00005))
+        assert lo <= int(pct) <= hi, (parts[1], prob)
     assert parts[4].startswith("long: up at 30d ")
 
     # Outcomes in the request must not change the score (they are not inputs).
@@ -237,7 +244,7 @@ def test_collapse_gate_uses_plain_label_when_dead_rule_is_on():
     assert t["collapse_removed"] == pytest.approx(0.2)
     assert t["collapse_removed_with_dead"] == pytest.approx(0.6)
     assert t["collapse_removed_with_dead"] >= C.GATES["min_collapse_removed"] > t["collapse_removed"]
-    g = V.gates(t, [{"sim_beats_all": True}])
+    g = V.gates(t, [{"sim_beats_all": True, "n_train": C.WF_MIN_TRAIN_ROWS}])
     assert g["collapse_ok"] is False and g["lift_ok"] and not g["passed"]
     # rule off (or trades_24h missing): plain == trained-on label, no extra figure
     off = train_mod.collapse_check(y_run, score, plain, plain, score, ret, with_dead=False)
@@ -350,6 +357,14 @@ def test_levels_rounds_and_calibration_never_see_the_test_part(synthetic_df, tmp
         finally:
             in_wf["on"] = False
 
+    real_choose = train_mod.choose_platt
+    seen["calib"] = []
+
+    def choose(raw, y, dates):        # the calibration choice: held-out rows only
+        seen["calib"].append(pd.to_datetime(pd.Series(dates), utc=True).max())
+        return real_choose(raw, y, dates)
+
+    monkeypatch.setattr(train_mod, "choose_platt", choose)
     monkeypatch.setattr(train_mod, "learn_cat_levels", learn)
     monkeypatch.setattr(train_mod, "fit_lgbm", fit)
     monkeypatch.setattr(train_mod, "_walk_forward", wf)
@@ -378,6 +393,10 @@ def test_levels_rounds_and_calibration_never_see_the_test_part(synthetic_df, tmp
         for idx in seen["levels"] + seen["fit"]:
             assert not idx & test_rows, b
             assert rows["message_date"][sorted(idx)].max() < before, b
+        # runner and collapse calibration chosen on rows posted before the test part
+        assert len(seen["calib"]) == 2 and all(t < before for t in seen["calib"]), b
+        if b == "medium":                                   # out-of-fold rows: inside train
+            assert all(t < split["t_train_end"] for t in seen["calib"])
         assert seen["levels"][0] == set(np.flatnonzero(split["train"]))  # main levels = train part
         if b == "medium":                                   # + one per inner fold: its fit rows only
             assert len(seen["levels"]) == 1 + C.KFOLD_K
@@ -536,11 +555,23 @@ def test_report_shows_dead_calls_and_recent_calibration(trained):
                 assert "collapse_removed_with_dead" in w
         for lab in ("runner", "collapse"):
             info = m["labels"][lab]
-            assert info["calib"]["rows_recent"] <= info["calib"]["rows_all"]
+            c = info["calib"]
+            assert c["rows_recent"] <= c["rows_all"] and c["used"] in ("recent", "all")
+            assert (c["choice"] is None) == (c["note"] is not None)   # compared, or a reason
+            if c["choice"]:
+                ch = c["choice"]
+                assert ch["rows_fit"] + ch["rows_eval"] == c["rows_all"]
+                assert (c["used"] == "recent") == (ch["brier_recent"] < ch["brier_all"])
             before, after = info["calibration_all_rows"], info["calibration"]
             # deciles are by rank: the same rows and outcomes, only the predictions move
             assert [c["observed"] for c in before] == [c["observed"] for c in after]
             assert info["brier_all_rows"] >= 0
+            if c["recent_fit"] == "recent":
+                assert info["brier_recent"] >= 0
+            else:                                  # no recent candidate: never the fallback
+                assert info["brier_recent"] is None and c["used"] == "all"
+            chosen = info["brier_recent"] if c["used"] == "recent" else info["brier_all_rows"]
+            assert info["lightgbm"]["brier"] == pytest.approx(chosen)
     report = (vdir / "report.md").read_text(encoding="utf-8")
     for needle in ("collapse label = collapse OR dead", "OR dead (trades_24h < 50)",
                    "model trained on collapse OR dead"):
@@ -553,9 +584,46 @@ def test_report_shows_dead_calls_and_recent_calibration(trained):
                    "(information only, not a gate)",
                    "bad outcomes removed incl. dead (collapse OR dead; information, not a gate)",
                    "| incl. dead (info, not a gate) |",
-                   "Platt calibration fitted on", "mean predicted (all held-out rows)",
-                   "(calibrated on all held-out rows, as before)"):
+                   "Platt calibration: **", "mean predicted (all held-out rows)",
+                   "mean predicted (chosen calibration)", "mean predicted (recent window)",
+                   "Brier on test (information only, never used to choose)"):
         assert needle in report, needle
+    # medium/long: out-of-fold rows span more than 2 x 14 days, so the two were compared
+    for b in C.FORWARD_SPLIT_BUCKETS:
+        for lab in ("runner", "collapse"):
+            assert meta["metrics"][b]["labels"][lab]["calib"]["choice"], (b, lab)
+    assert "Chosen on held-out rows only (never test rows)" in report
+
+
+def test_walk_forward_weeks_below_the_minimum_are_shown_but_not_counted(trained):
+    """Owner, 9 Oct 2026: weeks trained on fewer than WF_MIN_TRAIN_ROWS rows stay in
+    the walk-forward table, marked, and are left out of the gate and its counts."""
+    from scout_ml import validate as V
+    _, vdir = trained
+    meta = json.loads((vdir / "meta.json").read_text())
+    assert meta["wf_min_train_rows"] == C.WF_MIN_TRAIN_ROWS == 1000
+    report = (vdir / "report.md").read_text(encoding="utf-8")
+    small = 0
+    for b in BUCKET_KEYS:
+        m = meta["metrics"][b]
+        weeks = m["walk_forward"]
+        for w in weeks:
+            assert w["enough_train"] == (w["n_train"] >= C.WF_MIN_TRAIN_ROWS)
+            assert w["counted"] == (not w.get("skipped") and w["enough_train"])
+        counted = [w for w in weeks if w["counted"]]
+        not_counted = [w for w in weeks if not w.get("skipped") and not w["enough_train"]]
+        small += len(not_counted)
+        g = m["gates"]
+        assert g["windows_evaluated"] == len(counted)
+        assert g["windows_not_counted"] == len(not_counted)
+        assert g["windows_beating"] == sum(w["sim_beats_all"] for w in counted)
+        assert g["walk_forward_ok"] == (bool(counted) and all(w["sim_beats_all"] for w in counted))
+        assert g == V.gates(m["trading"], weeks)
+    assert small > 0                           # the synthetic data has early weeks below 1000
+    assert "| not counted (train < 1000) |" in report and "| counted |" in report
+    assert ("a week counts toward \"beats buy-all in every week\" only when its training part "
+            "has at least 1000 rows (WF_MIN_TRAIN_ROWS, set on 9 Oct 2026)") in report
+    assert " not counted)" in report           # verdict / gate cell: weeks not counted
 
 
 def test_report_shows_collapse_auc_on_the_plain_label(trained):

@@ -268,6 +268,15 @@ MIN_WINDOW_TEST_ROWS = 50              # walk-forward weeks smaller than this ar
 TOP_FRAC = 0.10                        # "buy the top 10% by runner score"
 SKIP_FRAC = 0.30                       # "skip the 30% with highest collapse score"
 GATES = {"min_top_lift": 2.0, "min_collapse_removed": 0.40}
+# Owner decision of 9 Oct 2026: a walk-forward week counts toward the "beats
+# buy-all in every week" gate only when its training part has at least this
+# many rows. Weeks below are still computed and shown, marked "not counted
+# (train < WF_MIN_TRAIN_ROWS)". The same weeks are left out of the walk-forward
+# summaries (variant table, dead-score proposal). The early weeks of an
+# expanding walk-forward from the data start (e.g. medium, week of 18 Aug 2026:
+# 530 train rows) stay in every report and would otherwise fail it forever.
+WF_MIN_TRAIN_ROWS = 1000
+WF_MIN_TRAIN_ROWS_SET_ON = "9 Oct 2026"
 
 # --- Calibration on recent weeks --------------------------------------------
 # The base rates drift week to week, so the Platt calibration is fitted on the
@@ -277,8 +286,23 @@ GATES = {"min_top_lift": 2.0, "min_collapse_removed": 0.40}
 # to all held-out rows (the earlier behaviour) when the recent rows have fewer
 # than CALIB_MIN_CLASS_ROWS of either class or the fit would invert the
 # ranking (slope <= 0). Ranking metrics (lift, collapses removed) do not change.
+# Whether this recent window or all held-out rows are used is chosen per label
+# (see CALIB_CHOICE_FIT_FRAC below).
 CALIB_RECENT_DAYS = 14
 CALIB_MIN_CLASS_ROWS = 20
+# Owner decision of 9 Oct 2026: the recent window is not always better (prod
+# report 20261009-2250, medium collapse: Brier 0.191 recent vs 0.170 all rows),
+# so the calibration is CHOSEN between "recent window" and "all held-out rows"
+# on the held-out rows alone (never test rows): they are ordered by time, both
+# methods are fitted on the earliest CALIB_CHOICE_FIT_FRAC of them and their
+# Brier is compared on the rest; the method with the lower Brier is then fitted
+# on all held-out rows. "all held-out rows" is used (fallback) when the
+# held-out rows span less than CALIB_RECENT_DAYS, the recent window of all
+# held-out rows cannot be fitted (then the report shows it as "n/a"), the later
+# or the earlier part has fewer than CALIB_MIN_CLASS_ROWS of a class, the
+# earlier part cannot fit the recent window (too few of a class in it, slope
+# <= 0, or it covers all of the earlier part), or the two Briers are equal.
+CALIB_CHOICE_FIT_FRAC = 0.5
 N_REF_QUANTILES = 101
 
 # --- LightGBM: deliberately small/regularised for ~10k rows ----------------

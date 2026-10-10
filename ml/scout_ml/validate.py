@@ -7,6 +7,7 @@ import numpy as np
 import pandas as pd
 from sklearn.metrics import average_precision_score, brier_score_loss, roc_auc_score
 
+from . import config as C   # read at call time: WF_MIN_TRAIN_ROWS
 from .config import (FORWARD_TEST_DAYS, GATES, KFOLD_K, LIFT_CI_Z, MIN_WINDOW_TEST_ROWS,
                      SIM_MAX_RET_PCT, SKIP_FRAC, TOP_FRAC, TRAIN_FRAC, VAL_FRAC)
 
@@ -211,15 +212,32 @@ def collapse_removed(y_collapse, collapse_score) -> float:
     return float(y[top_mask(collapse_score, SKIP_FRAC)].sum() / y.sum())
 
 
+def wf_enough_train(w: dict) -> bool:
+    """The week's training part has at least C.WF_MIN_TRAIN_ROWS rows (`n_train`
+    is required: a week without it is an error, never silently counted)."""
+    return w["n_train"] >= C.WF_MIN_TRAIN_ROWS
+
+
+def wf_counted(w: dict) -> bool:
+    """A walk-forward week counts toward the gate and the walk-forward
+    summaries: evaluated (not skipped) and trained on >= C.WF_MIN_TRAIN_ROWS rows."""
+    return not w.get("skipped") and wf_enough_train(w)
+
+
 def gates(test: dict, windows: list) -> dict:
-    """PASS needs all three: lift, collapse removal, and every evaluated
-    walk-forward window beating buy-everything (no evaluated window = fail)."""
+    """PASS needs all three: lift, collapse removal, and every COUNTED
+    walk-forward window beating buy-everything (no counted window = fail).
+    Counted = evaluated and trained on >= C.WF_MIN_TRAIN_ROWS rows (owner, 9 Oct
+    2026); evaluated weeks below that are reported as `windows_not_counted`."""
     evaluated = [w for w in windows if not w.get("skipped")]
+    counted = [w for w in evaluated if wf_counted(w)]
     g = {"lift_ok": bool(test["top_lift"] >= GATES["min_top_lift"]),
          "collapse_ok": bool(test["collapse_removed"] >= GATES["min_collapse_removed"]),
-         "walk_forward_ok": bool(evaluated) and all(w["sim_beats_all"] for w in evaluated),
-         "windows_evaluated": len(evaluated),
-         "windows_beating": sum(bool(w["sim_beats_all"]) for w in evaluated)}
+         "walk_forward_ok": bool(counted) and all(w["sim_beats_all"] for w in counted),
+         "windows_evaluated": len(counted),
+         "windows_beating": sum(bool(w["sim_beats_all"]) for w in counted),
+         "windows_not_counted": len(evaluated) - len(counted),
+         "wf_min_train_rows": C.WF_MIN_TRAIN_ROWS}
     g["passed"] = g["lift_ok"] and g["collapse_ok"] and g["walk_forward_ok"]
     return g
 

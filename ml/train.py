@@ -19,8 +19,8 @@ import pandas as pd
 from scout_ml import config as C
 from scout_ml.features import build_features, category, dex_family_rules, learn_cat_levels, num
 from scout_ml.labels import build_labels, dead_policy
-from scout_ml.model import (apply_calibrator, best_rounds, fit_baseline, fit_lgbm, fit_platt,
-                            fit_platt_recent, predict, usable_holdout)
+from scout_ml.model import (apply_calibrator, best_rounds, choose_platt, fit_baseline, fit_lgbm,
+                            fit_platt, fit_platt_recent, predict, usable_holdout)
 from scout_ml.report import render, variant_error
 from scout_ml import validate as V
 
@@ -67,12 +67,22 @@ def _class_check(y, mask, part_desc):
     return info
 
 
-def _calibrate_recent(fitted, info, raw, y, dates):
-    """Replace the calibrator by one fitted on the most recent held-out rows
-    (`raw`/`y`/`dates`: validation or out-of-fold rows only); the calibrator on
-    all of them (the earlier behaviour) is kept for the report."""
-    fitted["calibrator_all"] = fit_platt(raw, y)
-    fitted["calibrator"], info["calib"] = fit_platt_recent(raw, y, dates)
+def _calibrate_chosen(fitted, info, raw, y, dates):
+    """Replace the calibrator by the one `choose_platt` picks ("recent" window or
+    "all" held-out rows, compared on the held-out rows alone; `raw`/`y`/`dates`:
+    validation or out-of-fold rows only, never test rows). Both candidates fitted
+    on all held-out rows are kept for the report (test Brier: information only).
+    When the recent window cannot be fitted, there is no recent candidate
+    (`calibrator_recent` None; the report says "n/a"), never the silent
+    all-rows fallback of `fit_platt_recent` under the recent-window name."""
+    fitted["calibrator"], info["calib"] = choose_platt(raw, y, dates)
+    if info["calib"]["used"] == "recent":     # the chosen one is that candidate: no refit
+        fitted["calibrator_recent"] = fitted["calibrator"]
+        fitted["calibrator_all"] = fit_platt(raw, y)
+    else:
+        fitted["calibrator_all"] = fitted["calibrator"]
+        fitted["calibrator_recent"] = (fit_platt_recent(raw, y, dates)[0]
+                                       if info["calib"]["recent_fit"] == "recent" else None)
     if info["calib"]["note"]:
         info["messages"].append("calibration on all held-out rows: " + info["calib"]["note"])
 
@@ -83,11 +93,18 @@ def _finish_label(info, fitted, X, y, tr, te, out_dir, bucket, label):
     if fitted["note"]:
         info["messages"].append(fitted["note"])
     p_test = predict(fitted, X[te])
-    if fitted.get("calibrator_all") is not None:  # before: calibrated on all held-out rows
-        p_all = apply_calibrator(fitted["calibrator_all"],
-                                 fitted["model"].predict(X[te], raw_score=True))
-        info["calibration_all_rows"] = V.calibration_table(y[te], p_all)
-        info["brier_all_rows"] = V.model_metrics(y[te], p_all)["brier"]
+    if fitted.get("calibrator_all") is not None:
+        # both candidates on test: shown in the report, information only (the
+        # choice was made on held-out rows before; test rows never choose)
+        raw_te = fitted["model"].predict(X[te], raw_score=True)
+        for key, cal in (("all_rows", fitted["calibrator_all"]),
+                         ("recent", fitted["calibrator_recent"])):
+            if cal is None:                   # recent window cannot be fitted: no candidate
+                info[f"calibration_{key}"], info[f"brier_{key}"] = None, None
+                continue
+            p_c = apply_calibrator(cal, raw_te)
+            info[f"calibration_{key}"] = V.calibration_table(y[te], p_c)
+            info[f"brier_{key}"] = V.model_metrics(y[te], p_c)["brier"]
     gain = fitted["model"].booster_.feature_importance("gain")
     order = np.argsort(-gain)[:10]
     fitted["baseline"] = fit_baseline(X[tr], y[tr])  # kept in memory only (never saved)
@@ -106,14 +123,15 @@ def _finish_label(info, fitted, X, y, tr, te, out_dir, bucket, label):
 
 def _train_label(X, y, split, label, out_dir, bucket, dates):
     """short/3day: early stopping on the validation part, Platt calibration on
-    its most recent rows (C.CALIB_RECENT_DAYS; fallback: all of it)."""
+    its most recent rows (C.CALIB_RECENT_DAYS) or on all of it, whichever
+    `choose_platt` picks on the validation rows alone."""
     tr, va, te = split["train"], split["val"], split["test"]
     info = _class_check(y, tr, "earliest 70% minus the embargo")
     if info.get("skipped"):
         return info, None, None
     fitted = fit_lgbm(X[tr], y[tr], X[va], y[va])
     if fitted["calibrator"] is not None:
-        _calibrate_recent(fitted, info, fitted["model"].predict(X[va], raw_score=True), y[va],
+        _calibrate_chosen(fitted, info, fitted["model"].predict(X[va], raw_score=True), y[va],
                           dates[va])
     return _finish_label(info, fitted, X, y, tr, te, out_dir, bucket, label)
 
@@ -135,8 +153,9 @@ def _kfold_matrices(rows, dates, tokens, tr, horizon_days):
 def _train_label_kfold(X, y, split, folds, label, out_dir, bucket, dates):
     """medium/long: rounds = median best iteration over the usable purged
     folds; Platt calibration fitted on the most recent out-of-fold margins
-    (C.CALIB_RECENT_DAYS; fallback: all of them) of fold models refitted with
-    those rounds; final model on the whole train part."""
+    (C.CALIB_RECENT_DAYS) or on all of them, whichever `choose_platt` picks on
+    the out-of-fold rows alone, of fold models refitted with those rounds;
+    final model on the whole train part."""
     tr, te = split["train"], split["test"]
     info = _class_check(y, tr, "calls before the test date minus the embargo")
     if info.get("skipped"):
@@ -166,7 +185,7 @@ def _train_label_kfold(X, y, split, folds, label, out_dir, bucket, dates):
     raw, obs, when = np.concatenate(raw), np.concatenate(obs), pd.concat(when)
     cv["oof_rows"] = int(len(obs))
     fitted = fit_lgbm(X[tr], y[tr], n_estimators=rounds)
-    _calibrate_recent(fitted, info, raw, obs, when)
+    _calibrate_chosen(fitted, info, raw, obs, when)
     return _finish_label(info, fitted, X, y, tr, te, out_dir, bucket, label)
 
 
@@ -193,6 +212,7 @@ def _walk_forward(rows, Y, y_plain, y_with_dead, net_ret, dates, tokens, horizon
         tr, te = w["train"], w["test"]
         row = {"week": w["week"], "start": w["start"].strftime("%Y-%m-%d"),
                "n_train": int(tr.sum()), "n_test": int(te.sum())}
+        row["enough_train"] = V.wf_enough_train(row)   # below C.WF_MIN_TRAIN_ROWS: shown, not counted
         scores, X = {}, None
         for label, n_rounds in rounds.items():
             y = Y[label]
@@ -207,6 +227,7 @@ def _walk_forward(rows, Y, y_plain, y_with_dead, net_ret, dates, tokens, horizon
                                       y_with_dead[te], scores.get("collapse"), net_ret[te],
                                       with_dead))
             row["runner_auc"] = V.model_metrics(Y["runner"][te], scores["runner"])["roc_auc"]
+        row["counted"] = V.wf_counted(row)
         out.append(row)
     return out
 
@@ -324,7 +345,7 @@ def variant_summary(r: dict) -> dict:
         m = labs.get(lab) or {}
         return np.nan if m.get("skipped") else m[model]["roc_auc"]
 
-    weeks = [w for w in r["walk_forward"] if not w.get("skipped")]
+    weeks = [w for w in r["walk_forward"] if V.wf_counted(w)]   # as the gate: counted weeks only
     plain = r.get("collapse_auc_plain") or {}
     return {
         "runner_rate_test": t["all_pos"] / t["all_n"] if t["all_n"] else np.nan,
@@ -464,10 +485,13 @@ def _dead_walk_forward(rows, y, dates, tokens, horizon_days, rounds) -> list:
         row = {"week": w["week"], "start": w["start"].strftime("%Y-%m-%d"),
                "n_train": int(tr.sum()), "n_test": int(te.sum()), "n_dead": n_dead,
                "few_dead": n_dead < C.DEAD_SCORE_MIN_WEEK_DEAD}
+        row["enough_train"] = V.wf_enough_train(row)   # below C.WF_MIN_TRAIN_ROWS: shown, not counted
         if min(y[tr].sum(), (1 - y[tr]).sum()) < C.MIN_CLASS_ROWS or not V.window_ok(te.sum()):
             row["skipped"] = "too few training rows per class or test rows"
+            row["counted"] = False
             out.append(row)
             continue
+        row["counted"] = V.wf_counted(row)
         X = build_features(rows, learn_cat_levels(rows[tr]))
         p = predict(fit_lgbm(X[tr], y[tr], n_estimators=rounds), X[te])
         p_log = fit_baseline(X[tr], y[tr]).predict_proba(X[te][C.NUMERIC_FEATURES])[:, 1]
@@ -537,16 +561,16 @@ def dead_score(df: pd.DataFrame, L: pd.DataFrame) -> dict:
 def dead_score_proposal(res: dict) -> dict:
     """How this run fares against the PROPOSED gates (never applied): top-10%
     lift >= C.DEAD_SCORE_PROPOSED_LIFT in the test part, and in more than half of
-    the walk-forward weeks with at least C.DEAD_SCORE_MIN_WEEK_DEAD dead calls."""
-    out = {"min_lift": C.DEAD_SCORE_PROPOSED_LIFT}
+    the walk-forward weeks with at least C.DEAD_SCORE_MIN_WEEK_DEAD dead calls
+    that count (trained on >= C.WF_MIN_TRAIN_ROWS rows, as for the bucket gates)."""
+    out = {"min_lift": C.DEAD_SCORE_PROPOSED_LIFT, "wf_min_train_rows": C.WF_MIN_TRAIN_ROWS}
     gi = _gate_index()
     for model in ("lightgbm", "logistic"):
         top = res["top"][model][gi]
         if not math.isclose(top["frac"], C.DEAD_SCORE_GATE_FRAC):
             raise ValueError(f"top share {top['frac']} where {C.DEAD_SCORE_GATE_FRAC} was expected")
         lift = top["lift"]
-        weeks = [w for w in res["walk_forward"]
-                 if not w.get("skipped") and not w["few_dead"]]
+        weeks = [w for w in res["walk_forward"] if V.wf_counted(w) and not w["few_dead"]]
         meet = sum(bool(w[model]["top10_lift"] >= C.DEAD_SCORE_PROPOSED_LIFT) for w in weeks)
         out[model] = {"test_lift": lift,
                       "test_ok": bool(lift >= C.DEAD_SCORE_PROPOSED_LIFT),
@@ -635,6 +659,8 @@ def train(df: pd.DataFrame, out_root, version: str | None = None, variants: bool
                      "max_trades_24h": C.DEAD_TRADES_24H},
             "dex_family_rules": dex_family_rules(),  # serving maps dex -> family with these
             "calib_recent_days": C.CALIB_RECENT_DAYS,
+            "calib_choice_fit_frac": C.CALIB_CHOICE_FIT_FRAC,
+            "wf_min_train_rows": C.WF_MIN_TRAIN_ROWS,
             "models": models, "runner_reference": reference,
             "data": res["data"], "metrics": res["buckets"]}
     meta = json.loads(json.dumps(_json_safe(meta), allow_nan=False))  # fixed before any variant runs

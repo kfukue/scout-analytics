@@ -111,7 +111,7 @@ cd "$ML/src/ml"
 "$ML/venv/bin/python" -m pytest tests -q -p no:cacheprovider
 ```
 
-Expected: `138 passed` (one deprecation warning from fastapi is fine).
+Expected: `148 passed` (one deprecation warning from fastapi is fine).
 
 ## 3. Read-only checks before the export (optional, psql or pgAdmin)
 
@@ -379,8 +379,15 @@ From the top:
      collapse label, also when the model was trained on collapse OR dead; the
      "bad outcomes removed incl. dead" row under it is information only, not
      a gate;
-   - beats buy-all in every week: in every evaluated walk-forward week, the
-     top 10% earned more on average than buying every call.
+   - beats buy-all in every week: in every counted walk-forward week, the
+     top 10% earned more on average than buying every call. A week counts
+     only when its training part has at least 1000 rows (`WF_MIN_TRAIN_ROWS`,
+     owner decision of 9 Oct 2026); weeks below are still in the walk-forward
+     table, marked "not counted (train < 1000)", and the verdict cell says
+     how many (e.g. "yes (8/8 weeks; 3 not counted)"). The early weeks of
+     the data (e.g. `medium` from 18 Aug 2026, 530 train rows) are such weeks.
+     The variant table's walk-forward columns and the dead-score proposal use
+     the counted weeks only, too.
 2. **Data and exclusions**: one line per reason a row was left out (update
    post, repeat call, no pool, not in USD, extreme outcome), then per bucket
    how many calls are not labelled yet. Not labelled yet means the horizon is
@@ -390,6 +397,10 @@ From the top:
    `medium` and `long` the purged k-fold inside train (rounds, calibration),
    test metrics (LightGBM vs the logistic baseline), the gate table, the
    money simulation, the walk-forward table, calibration and top features.
+   Each label's "Platt calibration:" line names the calibration it uses
+   (**recent window** or **all held-out rows**), chosen on held-out rows only
+   (comparison Brier values given, or the reason no comparison was made);
+   paste those lines with the report.
 4. **Dead after the call: separate score (report only; not saved, not
    served)**: one extra model (LightGBM and logistic) for "dead" =
    `trades_24h < 50`, on the short bucket's rows and split, NULL
