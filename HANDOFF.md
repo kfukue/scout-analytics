@@ -2,39 +2,119 @@
 
 ## Session state at restart (10 October 2026, ~06:15 UTC)
 
+**main is at f072467** (PR #15, ML walk-forward min, merged 10 Oct; it only
+touches `ml/`). Prod still runs dc0a42d, which is fine: nothing in PR #15
+needs a Go restart.
+
 **Where the current docs live:**
 
 - The up-to-date HANDOFF.md, SKILL.md, agent files, `tester.md` and
-  `TESTING.md` are committed on branch `work/2026-10-09-agent-setup` in
-  worktree `.claude/worktrees/agent-a42a71ec2e3703f1b`, not yet pushed or
-  merged. main's copies are older until this branch is merged.
+  `TESTING.md` are committed (79b98f0; the testing pause note and these
+  session-state updates are an uncommitted `HANDOFF.md` change for a second
+  commit, which the owner makes) on branch `work/2026-10-09-agent-setup` in worktree
+  `.claude/worktrees/agent-a42a71ec2e3703f1b`, not yet pushed or merged. main's copies are older until this branch is merged.
 - Next PM: read this file from that worktree first.
 
 **Owner rules learnt this session:**
 
-- `.claude/settings.json` denies `git push` for agents. Agents may commit on
-  `work/...` branches (owner-approved); the owner pushes; after the push an
-  agent may open the PR with `gh pr create` (or the PM gives the compare URL
-  + body). Never commit to main.
+- `.claude/settings.json` denies `git push` for agents. The owner approved
+  agents committing on `work/...` branches in principle, but `git commit` is
+  not in `.claude/settings.json`'s allow list, so background agents' commits
+  are denied. Until the owner adds `Bash(git commit:*)` /
+  `PowerShell(git commit:*)` (his decision; agents never edit that file), the
+  PM prepares the exact commit commands and the owner commits. The owner
+  pushes; after the push an agent may open the PR with `gh pr create` (or the
+  PM gives the compare URL + body). Never commit to main.
 - Reviewer runs on `fable`; researcher on `opus` (Opus 5.5). Coding agents
   up to 10 at once.
 - New agent files (tester) load only after a restart once the setup-docs
   branch is merged.
+
+### Testing setup: paused (owner, 10 October)
+
+The owner paused the testing setup; resume later. Reason: owner's call;
+drive C: is nearly full (see "Disk" below), which breaks Go builds and
+throwaway Postgres in the scratchpad.
+
+- **Paused:** the `tester` agent (do not use it yet, even though
+  `.claude/agents/tester.md` and `TESTING.md` are in the agent-setup commit),
+  the throwaway-Postgres scripts and the CI workflow. Until resumed, coders
+  run DB tests with the manual throwaway-Postgres steps in `TESTING.md`.
+- **Scripts** (worktree `agent-afcf62469a29564cf`): untracked
+  `scripts/testdb.sh` (tested end to end in Git Bash: 313 tests, 0 DB
+  skipped) and `scripts/testdb.ps1` (never executed; the worktree hook blocks
+  powershell). Review: no unsafe deletion path; must-fix = a real PowerShell
+  5.1 run. When paused, a coder was applying review fixes (empty-arg guard in
+  `Invoke-Stop`, tolerant port probes in bash, refuse drive roots/links,
+  require `port=` in testdb.info, `SCOUT_TESTDB_PGBIN` README line) and
+  attempting the PowerShell run; state unknown, so check
+  `git -C <wt> status`/diff before resuming. Commit with
+  `git add --chmod=+x scripts/testdb.sh`.
+- **CI** (worktree `agent-aa31691b57e3bc7ff`, HEAD dc0a42d): untracked
+  `.github/workflows/test.yml`, `.github/workflows/README.md`,
+  `.github/dependabot.yml`, modified `.gitattributes`. All first-review fixes
+  applied (no rerun on panic/timeout/build failure, `-timeout 25m`, job 40
+  min, GOPRIVATE narrowed, token via a repo-scoped git `extraheader` instead
+  of `insteadOf`, `set -euo pipefail`, gofmt step, dependabot). A focused
+  re-review of the token handling was running when paused; re-run it before
+  committing. Repo appears public, so Actions minutes are free; owner to
+  confirm visibility.
+- **Resume steps:** free disk space on C: first; then finish the scripts
+  (PowerShell run by the owner or an agent), re-review the CI token handling,
+  commit each on `work/2026-10-09-testdb-scripts` /
+  `work/2026-10-09-ci-tests`, owner pushes, PRs; then start using the tester
+  per SKILL.md.
+
+**Disk:** C: had ~100 MB free (837 of 838 GB used) on 10 Oct. Cause not yet
+found (agent leftovers are < 1 GB); the owner is investigating (WizTree /
+folder sizes). Agents' Go builds (linker) and throwaway Postgres fail until
+this is fixed. Option for the owner: allow agents to use `D:\go-work\tmp`
+for `GOTMPDIR`/`TMP`/`TEMP` and for Postgres data dirs (denied by
+permissions on 10 Oct).
+
+**Leftover throwaway Postgres servers:** agents' test servers run as
+separate processes and survive a Claude restart. Two were seen on 10 Oct, on
+`127.0.0.1:55461` and `127.0.0.1:55970`; leftover data dirs `scratchpad\pg`
+(~143 MB) and `scratchpad\timing` (~128 MB) are in the old session's
+scratchpad. Clean-up (owner, PowerShell):
+
+1. `Get-CimInstance Win32_Process -Filter "name='postgres.exe'" | Select-Object ProcessId, CommandLine`
+2. For each server whose `-D` is under `...\AppData\Local\Temp\claude\...`:
+   `& "D:\postgreSQL\17\bin\pg_ctl.exe" -D "<path>" stop -m fast`, then
+   delete that folder.
+3. Never touch the server whose data dir is the owner's own.
 
 **In-flight work** (state at restart; each worktree under
 `.claude/worktrees/`):
 
 | Worktree | Work | State | Next step |
 |---|---|---|---|
-| agent-a42a71ec2e3703f1b | Agent setup docs + tester agent + TESTING.md + HANDOFF updates | Review fixes applied; committed on `work/2026-10-09-agent-setup` | Owner pushes; PR; after merge restart Claude Code so tester.md and the model settings load. |
-| agent-aa31691b57e3bc7ff | GitHub Actions CI draft `.github/workflows/test.yml` + README + dependabot + `.gitattributes` | Reviewed (no must-fix); infra was applying 12 review fixes at restart (panic false-green guard on the flaky rerun, `-timeout 25m`, `changes` as required check, README facts, narrow GOPRIVATE, set -u, eol=lf, dependabot, optional gofmt step) | Check `git -C <wt> status`/diff to see which fixes landed; finish, quick re-review, commit `work/2026-10-09-ci-tests`, owner pushes, PR. Repo appears PUBLIC, so Actions are free; owner asked to confirm visibility. |
-| agent-afcf62469a29564cf | `scripts/testdb.sh` + `scripts/testdb.ps1` (throwaway Postgres for DB tests) | bash version tested end to end (313 tests pass, 0 DB skipped); PowerShell version never executed (hook blocks powershell in worktrees); reviewer was running at restart | Re-run reviewer if its report is lost; fix findings; owner runs the PowerShell validation block; commit `work/2026-10-09-testdb-scripts`. |
-| agent-a8cd1f54c100d5817 | Analytics Timing tab (`/api/analytics` format 4 + frontend), based on dc0a42d | coder was building at restart | Check its diff/tests; if unfinished, a new coder continues in that worktree; then tester (after restart) + reviewer; commit `work/2026-10-09-timing-tab`. Spec: section 4 item 7; touch-and-drop option (a) pending owner confirmation. |
-| agent-a8c7da1f9ff6a0cce | Perceptor `insufficient` level + 12-min re-check | Reviewed, no must-fix; coder was fast-forwarding to dc0a42d, re-testing with DB tests and committing on `work/2026-10-09-perceptor-recheck` at restart | `git -C <wt> log -1` / status to see if committed; owner pushes; PR; after merge owner restarts prod listener. Deferred should-fix: recheck.go `paceWait` should only lower `nextLook`. |
-| agent-af53dbd18b713cb60 | ML walk-forward min 1000 training rows (`WF_MIN_TRAIN_ROWS`) + calibration | COMMITTED locally as 0043e95 on `work/2026-10-09-ml-wf-min` | Awaiting the owner's push + PR; after merge owner retrains on prod. |
+| agent-a42a71ec2e3703f1b | Agent setup docs + tester agent + TESTING.md + HANDOFF updates | Owner committed the prepared message as 79b98f0 (10 Oct); the pause note + session-state updates in `HANDOFF.md` are uncommitted, for a second commit by the owner; owner pushes; PR. | After merge restart Claude Code so the model settings load (tester.md loads too, but the tester stays paused). |
+| agent-aa31691b57e3bc7ff | GitHub Actions CI draft `.github/workflows/test.yml` + README + dependabot + `.gitattributes` | Paused (owner, 10 Oct) | See "Testing setup: paused" above. |
+| agent-afcf62469a29564cf | `scripts/testdb.sh` + `scripts/testdb.ps1` (throwaway Postgres for DB tests) | Paused (owner, 10 Oct) | See "Testing setup: paused" above. |
+| agent-a8cd1f54c100d5817 | Analytics Timing tab (`/api/analytics` format 4 + frontend), based on dc0a42d | Unknown at restart (coder likely stopped by the full disk) | First check `git -C <wt> status`/diff before continuing; check its tests; if unfinished, a new coder continues in that worktree; then reviewer (tester paused, see above); commit `work/2026-10-09-timing-tab`. Spec: section 4 item 7; touch-and-drop option (a) pending owner confirmation. |
+| agent-a8c7da1f9ff6a0cce | Perceptor `insufficient` level + 12-min re-check | Reviewed, no must-fix. Branch still `worktree-agent-a8c7da1f9ff6a0cce`. Fast-forwarded to dc0a42d; one conflict in `scout_models.data.go` resolved keeping both sections (timing first, then re-check). 18 files UNCOMMITTED in the working tree (15 modified + `recheck.go`, `recheck_db_test.go`, `recheck_test.go`). `go build`/`go vet` OK, gofmt clean; full `go test -race -p 1 ./...` NOT run (linker failed: C: full). `onchainStateVersion` unchanged (2). Stash trap: see "Perceptor re-check" below the table. | Once C: has space: rebase onto current main (f072467, only adds `ml/`, should fast-forward cleanly); run the full tests with DB tests; exclude `HANDOFF.md` from the commit (`git checkout <main> -- HANDOFF.md` in that worktree; its only change is an "In progress (coder)" paragraph already covered here); commit as `work/2026-10-09-perceptor-recheck` (owner commits while agents' `git commit` is denied); owner pushes; PR with the deploy note below; after merge owner restarts prod listener. Deferred should-fix: recheck.go `paceWait` should only lower `nextLook`. |
+| agent-af53dbd18b713cb60 | ML walk-forward min 1000 training rows (`WF_MIN_TRAIN_ROWS`) + calibration | `work/2026-10-09-ml-wf-min` (0043e95) pushed and merged by the owner on 10 Oct (PR #15, f072467) | Owner retrains on prod (`--variants` optional) and sends the report's PASS/FAIL lines. |
 | agent-ae1d8c7d8de93a35b | GCP public site draft (Cloud Run, `deploy/gcp/`, INTERFACE.md) | Reviewed and fixed; not committed | Commit `work/2026-10-09-gcp-site` (infra agent), owner pushes, PR. No cloud resources without owner approval. |
 | agent-ae167c3d46439a04d | sAlpha re-ask | Not finished | After the Perceptor re-check merges: update onto main, add `notify_message_id` for re-check deliveries, treat `sending` as not sent in `FirstSentDelivery`, live-path Bot API 429 pause, then review. `notify_message_id`, `FirstSentDelivery` and `botAPIRedact` exist only on this re-ask branch; the `sending` status exists only on the Perceptor re-check branch (agent-a8c7da1f9ff6a0cce), so the `FirstSentDelivery` item waits for the re-check merge and re-ask being updated onto it. |
 | agent-adc7b7e6c79d4bb23 | Timing backend | MERGED (PR #14, dc0a42d) | Owner can remove the worktree. |
+
+**Perceptor re-check (worktree `agent-a8c7da1f9ff6a0cce`): trap and PR
+deploy note.**
+
+- **Stash trap:** `stash@{0}` ("recheck") is only a BACKUP copy of the same
+  uncommitted changes. Do NOT `stash pop` it (it would double-apply); drop
+  it only after the commit exists. Never touch `stash@{1}` (GitHub Desktop,
+  ml-variants).
+- **Deploy note for its PR:** its `scoutanalytics.sql` contains a bulk
+  `UPDATE scout_investigations SET verdict_level='insufficient' WHERE verdict_level='unknown' AND report_text ILIKE '%not enough data yet%'`
+  that runs automatically at every Go start (repeat-safe). Before merging,
+  the owner runs the read-only count
+  `SELECT count(*) FROM scout_investigations WHERE verdict_level='unknown' AND report_text ILIKE '%not enough data yet%';`
+  and the number goes in the PR's Deploy notes.
+- The migration also adds `AND i.details->>'recheck' IS NULL` to
+  `scout_call_dataset_v`: re-check reports are excluded from training
+  (leakage rule).
 
 **Verified on prod 10 October (owner-run checks):**
 
@@ -73,7 +153,7 @@
 
 ## Introduction
 
-Up to date as of 10 October 2026 (main at dc0a42d). Start Claude
+Up to date as of 10 October 2026 (main at f072467). Start Claude
 Code in the repo root; `.claude/settings.json` makes the session the product
 manager, which delegates to the agents in `.claude/agents/` (see "Agent setup").
 
@@ -100,16 +180,11 @@ pending (9 October 2026). Items marked "on branch" are not on `main` yet.
   under `.claude/worktrees/` — see the Session state table at the top):
   - Perceptor re-check: `insufficient` level for "not enough data yet" reports
     plus an automatic re-check about 12 minutes later.
-  - ML walk-forward minimum training rows (`WF_MIN_TRAIN_ROWS`) and
-    calibration: COMMITTED locally as 0043e95 on `work/2026-10-09-ml-wf-min`
-    (worktree agent-af53dbd18b713cb60), awaiting the owner's push + PR; after
-    merge, training with `--variants`.
   - GCP public site draft (`deploy/gcp/`).
   - Throwaway-Postgres scripts `scripts/testdb.ps1` / `scripts/testdb.sh`
-    (agent-afcf62469a29564cf; review fixes + PowerShell validation in
-    progress).
-  - CI draft `.github/workflows/test.yml` (agent-aa31691b57e3bc7ff; review
-    fixes in progress; owner approval).
+    (agent-afcf62469a29564cf) (paused, see Session state).
+  - CI draft `.github/workflows/test.yml` (agent-aa31691b57e3bc7ff; owner
+    approval) (paused, see Session state).
   - sAlpha re-ask (re-ask when the first answer was declined, empty or timed
     out; section 3 "Decisions 9 October"): after the Perceptor re-check
     merges, rebase. Still to do on that branch: store `notify_message_id` for
@@ -137,6 +212,8 @@ pending (9 October 2026). Items marked "on branch" are not on `main` yet.
   - `scout_models_db_test.go:18`: the example DSN in the comment still uses
     `localhost:5432`; change it to a throwaway port as in README/TESTING.md.
 - **Owner checks:**
+  - disk space: free space on C: (Go build cache `go clean -cache`, temp
+    files); ~100 MB free on 10 Oct blocks Go builds and the testing setup;
   - price providers: confirm which external USD price sources may be used as
     a fallback;
   - DNS manager: who hosts DNS for lylelabs.io, needed to point
@@ -916,7 +993,9 @@ Later:
 ## How to test
 
 Full guide: `TESTING.md` (throwaway DB scripts, CI, the complete command
-list). The short version:
+list). The scripts and CI are not on `main` and are paused (Session state,
+"Testing setup: paused"); use the manual throwaway-Postgres steps. The short
+version:
 
 - From the repo root: `go vet ./...` and `go test -race ./...` (`./...`
   also covers `internal/database`). Database tests need
@@ -986,12 +1065,13 @@ Checks after deploying `work/2026-10-08-ml-pool-web` (deployed 8 October in
   with the Go, JS, CSP and Charts rules), `ml-coder`, `react-coder`, `infra`
   (approval-gated), `reviewer`, `researcher`, `product-manager`, and `tester`
   (added 9 October: runs and writes unit and integration tests in a coder's
-  worktree, test files only). All 8 are active.
+  worktree, test files only). All 8 are defined; the tester is paused
+  (owner, 10 Oct; see Session state).
 - Testing rules for all agents: `TESTING.md` (repo root).
 - The tester (verify mode) runs after the coder when a change touches
   `scoutanalytics.sql`, tracker/on-chain code, delivery/notify/re-check/re-ask,
-  the web snapshot/API or `ml/` (rule in the PM skill); the reviewer runs
-  before every commit.
+  the web snapshot/API or `ml/` (rule in the PM skill), once the testing
+  setup is resumed; the reviewer runs before every commit.
 - At most 10 coding agents in parallel (owner's limit, raised 9 Oct 2026).
 - `settings.json`: read-only git, `node --check` and the ml venv pytest
   (`ml/.venv`, or `.venv` from inside `ml/`) are allowed; secrets are denied in
