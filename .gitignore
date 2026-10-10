@@ -25,3 +25,10 @@ __pycache__/
 /.claude/worktrees/
 /.claude/commands.txt
 /commands.txt
+
+# GCP deploy (never commit keys or rendered files)
+gcp-*.json
+*-key.json
+*.p12
+/deploy/gcp/**/*.rendered.*
+/deploy/gcp/firebase/.firebase/

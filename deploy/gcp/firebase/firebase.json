@@ -1,0 +1,14 @@
+{
+  "hosting": {
+    "public": "public",
+    "ignore": ["firebase.json", "**/.*"],
+    "cleanUrls": false,
+    "trailingSlash": false,
+    "rewrites": [
+      {
+        "source": "**",
+        "run": { "serviceId": "scout-web", "region": "us-central1" }
+      }
+    ]
+  }
+}
