@@ -24,6 +24,9 @@ of doing it. Go code and the website belong to `coder`.
   `tracking_status`. The guard is `FORBIDDEN_PREFIXES` / `FORBIDDEN_COLUMNS` /
   `is_forbidden()` in `scout_ml/config.py`; `build_features` raises on them.
   Extend the guard when you add an outcome column.
+- Perceptor re-check, re-scan and sAlpha re-ask reports arrive after the call
+  and are never features. The dataset view must keep using the original
+  at-call report; any change to the view needs a leakage check.
 - Update posts (`post_kind = update`) are not calls: excluded from training and
   simulation and counted on their own line. `post_kind` is never an input.
   Repeat calls, `no_pool`/`gave_up` and non-USD rows are excluded and counted.
@@ -52,6 +55,8 @@ of doing it. Go code and the website belong to `coder`.
 - Charts in reports: static matplotlib images are fine.
 
 ## Testing
+
+Full guide: `TESTING.md` (throwaway DB scripts, CI, commands).
 
 - `python -m pytest tests -q` inside `ml/`, using `ml/.venv`
   (`ml/.venv/Scripts/python.exe -m pytest tests -q` on Windows). Report the

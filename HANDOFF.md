@@ -1,6 +1,79 @@
 # Scout analytics: handoff to Claude Code
 
-Up to date as of 8 October 2026 (evening: 4e7e049 deployed). Start Claude
+## Session state at restart (10 October 2026, ~06:15 UTC)
+
+**Where the current docs live:**
+
+- The up-to-date HANDOFF.md, SKILL.md, agent files, `tester.md` and
+  `TESTING.md` are committed on branch `work/2026-10-09-agent-setup` in
+  worktree `.claude/worktrees/agent-a42a71ec2e3703f1b`, not yet pushed or
+  merged. main's copies are older until this branch is merged.
+- Next PM: read this file from that worktree first.
+
+**Owner rules learnt this session:**
+
+- `.claude/settings.json` denies `git push` for agents. Agents may commit on
+  `work/...` branches (owner-approved); the owner pushes; after the push an
+  agent may open the PR with `gh pr create` (or the PM gives the compare URL
+  + body). Never commit to main.
+- Reviewer runs on `fable`; researcher on `opus` (Opus 5.5). Coding agents
+  up to 10 at once.
+- New agent files (tester) load only after a restart once the setup-docs
+  branch is merged.
+
+**In-flight work** (state at restart; each worktree under
+`.claude/worktrees/`):
+
+| Worktree | Work | State | Next step |
+|---|---|---|---|
+| agent-a42a71ec2e3703f1b | Agent setup docs + tester agent + TESTING.md + HANDOFF updates | Review fixes applied; committed on `work/2026-10-09-agent-setup` | Owner pushes; PR; after merge restart Claude Code so tester.md and the model settings load. |
+| agent-aa31691b57e3bc7ff | GitHub Actions CI draft `.github/workflows/test.yml` + README + dependabot + `.gitattributes` | Reviewed (no must-fix); infra was applying 12 review fixes at restart (panic false-green guard on the flaky rerun, `-timeout 25m`, `changes` as required check, README facts, narrow GOPRIVATE, set -u, eol=lf, dependabot, optional gofmt step) | Check `git -C <wt> status`/diff to see which fixes landed; finish, quick re-review, commit `work/2026-10-09-ci-tests`, owner pushes, PR. Repo appears PUBLIC, so Actions are free; owner asked to confirm visibility. |
+| agent-afcf62469a29564cf | `scripts/testdb.sh` + `scripts/testdb.ps1` (throwaway Postgres for DB tests) | bash version tested end to end (313 tests pass, 0 DB skipped); PowerShell version never executed (hook blocks powershell in worktrees); reviewer was running at restart | Re-run reviewer if its report is lost; fix findings; owner runs the PowerShell validation block; commit `work/2026-10-09-testdb-scripts`. |
+| agent-a8cd1f54c100d5817 | Analytics Timing tab (`/api/analytics` format 4 + frontend), based on dc0a42d | coder was building at restart | Check its diff/tests; if unfinished, a new coder continues in that worktree; then tester (after restart) + reviewer; commit `work/2026-10-09-timing-tab`. Spec: section 4 item 7; touch-and-drop option (a) pending owner confirmation. |
+| agent-a8c7da1f9ff6a0cce | Perceptor `insufficient` level + 12-min re-check | Reviewed, no must-fix; coder was fast-forwarding to dc0a42d, re-testing with DB tests and committing on `work/2026-10-09-perceptor-recheck` at restart | `git -C <wt> log -1` / status to see if committed; owner pushes; PR; after merge owner restarts prod listener. Deferred should-fix: recheck.go `paceWait` should only lower `nextLook`. |
+| agent-af53dbd18b713cb60 | ML walk-forward min 1000 training rows (`WF_MIN_TRAIN_ROWS`) + calibration | COMMITTED locally as 0043e95 on `work/2026-10-09-ml-wf-min` | Awaiting the owner's push + PR; after merge owner retrains on prod. |
+| agent-ae1d8c7d8de93a35b | GCP public site draft (Cloud Run, `deploy/gcp/`, INTERFACE.md) | Reviewed and fixed; not committed | Commit `work/2026-10-09-gcp-site` (infra agent), owner pushes, PR. No cloud resources without owner approval. |
+| agent-ae167c3d46439a04d | sAlpha re-ask | Not finished | After the Perceptor re-check merges: update onto main, add `notify_message_id` for re-check deliveries, treat `sending` as not sent in `FirstSentDelivery`, live-path Bot API 429 pause, then review. `notify_message_id`, `FirstSentDelivery` and `botAPIRedact` exist only on this re-ask branch; the `sending` status exists only on the Perceptor re-check branch (agent-a8c7da1f9ff6a0cce), so the `FirstSentDelivery` item waits for the re-check merge and re-ask being updated onto it. |
+| agent-adc7b7e6c79d4bb23 | Timing backend | MERGED (PR #14, dc0a42d) | Owner can remove the worktree. |
+
+**Verified on prod 10 October (owner-run checks):**
+
+- Prod checkout at dc0a42d; listener (`-listen-only`), tracker (`-track`)
+  and `-web` started 9 Oct 22:34 PDT, after the pull, so all run the timing
+  backend.
+- `timedatectl`: clock synchronized, NTP active.
+- Timing backfill verified: every first call has timing in every horizon;
+  rows without timing (~149 per horizon) are all `repeat` calls; all 245
+  rugged calls have rug times (65 `event`, 7 `at_call`, 173
+  `detected`/approximate); 0 rows re-stored after timing; 0 negative values.
+- First numbers (horizon: timed / reached 2× / median s to 2× / still ≥ 2×
+  at end): 1h 5247/1365/434/229; 1d 5196/1863/850/81; 3d
+  5058/1924/1002/66; 7d 4884/1905/1051/50; 30d 2982/1247/1021/28.
+
+**Owner decisions still open:**
+
+- touch-and-drop option (a) (touch 2× then drop = reached 2×, 0 held; the
+  Timing tab uses (a) by default);
+- is the GitHub repo meant to be public;
+- Perceptor re-scan 250/day + 1440 h max age (current 100/day, 30 days);
+- public-site stopgap;
+- price providers;
+- DNS manager for lylelabs.io.
+- Optional: fix PC PATH `D:\postgreSQL\bin` -> `D:\postgreSQL\17\bin`.
+
+**Planned later:**
+
+- test-DB safety guard (DB tests refuse any URL that is not `scout_test` on
+  localhost) after the Perceptor and sAlpha branches merge;
+- ML timing outcome columns (`timing_` forbidden prefix);
+- GCP export in Go per INTERFACE.md;
+- the owner's settings allow-list could add initdb/pg_ctl/createdb,
+  `go tool cover`, `node testdata/...`, `scripts/testdb.*` so the tester
+  avoids prompts (owner's file; agents never edit it).
+
+## Introduction
+
+Up to date as of 10 October 2026 (main at dc0a42d). Start Claude
 Code in the repo root; `.claude/settings.json` makes the session the product
 manager, which delegates to the agents in `.claude/agents/` (see "Agent setup").
 
@@ -17,11 +90,80 @@ from that repo's `main` at 4369a1d (PR #20), plus one standalone commit (own
 section 5 is an **old-repo** hash; the rewritten hashes for the ones that
 matter are in section 5. Package `main` is at the repo root: `go run .`.
 
+## Deferred / open
+
+Kept current by the PM whenever an item is deferred or an owner check is
+pending (9 October 2026). Items marked "on branch" are not on `main` yet.
+
+- **Awaiting owner commit/merge** (not on `main`; each item exists as
+  uncommitted changes, or a local commit not yet pushed, in an agent worktree
+  under `.claude/worktrees/` — see the Session state table at the top):
+  - Perceptor re-check: `insufficient` level for "not enough data yet" reports
+    plus an automatic re-check about 12 minutes later.
+  - ML walk-forward minimum training rows (`WF_MIN_TRAIN_ROWS`) and
+    calibration: COMMITTED locally as 0043e95 on `work/2026-10-09-ml-wf-min`
+    (worktree agent-af53dbd18b713cb60), awaiting the owner's push + PR; after
+    merge, training with `--variants`.
+  - GCP public site draft (`deploy/gcp/`).
+  - Throwaway-Postgres scripts `scripts/testdb.ps1` / `scripts/testdb.sh`
+    (agent-afcf62469a29564cf; review fixes + PowerShell validation in
+    progress).
+  - CI draft `.github/workflows/test.yml` (agent-aa31691b57e3bc7ff; review
+    fixes in progress; owner approval).
+  - sAlpha re-ask (re-ask when the first answer was declined, empty or timed
+    out; section 3 "Decisions 9 October"): after the Perceptor re-check
+    merges, rebase. Still to do on that branch: store `notify_message_id` for
+    re-check deliveries; treat the `sending` status as not sent in
+    `FirstSentDelivery`; Bot API 429 pause on the live path; then review.
+    `notify_message_id`, `FirstSentDelivery` and `botAPIRedact` exist only on
+    the re-ask branch (worktree `agent-ae167c3d46439a04d`); the `sending`
+    delivery status exists only on the Perceptor re-check branch
+    (`agent-a8c7da1f9ff6a0cce`), so the `FirstSentDelivery` item can only be
+    done after the re-check merges and re-ask is updated onto it.
+- **Should-fix, deferred:** in `recheck.go` (re-check branch), the `paceWait`
+  branch should only lower `nextLook`:
+  `if at := now.Add(wait); at.Before(l.nextLook) { l.nextLook = at }`.
+- **Small fixes:**
+  - narrow `isNoSuchValue` (`onchain.go`);
+  - the "0 red flags" parser bug: a Perceptor report with zero red flags is
+    parsed wrongly;
+  - `reply_to_msg_id` filtering: only accept bot replies that reply to our
+    own request;
+  - wait-group hardening: the listener goroutines on a Telegram reconnect;
+  - test-DB safety guard: make DB tests refuse any `SCOUT_TEST_DATABASE_URL`
+    that is not database `scout_test` on localhost/127.0.0.1 (touches many
+    `*_db_test.go` files; do it after the Perceptor re-check and sAlpha
+    branches merge).
+  - `scout_models_db_test.go:18`: the example DSN in the comment still uses
+    `localhost:5432`; change it to a throwaway port as in README/TESTING.md.
+- **Owner checks:**
+  - price providers: confirm which external USD price sources may be used as
+    a fallback;
+  - DNS manager: who hosts DNS for lylelabs.io, needed to point
+    `scout-analytics.lylelabs.io` at Cloud Run (section 4 item 8);
+  - touch-and-drop option (a): how a token that touches 2× and immediately
+    falls back is shown in the Timing analytics; option (a) counts it as
+    reaching 2×, with time held 0 (section 4 item 7); owner to confirm;
+  - stopgap decision: whether to ship an interim version of the public site
+    before the full GCP export exists (section 4 item 8);
+  - re-scan 250/day and 1440 h max age: a proposed raise from the current
+    Perceptor re-scan defaults (100/day, 30 days; section 3 "Prod
+    settings"); the owner decides.
+- **Later:** Timing tab frontend (`/api/analytics` format 4): in progress
+  (worktree agent-a8cd1f54c100d5817); ML timing outcome columns: extend the
+  leakage guard (`FORBIDDEN_PREFIXES`/`FORBIDDEN_COLUMNS`) for the timing and
+  rug columns (`peak_late_after_s`, `first_2x_after_s`, `above_2x_s`,
+  `fall_below_2x_after_s`, `above_2x_censored`, `timing_at`, `rug_at`,
+  `rug_at_kind`) BEFORE adding them to `scout_call_dataset_v`; GCP export in Go per `deploy/gcp/INTERFACE.md` (not on `main` yet); the mcap
+  comparison query.
+- **Paused:** multi-source calls (section 4 item 6).
+
 ## What the system is
 
 Repo `kfukue/scout-analytics`, branch `main` (the only branch carried over).
 Production runs from a checkout of this repo since the cut-over (section 5,
-owner confirmed 8 October); prod runs `main` at **4e7e049** (section 3).
+owner confirmed 8 October); prod runs `main` at **dc0a42d** (listener,
+tracker and `-web` started 9 Oct 22:34 PDT after the pull; section 3).
 
 - Listener: reads @scoutrobinhood, tells real calls from "hit 3X" update posts
   (`postkind.go`), sends new tokens to @perceptor0xBot and @salpha_research_bot,
@@ -106,6 +248,18 @@ extracted from 4369a1d.
 Since the cut-over (8 October) prod runs from the new checkout of this repo
 (section 5); the old checkout (old repo at 4369a1d) is kept for rollback.
 
+In this repo (`kfukue/scout-analytics`; its PR numbers restart at #1, so these
+are not the old repo's #10–#14 above), merged to `main` on 9 October:
+
+- #11: 46a59e4: deflaked pacing test; parallel coder limit raised to 10
+  (owner).
+- #12: eff4868: ML dead rule off by default; separate report-only "dead after
+  the call" score.
+- #13: 251f5ba: token supply lookup; Analytics "Market cap at call" = price ×
+  supply (format 3).
+- #14: 40fb014 (merge dc0a42d): timing after the call (time to peak, 2×
+  reached/held/fell back, rug time) and `-backfill-timing` (section 4 item 7).
+
 ## 2. Merged and deployed: the 8 October work and the re-scan backend
 
 Both branches went out together. `work/2026-10-09-perceptor-rescan`
@@ -139,7 +293,8 @@ c. **Website readability + `?days=` age filter**: `frontend/*`, `web.go`,
    section. Reviewed.
 
 Done: the website "Perceptor today" label (section 4 item 2), merged
-(PR #2/#3) and deployed.
+(1970c35, PR #3 = merge ecb7d55; PR #2 = merge f7b0ee0 carried only the
+ML fixes bb6ac10) and deployed.
 
 ## 3. Prod state and pending owner actions
 
@@ -176,6 +331,11 @@ Deployed 8 October (owner confirmed):
   started in, and a variable already set in the shell wins over the file.
   After every restart, check the `latest prices on:` line.
 
+Done 10 October (owner confirmed): prod checkout at **dc0a42d**; listener,
+tracker and `-web` restarted 9 Oct 22:34 PDT after the pull (they run the
+timing backend); `timedatectl` shows the clock synchronized (NTP active);
+the timing negative-values check returned 0.
+
 Still to confirm in prod:
 
 - the `latest prices: … waiting` count falling over the first 1–2 hours;
@@ -188,15 +348,16 @@ Pending owner actions:
    section 4 item 1).
 2. Done 8 October: failed-rescan limit decided = 2 (section 4 item 2).
 3. Answer the five early-transaction questions (section 4 item 4).
-4. `.claude/commands.txt`: add to `.gitignore` or delete (below).
+4. Done: `.claude/commands.txt` is in `.gitignore` (c9e9fcc, PR #6 =
+   merge 0122a98).
 5. Optional: the sizing queries (read-only, in pgAdmin).
 6. No longer needed (resolved by query, 8 October): `-price-check` on
    calls 664, 578 and 504 (the "Uniswap V4" flat calls, section 4 item 1).
 7. Answer the five Analytics page questions (section 4 item 5; the PM chose
    defaults meanwhile).
 
-`.claude/commands.txt` is an untracked local prompt file (no secrets). It
-should go in `.gitignore` or be deleted; the owner decides.
+`.claude/commands.txt` is an untracked local prompt file (no secrets); it is
+ignored since c9e9fcc (`/.claude/commands.txt` in `.gitignore`).
 
 Decisions taken 8 October: the 1-hour latest-price refresh for old calls is
 approved; the Perceptor re-scan is approved with the defaults in section 4;
@@ -210,15 +371,15 @@ Decisions 9 October (owner):
   has state, else latest; stored in `scout_call_tracking.token_supply` /
   `token_supply_block`. Analytics factor = price at the post × supply
   ("fully diluted"); no fallback to the posted figure; not an ML feature
-  for now. In progress (coder).
+  for now. Shipped (251f5ba, PR #13, 9 October).
 - sAlpha: stop forwarding declines. Re-ask 6–24 h after the call when the
   reply was a decline, empty or a timeout (`scan_kind='reask'`, separate
   from the Perceptor rescan lane, at most 60 a day; the follow-up is
   delivered as a reply to the original delivery message; never feeds ML).
   In progress (coder).
 - ML: the dead rule is off by default (the collapse label is plain again);
-  a separate report-only "dead after the call" score. In progress
-  (ml-coder).
+  a separate report-only "dead after the call" score. Shipped (eff4868,
+  PR #12, 9 October).
 - ML: keep DEX families, not raw DEX names (raw wins only in the test
   period, not walk-forward). The "tradeable runners" variant: revisit for
   the 7-day model after more weeks.
@@ -228,9 +389,12 @@ Decisions 9 October (owner):
   the KOL message Call Analyser links to; later callers are recorded and
   tracked, not delivered; fall back to Call Analyser's repost if the KOL
   post can't be read). "Diamond" (💎) = elite.
-- Queued: the Analytics Timing tab (section 4 item 7), after the
-  market-cap branch is reviewed. Planning: a public website on GCP (item
-  8).
+- The Analytics Timing tab (section 4 item 7): the backend is merged to
+  `main` (PR #14, dc0a42d); `-backfill-timing` was run on prod on 9 October
+  and checked with owner-run read-only SQL (results in section 4 item 7;
+  the negative-values sanity check is done: 0). Prod runs dc0a42d (owner
+  confirmed 10 October). The tab itself (frontend,
+  format 4) comes next. Public website on GCP Cloud Run (item 8).
 
 **Prod settings** (for reference):
 
@@ -272,8 +436,8 @@ Decisions 9 October (owner):
      fails: short 1.16, 3day 1.83 (CI about 0.9–3.2), medium 0.52, long
      not meaningful. Buying all calls loses −21% (1d), −27% (3d), −44%
      (7d).
-   - **ML fixes done (ml-coder, 8 October; on the branch, not yet
-     merged):**
+   - **ML fixes done (ml-coder, 8 October; merged to `main` in bb6ac10,
+     PR #2 = merge f7b0ee0):**
      - drop `secs_since_prev_call`/`prior_calls` (always NULL/0 for first
        calls);
      - categorical levels from train rows only, case-insensitive (old
@@ -288,19 +452,26 @@ Decisions 9 October (owner):
        `config.py`.
      - The gates are unchanged.
      - Tested locally: 74 pytest passed.
-     - Next: the owner merges, then retrains on prod with
+     - Next: retrain on prod with
        `REPO="$PWD" ML=~/scout-ml bash ~/scout-ml/run_training.sh
-       --skip-install` and copies `report.md` to `ml-results/`.
+       --skip-install` and copy `report.md` to `ml-results/`.
+   - **Done since (merged to `main`):**
+     - DEX names grouped into stable families (182022e,
+       PR #4 = merge 296cad5; family rules completed in b2154ab, PR #9 =
+       merge 6284538). There are about 50 posted DEX names, many
+       short-lived and time-specific: e.g. "Pons" until mid-Aug then "Pons
+       V2", "Pools Trade Instant" in Aug only, "O1 Rwa" for one week.
+     - Recent-window calibration (the base rate drifts week to week;
+       182022e, PR #4).
+     - A "dead after the call" outcome (`trades_24h`; 182022e, PR #4); the
+       dead rule is off by default and there is a separate report-only
+       "dead after the call" score (eff4868, PR #12 = merge 87d3e94).
+     - `--variants` comparison (dead rule, DEX inputs, tradeable runners;
+       b2154ab, PR #9).
    - **Queued ML items:**
-     - Group DEX names and quote assets into stable families. There are
-       about 50 posted DEX names, many short-lived and time-specific: e.g.
-       "Pons" until mid-Aug then "Pons V2", "Pools Trade Instant" in Aug
-       only, "O1 Rwa" for one week.
-     - Calibrate on recent weeks or weight recent calls (the base rate
-       drifts week to week).
-     - A "dead after the call" label/flag (e.g. fewer than about 50
-       trades in the 24 h after the call), so flat dead tokens are not
-       counted as safe non-collapses.
+     - Quote assets into stable families (queued with the DEX families on
+       8 October; `ml/` has no quote-asset families yet, only
+       case-insensitive level matching).
      - Optional: refit on all data before saving the model.
      - Optional: case-insensitive `pre_vol_unit` / `price_unit`.
    - **Query findings (the owner ran them 8 October):**
@@ -326,13 +497,13 @@ Decisions 9 October (owner):
        with lows of about 4.5–5e-8 ETH; likely templated launches with a
        fixed liquidity range.
      - ML impact: the low v4 collapse rate from 21 Sep is partly dead
-       tokens counted as non-collapses, hence the queued "dead after the
-       call" item.
+       tokens counted as non-collapses, hence the "dead after the call"
+       outcome (now merged, above).
 2. **Perceptor re-scan of first calls without a Perceptor report**
    (approved 8 October with the defaults below). **Backend merged
    (0a46f28, in PR #1 = 4e7e049) and deployed 8 October; the lane is on
    in prod since 8 October (`SCOUT_RESCAN=on`).** The website "Perceptor
-   today" label is merged (PR #2/#3) and deployed.
+   today" label is merged (PR #3) and deployed.
    - What it does, backend only:
      - `scan_kind` column on `scout_investigations` (`'live'`/`'rescan'`,
        idempotent `ADD COLUMN IF NOT EXISTS`, default `'live'`) with a
@@ -375,9 +546,9 @@ Decisions 9 October (owner):
      - The daily cap can undercount while database inserts fail (the gap
        still holds).
      - A "Perceptor today" change sends no SSE event in 4e7e049; the label
-       (merged in PR #2/#3) adds one (`report` with `tool: perceptor_today`).
+       (merged in PR #3) adds one (`report` with `tool: perceptor_today`).
    - Done on this line: the frontend "Perceptor today" label, merged
-     (PR #2/#3) and deployed; the lane is on in prod since 8 October.
+     (PR #3) and deployed; the lane is on in prod since 8 October.
    - Off by default: `SCOUT_RESCAN=on`. Settings and defaults:
      `SCOUT_RESCAN_MAX_AGE=720h`, `SCOUT_RESCAN_MAX_PER_DAY=100`,
      `SCOUT_RESCAN_GAP=10m`, `SCOUT_RESCAN_IDLE=5m`,
@@ -471,9 +642,9 @@ Decisions 9 October (owner):
        tax. Rugged calls keep their pre-rug peak here (the list hides it).
      - Defaults the PM chose (owner may change): weeks Mon–Sun UTC, returns
        before tax, 1d default.
-   - **Chart batch: built 8 October, uncommitted on
-     `work/2026-10-09-analytics-charts`** (coder; reviewed; awaiting
-     commit/PR and deploy). Three tabs over the same feed (`/api/analytics`
+   - **Chart batch: built 8 October, merged to `main` (45e448b, PR #7 =
+     merge cb4c006)** (coder; reviewed; on prod since dc0a42d, started
+     9 Oct 22:34 PDT). Three tabs over the same feed (`/api/analytics`
      format 2, which adds per first call the values known at the call:
      called-at market cap, holders, elite/good holders, elite/good live buys
      count and USD, and the hour before the call: buy/sell volume in USD,
@@ -497,17 +668,13 @@ Decisions 9 October (owner):
        choices (quiet choice only), plus one line for the chosen family /
        verdict; label and caption fixes.
      - Market cap factor: the owner chose "market cap at call from the
-       price" (entry price × supply), but the token supply is not stored
-       anywhere, so the page still sends the posted `called_at_mcap_usd`,
-       labelled "Market cap at call (posted)". A price-based one needs a
-       `totalSupply()` read per token (about 4.7k node calls once, then one
-       per new call), stored with the call (optional `onchain` JSON field
-       or a new `scout_call_tracking` column), a backfill pass, and the
-       website load query; owner to decide (details in the coder's report
-       of 9 October).
-     - Needs its own PR from `work/2026-10-09-analytics-charts`: `main`
-       already has PR #6 (merge 0122a98), which merged only the skill
-       commit (c9e9fcc), not this batch.
+       price" (entry price × supply). Shipped in 251f5ba (PR #13 = merge
+       2a50d32): the token supply is stored in
+       `scout_call_tracking.token_supply` and the Analytics "Market cap at
+       call" is price × supply (`/api/analytics` format 3); see section 3
+       "Decisions 9 October".
+     - PR history: PR #6 (merge 0122a98) merged only the skill commit
+       (c9e9fcc); the chart batch itself came in PR #7.
    - **Section 2, "Model insights": next** (now only an empty "coming soon"
      heading). Plan: show the model report from the training run's
      `meta.json`, read from a folder set by a new `SCOUT_ML_DIR` setting;
@@ -531,9 +698,25 @@ Decisions 9 October (owner):
      - Call Analyser delivery: first post per token, or every caller.
    - Phase plan: 0 pin the readers to Scout; 1 Robinhood sources; 2 store
      Base; 3 track Base.
-7. **Analytics Timing tab** (queued; starts after the price-based
-   market-cap branch is reviewed). Results after the call: never model
-   inputs.
+7. **Analytics Timing tab** (backend merged; frontend next). Results
+   after the call: never model inputs.
+   - Status (9 October): the backend (the timing function, the columns
+     below and `-backfill-timing`) is **merged to `main` (40fb014, PR #14,
+     merge dc0a42d)**. Prod's listener, tracker and `-web` run dc0a42d
+     (started 9 Oct 22:34 PDT; owner confirmed 10 October). The Timing tab
+     frontend (`/api/analytics` format 4) comes
+     next ("Deferred / open").
+   - Backfill (prod, 9 October): the owner ran `-backfill-timing` (dry run
+     and real run) and checked it with read-only SQL:
+     - every first call has timing in every horizon (5,247 calls);
+     - the ~149 rows per horizon without timing are all `repeat` calls
+       (no late entry; expected);
+     - all 245 rugged calls have a rug time: 65 `event`, 7 `at_call`,
+       173 `detected` (approximate: the time of the end-of-tracking
+       check);
+     - 0 rows re-stored after timing;
+     - negative-values sanity check (10 October): 0 negative values;
+     - first numbers are in "Session state at restart" at the top.
    - What it shows:
      - time to peak: how long after the call the best price came;
      - how long it held +100%: when it first reached 2×, total time at or
@@ -549,8 +732,10 @@ Decisions 9 October (owner):
      - a "still at 2× after t" curve (Kaplan–Meier, from the first cross)
        and a "share rugged by t" curve;
      - all on a new "Timing" tab with the same filters and factor picker.
-   - Data: no timing is stored today (`scout_call_returns` has the peak
-     size, not its time). Computed from stored candles
+   - Data: before dc0a42d no timing was stored (`scout_call_returns` had the
+     peak size, not its time); the columns below (plus
+     `above_2x_censored`) are on `main` since dc0a42d. Computed from stored
+     candles
      (`scout_call_candles`: 5-minute for the first 24 h, hourly up to the
      last completed horizon ≤ 30d). No new node calls for peaks/2×, no
      re-tracking, `onchainStateVersion` unchanged. Resolution: 5 min on
@@ -579,13 +764,15 @@ Decisions 9 October (owner):
        forbidden as inputs (add a `timing_` forbidden prefix), so later
        report-only scores can predict e.g. "fast runner: 2× within 1 h",
        "early rug: rug within 24 h", "holds 2× ≥ 6 h".
-8. **Public cloud website on GCP** (planning).
+8. **Public cloud website on GCP** (Cloud Run; draft not on `main` yet).
    - Owner decisions (9 October): GCP; the site is public (anyone with the
-     link).
+     link). GCP Cloud Run for the public read-only site
+     `scout-analytics.lylelabs.io` (draft in `deploy/gcp/`, not on `main`
+     yet, pending commit/merge). Options A-C below are superseded and kept for history.
    - Plan: the prod server exports the website's numbers (built from the
      existing in-memory snapshot) to GCP when data changes. The public
      site never connects to Postgres or the node.
-   - Options under study:
+   - Options that were under study (superseded by Cloud Run):
      - (A) Firebase Hosting / Cloud Storage + CDN with JSON files;
      - (B) Firestore (one doc per call + summary docs, realtime
        listeners);
@@ -706,8 +893,9 @@ Later:
   `POST /api/refresh`). Keep p95 under 10 ms; rerun
   `go test -run xxx -bench BenchmarkWebSnapshot -benchmem` after touching it.
 - Only real calls are scanned, delivered and tracked; one row per token.
-- The owner commits and pushes; agents' git commit and push are blocked by
-  permissions. Never commit to `main`.
+- Agents never push (`git push` is denied in `.claude/settings.json`); with
+  the owner's approval they commit on `work/...` branches, never on `main`;
+  the owner pushes and merges.
 - Wait for all checks (tests, reviewer) before committing; separate clean
   commits per change.
 - Say "tested locally" unless it ran on the prod server. Flag anything that
@@ -720,21 +908,29 @@ Later:
 - Ops folders get distinct names and a status row in `ops/README.md`.
 - One line of work at a time on this database: two branches migrating the same
   schema caused both production startup failures so far.
-- At most **3** coding agents in parallel, each on disjoint files.
+- At most **10** coding agents in parallel (raised from 3 on 9 October 2026),
+  each on disjoint files or in its own worktree.
 - The owner prefers not to set up a local test database. For prod data he runs
   read-only queries and pastes the results.
 
 ## How to test
 
-- From the repo root: `go vet .` and `go test -race .`. Database tests need
+Full guide: `TESTING.md` (throwaway DB scripts, CI, the complete command
+list). The short version:
+
+- From the repo root: `go vet ./...` and `go test -race ./...` (`./...`
+  also covers `internal/database`). Database tests need
   `SCOUT_TEST_DATABASE_URL` pointing at a throwaway Postgres named
   `scout_test` (`TestOpenScoutStoreSelection` needs that name), run with
   `-p 1`; without it they are skipped.
 - Throwaway Postgres: `initdb` in the agent's own scratchpad subdirectory, its
   own port on 127.0.0.1, `pg_ctl stop` and delete the directory at the end.
   Never touch the Windows Postgres service on port 5432.
-- `TestLatestPriceInterruptedLeavesRowUntouched` is flaky (about 1 run in 10,
-  old code too); rerun before treating it as real.
+- `TestLatestPriceInterruptedLeavesRowUntouched` was flaky (about 1 run in 10)
+  before aa60a3b (7 October); it has not been seen failing since. If it fails,
+  rerun it once
+  (`go test -race -p 1 -run '^TestLatestPriceInterruptedLeavesRowUntouched$' -count=10 .`)
+  and report the result.
 - On-chain code uses the fake chain in `onchain_test.go`; never call real nodes.
 - `ml/`: `python -m pytest tests -q` with the ml venv.
 - Go files are CRLF: check gofmt on LF copies.
@@ -788,9 +984,14 @@ Checks after deploying `work/2026-10-08-ml-pool-web` (deployed 8 October in
 - `.claude/agents/` (committed in bde6d81 in the old repo; copied here in the
   standalone commit with paths for this layout): `coder` (Go + plain JS website,
   with the Go, JS, CSP and Charts rules), `ml-coder`, `react-coder`, `infra`
-  (approval-gated), `reviewer`, `researcher`, `product-manager`. All 7 are
-  active.
-- The reviewer runs before every commit.
+  (approval-gated), `reviewer`, `researcher`, `product-manager`, and `tester`
+  (added 9 October: runs and writes unit and integration tests in a coder's
+  worktree, test files only). All 8 are active.
+- Testing rules for all agents: `TESTING.md` (repo root).
+- The tester (verify mode) runs after the coder when a change touches
+  `scoutanalytics.sql`, tracker/on-chain code, delivery/notify/re-check/re-ask,
+  the web snapshot/API or `ml/` (rule in the PM skill); the reviewer runs
+  before every commit.
 - At most 10 coding agents in parallel (owner's limit, raised 9 Oct 2026).
 - `settings.json`: read-only git, `node --check` and the ml venv pytest
   (`ml/.venv`, or `.venv` from inside `ml/`) are allowed; secrets are denied in
@@ -811,6 +1012,8 @@ Checks after deploying `work/2026-10-08-ml-pool-web` (deployed 8 October in
     file-level splits when possible.
   - In Git Bash `grep -c $'\r'` reports 0 even for CRLF files; count CRs with
     `tr -cd '\r' | wc -c`.
+  - In Git Bash, `sed -i` can strip carriage returns from CRLF files; prefer
+    the Edit tool and recheck CRLF afterwards.
   - The owner merged the stacked branch directly (PR #1). A PR from a
     stacked branch includes the base branch's commits.
 
