@@ -704,3 +704,45 @@ For deployment it changes:
   path, plus 1 `LISTEN` connection for `-web`, plus the main API and pgAdmin.
   Keep the total below Postgres `max_connections`, which matters most on a
   small managed Postgres tier.
+
+### 7.5 Public website on GCP (draft, owner decisions 9 Oct 2026)
+
+Drafts only. Nothing is created and the Go side is not written yet. Everything
+is in [`deploy/gcp/`](deploy/gcp/README.md):
+
+- **Shape:** prod `-web` keeps reading `assetdb` and also uploads the public
+  snapshot to a private GCS bucket in `us-central1`, split into three parts by
+  change rate (reports, rows, latest prices), at most once a minute and only
+  the parts that changed. A Cloud Run service (min instances 0) runs `-web`
+  with `SCOUT_WEB_SOURCE=gcs`: no database, node or Telegram. It serves the
+  site publicly behind a Firebase Hosting rewrite at `__HOSTNAME__` (default
+  `scout-analytics.lylelabs.io`, owner decision), polls instead of using SSE, and
+  does not offer "Refresh now".
+- **What is public:** everything the LAN site shows. Never: the private
+  delivery group's invite link or links into it, the notify target
+  (`SCOUT_NOTIFY_PEER` / `SCOUT_NOTIFY_CHAT_ID` as handle or invite hash),
+  secrets, server/DB/node addresses. Every exported string is scrubbed (with a
+  lenient percent/HTML decoder that a stray `%` cannot defeat), and the
+  exporter refuses to upload if the final export still matches a private-link
+  pattern, the notify target, a configured secret value (`API_HASH`,
+  `TG_PASSWORD`, `PHONE`, `SCOUT_NOTIFY_BOT_TOKEN`, `SCOUT_PRICE_API_KEY`, the
+  DB password) or a server address (including `SCOUT_WEB_ADDR` and a private
+  `SCOUT_PRICE_API_BASE`). The refusal log names the variable, never the value.
+- **Freshness and alerting:** with unchanged data the exporter rewrites the
+  pointer every 2 minutes (heartbeat), so a quiet but healthy prod never shows
+  as stale; no heartbeat while an upload is refused or failing, or while prod
+  cannot read `assetdb` (each heartbeat needs a fresh read with the same
+  content). Prod needs NTP.
+  The uptime check targets `/api/summary` (`"stale":false`, timeout 20 s),
+  not `/api/health`, which never triggers a snapshot check.
+- **`assetdb` (shared with the main API):** no extra reads or connections. The
+  export reuses the snapshot `-web` already reads.
+- [`deploy/gcp/README.md`](deploy/gcp/README.md): the owner runbook (org-policy
+  pre-checks and the key exception, gcloud and Firebase steps with cost notes,
+  rollback, teardown, cost and upload-volume tables, open questions).
+- [`deploy/gcp/INTERFACE.md`](deploy/gcp/INTERFACE.md): the spec for the Go
+  coder (export/read modes, split format, allowlist, scrub and deny check,
+  `/api/health`, banner data).
+- New secret on prod: the uploader credential
+  `/etc/scoutanalytics/gcp-export.json` (root:scout 0640, never in git), like
+  `.env`. Keyless alternative: X.509 Workload Identity Federation.

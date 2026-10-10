@@ -1,0 +1,53 @@
+# DRAFT - ignore file for deploy/gcp/Dockerfile.
+#
+# Why this name: the build context is the repo root, and Docker only reads
+# .dockerignore at the context root. With BuildKit (Docker 23+ default, or
+# DOCKER_BUILDKIT=1), a file named <Dockerfile>.dockerignore next to the
+# Dockerfile is used instead, so this file applies to
+# `docker build -f deploy/gcp/Dockerfile .` without adding a root .dockerignore.
+#
+# Allowlist: ignore everything, then let in only what the build needs.
+
+*
+!go.mod
+!go.sum
+!*.go
+!internal/
+!internal/**
+!frontend/
+!frontend/**
+!scoutanalytics.sql
+
+# tests are not needed in the image
+*_test.go
+testdata/
+
+# Secrets and private data: never in the context, even if the allowlist above
+# is widened later (later rules win).
+.env
+.env.*
+**/.env
+**/.env.*
+scout.session.json
+*.session.json
+**/*.session.json
+scoutanalytics_data/
+**/scoutanalytics_data/
+*.json
+**/*.json
+*.pem
+*.key
+*.p12
+**/*.pem
+**/*.key
+**/*.p12
+gcp-*.json
+**/gcp-*.json
+*-key.json
+**/*-key.json
+ml/
+models/
+ml-results/
+.claude/
+.git/
+*.csv

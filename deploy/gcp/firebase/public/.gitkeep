@@ -1,0 +1,4 @@
+# Keep this directory EMPTY (dotfiles are not deployed). Any file here, above
+# all an index.html, would be served by Firebase Hosting instead of the
+# Cloud Run rewrite. Never run `firebase init hosting` here: it writes
+# public/index.html and public/404.html. See deploy/gcp/README.md, step 10.

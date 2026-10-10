@@ -1,0 +1,47 @@
+# DRAFT - what `gcloud builds submit` may upload (deploy/gcp/README.md, step 6).
+# Pass it explicitly: gcloud builds submit --ignore-file=deploy/gcp/.gcloudignore ...
+# gcloud uploads the source to the Cloud Build staging bucket
+# (gs://PROJECT_ID_cloudbuild/source/) BEFORE any .dockerignore applies, so this
+# file is what keeps secrets off Google's side. Same allowlist as
+# deploy/gcp/Dockerfile.dockerignore, plus the Dockerfile and the build config.
+# Run builds from a clean clone, never from the prod working directory.
+# Dry check: README.md step 6, "Before the first upload".
+
+/*
+!/go.mod
+!/go.sum
+!/*.go
+!/internal/
+!/frontend/
+!/scoutanalytics.sql
+!/deploy/
+/deploy/*
+!/deploy/gcp/
+/deploy/gcp/*
+!/deploy/gcp/Dockerfile
+!/deploy/gcp/Dockerfile.dockerignore
+!/deploy/gcp/cloudbuild.yaml
+
+*_test.go
+testdata/
+
+# secrets and private data (never uploaded, whatever the rules above say)
+.env
+.env.*
+scout.session.json
+*.session.json
+scoutanalytics_data/
+*.pem
+*.key
+*.p12
+gcp-*.json
+*-key.json
+ml/
+models/
+ml-results/
+.claude/
+.git/
+*.csv
+
+# no JSON at all (keys, session files, exports); the build needs none
+*.json
