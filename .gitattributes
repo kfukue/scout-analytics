@@ -1,2 +1,4 @@
 # shell scripts run on the Linux prod server: always LF
 *.sh text eol=lf
+# deploy drafts (systemd units, env files, Dockerfile, .gcloudignore, YAML, JSON): always LF
+deploy/gcp/** text eol=lf

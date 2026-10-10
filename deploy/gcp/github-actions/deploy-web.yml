@@ -1,0 +1,77 @@
+# OPTIONAL DRAFT - not active. GitHub only runs workflows under .github/workflows/;
+# this file lives here on purpose until the owner decides to use CI
+# (deploy/gcp/README.md, "Optional: GitHub Actions"). To enable: complete
+# README step 9 (Workload Identity Federation), set the repository VARIABLES
+# below (not secrets: none of them is secret), then copy this file to
+# .github/workflows/deploy-web.yml.
+#
+# No keys or secrets in the repo: GitHub's OIDC token is exchanged for a
+# short-lived token of the deployer service account.
+#
+# Repository variables (Settings > Secrets and variables > Actions > Variables):
+#   GCP_PROJECT_ID, GCP_REGION, GCP_WIF_PROVIDER
+#   (projects/PROJECT_NUMBER/locations/global/workloadIdentityPools/github/providers/scout-analytics),
+#   GCP_DEPLOYER_SA (scout-web-deployer@PROJECT_ID.iam.gserviceaccount.com)
+
+name: deploy-web (Cloud Run)
+
+on:
+  workflow_dispatch: {}   # manual only; add `push: branches: [main]` later if wanted
+
+permissions:
+  contents: read
+  id-token: write          # needed for the OIDC token
+
+concurrency:
+  group: deploy-web
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-24.04
+    # Required: the WIF condition (README step 9) admits only tokens with
+    # environment == production, ref == refs/heads/main and this repository's
+    # and owner's numeric ids. Add required reviewers on this environment in GitHub.
+    environment: production
+    env:
+      IMAGE: ${{ vars.GCP_REGION }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID }}/scout/scout-web:${{ github.sha }}
+    steps:
+      # Pin third-party actions to full commit SHAs before enabling.
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      # database tests skip themselves without SCOUT_TEST_DATABASE_URL (never set it here)
+      - name: Unit tests (no database)
+        run: go test ./...
+
+      - id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_DEPLOYER_SA }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Build and push the image
+        run: |
+          gcloud auth configure-docker "${{ vars.GCP_REGION }}-docker.pkg.dev" --quiet
+          DOCKER_BUILDKIT=1 docker build -f deploy/gcp/Dockerfile -t "$IMAGE" .
+          docker push "$IMAGE"
+
+      - name: Deploy a new revision (image only; other settings stay as in service.yaml)
+        run: |
+          gcloud run deploy scout-web \
+            --project="${{ vars.GCP_PROJECT_ID }}" \
+            --region="${{ vars.GCP_REGION }}" \
+            --image="$IMAGE"
+
+      - name: Check health of the new revision
+        run: |
+          URL=$(gcloud run services describe scout-web --project="${{ vars.GCP_PROJECT_ID }}" \
+                --region="${{ vars.GCP_REGION }}" --format='value(status.url)')
+          curl -fsS "$URL/api/health"
