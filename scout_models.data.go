@@ -1327,18 +1327,23 @@ func (st *ScoutStore) UpsertReturn(ctx context.Context, callID int, h horizon, r
 	}
 	_, err := st.Pool.Exec(ctx, `INSERT INTO scout_call_returns
 		(call_id, horizon, horizon_seconds, due_at, status, price_usd, return_pct, max_gain_pct, max_drawdown_pct,
-		 max_price_usd, min_price_usd, last_trade_at, return_late_pct, max_gain_late_pct, max_drawdown_late_pct, computed_at)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,now())
+		 max_price_usd, min_price_usd, last_trade_at, return_late_pct, max_gain_late_pct, max_drawdown_late_pct, computed_at,
+		 peak_late_after_s, first_2x_after_s, above_2x_s, fall_below_2x_after_s, above_2x_censored, timing_at)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,now(),$16,$17,$18,$19,$20,$21)
 		ON CONFLICT (call_id, horizon) DO UPDATE SET
 		 horizon_seconds = EXCLUDED.horizon_seconds, due_at = EXCLUDED.due_at, status = EXCLUDED.status,
 		 price_usd = EXCLUDED.price_usd, return_pct = EXCLUDED.return_pct, max_gain_pct = EXCLUDED.max_gain_pct,
 		 max_drawdown_pct = EXCLUDED.max_drawdown_pct, max_price_usd = EXCLUDED.max_price_usd,
 		 min_price_usd = EXCLUDED.min_price_usd, last_trade_at = EXCLUDED.last_trade_at,
 		 return_late_pct = EXCLUDED.return_late_pct, max_gain_late_pct = EXCLUDED.max_gain_late_pct,
-		 max_drawdown_late_pct = EXCLUDED.max_drawdown_late_pct, computed_at = now()`,
+		 max_drawdown_late_pct = EXCLUDED.max_drawdown_late_pct, computed_at = now(),
+		 peak_late_after_s = EXCLUDED.peak_late_after_s, first_2x_after_s = EXCLUDED.first_2x_after_s,
+		 above_2x_s = EXCLUDED.above_2x_s, fall_below_2x_after_s = EXCLUDED.fall_below_2x_after_s,
+		 above_2x_censored = EXCLUDED.above_2x_censored, timing_at = EXCLUDED.timing_at`,
 		callID, h.Name, int(h.Dur/time.Second), r.DueAt.UTC(), r.Status, nz(r.PriceUSD), nz(r.ReturnPct),
 		nz(r.MaxGainPct), nz(r.MaxDDPct), nz(r.MaxPriceUSD), nz(r.MinPriceUSD), r.LastTradeAt,
-		r.ReturnLatePct, r.MaxGainLatePct, r.MaxDDLatePct)
+		r.ReturnLatePct, r.MaxGainLatePct, r.MaxDDLatePct,
+		r.PeakLateAfterS, r.First2xAfterS, r.Above2xS, r.FallBelow2xAfterS, r.Above2xCensored, r.TimingAt)
 	return err
 }
 
@@ -1845,4 +1850,191 @@ func (st *ScoutStore) SelectWebReports(ctx context.Context, ids []int) (map[int]
 		out[r.ID] = &r
 	}
 	return out, rows.Err()
+}
+
+// ---------------------------------------------------------------------------
+// Timing and rug time (timing.go, timing_backfill.go)
+// ---------------------------------------------------------------------------
+
+// RugAt returns a call's stored rug time (nil = none stored).
+func (st *ScoutStore) RugAt(ctx context.Context, callID int) (*time.Time, error) {
+	var at *time.Time
+	err := st.Pool.QueryRow(ctx, `SELECT rug_at FROM scout_call_tracking WHERE call_id = $1`, callID).Scan(&at)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("rug_at of call %d: %w", callID, err)
+	}
+	return at, nil
+}
+
+// SetRugAt stores a call's rug time and its kind (event | at_call | detected).
+// Only these two columns change (not updated_at, status or the state).
+func (st *ScoutStore) SetRugAt(ctx context.Context, callID int, at time.Time, kind string) error {
+	if _, err := st.Pool.Exec(ctx, `UPDATE scout_call_tracking SET rug_at = $2, rug_at_kind = $3 WHERE call_id = $1`,
+		callID, at.UTC(), kind); err != nil {
+		return fmt.Errorf("set rug_at of call %d: %w", callID, err)
+	}
+	return nil
+}
+
+// SetRugAtIfMissing is SetRugAt for a row without a rug time only (the
+// backfill: a rug time stored meanwhile by the tracker wins). Reports whether
+// the row was written.
+func (st *ScoutStore) SetRugAtIfMissing(ctx context.Context, callID int, at time.Time, kind string) (bool, error) {
+	tag, err := st.Pool.Exec(ctx, `UPDATE scout_call_tracking SET rug_at = $2, rug_at_kind = $3
+		WHERE call_id = $1 AND rug_at IS NULL`, callID, at.UTC(), kind)
+	if err != nil {
+		return false, fmt.Errorf("set rug_at of call %d: %w", callID, err)
+	}
+	return tag.RowsAffected() == 1, nil
+}
+
+// ClearRugAt drops a call's rug time (its on-chain state starts again).
+func (st *ScoutStore) ClearRugAt(ctx context.Context, callID int) error {
+	if _, err := st.Pool.Exec(ctx, `UPDATE scout_call_tracking SET rug_at = NULL, rug_at_kind = NULL
+		WHERE call_id = $1 AND (rug_at IS NOT NULL OR rug_at_kind IS NOT NULL)`, callID); err != nil {
+		return fmt.Errorf("clear rug_at of call %d: %w", callID, err)
+	}
+	return nil
+}
+
+// timingBackfillWhereSQL: horizons -backfill-timing fills in: done, no timing
+// yet, a late entry and late peak, on-chain state version 2 or later (it has
+// candles), and the horizon done in that state (a call tracked again from
+// scratch has not rebuilt its candles for it yet).
+const timingBackfillWhereSQL = ` FROM scout_call_returns r JOIN scout_call_tracking t ON t.call_id = r.call_id
+	WHERE r.status = 'done' AND r.timing_at IS NULL AND r.max_gain_late_pct IS NOT NULL
+	  AND t.entry_late_price_usd > 0 AND t.onchain IS NOT NULL
+	  AND COALESCE((t.onchain->>'v')::int, 0) >= 2
+	  AND COALESCE((t.onchain->'done'->>r.horizon)::boolean, false)`
+
+// TimingBackfillCallIDs returns the calls with at least one horizon to fill in.
+func (st *ScoutStore) TimingBackfillCallIDs(ctx context.Context) ([]int, error) {
+	rows, err := st.Pool.Query(ctx, `SELECT DISTINCT r.call_id`+timingBackfillWhereSQL+` ORDER BY r.call_id`)
+	if err != nil {
+		return nil, fmt.Errorf("timing backfill calls: %w", err)
+	}
+	defer rows.Close()
+	var ids []int
+	for rows.Next() {
+		var id int
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("timing backfill calls: %w", err)
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("timing backfill calls: %w", err)
+	}
+	return ids, nil
+}
+
+// timingBackfillRow is one horizon to fill in, with what its timing needs.
+type timingBackfillRow struct {
+	CallID         int
+	Horizon        string
+	DueAt          time.Time
+	PriceUSD       *float64 // 0 = rugged at or before the horizon's end
+	MaxGainLatePct float64
+	EntryAt        time.Time
+	EntryLate      float64
+	RugAt          *time.Time
+}
+
+// TimingBackfillHorizons returns the horizons to fill in of the given calls,
+// by call and horizon length.
+func (st *ScoutStore) TimingBackfillHorizons(ctx context.Context, ids []int) ([]timingBackfillRow, error) {
+	rows, err := st.Pool.Query(ctx, `SELECT r.call_id, r.horizon, r.due_at, r.price_usd::float8, r.max_gain_late_pct::float8,
+		t.entry_at, t.entry_late_price_usd::float8, t.rug_at`+timingBackfillWhereSQL+` AND r.call_id = ANY($1::int[])
+		ORDER BY r.call_id, r.horizon_seconds`, ids)
+	if err != nil {
+		return nil, fmt.Errorf("timing backfill horizons: %w", err)
+	}
+	defer rows.Close()
+	var out []timingBackfillRow
+	for rows.Next() {
+		var r timingBackfillRow
+		if err := rows.Scan(&r.CallID, &r.Horizon, &r.DueAt, &r.PriceUSD, &r.MaxGainLatePct, &r.EntryAt, &r.EntryLate, &r.RugAt); err != nil {
+			return nil, fmt.Errorf("timing backfill horizons: %w", err)
+		}
+		out = append(out, r)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("timing backfill horizons: %w", err)
+	}
+	return out, nil
+}
+
+// timingWrite is one horizon's computed timing.
+type timingWrite struct {
+	CallID  int
+	Horizon string
+	T       horizonTiming
+}
+
+// SetHorizonTimings writes computed timings into horizons that still have
+// none (timing_at IS NULL), in one batch: only the timing columns change.
+// Returns the rows written.
+func (st *ScoutStore) SetHorizonTimings(ctx context.Context, ws []timingWrite) (int, error) {
+	if len(ws) == 0 {
+		return 0, nil
+	}
+	b := &pgx.Batch{}
+	for _, w := range ws {
+		b.Queue(`UPDATE scout_call_returns SET peak_late_after_s = $3, first_2x_after_s = $4, above_2x_s = $5,
+			fall_below_2x_after_s = $6, above_2x_censored = $7, timing_at = now()
+			WHERE call_id = $1 AND horizon = $2 AND status = 'done' AND timing_at IS NULL`,
+			w.CallID, w.Horizon, w.T.PeakLateAfterS, w.T.First2xAfterS, w.T.Above2xS, w.T.FallBelow2xAfterS, w.T.Censored)
+	}
+	br := st.Pool.SendBatch(ctx, b)
+	n := 0
+	for range ws {
+		tag, err := br.Exec()
+		if err != nil {
+			_ = br.Close() // the batch is abandoned; its close error adds nothing to err
+			return n, fmt.Errorf("write timing: %w", err)
+		}
+		n += int(tag.RowsAffected())
+	}
+	if err := br.Close(); err != nil {
+		return n, fmt.Errorf("write timing: %w", err)
+	}
+	return n, nil
+}
+
+// rugAtBackfillRow is a rugged call without a rug time, with its state.
+type rugAtBackfillRow struct {
+	CallID int
+	State  onchainState
+}
+
+// RugAtBackfillRows returns the calls whose on-chain state (version 2 or
+// later) has a rug block but that have no rug time stored.
+func (st *ScoutStore) RugAtBackfillRows(ctx context.Context) ([]rugAtBackfillRow, error) {
+	rows, err := st.Pool.Query(ctx, `SELECT call_id, onchain FROM scout_call_tracking
+		WHERE rug_at IS NULL AND onchain IS NOT NULL AND COALESCE((onchain->>'v')::int, 0) >= 2
+		  AND COALESCE((onchain->>'rug_block')::numeric, 0) > 0
+		ORDER BY call_id`)
+	if err != nil {
+		return nil, fmt.Errorf("rugged calls without a rug time: %w", err)
+	}
+	defer rows.Close()
+	var out []rugAtBackfillRow
+	for rows.Next() {
+		var r rugAtBackfillRow
+		var raw []byte
+		if err := rows.Scan(&r.CallID, &raw); err != nil {
+			return nil, fmt.Errorf("rugged calls without a rug time: %w", err)
+		}
+		if err := json.Unmarshal(raw, &r.State); err != nil {
+			return nil, fmt.Errorf("on-chain state of call %d: %w", r.CallID, err)
+		}
+		out = append(out, r)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("rugged calls without a rug time: %w", err)
+	}
+	return out, nil
 }
