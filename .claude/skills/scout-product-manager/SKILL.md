@@ -37,12 +37,13 @@ anything non-trivial (`DEPLOY.md` and `ml/RUNBOOK.md` for deploy and training).
 - **Model** (`ml/`): LightGBM plus a logistic baseline, buckets `short`, `3day`,
   `medium`, `long`; first calls only. A bucket passes only if top-10% lift >= 2,
   skipping the 30% highest collapse scores removes >= 40% of (plain) collapses,
-  and the top-10% simulation beats buy-everything in every walk-forward week.
-  Scores are NOT added to deliveries until a report passes. The `long` bucket
-  waits for matured data until about 25 December 2026. Trained on the prod
-  server with `ml/run_training.sh` into `~/scout-ml` (Python 3.11 venv; never
-  replace the system python3). Reports copied to the PC go in `ml-results/`
-  (gitignored).
+  and the top-10% simulation beats buy-everything in every walk-forward week
+  (a pending branch limits this to weeks with at least 1000 training rows,
+  `WF_MIN_TRAIN_ROWS`; not on main yet). Scores are NOT added to deliveries
+  until a report passes. The `long` bucket waits for matured data until about
+  25 December 2026. Trained on the prod server with `ml/run_training.sh` into
+  `~/scout-ml` (Python 3.11 venv; never replace the system python3). Reports
+  copied to the PC go in `ml-results/` (gitignored).
 
 ## Agents: who gets what
 
@@ -53,11 +54,15 @@ anything non-trivial (`DEPLOY.md` and `ml/RUNBOOK.md` for deploy and training).
 - `react-coder`: React projects (not the `frontend/` site).
 - `infra`: deployment and devops drafts only; anything that touches real cloud
   resources or costs money needs the owner's approval.
+- `tester`: runs and writes unit and integration tests in a coder's worktree;
+  writes test files only.
 - `reviewer`: read-only review of a coder's uncommitted diff.
+- `reviewer` runs on `model: fable`; `researcher` runs on `model: opus` (Opus
+  5.5 at the time of writing). Both are set in their frontmatter.
 
 One coder at a time on overlapping files. Run coders in parallel only on
 disjoint files (name the files in each task) or in isolated git worktrees; at
-most 5 coding agents at once. Subagents start cold: give each one the goal, the
+most 10 coding agents at once. Subagents start cold: give each one the goal, the
 relevant files, the rules below, and what to report back.
 
 ## How to work
@@ -68,10 +73,19 @@ relevant files, the rules below, and what to report back.
 3. Review before accepting: does it answer the task, were tests actually run
    (which ones), is every claim backed by evidence? Send it back with specific
    feedback when it falls short; verify surprising claims yourself.
-4. Before giving the owner commit commands, run `reviewer` on the diff (or on
+4. After the coder reports and before the reviewer, run `tester` (mode
+   "verify") in the coder's worktree when the change touches
+   `scoutanalytics.sql`, tracker/on-chain code, delivery/notify/re-check/
+   re-ask, the web snapshot/API, or `ml/`; skip it for docs-only changes.
+   Tester and coder never run at the same time in one worktree. If the tester
+   leaves failing tests, send them to the coder, then re-run the tester. Use
+   tester mode "gap audit" when an area has had repeated bugs.
+5. Before giving the owner commit commands, run `reviewer` on the diff (or on
    the files the task named). Send must-fix findings back to the coder.
-5. Keep `HANDOFF.md` current after each shipped item (ask a coder to update it).
-6. Report in plain language: what was decided, what was done, what was verified
+6. Keep `HANDOFF.md` current after each shipped item (ask a coder to update it).
+   Also keep its "Deferred / open" section current whenever an item is
+   deferred or an owner check is pending, not only when something ships.
+7. Report in plain language: what was decided, what was done, what was verified
    and how, and what is still open or needs the owner's action.
 
 ## Rules to follow and pass on
@@ -89,9 +103,14 @@ relevant files, the rules below, and what to report back.
   No agent connects to the production database. Resets, re-tracks or bulk
   UPDATEs are proposed as SQL for the owner to decide, never run by agents.
 - **Git:** commits and pushes are the owner's decision. Never commit to `main`.
-  Never move or switch a branch that is checked out on the owner's machine.
-  Agents leave their changes uncommitted in the working tree; you give the owner
-  exact commit commands that name the files.
+  Never move or switch a branch that is checked out in the main checkout or in
+  another worktree. See "Worktree lifecycle" below.
+- **ML leakage:** training features use only data available at the time of the
+  call. Perceptor 12-minute re-check, re-scan and sAlpha re-ask results are
+  never training inputs. The dataset view `scout_call_dataset_v` is the
+  contract; any change to it needs a leakage check (pass this on to coders and
+  the reviewer). This once went wrong (a request to prefer the re-check report
+  in the view) and was reverted.
 - **Expensive changes:** anything that makes the tracker redo history (e.g.
   `onchainStateVersion`) costs days of node time. Flag it before it ships.
 - **No rate guessing:** report tested behaviour, not speed-ups, unless measured
@@ -102,26 +121,47 @@ relevant files, the rules below, and what to report back.
 - **`.env`:** the tracker reads `.env` from the folder it is started in, and
   a variable already set in the shell wins over the file.
 
+### Worktree lifecycle
+
+- Coders usually run in isolated worktrees under
+  `.claude/worktrees/agent-<id>`, with their changes left uncommitted there.
+- After review passes, give the owner exact commands. In that worktree: create
+  or rename the branch (`git switch -c work/<YYYY-MM-DD>-<topic>`, or
+  `git branch -m work/<YYYY-MM-DD>-<topic>`), `git add` naming the files,
+  `git commit`, `git push -u origin work/<YYYY-MM-DD>-<topic>`, open a PR
+  (`gh pr create`) and merge it on GitHub. Then, from the main checkout:
+  `git pull`, `git worktree remove .claude/worktrees/agent-<id>` and
+  `git branch -d work/<YYYY-MM-DD>-<topic>` (plus the worktree's original
+  `worktree-agent-<id>` branch if `git switch -c` left it behind).
+- If `main` has moved and the branch touches the same files: after the owner
+  has committed the branch in the worktree, have the coder run
+  `git rebase main` (or `git merge main`) there, resolve conflicts and re-run
+  the tests; the owner then commits/pushes again before review.
+- Prune merged worktrees. List leftovers to the owner rather than deleting
+  unmerged work.
+- Commits and pushes stay the owner's decision; never commit to `main`; never
+  move or switch a branch that is checked out in the main checkout or in
+  another worktree.
+
 ## Testing
 
-- Go: `go build ./...`, `go vet ./...`, `go test -race ./...`. DB tests run only
-  when `SCOUT_TEST_DATABASE_URL` points at a throwaway Postgres (database
-  `scout_test`, run with `-p 1`); otherwise they are skipped, so say which ran.
+Full guide: `TESTING.md` (layers, throwaway DB scripts, CI, commands, known
+flaky tests, how to report). Pass it on to coders and the tester. Essentials:
+
+- DB tests must actually run: they need `SCOUT_TEST_DATABASE_URL` pointing at a
+  throwaway Postgres (database `scout_test`, `-p 1`) and are skipped otherwise.
+  Every report says which tests ran and which were skipped.
 - On-chain code is tested against the fake chain in `onchain_test.go`; tests
-  never call the real nodes.
-- Frontend JS: `node --check`. Website changes: benchmark
-  `BenchmarkWebSnapshot` before and after.
-- Headless browser checks: a throwaway `--user-data-dir` in the session
-  scratchpad, and Edge/Chrome started with `--disable-sync --disable-extensions
-  --no-first-run --no-default-browser-check` (plus Edge `--inprivate` if it
-  works headless), so the test profile is never signed into the owner's
-  Microsoft account and never loads his extensions (on 9 October a test
-  profile synced his extensions, a wallet among them). Close the browser by
-  PID and delete the profile directory afterwards. Pass this on to coders.
-- ML: `python -m pytest tests -q` inside `ml/`.
+  never call the real nodes, Telegram or the production database.
+- Headless browser checks use a throwaway, sync-free, extension-free profile in
+  the scratchpad, closed by PID and deleted afterwards (the 9 October incident;
+  exact flags in `TESTING.md`).
 - Every behaviour change gets a test.
-- Known flaky: `TestLatestPriceInterruptedLeavesRowUntouched` (about 1 in 10);
-  rerun before treating it as real.
+- `TestLatestPriceInterruptedLeavesRowUntouched` was flaky (about 1 run in 10)
+  before aa60a3b (7 October); it has not been seen failing since. If it fails,
+  rerun it once
+  (`go test -race -p 1 -run '^TestLatestPriceInterruptedLeavesRowUntouched$' -count=10 .`)
+  and report the result.
 
 ## Prod commands the owner runs
 
@@ -155,13 +195,24 @@ Every Go start applies `scoutanalytics.sql` unless `SCOUT_DB_AUTO_MIGRATE=false`
 - Perceptor re-scan on with the defaults: 100 per day, 10 m gap, 30-day max age,
   2 failures.
 - Analytics page defaults: Monday-Sunday UTC weeks, returns before tax, 1d
-  horizon by default, factor groups selectable 4/5/10 (default 5), market cap at
-  the call derived from price.
-- Planned multi-source calls: aggregate several call channels (scout first;
-  Robinhood Chain, maybe Base later). Perceptor and sAlpha reports for all
-  sources, one scan per token reused across sources, scout first in the queue.
-  All sources deliver to the same private group, labelled by channel, with the
-  same `clean,caution` filter.
+  horizon by default, factor groups selectable 4/5/10 (default 5).
+- Analytics "Market cap at call" = price x token supply (commit 251f5ba,
+  `/api/analytics` format 3).
+- The "dead after the call" score is report-only, never a gate or a delivery
+  input; the dead rule is off by default (commit eff4868).
+- Perceptor reports that say "not enough data yet" get an `insufficient` level
+  and an automatic re-check about 12 minutes later instead of being dropped
+  (on a branch, pending merge).
+- sAlpha: re-ask when the first answer was declined, empty or timed out (in
+  progress, not yet merged).
+- Public read-only site on GCP Cloud Run at `scout-analytics.lylelabs.io`
+  (draft in `deploy/gcp/` on a branch, not on main). Nothing is created in the
+  cloud without the owner's approval.
+- Multi-source calls: paused. The plan, for when they resume: aggregate several
+  call channels (scout first; Robinhood Chain, maybe Base later). Perceptor and
+  sAlpha reports for all sources, one scan per token reused across sources,
+  scout first in the queue. All sources deliver to the same private group,
+  labelled by channel, with the same `clean,caution` filter.
 
 ## Working on the owner's PC from a cloud session
 
