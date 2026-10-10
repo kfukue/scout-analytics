@@ -598,6 +598,7 @@ The on-chain tracker also stores what a model needs (state version 2):
 | Price path | `scout_call_candles` | 5-minute candles for the first 24 hours, hourly candles for the whole window. Only buckets with trades. |
 | Trading before the call | `scout_call_precall` | Swaps, buys, sells, volume and price change in the 5, 15 and 60 minutes before the post. |
 | Peaks and lows | `scout_call_returns.max_gain_pct`, `max_drawdown_pct` | Each trade is valued at its own hour's ETH (or quote asset) price, not the price at the horizon. |
+| Timing (outcomes) | `scout_call_returns.peak_late_after_s`, `first_2x_after_s`, `above_2x_s`, `fall_below_2x_after_s`, `above_2x_censored`, `timing_at`; `scout_call_tracking.rug_at`, `rug_at_kind` | When the peak came, when 2x was first reached, how long it held, and when the pool was drained. See "Timing after the call". Never model inputs. |
 
 Calls tracked by an earlier version are queued again automatically at startup and
 tracked from scratch (their old results stay until replaced). Expect the tracker
@@ -610,6 +611,138 @@ NULL = not classified yet): the training code leaves those rows out and never us
 `post_kind` as a model input. `prior_calls`, `secs_since_prev_call`, `calls_prev_1h` and
 `calls_prev_24h` are unchanged: they still count every stored post, update posts included.
 Training, the report and the scoring service live in [`ml/`](ml/README.md).
+
+### Timing after the call (`-backfill-timing`)
+
+For each on-chain horizon that is `done`, the tracker also stores **when** things happened,
+computed from the call's stored candles (no extra node request). These are outcomes, like
+the returns: never model inputs. Seconds are counted from `entry_at` (the post); E is
+`entry_late_price_usd` (the realistic entry).
+
+| Column (`scout_call_returns`) | Meaning |
+|---|---|
+| `peak_late_after_s` | Start of the first bucket whose high is the horizon's late peak (E × (1 + `max_gain_late_pct`/100)). `0` when the peak is the entry itself (`max_gain_late_pct` = 0). When no candle reaches the stored peak, no timing is stored for the horizon (`timing_at` stays NULL, logged). |
+| `first_2x_after_s` | Start of the first bucket whose high touched 2E. NULL = never reached 2×. |
+| `above_2x_s` | Seconds a close was at or above 2E (see below). `0` = never reached 2×, or touched 2× but never closed at or above it. |
+| `fall_below_2x_after_s` | First time, from the first 2× on, that a close was under 2E, or the rug time if the window ended with a rug while still at 2×. NULL = never reached 2×, or censored. |
+| `above_2x_censored` | `true` = reached 2× and no close under 2E was seen by the end of the window (no rug): the hold was cut off by the horizon, not ended. This includes a first 2× in the bucket that holds the horizon's end (`above_2x_s` 0). `false` otherwise (also when 2× was never reached). |
+| `timing_at` | When the timing was computed. NULL = not computed (stored before these columns existed; `-backfill-timing` fills it in). |
+
+How it is measured:
+
+- The price path: 5-minute candles before `entry_at` + 24 h, hourly candles after. The first
+  bucket is clipped to start at the post; the hourly bucket that straddles `entry_at` + 24 h
+  counts from `entry_at` + 24 h. Resolution: 5 minutes on day one, 1 hour after.
+- The window is from the post to the horizon's end, or to the rug when the pool was drained
+  before it (`rug_at`).
+- "Reached 2×" means the price touched 2E (a candle high). It counts only when the horizon's
+  stored late peak is at least 2E, because candles also hold the trades between the post and
+  the late entry. Buckets that end before the late entry are not used.
+- The bucket that holds the late entry (`entry_at` + `SCOUT_ENTRY_DELAY`) counts from the late
+  entry, and its high can come from a trade before it. It is used for the peak and the first
+  2× only when no later bucket matches. In that case the stored late peak, which counts only
+  trades after the late entry, shows that the hit came after it. When the peak is found in
+  that bucket, the first 2× is there too. When a later bucket also reaches 2×, the first 2×
+  and the time held are counted from that later bucket, even if the late-entry bucket may
+  have had a 2× trade after the late entry (conservative: candles cannot tell).
+- Time at 2× is measured on closes. From the first 2× bucket on, each bucket's close counts
+  from the end of the bucket and is carried forward across buckets without trades. A bucket
+  that touched 2× but closed under it adds nothing, so a touch and drop gives
+  `above_2x_s` = 0 with `first_2x_after_s` set. The close of the bucket that holds the late
+  entry only counts when that bucket is the first 2× bucket, and then it is a price after the
+  late entry. Closes after the window's end are not used, so a bucket that straddles the
+  horizon's end gives the same result whether or not it holds later trades. If the first 2×
+  bucket itself ends after the window's end, nothing is held.
+- The fall below 2× is the end of the first bucket (from the first 2× bucket on) that closes
+  under 2E.
+
+| Column (`scout_call_tracking`) | Meaning |
+|---|---|
+| `rug_at` | When the pool was drained: the exact time of the rug block (one node lookup per rugged call). NULL = not rugged, or rugged without a rug block (e.g. the 5%-of-entry rule). |
+| `rug_at_kind` | `event`: a price event in the horizon scan or the latest-price pass showed the pool drained. `at_call`: drained at or before the call (its time can be before `entry_at`). `detected`: found only by the end-of-tracking liquidity check; the time is that check's. Keep the three apart in analyses. |
+
+New calls get all of this from the tracker. For calls tracked before, run once (needs the
+database; the node only for the rug times):
+
+> **Deploy first.** Put the new binary on every process that tracks (the listener and any
+> `-track`) **before** any re-track or `-retry-no-pool`. A binary from before this change
+> re-stores a re-tracked horizon without touching the timing columns and does not clear
+> `rug_at`. The old timing and rug time then stay with `timing_at` set, and `-backfill-timing`
+> does not repair them because it selects only `timing_at IS NULL`.
+>
+> To find rows an old binary re-stored after their timing was computed (`computed_at` moves on
+> every store, `timing_at` only with the timing; the minute is a margin):
+>
+> ```sql
+> -- read-only
+> SELECT call_id, horizon, computed_at, timing_at FROM scout_call_returns
+>  WHERE timing_at IS NOT NULL AND computed_at > timing_at + interval '1 minute';
+> SELECT call_id, rug_at, rug_at_kind, onchain->>'rug_block' AS rug_block FROM scout_call_tracking
+>  WHERE rug_at IS NOT NULL
+>    AND (COALESCE((onchain->>'rug_block')::numeric, 0) = 0
+>         OR call_id IN (SELECT call_id FROM scout_call_returns
+>                         WHERE timing_at IS NOT NULL AND computed_at > timing_at + interval '1 minute'));
+> ```
+>
+> PROPOSED repair (not run; the owner decides). Run it after the re-tracks are finished, rug
+> times first because they use the same condition, then `-backfill-timing`:
+>
+> ```sql
+> UPDATE scout_call_tracking SET rug_at = NULL, rug_at_kind = NULL
+>  WHERE rug_at IS NOT NULL
+>    AND (COALESCE((onchain->>'rug_block')::numeric, 0) = 0
+>         OR call_id IN (SELECT call_id FROM scout_call_returns
+>                         WHERE timing_at IS NOT NULL AND computed_at > timing_at + interval '1 minute'));
+> UPDATE scout_call_returns SET peak_late_after_s = NULL, first_2x_after_s = NULL, above_2x_s = NULL,
+>        fall_below_2x_after_s = NULL, above_2x_censored = NULL, timing_at = NULL
+>  WHERE timing_at IS NOT NULL AND computed_at > timing_at + interval '1 minute';
+> ```
+>
+> Expect few rows. If nearly every row matches, check the clock difference between the
+> tracker's host (`timing_at`) and the database host (`computed_at`) first.
+>
+> Limits: a re-track that is still running (or a row whose on-chain state is reset but not yet
+> tracked again) is not found until its horizons are stored. A rug time is only caught when
+> the state has no rug block, or when a horizon of the same call was re-stored. A re-track
+> that found a different rug block without re-storing any horizon is not found.
+
+```bash
+./scoutanalytics -backfill-timing -dry-run   # count only: horizons to compute, node lookups it would make
+./scoutanalytics -backfill-timing            # do it
+```
+Example dry-run output (the numbers are only an illustration):
+```
+backfill-timing (dry run): 41210 horizon(s) of 9874 call(s) to compute from the stored candles
+backfill-timing (dry run): 312 rugged call(s) without a rug time: 312 node lookup(s) (eth_getBlockByNumber, one per call)
+backfill-timing (dry run): 290 rugged horizon(s) wait for those lookups; 0 rugged horizon(s) have no rug block and would be skipped
+```
+
+- It selects horizons with status `done` and `timing_at` NULL, with a late entry and late
+  peak, on-chain state version 2 or later, and the horizon marked done in that state.
+- Rug times are looked up first (one `eth_getBlockByNumber` per rugged call without
+  `rug_at`, one at a time, paced by `SCOUT_RPC_RPS`). Then the timing is computed from the
+  candles, 200 calls per batch.
+- Without a node it does not stop. When 3 rug-time lookups in a row fail, at any point of
+  the step (node unreachable; each failed lookup is retried for several seconds), the rest
+  of the rug-time step is skipped; a lookup that succeeds starts the count again, and a
+  failure to store a rug time (database) does not count. The other horizons are still filled
+  in. The rugged horizons of calls without a rug time are skipped and counted, and a later
+  run with the node fills them in. `SCOUT_RPC_URL` defaults to `http://localhost:8540`, so
+  "no node" means that address (or the one set) does not answer.
+- It writes only the new columns. Status, schedules, on-chain state, returns, candles and
+  `updated_at` are not touched, and nothing is tracked again. A row that got its timing or
+  rug time in the meantime (e.g. from a running tracker) is left as it is, so running the
+  command again is harmless. A second run only tries again the horizons the first one skipped
+  (see below); when nothing was skipped, it finds nothing to do.
+- The kind of a past rug is read from the stored state: the rug block at or before the call
+  block is `at_call`; a rug block that a scan cursor has passed is `event`; otherwise it is
+  `detected`.
+- The late entry is taken as `SCOUT_ENTRY_DELAY` after the post, as currently set.
+- Skipped and counted: rugged horizons whose rug time could not be found, and horizons whose
+  candles do not reach the stored late peak (or its 2×) (logged per call). Those keep
+  `timing_at` NULL, so a later run tries them again. The tracker does the same: when the rug
+  block's time cannot be read, it asks the node once per call and run, stores the rug and
+  the horizons, and leaves the rugged horizons' timing to `-backfill-timing`.
 
 ### Scoring new calls
 

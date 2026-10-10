@@ -986,7 +986,7 @@ func TestLatestPriceInterruptedLeavesRowUntouched(t *testing.T) {
 func ltHorizonResults(t *testing.T, st *ScoutStore, id int) (returns, candles string) {
 	t.Helper()
 	ctx := context.Background()
-	if err := st.Pool.QueryRow(ctx, `SELECT COALESCE(jsonb_agg(to_jsonb(r) - 'call_id' - 'computed_at' ORDER BY horizon_seconds)::text, '')
+	if err := st.Pool.QueryRow(ctx, `SELECT COALESCE(jsonb_agg(to_jsonb(r) - 'call_id' - 'computed_at' - 'timing_at' ORDER BY horizon_seconds)::text, '')
 		FROM scout_call_returns r WHERE call_id = $1`, id).Scan(&returns); err != nil {
 		t.Fatal(err)
 	}

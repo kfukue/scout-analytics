@@ -114,6 +114,11 @@ func (s *scanner) trackOneOnchain(ctx context.Context, t *ScoutCallTracking, pos
 			fail(TrackError, fmt.Errorf("clear candles: %w", err), backoff(t.Attempts))
 			return
 		}
+		if err := s.db.ClearRugAt(ctx, t.CallID); err != nil { // timing.go: the rug time belongs to the old state
+			st = nil
+			fail(TrackError, err, backoff(t.Attempts))
+			return
+		}
 		t.EntryLatePriceUSD = nil
 		// Fresh on-chain state: drop any entry price left by another source
 		// (e.g. GeckoTerminal) so every number for this call comes from one source.
@@ -337,6 +342,10 @@ func (s *scanner) trackOneOnchain(ctx context.Context, t *ScoutCallTracking, pos
 	// A rugged call is flagged at once, without waiting for the last horizon.
 	if st.RugBlock > 0 {
 		s.flagRugged(t, st)
+		// timing.go: its exact time, once (a rug at the call has no rugged horizon yet).
+		if _, err := s.ensureRugAt(ctx, t.CallID, st); err != nil && ctx.Err() == nil {
+			log.Printf("%s: rug time not stored: %v", tag, err)
+		}
 	}
 
 	// 4. Schedule the next horizon, or finish.
@@ -366,6 +375,10 @@ func (s *scanner) trackOneOnchain(ctx context.Context, t *ScoutCallTracking, pos
 				// return becomes -100% from now on.
 				rug = true
 				st.RugBlock, st.RugLiquidityUSD = latest, &quoteSide
+				// timing.go: the rug's time is this check's (no price event shows it).
+				if err := s.db.SetRugAt(ctx, t.CallID, now, rugAtDetected); err != nil {
+					log.Printf("%s: rug time not stored: %v", tag, err)
+				}
 			}
 		}
 	}
@@ -512,6 +525,7 @@ func (s *scanner) saveHorizonOnchain(ctx context.Context, t *ScoutCallTracking, 
 			r.LastTradeAt = &lt
 		}
 	}
+	s.fillHorizonTiming(ctx, t, st, &r, late, rugged, tag) // timing.go
 	if err := s.db.UpsertReturn(ctx, t.CallID, h, r); err != nil {
 		fail(TrackError, fmt.Errorf("save %s: %w", h.Name, err), backoff(t.Attempts))
 		return false
