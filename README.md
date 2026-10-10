@@ -1265,11 +1265,15 @@ SELECT date_trunc('day', requested_at) d, tool, status, count(*)
 FROM scout_investigations_v GROUP BY 1,2,3 ORDER BY 1 DESC, 2;
 ```
 
-DB integration tests (use a THROWAWAY database; they drop and recreate the scout_* tables):
+DB integration tests (use a THROWAWAY database; they drop and recreate the scout_* tables).
+`<port>` is a throwaway Postgres on its own port (see `TESTING.md`); never the shared server
+on 5432:
 
 ```
-SCOUT_TEST_DATABASE_URL=postgres://postgres@localhost:5432/scout_test?sslmode=disable go test -p 1 .
+SCOUT_TEST_DATABASE_URL=postgres://postgres@127.0.0.1:<port>/scout_test?sslmode=disable go test -p 1 .
 ```
+
+Full testing guide (throwaway Postgres, every command, known flaky tests): `TESTING.md`.
 
 ## Website
 

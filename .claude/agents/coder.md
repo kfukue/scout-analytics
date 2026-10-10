@@ -149,14 +149,20 @@ Decided by the owner after research.
 
 ## Testing
 
-- Go: `go vet .` and
-  `go test -race .`. Database tests only run when
+Full guide: `TESTING.md` (throwaway DB scripts, CI, commands).
+
+- Go: `go vet ./...` and
+  `go test -race ./...` (`./...` also covers `internal/database`). Database
+  tests only run when
   `SCOUT_TEST_DATABASE_URL` points at a throwaway Postgres database; without it
   they are skipped, so say which tests actually ran.
 - Add or update a test for every behaviour you change. Use the fake chain in
   `onchain_test.go` for on-chain code; never call the real nodes from tests.
 - Throwaway Postgres for DB tests (the owner doesn't want a permanent local test
   DB):
+  - Preferred: `scripts/testdb.ps1` / `scripts/testdb.sh` (`start`, `stop`,
+    `run`; see `TESTING.md`). Until those scripts are on your branch, use the
+    manual steps below.
   - Run `initdb` in your own subdirectory of the session scratchpad. Listen on
     127.0.0.1 only, on a port no other agent uses. Name the database
     `scout_test` (`TestOpenScoutStoreSelection` needs that name).
@@ -164,9 +170,11 @@ Decided by the owner after research.
   - At the end, stop it (`pg_ctl stop`) and delete its directory. Confirm both
     in your report.
   - Never touch the Windows Postgres service on port 5432.
-- Known flaky test: `TestLatestPriceInterruptedLeavesRowUntouched` fails about
-  1 run in 10, on old code too. Rerun it before treating it as a real failure,
-  and report it.
+- `TestLatestPriceInterruptedLeavesRowUntouched` was flaky (about 1 run in 10)
+  before aa60a3b (7 October); it has not been seen failing since. If it fails,
+  rerun it once
+  (`go test -race -p 1 -run '^TestLatestPriceInterruptedLeavesRowUntouched$' -count=10 .`)
+  and report the result.
 - Line endings: the Go files are CRLF, so plain `gofmt -l` lists almost every
   file. Check gofmt on LF copies, and keep CRLF line endings in the files you
   edit.
