@@ -94,6 +94,13 @@ How it validates (no random splits):
   so this drops nothing; the report counts embargo and token drops apart;
 - walk-forward: train up to week N, test on week N+1, for every week (the
   main model's round count; category levels from each window's training rows).
+  A week counts toward the "beats buy-all in every week" gate, and toward the
+  walk-forward summaries (variant table, dead-score proposal), only when its
+  training part has at least `WF_MIN_TRAIN_ROWS` (1000) rows (owner decision,
+  9 Oct 2026). Weeks below are still computed and shown, marked "not counted
+  (train < 1000)": the early weeks of an expanding walk-forward from the data
+  start (e.g. `medium`, week of 18 Aug 2026, 530 train rows) would otherwise
+  fail the gate in every report.
 
 Calls without a pool (`no_pool`, `gave_up`, or no late entry price) and rows
 whose prices are not in USD are excluded; the report says how many. The tracker
@@ -206,7 +213,8 @@ depend on those weeks.
 
 The section ends with **proposed** gates (not applied; nothing passes or
 fails on them): top-10% precision >= 3x the base rate in the test part, and
-in more than half of the walk-forward weeks with at least 5 dead calls; it
+in more than half of the walk-forward weeks with at least 5 dead calls (and at
+least 1000 training rows, as for the bucket gates); it
 says how each model fares. Whether a dead score may ever be used is for the
 product manager to decide. An error in this section prints a `WARNING`,
 records `"dead_score": {"error": ...}` and does not fail the run (the saved
@@ -286,11 +294,27 @@ most recent held-out rows only: the validation rows (`short`, `3day`) or the
 out-of-fold rows (`medium`, `long`) posted within `CALIB_RECENT_DAYS` (14) days
 of the newest of them, never on rows the model was fitted on. With fewer than
 `CALIB_MIN_CLASS_ROWS` (20) of a class there, or a fit that would invert the
-ranking, it falls back to all held-out rows (as before). The validation part
-of `short`/`3day` usually spans less than 14 days, so for them this is the same
-calibration as before (the report says so). Calibration does not change the
-ranking, so lift, collapses removed and the gates are unaffected; the report
-shows the test deciles and the Brier score for both calibrations.
+ranking, it falls back to all held-out rows (as before).
+
+The recent window is not always better (prod report 20261009-2250, `medium`
+collapse: test Brier 0.191 recent vs 0.170 all rows), so since 9 Oct 2026
+(owner decision) each label (runner, collapse, and the separate dead score)
+**chooses** between "recent window" and "all held-out rows" on its held-out
+rows alone, never on test rows: the held-out rows are ordered by time, both
+methods are fitted on the earliest `CALIB_CHOICE_FIT_FRAC` (50%) of them, and
+their Brier score is compared on the rest; the lower wins (equal: all rows)
+and is then fitted on all held-out rows. It uses all held-out rows without a
+comparison when the held-out rows (or their earlier half) span less than 14
+days, when the later half or the earlier half has fewer than 20 of a class,
+when the recent window of the earlier half cannot be fitted, or when the recent
+window of all held-out rows cannot be fitted (only in that last case the report
+shows the recent window as "n/a (recent window cannot be fitted)" instead of
+the all-rows fallback). The validation part of `short`/`3day` usually spans
+less than 28 days, so for them it is all held-out rows (the report says why).
+Calibration does not change the ranking, so lift, collapses removed and the
+gates are unaffected. The report names the chosen calibration and the
+comparison Brier values per label, and shows the test deciles and test Brier
+of both calibrations (information only; test rows never choose).
 
 ### Variant comparison (`--variants`)
 
@@ -324,8 +348,9 @@ The end of `report.md` has one table per bucket (`meta.json`: `"variants"`):
 runner rate on test, runner lift top 10% with its 95% interval, runner ROC AUC
 (LightGBM / logistic), collapse ROC AUC on the plain label (comparable across
 variants) and on the label each variant trained on, collapses removed (plain,
-the gate), weeks beating buy-all, walk-forward mean lift and mean collapses
-removed, simulation top 10% vs all calls, and the gate result. Lift and runner
+the gate), counted weeks beating buy-all, walk-forward mean lift and mean
+collapses removed (counted weeks only, as the gate), simulation top 10% vs all
+calls, and the gate result. Lift and runner
 AUC of the tradeable variant use its own (stricter) runner label; compare its
 runner rate. The logistic baseline uses numeric inputs only, so it is the same
 in the DEX variants. All variants are compared on the same test part: picking
@@ -349,7 +374,9 @@ the dead score, and about 2 min with `--variants`).
 
 1. **Verdict** - PASS/FAIL per bucket. PASS needs all of: top-10% lift >= 2;
    skipping the 30% highest collapse scores removes >= 40% of collapses; the
-   top-10% simulation beats buy-everything in every walk-forward week. Each
+   top-10% simulation beats buy-everything in every counted walk-forward week
+   (a week counts when its training part has at least 1000 rows; see
+   "Validation"; the verdict cell says how many weeks were not counted). Each
    top-10% lift (test and every walk-forward week) comes with an approximate
    95% interval (Wilson interval of the runner rate in the top 10%, divided by
    the base rate) and the runner counts in the top 10% and overall; the gate
@@ -365,8 +392,10 @@ the dead score, and about 2 min with `--variants`).
    out-of-fold rows used for calibration). Each bucket also has a "Dead after
    the call" table with the collapse ROC AUC on the plain collapse label
    (comparable with reports from before the dead rule), and each label's
-   calibration table shows the predictions of the recent-rows calibration
-   next to those of the earlier one.
+   calibration line names the chosen calibration (recent window or all
+   held-out rows) with the held-out comparison Brier values; its table shows
+   the predictions of the chosen, the recent-window and the all-rows
+   calibration side by side.
 4. **Dead after the call: separate score** (report only; see "Dead after the
    call: separate score" above).
 5. With `--variants` only: **Variant comparison**, one table per bucket (see
@@ -434,7 +463,7 @@ roll back, write an older version name into `models/LATEST`. Compare the new
     scout_ml/report.py    report.md
     train.py  serve.py  make_synthetic.py  tests/
 
-    python -m pytest tests -q        # 138 passed, about 2.5 minutes
+    python -m pytest tests -q        # 148 passed, about 2.5 minutes
 
 `build_features` raises if an outcome or bookkeeping column (anything starting
 with `ret_`, `max_gain_`, `max_dd_`, `trades_`, plus `rugged`, `tracking_status`,
