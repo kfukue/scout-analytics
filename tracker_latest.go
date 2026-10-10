@@ -468,7 +468,23 @@ func (s *scanner) latestOne(ctx context.Context, t *ScoutCallTracking, head uint
 			d := poolDepthUSD(*rugLiq)
 			depth = &d
 		}
-		return true, s.saveLatestRugged(ctx, t, readAt, patch, depth)
+		if err := s.saveLatestRugged(ctx, t, readAt, patch, depth); err != nil {
+			return true, err
+		}
+		// timing.go: the rug's exact time (one node request), only once the
+		// rug is saved, so a slow or failed lookup never holds it up; without
+		// it -backfill-timing can look the time up later.
+		rugTS, err := o.rpc.blockTime(ctx, rugBlock)
+		if err != nil {
+			log.Printf("call %d: rug time not stored: time of block %d: %v", t.CallID, rugBlock, err)
+			return true, nil
+		}
+		sctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), latestSaveTimeout)
+		defer cancel()
+		if err := s.db.SetRugAt(sctx, t.CallID, time.Unix(rugTS, 0).UTC(), rugAtEvent); err != nil {
+			log.Printf("call %d: rug time not stored: %v", t.CallID, err)
+		}
+		return true, nil
 	}
 	// Quote units → the call's price unit.
 	price := priceQ

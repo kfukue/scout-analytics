@@ -402,6 +402,14 @@ type horizonResult struct {
 	ReturnLatePct  *float64
 	MaxGainLatePct *float64
 	MaxDDLatePct   *float64
+
+	// Timing (on-chain source only; timing.go). TimingAt nil = not computed.
+	PeakLateAfterS    *int
+	First2xAfterS     *int
+	Above2xS          *int
+	FallBelow2xAfterS *int
+	Above2xCensored   *bool
+	TimingAt          *time.Time
 }
 
 // horizonStats computes return / peak gain / drawdown at entry+h from hourly

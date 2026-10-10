@@ -1495,6 +1495,9 @@ type onchainState struct {
 	warnedJump  bool   // the 1e6× backstop was logged for this call in this run (not stored)
 	ponsChecked bool   // graduated() was asked since this state was loaded (not stored)
 	ponsGradAt  uint64 // PoolGraduated block found while locating the close (not stored; ponsFindPool uses it)
+
+	rugAtErr      error  // ensureRugAt (timing.go): the rug block's time could not be read in this run (not stored)
+	rugAtErrBlock uint64 // the rug block that lookup was for
 }
 
 // onchainStateVersion: calls tracked with an older state are tracked again from

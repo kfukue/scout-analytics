@@ -1584,7 +1584,7 @@ func main() {
 	oneShot := flag.String("scan", "", "investigate a single CA with every tool, print the reports and deliver them (if allowed), then exit")
 	_ = flag.Bool("deliver", true, "deprecated: -scan now delivers by default (use -no-deliver to only print)")
 	noDeliver := flag.Bool("no-deliver", false, "with -scan / -post: print the reports only, don't send them")
-	dryRun := flag.Bool("dry-run", false, "listen and scan, but never deliver (verdicts are logged)")
+	dryRun := flag.Bool("dry-run", false, "listen and scan, but never deliver (verdicts are logged); with -rescan-missing or -backfill-timing: only count, write nothing")
 	backfillFlag := flag.Bool("backfill", false, "import past calls from the channel history into the DB (no bot scans) so their performance can be tracked, then exit")
 	backfillFrom := flag.Int("backfill-from", 1, "with -backfill: oldest post id to import")
 	backfillTo := flag.Int("backfill-to", 0, "with -backfill: newest post id to import (0 = latest)")
@@ -1604,6 +1604,7 @@ func main() {
 	retryLaunchpad := flag.String("retry-launchpad", "", "with -retry-no-pool: only calls whose launchpad or dex is one of these, comma-separated, e.g. pons_v2 (case, spaces and _ ignored)")
 	retryDryRun := flag.Bool("retry-dry-run", false, "with -retry-no-pool: only print what would be reset")
 	rescanMissing := flag.Bool("rescan-missing", false, "with -dry-run: list and count the first calls without a Perceptor report that the rescan lane (SCOUT_RESCAN) would re-scan under the current settings, and how long it would take, then exit (DB only; nothing is scanned)")
+	backfillTiming := flag.Bool("backfill-timing", false, "fill in the timing columns of done on-chain horizons from the stored candles, and the rug time of rugged calls (one node lookup each), then exit; with -dry-run: only count (DB only, no Telegram)")
 	flag.Parse()
 	if !*retryNoPool && (*retryGaveUp || *retryLaunchpad != "" || *retryDryRun) {
 		log.Fatal("-retry-gave-up, -retry-launchpad and -retry-dry-run are used with -retry-no-pool")
@@ -1650,6 +1651,17 @@ func main() {
 			dbSource, db.Describe(ctx), db.Pool.Config().MaxConns, db.MaxConnsFrom)
 	} else {
 		log.Println("SCOUT_DB=off — not recording to SQL")
+	}
+
+	// -backfill-timing (timing_backfill.go): database, and the node for rug times.
+	if *backfillTiming {
+		if s.db == nil {
+			log.Fatal("-backfill-timing needs the database (SCOUT_DB=off is set)")
+		}
+		if _, err := runTimingBackfill(ctx, s, os.Stdout, *dryRun); err != nil {
+			log.Fatalf("backfill-timing: %v", err)
+		}
+		return
 	}
 
 	// Modes that need only the database (no Telegram login).

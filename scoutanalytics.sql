@@ -280,6 +280,22 @@ CREATE TABLE IF NOT EXISTS scout_call_candles (
     PRIMARY KEY (call_id, interval_seconds, bucket_start)
 );
 
+-- Timing of each horizon, from the candles (outcomes: never model inputs). Seconds after
+-- entry_at; NULL timing_at = not computed (tracked before the columns existed: -backfill-timing).
+-- E = entry_late_price_usd; "2x" = a candle high at or above 2E (only when the stored late peak
+-- is at least 2E); time held = the last close carried forward, at or above 2E (closes only).
+ALTER TABLE scout_call_returns ADD COLUMN IF NOT EXISTS peak_late_after_s     INTEGER;      -- first bucket reaching the late peak (0 = the peak is the entry)
+ALTER TABLE scout_call_returns ADD COLUMN IF NOT EXISTS first_2x_after_s      INTEGER;      -- first bucket whose high reached 2E (NULL = never)
+ALTER TABLE scout_call_returns ADD COLUMN IF NOT EXISTS above_2x_s            INTEGER;      -- seconds the carried close was >= 2E, from the first 2x bucket's end (0 = never reached or never closed at 2x)
+ALTER TABLE scout_call_returns ADD COLUMN IF NOT EXISTS fall_below_2x_after_s INTEGER;      -- first close under 2E from the first cross on, or the rug (NULL = never reached / censored)
+ALTER TABLE scout_call_returns ADD COLUMN IF NOT EXISTS above_2x_censored     BOOLEAN;      -- still >= 2E at the end of the window, no rug
+ALTER TABLE scout_call_returns ADD COLUMN IF NOT EXISTS timing_at             TIMESTAMPTZ;  -- when the timing was computed
+-- When the pool was drained (exact block time). Kind: event (a price event in a scan),
+-- at_call (drained at or before the call; can be before entry_at), detected (found only by
+-- the end-of-tracking liquidity check: the time of that check). NULL = not rugged, or unknown.
+ALTER TABLE scout_call_tracking ADD COLUMN IF NOT EXISTS rug_at      TIMESTAMPTZ;
+ALTER TABLE scout_call_tracking ADD COLUMN IF NOT EXISTS rug_at_kind TEXT;
+
 -- Trading in the pool during the hour before the call (features known at call time).
 CREATE TABLE IF NOT EXISTS scout_call_precall (
     call_id            INTEGER      PRIMARY KEY REFERENCES scout_calls (id) ON DELETE CASCADE,
