@@ -52,6 +52,9 @@ type fakeChain struct {
 	// callErr (optional): a JSON-RPC error message for an eth_call ("" = none),
 	// e.g. a busy node; to and sel are lower case.
 	callErr func(to, sel string, block uint64) string
+	// blockErr (optional): a JSON-RPC error message for eth_getBlockByNumber of
+	// block n ("" = none). Called with f.mu held.
+	blockErr func(n uint64) string
 	// dataCalls: eth_call handlers that see the whole call data (arguments),
 	// asked before calls; "to|selector".
 	dataCalls map[string]func(data string, block uint64) (string, bool)
@@ -158,6 +161,12 @@ func (f *fakeChain) serve(w http.ResponseWriter, r *http.Request) {
 		var tag string
 		json.Unmarshal(req.Params[0], &tag)
 		n := num(tag)
+		if f.blockErr != nil {
+			if msg := f.blockErr(n); msg != "" {
+				fail(msg)
+				return
+			}
+		}
 		if n == 0 || n > f.latest {
 			ok(nil)
 			return
