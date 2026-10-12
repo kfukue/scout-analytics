@@ -49,45 +49,69 @@ anything non-trivial (`DEPLOY.md` and `ml/RUNBOOK.md` for deploy and training).
 
 ## Agents: who gets what
 
-- `researcher`: read-only investigation of code, data, model reports and
-  outside sources (web). Tell it to separate verified from inferred.
-- `coder`: Go and the plain-JavaScript website.
-- `ml-coder`: the Python package in `ml/`.
-- `react-coder`: React projects (not the `frontend/` site).
-- `infra`: deployment and devops drafts only; anything that touches real cloud
-  resources or costs money needs the owner's approval.
-- `tester`: runs and writes unit and integration tests in a coder's worktree;
-  writes test files only.
-- `reviewer`: read-only review of a coder's uncommitted diff.
-- `reviewer` runs on `model: fable`; `researcher` runs on `model: opus` (Opus
-  5.5 at the time of writing). Both are set in their frontmatter.
+Five agents, by function (`.claude/agents/`). Project rules live in skills
+(`.claude/skills/`): every agent preloads `scout-rules` (shared hard rules,
+reporting basics, where things are); the area skills are loaded on demand.
+No agent can start another agent; only you delegate.
 
-One coder at a time on overlapping files. Run coders in parallel only on
-disjoint files (name the files in each task) or in isolated git worktrees; at
-most 10 coding agents at once. Subagents start cold: give each one the goal, the
-relevant files, the rules below, and what to report back.
+- `investigate`: read-only answers about code, data, model reports
+  (`ml/models/<version>/report.md`, `ml-results/`) and outside sources (web);
+  also drafts plans and specs. Tell it to separate verified from inferred.
+- `implement`: changes files in a worktree to your spec, any area. Name the
+  area skill(s) in every brief:
+  - `scout-go`: Go code, `scoutanalytics.sql`, `SCOUT_*` config;
+  - `scout-web`: the `-web` server and `frontend/` (plus `scout-go` for the Go
+    side);
+  - `scout-ml`: the Python package in `ml/` and any change to
+    `scout_call_dataset_v`;
+  - `scout-infra`: deployment and devops drafts only; anything that touches
+    real cloud resources or costs money needs the owner's approval.
+- `simplify`: after `implement`, in the same worktree, simplifies the changed
+  code without changing behaviour; give it the implementer's test commands.
+- `verify`: runs and writes unit and integration tests in the implementer's
+  worktree; writes test files only.
+- `review`: read-only review of an uncommitted diff; ends with PASS/FAIL.
+- `review` runs on `model: fable`; `investigate` runs on `model: opus` (Opus
+  5.5 at the time of writing). Both are set in their frontmatter; the others
+  inherit the session model.
+
+One writer at a time per worktree: `implement`, `simplify` and `verify` never
+run at the same time in one worktree. Run writing agents in parallel only on
+disjoint files (name the files in each task) or in separate git worktrees; at
+most 10 writing agents at once. Subagents start cold: give each one the goal,
+the relevant files, the area skill(s), the rules below, and what to report
+back.
 
 ## How to work
 
 1. Confirm what the owner wants and what "done" means. Ask one short question
    only if the request is ambiguous.
-2. Split the work and delegate each piece to the right agent.
-3. Review before accepting: does it answer the task, were tests actually run
-   (which ones), is every claim backed by evidence? Send it back with specific
+2. Split the work and delegate each piece: questions and plans to
+   `investigate`, changes to `implement` (name the area skill(s)). Review
+   before accepting: does it answer the task, were tests actually run (which
+   ones), is every claim backed by evidence? Send it back with specific
    feedback when it falls short; verify surprising claims yourself.
-4. After the coder reports and before the reviewer, run `tester` (mode
-   "verify") in the coder's worktree when the change touches
+3. For non-trivial code changes, run `simplify` in the same worktree after
+   `implement` reports, and pass it the implementer's test commands. Skip it
+   for docs/config-only changes.
+4. Then run `verify` (mode "verify") in that worktree when the change touches
    `scoutanalytics.sql`, tracker/on-chain code, delivery/notify/re-check/
-   re-ask, the web snapshot/API, or `ml/`; skip it for docs-only changes.
-   Tester and coder never run at the same time in one worktree. If the tester
-   leaves failing tests, send them to the coder, then re-run the tester. Use
-   tester mode "gap audit" when an area has had repeated bugs.
-5. Before giving the owner commit commands, run `reviewer` on the diff (or on
-   the files the task named). Send must-fix findings back to the coder.
-6. Keep `HANDOFF.md` current after each shipped item (ask a coder to update it).
-   Also keep its "Deferred / open" section current whenever an item is
-   deferred or an owner check is pending, not only when something ships.
-7. Report in plain language: what was decided, what was done, what was verified
+   re-ask, the web snapshot/API, or `ml/`; skip it for docs-only changes. If
+   `verify` leaves failing tests, send them to `implement`, then re-run
+   `verify`. Use mode "gap audit" when an area has had repeated bugs.
+   **PAUSED by the owner since 10 October, still paused as of 12 October:
+   until resumed, `implement` runs the tests itself per `TESTING.md`.**
+5. Before giving the owner commit commands, run `review` on the diff (or on
+   the files the task named). It ends with PASS or FAIL. Send must-fix
+   findings back to `implement`, then run `review` again; after at most 3 fix
+   rounds without a PASS, escalate to the owner with the open findings.
+6. After a PASS, give the owner the exact commit commands (see "Worktree
+   lifecycle").
+7. Keep `HANDOFF.md` current after each shipped item (ask `implement` to
+   update it). Also keep its "Deferred / open" section current whenever an
+   item is deferred or an owner check is pending, not only when something
+   ships.
+8. Report in plain language: what was decided, what was done, what was verified
    and how, and what is still open or needs the owner's action.
 
 ## Rules to follow and pass on
@@ -110,14 +134,14 @@ relevant files, the rules below, and what to report back.
 - **ML leakage:** training features use only data available at the time of the
   call. Perceptor 12-minute re-check, re-scan and sAlpha re-ask results are
   never training inputs. The dataset view `scout_call_dataset_v` is the
-  contract; any change to it needs a leakage check (pass this on to coders and
-  the reviewer). This once went wrong (a request to prefer the re-check report
+  contract; any change to it needs a leakage check (pass this on to `implement`
+  and `review`). This once went wrong (a request to prefer the re-check report
   in the view) and was reverted.
 - **Expensive changes:** anything that makes the tracker redo history (e.g.
   `onchainStateVersion`) costs days of node time. Flag it before it ships.
 - **No rate guessing:** report tested behaviour, not speed-ups, unless measured
   on the owner's node.
-- **Processes and test DBs:** coders stop only their own processes, by PID. DB
+- **Processes and test DBs:** agents stop only their own processes, by PID. DB
   tests use a throwaway Postgres in the agent's own scratch directory on its own
   port; never the Windows Postgres service on 5432.
 - **`.env`:** the tracker reads `.env` from the folder it is started in, and
@@ -125,8 +149,9 @@ relevant files, the rules below, and what to report back.
 
 ### Worktree lifecycle
 
-- Coders usually run in isolated worktrees under
-  `.claude/worktrees/agent-<id>`, with their changes left uncommitted there.
+- `implement` usually runs in an isolated worktree under
+  `.claude/worktrees/agent-<id>`, with its changes left uncommitted there;
+  `simplify` and `verify` follow in the same worktree.
 - After review passes, give the owner exact commands. In that worktree: create
   or rename the branch (`git switch -c work/<YYYY-MM-DD>-<topic>`, or
   `git branch -m work/<YYYY-MM-DD>-<topic>`), `git add` naming the files,
@@ -136,7 +161,7 @@ relevant files, the rules below, and what to report back.
   `git branch -d work/<YYYY-MM-DD>-<topic>` (plus the worktree's original
   `worktree-agent-<id>` branch if `git switch -c` left it behind).
 - If `main` has moved and the branch touches the same files: after the owner
-  has committed the branch in the worktree, have the coder run
+  has committed the branch in the worktree, have `implement` run
   `git rebase main` (or `git merge main`) there, resolve conflicts and re-run
   the tests; the owner then commits/pushes again before review.
 - Prune merged worktrees. List leftovers to the owner rather than deleting
@@ -148,7 +173,8 @@ relevant files, the rules below, and what to report back.
 ## Testing
 
 Full guide: `TESTING.md` (layers, throwaway DB scripts, CI, commands, known
-flaky tests, how to report). Pass it on to coders and the tester. Essentials:
+flaky tests, how to report). Pass it on to `implement`, `simplify` and
+`verify`. Essentials:
 
 - DB tests must actually run: they need `SCOUT_TEST_DATABASE_URL` pointing at a
   throwaway Postgres (database `scout_test`, `-p 1`) and are skipped otherwise.

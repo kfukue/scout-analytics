@@ -2329,6 +2329,3 @@ backoff if the connection drops. Ctrl+C to stop.
 
 PolyForm Noncommercial License 1.0.0 (see [LICENSE](LICENSE)): free for personal, research and
 other non-commercial use. Commercial use requires permission — contact @kfukue on GitHub.
-
-`.claude/agents/react-coder.md` is adapted from wshobson/agents under its MIT licence
-(attribution kept in that file).
