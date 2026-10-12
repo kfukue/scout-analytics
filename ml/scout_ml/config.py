@@ -26,6 +26,18 @@ BUCKETS = {
              "collapse_or_rugged": True, "ret_col": "ret_late_30d"},
 }
 LABELS = ("runner", "collapse")
+
+# --- Delivery line (serving) -------------------------------------------------
+# Which buckets /score puts in `line`; chosen per request by the scoring
+# service from the SCOUT_MODEL_LINE environment variable. "passed" (default):
+# only buckets whose gates passed. "all": every bucket with a runner model,
+# a bucket that did not pass marked with LINE_NOT_VALIDATED right after its
+# horizon ("3d (not validated): runner 9%, collapse 71%"). Any other value
+# counts as the default. Scores never filter deliveries in either mode.
+LINE_MODE_ENV = "SCOUT_MODEL_LINE"
+LINE_MODES = ("passed", "all")
+LINE_MODE_DEFAULT = "passed"
+LINE_NOT_VALIDATED = "(not validated)"
 NO_POOL_STATUSES = ("no_pool", "gave_up")  # calls we could never have traded
 REPEAT_STATUS = "repeat"  # a later call of a token: the tracker follows the first call only
 UPDATE_KIND = "update"  # post_kind of a "$TOKEN hit 3X ..." post about an earlier call: not a call

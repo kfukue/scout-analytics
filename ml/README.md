@@ -451,12 +451,35 @@ stored and checked live; `passed` is true only when `meta.json` records
 `meta.json` without gate info, counts as not passed). Without a collapse model
 `collapse_prob` is null.
 
-`line` names only the buckets that passed their gates, by horizon (`1d`, `3d`,
-`7d`, `30d`), after the model version, e.g. with only `medium` passed:
+`SCOUT_MODEL_LINE` chooses which buckets `line` names, by horizon (`1d`, `3d`,
+`7d`, `30d`), in that order, after the model version:
 
-    Model 20261010-0621 · 7d: runner 12%, collapse 64%
+- `passed` (the default, also when unset): only the buckets that passed their
+  gates, e.g. with only `medium` passed:
 
-When no bucket passed, `line` is `""` and the listener appends nothing.
+      Model 20261010-0621 · 7d: runner 12%, collapse 64%
+
+  When no bucket passed, `line` is `""` and the listener appends nothing.
+- `all`: every bucket in `buckets` (a skipped bucket, with no model, never
+  appears). A bucket that did not pass is marked `(not validated)` right after
+  its horizon; a passing bucket looks as above. With only `medium` passed:
+
+      Model 20261010-0621 · 1d (not validated): runner 31%, collapse 44% · 3d (not validated): runner 9%, collapse 71% · 7d: runner 12%, collapse 64% · 30d (not validated): up 55%, collapse 20%
+
+  When no bucket passed, every part is marked; `line` is `""` only when no
+  bucket has a model.
+
+Case and surrounding spaces are ignored; any other value counts as `passed`
+and logs one warning (per distinct value). The service reads the variable on
+each request, but a running process does not see a changed environment:
+changing it takes a restart of the scoring service only (no retrain, no
+`LATEST` change, no listener restart). The mode changes only `line`, never a
+score or `passed`, and scores never filter deliveries in either mode. The
+marker and the values are in `scout_ml/config.py` (`LINE_*`).
+
+On 12 Oct 2026 the owner chose `SCOUT_MODEL_LINE=all` on prod: he is the only
+reader of the private delivery group, so he sees every bucket's numbers, with
+the unvalidated ones marked. The default stays `passed` for any other setup.
 
 Each bucket is scored with the category levels its models were trained with (stored per
 bucket in `meta.json`).
@@ -471,8 +494,9 @@ Start the service, then run the listener with
     SCOUT_MODEL_URL=http://127.0.0.1:8601
 
 It posts the row of a new call to `/score` and can append `line` to its message
-(nothing when `line` is empty, i.e. no bucket passed its gates). Scores never
-filter deliveries.
+(nothing when `line` is empty: with the default `SCOUT_MODEL_LINE=passed` when
+no bucket passed its gates, with `all` only when no bucket has a model). Scores
+never filter deliveries.
 
 ## Retrain
 
@@ -492,7 +516,7 @@ roll back, write an older version name into `models/LATEST`. Compare the new
     scout_ml/report.py    report.md
     train.py  serve.py  make_synthetic.py  tests/
 
-    python -m pytest tests -q        # 179 passed, about 2.5 minutes
+    python -m pytest tests -q        # 187 passed, about 2.5 minutes
 
 `build_features` raises if an outcome or bookkeeping column (anything starting
 with `ret_`, `max_gain_`, `max_dd_`, `trades_`, `peak_late_after_`, `peak_after_`,
