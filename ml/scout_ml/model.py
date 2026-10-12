@@ -242,13 +242,20 @@ class Bundle:
         gates = entry.get("gates") if isinstance(entry, dict) else None
         return isinstance(gates, dict) and gates.get("passed") is True
 
-    def score(self, row: dict) -> dict:
+    def score(self, row: dict, line_mode: str = C.LINE_MODE_DEFAULT) -> dict:
         """Score one raw view row -> the /score response body.
 
         `buckets` has every bucket with a runner model (a bucket skipped at
-        training is left out), each with `passed`. `line` names only the
-        buckets that passed their gates, by horizon (e.g. "7d"), and is "" when
-        none passed: the listener then appends nothing to the message."""
+        training is left out), each with `passed`. `line` names buckets by
+        horizon (e.g. "7d"), in BUCKETS order, after the model version:
+        - line_mode "passed" (default, and for any value not in C.LINE_MODES):
+          only the buckets that passed their gates; "" when none passed (the
+          listener then appends nothing to the message);
+        - line_mode "all": every bucket in `buckets`, a bucket that did not
+          pass marked C.LINE_NOT_VALIDATED after its horizon, e.g.
+          "3d (not validated): runner 9%, collapse 71%".
+        The mode changes only `line`, never a score or `passed`."""
+        show_all = line_mode == "all"
         buckets, parts = [], []
         for b, cfg in BUCKETS.items():
             if f"{b}_runner" not in self.models:
@@ -256,12 +263,13 @@ class Bundle:
             X = self.features(row, b)
             runner = float(predict(self.models[f"{b}_runner"], X)[0])
             collapse = None
-            text = f"{cfg['horizon_days']}d: {cfg['runner_word']} {runner * 100:.0f}%"
+            passed = self.passed(b)
+            label = f"{cfg['horizon_days']}d" + ("" if passed else f" {C.LINE_NOT_VALIDATED}")
+            text = f"{label}: {cfg['runner_word']} {runner * 100:.0f}%"
             if f"{b}_collapse" in self.models:
                 collapse = float(predict(self.models[f"{b}_collapse"], X)[0])
                 text += f", collapse {collapse * 100:.0f}%"
-            passed = self.passed(b)
-            if passed:
+            if passed or show_all:
                 parts.append(text)
             buckets.append({
                 "bucket": b, "passed": passed, "runner_prob": round(runner, 4),

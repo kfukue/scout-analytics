@@ -130,15 +130,22 @@ def render_report_for(df, root, monkeypatch):
     return (out / "report.md").read_text(encoding="utf-8")
 
 
-def _client(monkeypatch, model_dir):
+def _client(monkeypatch, model_dir, line=None):
+    """A test client on model_dir; `line` sets SCOUT_MODEL_LINE (None: unset)."""
     monkeypatch.setenv("SCOUT_MODEL_DIR", str(model_dir))
+    if line is None:
+        monkeypatch.delenv(C.LINE_MODE_ENV, raising=False)
+    else:
+        monkeypatch.setenv(C.LINE_MODE_ENV, line)
     import serve
     return TestClient(serve.app)
 
 
-def _check_shape(body, version, buckets=BUCKET_KEYS):
+def _check_shape(body, version, buckets=BUCKET_KEYS, line_mode="passed"):
     """Every bucket with a runner model is in `buckets`; `line` names exactly
-    the passed ones, by horizon, in BUCKETS order ("" when none passed)."""
+    the passed ones, by horizon, in BUCKETS order ("" when none passed). With
+    line_mode="all" it names every bucket in `buckets`, the ones that did not
+    pass marked C.LINE_NOT_VALIDATED right after the horizon."""
     assert set(body) == {"model_version", "line", "buckets"}
     assert body["model_version"] == version
     assert [b["bucket"] for b in body["buckets"]] == buckets
@@ -147,7 +154,9 @@ def _check_shape(body, version, buckets=BUCKET_KEYS):
         assert isinstance(b["passed"], bool)
         assert 0.0 <= b["runner_prob"] <= 1.0 and 0.0 <= b["runner_rank_pct"] <= 100.0
         assert b["collapse_prob"] is None or 0.0 <= b["collapse_prob"] <= 1.0
-    shown = [f"{C.BUCKETS[b['bucket']]['horizon_days']}d" for b in body["buckets"] if b["passed"]]
+    shown = [f"{C.BUCKETS[b['bucket']]['horizon_days']}d"
+             + ("" if b["passed"] else f" {C.LINE_NOT_VALIDATED}")
+             for b in body["buckets"] if b["passed"] or line_mode == "all"]
     if not shown:
         assert body["line"] == ""
         return
@@ -235,8 +244,8 @@ def test_missing_models_are_left_out(trained, tmp_path, monkeypatch):
     assert part.startswith("3d: runner ") and "collapse" not in part and "30d" not in body["line"]
 
 
-def _score(monkeypatch, root, row):
-    r = _client(monkeypatch, root).post("/score", json={"row": row})
+def _score(monkeypatch, root, row, line=None):
+    r = _client(monkeypatch, root, line).post("/score", json={"row": row})
     assert r.status_code == 200, r.text
     return r.json()
 
@@ -293,6 +302,86 @@ def test_missing_gate_info_fails_closed(trained, synthetic_df, tmp_path, monkeyp
     body = _score(monkeypatch, tmp_path, json.loads(synthetic_df.iloc[[5]].to_json(orient="records"))[0])
     _check_shape(body, vdir.name)
     assert body["line"] == "" and [b["passed"] for b in body["buckets"]] == [False] * 4
+
+
+@pytest.mark.parametrize("line", ["all", " ALL "])
+def test_line_all_shows_every_bucket_and_marks_only_the_failing_ones(trained, synthetic_df,
+                                                                      tmp_path, monkeypatch, line):
+    """SCOUT_MODEL_LINE=all, only medium passed: the line has all four buckets in
+    BUCKETS order, 1d/3d/30d marked "(not validated)", the 7d part exactly as in
+    the default (passed-only) line; `buckets` (scores and `passed`) unchanged."""
+    _, vdir = trained
+    row = json.loads(synthetic_df.iloc[[5]].to_json(orient="records"))[0]
+    _with_gates(vdir, tmp_path, passed={"medium": True})
+    default = _score(monkeypatch, tmp_path, row)                 # unset = passed-only
+    assert _score(monkeypatch, tmp_path, row, "passed") == default
+    body = _score(monkeypatch, tmp_path, row, line)
+    _check_shape(body, vdir.name, line_mode="all")
+    assert body["buckets"] == default["buckets"]                 # the mode changes only `line`
+    assert body["model_version"] == default["model_version"]
+    parts = body["line"].split(" · ")
+    assert parts[0] == f"Model {vdir.name}" and len(parts) == 5
+    import re
+    assert re.fullmatch(r"1d \(not validated\): runner \d+%, collapse \d+%", parts[1]), parts[1]
+    assert re.fullmatch(r"3d \(not validated\): runner \d+%, collapse \d+%", parts[2]), parts[2]
+    assert parts[3] == default["line"].split(" · ")[1]           # passing bucket unchanged
+    assert re.fullmatch(r"7d: runner \d+%, collapse \d+%", parts[3]), parts[3]
+    assert re.fullmatch(r"30d \(not validated\): up \d+%(, collapse \d+%)?", parts[4]), parts[4]
+    assert body["line"].count(C.LINE_NOT_VALIDATED) == 3
+
+
+@pytest.mark.parametrize("drop", [None, "metrics"])
+def test_line_all_marks_every_bucket_when_none_passed(trained, synthetic_df, tmp_path,
+                                                      monkeypatch, drop):
+    """SCOUT_MODEL_LINE=all and no bucket passed (or no gate info at all, which
+    fails closed): the line still shows every bucket, each one marked."""
+    _, vdir = trained
+    _with_gates(vdir, tmp_path, passed={}, drop=drop)
+    for row in (json.loads(synthetic_df.iloc[[5]].to_json(orient="records"))[0], {}):
+        assert _score(monkeypatch, tmp_path, row)["line"] == ""      # default: nothing
+        body = _score(monkeypatch, tmp_path, row, "all")
+        _check_shape(body, vdir.name, line_mode="all")
+        assert not any(b["passed"] for b in body["buckets"])
+        parts = body["line"].split(" · ")
+        assert [p.split(":")[0] for p in parts[1:]] == [
+            f"{h}d {C.LINE_NOT_VALIDATED}" for h in (1, 3, 7, 30)], body["line"]
+
+
+def test_line_all_leaves_out_buckets_without_a_model(trained, tmp_path, monkeypatch):
+    """SCOUT_MODEL_LINE=all never shows a skipped bucket (no runner model); a
+    bucket without a collapse model shows its runner part alone."""
+    _, vdir = trained
+    copy = _with_gates(vdir, tmp_path, passed={"short": True})
+    meta = json.loads((copy / "meta.json").read_text())
+    meta["models"] = [m for m in meta["models"] if m not in ("3day_collapse", "long_runner")]
+    (copy / "meta.json").write_text(json.dumps(meta))
+    body = _score(monkeypatch, tmp_path, {"mcap_usd": 5e4}, "all")
+    _check_shape(body, vdir.name, ["short", "3day", "medium"], line_mode="all")
+    parts = body["line"].split(" · ")
+    assert len(parts) == 4 and "30d" not in body["line"]
+    assert parts[1].startswith("1d: runner ")
+    assert parts[2].startswith(f"3d {C.LINE_NOT_VALIDATED}: runner ") and "collapse" not in parts[2]
+    assert parts[3].startswith(f"7d {C.LINE_NOT_VALIDATED}: runner ")
+
+
+@pytest.mark.parametrize("value", ["everything", "1", "passed,all"])
+def test_invalid_line_mode_is_passed_only_and_warns_once(trained, synthetic_df, tmp_path,
+                                                         monkeypatch, caplog, value):
+    """Any SCOUT_MODEL_LINE other than passed/all (case and spaces ignored) acts
+    as the default, passed-only, and logs one warning, not one per request."""
+    import serve
+    monkeypatch.setattr(serve, "_warned", set())
+    _, vdir = trained
+    row = json.loads(synthetic_df.iloc[[5]].to_json(orient="records"))[0]
+    _with_gates(vdir, tmp_path, passed={"medium": True})
+    default = _score(monkeypatch, tmp_path, row)
+    with caplog.at_level("WARNING", logger="scout-ml"):
+        bodies = [_score(monkeypatch, tmp_path, row, value) for _ in range(3)]
+    assert all(b == default for b in bodies)
+    _check_shape(bodies[0], vdir.name)
+    assert C.LINE_NOT_VALIDATED not in bodies[0]["line"]
+    warnings = [r for r in caplog.records if r.name == "scout-ml" and C.LINE_MODE_ENV in r.getMessage()]
+    assert len(warnings) == 1 and repr(value) in warnings[0].getMessage()
 
 
 def test_no_model_dir_gives_503_not_a_crash(tmp_path, monkeypatch):
