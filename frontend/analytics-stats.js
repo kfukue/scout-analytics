@@ -1,7 +1,9 @@
 // Scout analytics: the pure calculations of the Analytics page (no DOM, no
 // state): mean and median, equal-count groups, the fixed return bands, the
 // outcome classes, the symmetric-log and log scales, UTC weeks and hours,
-// "$100 on every call" and "gave back more than half". Plain JavaScript,
+// "$100 on every call" and "gave back more than half"; and for the Timing tab
+// the time bands, the 0-held rule, Kaplan–Meier and the share rugged by t,
+// the time axis and short durations. Plain JavaScript,
 // loaded by analytics.html before analytics.js (window.AnaStats), and by
 // testdata/analytics-stats.test.js under Node (module.exports).
 (function (root) {
@@ -405,8 +407,154 @@
     return (v > 0 ? '+' : '−') + body + '%';
   }
 
+  // ---- Timing after the call (the Timing tab) -------------------------------
+
+  // The log bands of a time after the call, in seconds. A value on a boundary
+  // goes to the band above it (exactly 5 minutes is in "5–15m"); the last band
+  // takes everything from 7 days on (no window is longer than 30 days).
+  var TIME_BANDS = [
+    { label: '< 5m', lo: 0, hi: 300 },
+    { label: '5–15m', lo: 300, hi: 900 },
+    { label: '15–60m', lo: 900, hi: 3600 },
+    { label: '1–4h', lo: 3600, hi: 14400 },
+    { label: '4–24h', lo: 14400, hi: 86400 },
+    { label: '1–3d', lo: 86400, hi: 259200 },
+    { label: '3–7d', lo: 259200, hi: 604800 },
+    { label: '7–30d', lo: 604800, hi: Infinity }
+  ];
+
+  // The band of a time in seconds; −1 when not a number or below 0.
+  function timeBand(s) {
+    if (!isNum(s) || s < 0) { return -1; }
+    for (var i = TIME_BANDS.length - 1; i > 0; i--) {
+      if (s >= TIME_BANDS[i].lo) { return i; }
+    }
+    return 0;
+  }
+
+  // Counts per time band of a list of seconds.
+  function timeHistogram(list) {
+    var out = [];
+    for (var i = 0; i < TIME_BANDS.length; i++) { out.push(0); }
+    for (var j = 0; j < list.length; j++) {
+      var b = timeBand(list[j]);
+      if (b >= 0) { out[b]++; }
+    }
+    return out;
+  }
+
+  // The time held at 2× of a timed call, by the owner's rule: a call that
+  // never reached 2× (first 2× missing) counts as 0 held; one that touched 2×
+  // but never closed at or above it has held 0 already. NaN when held is
+  // missing although 2× was reached.
+  function heldValue(t2x, held) {
+    if (!isNum(t2x)) { return 0; }
+    return isNum(held) ? held : NaN;
+  }
+
+  // One call for the "still at 2× after t" curve, counted from the first 2×
+  // cross: null when 2× was never reached (or the times are missing).
+  // Censored (still at 2× when the window ended, no rug): { t: held, event:
+  // false }. Otherwise it fell back: t = the time held on closes, but at
+  // most the time from the first cross to the first close under 2×
+  // (tfall − t2x; tfall is the rug when it rugged at 2×), so a call that
+  // fell back and later rose again counts its first stretch only; a touch
+  // and drop (held 0) falls at 0.
+  function holdItem(t2x, held, tfall, censored) {
+    if (!isNum(t2x) || !isNum(held)) { return null; }
+    if (censored) { return { t: Math.max(0, held), event: false }; }
+    var t = held;
+    if (isNum(tfall)) { t = Math.min(t, tfall - t2x); }
+    return { t: Math.max(0, t), event: true };
+  }
+
+  // Kaplan–Meier estimate of the share still "alive" after t, from items
+  // { t, event } (event false = censored at t). At a time with both, the
+  // censored ones still count as at risk (the usual convention). Returns
+  // points [{ t, s, atRisk, d }] (s = the share right after t; the first is
+  // { t: 0, s: 1 }; one more per time with an event), n, events, censored,
+  // median (the first t at which s ≤ 0.5; NaN when never) and end (the
+  // largest t).
+  function kaplanMeier(items) {
+    var list = items.filter(function (x) { return x && isNum(x.t); }).slice();
+    list.sort(function (a, b) { return a.t - b.t; });
+    var n = list.length;
+    var out = [{ t: 0, s: 1, atRisk: n, d: 0 }];
+    var s = 1, events = 0, censored = 0, med = NaN;
+    for (var i = 0; i < n;) {
+      var t = list[i].t, d = 0, c = 0, j = i;
+      while (j < n && list[j].t === t) {
+        if (list[j].event) { d++; } else { c++; }
+        j++;
+      }
+      var atRisk = n - i;
+      if (d > 0) {
+        s *= 1 - d / atRisk;
+        out.push({ t: t, s: s, atRisk: atRisk, d: d });
+        if (!isNum(med) && s <= 0.5 + 1e-12) { med = t; }
+      }
+      events += d;
+      censored += c;
+      i = j;
+    }
+    return { points: out, n: n, events: events, censored: censored, median: med, end: n ? list[n - 1].t : 0 };
+  }
+
+  // The value of a step curve (points as kaplanMeier's, sorted by t) at t:
+  // the last point at or before t.
+  function stepAt(points, t) {
+    var v = NaN;
+    for (var i = 0; i < points.length && points[i].t <= t; i++) { v = points[i].s; }
+    return v;
+  }
+
+  // The share of n calls whose time is at most t, as a step curve: points
+  // [{ t, s, k }] starting at { t: 0, s: 0, k: 0 }, one per distinct time
+  // (times below 0 count at 0).
+  function cumulativeShare(times, n) {
+    var list = times.filter(isNum).map(function (v) { return Math.max(0, v); });
+    list.sort(function (a, b) { return a - b; });
+    var out = [{ t: 0, s: 0, k: 0 }];
+    if (!n) { return out; }
+    for (var i = 0; i < list.length;) {
+      var j = i;
+      while (j < list.length && list[j] === list[i]) { j++; }
+      var last = out[out.length - 1];
+      if (last.t === list[i]) { out.pop(); }
+      out.push({ t: list[i], s: j / n, k: j });
+      i = j;
+    }
+    return out;
+  }
+
+  // The time axis of the Timing charts: log10(1 + minutes), and its inverse.
+  function timeAxis(s) { return Math.log10(1 + Math.max(0, s) / 60); }
+  function timeAxisInv(x) { return (Math.pow(10, x) - 1) * 60; }
+
+  // A duration in seconds, short: "0m", "45m", "3.5h", "2.1d" (minutes below
+  // an hour, hours below a day).
+  function fmtDur(s) {
+    if (!isNum(s)) { return '–'; }
+    var neg = s < 0;
+    var a = Math.abs(s);
+    var out;
+    if (a < 3600) {
+      var m = Math.round(a / 60);
+      out = m === 60 ? '1h' : m + 'm';
+    } else if (a < 86400) {
+      var h = (a / 3600).toFixed(1).replace(/\.0$/, '');
+      out = h === '24' ? '1d' : h + 'h';
+    } else {
+      out = (a / 86400).toFixed(1).replace(/\.0$/, '') + 'd';
+    }
+    return (neg && out !== '0m' ? '−' : '') + out;
+  }
+
   var api = {
     isNum: isNum, mean: mean, median: median, summarize: summarize,
+    TIME_BANDS: TIME_BANDS, timeBand: timeBand, timeHistogram: timeHistogram, heldValue: heldValue,
+    holdItem: holdItem, kaplanMeier: kaplanMeier, stepAt: stepAt, cumulativeShare: cumulativeShare,
+    timeAxis: timeAxis, timeAxisInv: timeAxisInv, fmtDur: fmtDur,
     equalCountGroups: equalCountGroups, BANDS: BANDS, band: band, histogram: histogram,
     OUTCOMES: OUTCOMES, outcome: outcome,
     symlog: symlog, symlogInv: symlogInv, log1p10: log1p10, log1p10Inv: log1p10Inv,

@@ -1,6 +1,8 @@
-// Scout analytics page: three tabs (Overview, By factor, Peak vs final) over
-// one compact feed. Plain JavaScript, no dependencies; the pure calculations
-// are in analytics-stats.js (window.AnaStats), loaded before this file.
+// Scout analytics page: four tabs (Overview, By factor, Peak vs final, Timing)
+// over one compact feed. Plain JavaScript; the pure calculations are in
+// analytics-stats.js (window.AnaStats), loaded before this file. The Timing
+// tab draws with the vendored ECharts build (frontend/vendor, window.echarts,
+// loaded first); the other tabs draw their own SVG.
 //
 // GET /api/analytics sends one compact row per first call (built once per
 // snapshot on the server); this page filters, groups and draws them itself,
@@ -14,7 +16,7 @@
 
   var A = window.AnaStats;
   var DASH = '–';
-  var FORMAT = 3;          // the body's "format" this page understands
+  var FORMAT = 4;          // the body's "format" this page understands
   var MIN_N = 20;          // fewer calls with data than this: the group is greyed out
   var REFRESH_MS = 60000;  // ask again (cheap: 304 while nothing changed)
   var REDRAW_MS = 600000;  // on a 304, draw again only this often ("not due yet" moves slowly)
@@ -59,7 +61,7 @@
 
   var state = {
     horizon: '1d', metric: 'ret', stat: 'median', quiet: 'all', period: 'week', family: 'all', verdict: 'all',
-    tab: 'overview', factor: 'verdict', k: '5', path: 'all'
+    tab: 'overview', factor: 'verdict', k: '5', path: 'all', tmGroup: 'verdict'
   };
   var data = null;        // the last body read
   var col = {};           // column name → index in a row
@@ -1230,6 +1232,562 @@
       'Points on the dashed line ended at their peak; below it, they gave some back. Rugged calls keep their peak before the rug.';
   }
 
+  // ---- Timing -----------------------------------------------------------------
+  //
+  // When things happened after the call (time to peak, to the first 2×, time
+  // held at 2×, time to fall back below 2×, time to rug), for the calls with
+  // data for the window whose timing is computed ("timed"). Drawn with ECharts
+  // (frontend/vendor, window.echarts): canvas only; tooltips are elements built
+  // here with textContent (the library's own tooltip markup carries style
+  // attributes, which the page's CSP blocks); colours from the CSS variables.
+
+  // The groups of the Timing tab: the Perceptor verdict at the call, the week
+  // or month (the Period choice), the pool family, the DEX named in the post,
+  // and the number factors of the By factor tab.
+  var TM_GROUPS = [
+    { key: 'verdict', label: 'Perceptor verdict at the call', kind: 'cat' },
+    { key: 'period', label: 'Week or month of the call (Period above)', kind: 'period' },
+    { key: 'family', label: 'Pool family (DEX family)', kind: 'family' },
+    { key: 'dex', label: 'DEX named in the post', kind: 'dex' }
+  ].concat(FACTORS.filter(function (f) { return f.kind !== 'cat'; }));
+  var TM_TICKS = [0, 300, 900, 3600, 14400, 86400, 259200, 604800, 2592000];
+  var RUG_EVENT = 'event', RUG_AT_CALL = 'at_call', RUG_DETECTED = 'detected';
+  var darkMQ = window.matchMedia ? window.matchMedia('(prefers-color-scheme: dark)') : null;
+  var calmMQ = window.matchMedia ? window.matchMedia('(prefers-reduced-motion: reduce)') : null;
+  var charts = {};      // box id → ECharts instance
+  var themes = {};      // registered theme names
+  var chartScheme = ''; // 'dark' | 'light': the scheme the charts were made in
+
+  function nz(v) { return isNum(v) ? v : NaN; }
+
+  // The timing of a row for window hz (index hIdx); null when it has none.
+  // held follows the owner's rule: 0 when 2× was never reached.
+  function timingOf(r, hIdx, hz) {
+    if (!((r[col.timed] >> hIdx) & 1)) { return null; }
+    var t2x = r[col['t2x_' + hz]], held = r[col['held_' + hz]], tfall = r[col['tfall_' + hz]];
+    var cens = ((r[col.cens_2x] >> hIdx) & 1) === 1;
+    var reached = isNum(t2x);
+    return {
+      peak: nz(r[col['tpeak_' + hz]]), t2x: nz(t2x), held: A.heldValue(t2x, held), tfall: nz(tfall), cens: reached && cens,
+      reached: reached, touchDrop: reached && held === 0 && !cens, hold: A.holdItem(t2x, held, tfall, cens)
+    };
+  }
+
+  // The rug time of a row: { kind, s } (kind '' = not rugged; 'none' =
+  // flagged rugged without a rug time).
+  function rugOf(r) {
+    var ki = r[col.rug_kind];
+    if (!(ki >= 0)) { return { kind: isRugged(r) ? 'none' : '', s: NaN }; }
+    return { kind: data.rug_kinds[ki] || 'other', s: nz(r[col.rug_s]) };
+  }
+
+  function newTm() {
+    return {
+      n: 0, reached: 0, cens: 0, touch: 0, peaks: [], t2xs: [], helds: [], heldsReached: [], falls: [], holds: [],
+      rugIn: [], rugLater: [], atCall: [], detected: [], other: 0, noTime: 0
+    };
+  }
+  // Adds a timed call to an accumulator; H = the window in seconds.
+  function addTm(acc, tm, rug, H) {
+    acc.n++;
+    if (isNum(tm.peak)) { acc.peaks.push(tm.peak); }
+    if (isNum(tm.held)) { acc.helds.push(tm.held); }
+    if (tm.reached) {
+      acc.reached++;
+      acc.t2xs.push(tm.t2x);
+      if (isNum(tm.held)) { acc.heldsReached.push(tm.held); }
+      if (tm.cens) { acc.cens++; }
+      if (tm.touchDrop) { acc.touch++; }
+      if (tm.hold) { acc.holds.push(tm.hold); }
+      if (isNum(tm.tfall)) { acc.falls.push(tm.tfall); }
+    }
+    switch (rug.kind) {
+      case '': break;
+      case RUG_EVENT:
+        if (isNum(rug.s) && rug.s <= H) { acc.rugIn.push(Math.max(0, rug.s)); } else { acc.rugLater.push(rug.s); }
+        break;
+      case RUG_AT_CALL: acc.atCall.push(rug.s); break;
+      case RUG_DETECTED: acc.detected.push(rug.s); break;
+      case 'none': acc.noTime++; break;
+      default: acc.other++;
+    }
+  }
+
+  function tmGroupDef() {
+    for (var i = 0; i < TM_GROUPS.length; i++) { if (TM_GROUPS[i].key === state.tmGroup) { return TM_GROUPS[i]; } }
+    return TM_GROUPS[0];
+  }
+
+  // The groups of the timed calls by the chosen grouping: [{ label, acc }],
+  // in the order of the other tabs (periods newest first), and how many
+  // calls have no value for a number factor.
+  function tmGroups(timed, H) {
+    var g = tmGroupDef();
+    var map = {};
+    var noValue = 0;
+    var otherDex = {};
+    var keyOf;
+    if (g.kind === 'cat') {
+      keyOf = function (r) { var v = verdictKey(r); return { key: v, label: VERDICT_LABEL[v] || v, order: r[col.verdict] }; };
+    } else if (g.kind === 'period') {
+      keyOf = function (r) { var ps = periodStart(r[col.t]); return { key: 'p' + ps, label: periodLabel(ps), order: -ps }; };
+    } else if (g.kind === 'family') {
+      keyOf = function (r) { var f = familyKey(r), fi = r[col.family]; return { key: f, label: FAMILY_LABEL[f] || f, order: fi < 0 ? 1e6 : fi }; };
+    } else if (g.kind === 'dex') {
+      keyOf = function (r) {
+        var di = r[col.dex];
+        if (di < 0) { return { key: 'none', label: 'Not given', order: 2e6 }; }
+        if (di < TOP_DEX) { return { key: 'd' + di, label: data.dexes[di], order: di }; }
+        otherDex[di] = true;
+        return { key: 'other', label: 'Other', order: 1e6 };
+      };
+    } else {
+      var vals = [];
+      timed.forEach(function (x) { var v = factorValue(x.r, g); if (isNum(v)) { vals.push(v); } });
+      var eq = A.equalCountGroups(vals, Number(state.k));
+      var labels = A.rangeLabels(eq.groups, g.kind);
+      keyOf = function (r) {
+        var v = factorValue(r, g);
+        var i = isNum(v) ? eq.index(v) : -1;
+        return i < 0 ? null : { key: 'g' + i, label: labels[i], order: i };
+      };
+    }
+    timed.forEach(function (x) {
+      var k = keyOf(x.r);
+      if (!k) { noValue++; return; }
+      var e = map[k.key];
+      if (!e) { e = map[k.key] = { label: k.label, order: k.order, acc: newTm() }; }
+      addTm(e.acc, x.tm, x.rug, H);
+    });
+    if (map.other && g.kind === 'dex') { map.other.label = 'Other (' + fmtInt(Object.keys(otherDex).length) + ' names)'; }
+    return { def: g, groups: sorted(map), noValue: noValue };
+  }
+
+  // ---- ECharts plumbing ----
+
+  function cssVar(name) { return getComputedStyle(document.documentElement).getPropertyValue(name).trim(); }
+  function chartsReady() { return !!(window.echarts && typeof window.echarts.init === 'function'); }
+  function disposeCharts() {
+    Object.keys(charts).forEach(function (id) { charts[id].dispose(); });
+    charts = {};
+  }
+  // The registered theme of the colour scheme now in use, made from the page's
+  // CSS variables (light or dark) the first time it is needed.
+  function themeName() {
+    var scheme = darkMQ && darkMQ.matches ? 'dark' : 'light';
+    var name = 'scout-' + scheme;
+    if (!themes[name]) {
+      var axis = {
+        axisLine: { lineStyle: { color: cssVar('--border-input') } },
+        axisTick: { lineStyle: { color: cssVar('--border-input') } },
+        axisLabel: { color: cssVar('--muted') },
+        splitLine: { lineStyle: { color: cssVar('--border') } }
+      };
+      window.echarts.registerTheme(name, {
+        color: ['--c0', '--c1', '--c2', '--c3', '--c4', '--c5', '--c6', '--c7', '--c8', '--c9'].map(cssVar),
+        backgroundColor: 'transparent',
+        textStyle: { color: cssVar('--muted'), fontFamily: getComputedStyle(document.body).fontFamily, fontSize: 11 },
+        categoryAxis: axis, valueAxis: axis,
+        tooltip: { backgroundColor: cssVar('--surface'), borderColor: cssVar('--border'), textStyle: { color: cssVar('--text') } }
+      });
+      themes[name] = true;
+    }
+    if (chartScheme !== scheme) { disposeCharts(); chartScheme = scheme; }
+    return name;
+  }
+  // The chart of a box (made on first use, in the theme of the scheme now in use).
+  function chartIn(box) {
+    var name = themeName();
+    var c = charts[box.id];
+    if (c && c.getDom() !== box) { c.dispose(); c = null; }
+    if (!c) {
+      c = window.echarts.init(box, name, { renderer: 'canvas' });
+      charts[box.id] = c;
+    }
+    return c;
+  }
+  function draw(box, option) {
+    if (!charts[box.id]) { box.replaceChildren(); } // a message left by chartMsg
+    var c = chartIn(box);
+    c.setOption(option, { notMerge: true });
+    c.resize();
+  }
+  function animate() { return !(calmMQ && calmMQ.matches); }
+
+  // A tooltip: a heading and rows of [swatch class, text], as elements with
+  // textContent only.
+  function tipBox(head, rows) {
+    var box = el('div', 'ech-tip');
+    box.appendChild(el('div', 'ech-tip-h', head));
+    rows.forEach(function (row) {
+      var line = el('div', 'ech-tip-row');
+      if (row[0]) { line.appendChild(el('span', 'sw ' + row[0])); }
+      line.appendChild(el('span', null, row[1]));
+      box.appendChild(line);
+    });
+    return box;
+  }
+  function tooltipBase(formatter, trigger) {
+    return {
+      trigger: trigger || 'axis', confine: true, className: 'ech-tip-box', renderMode: 'html', formatter: formatter,
+      axisPointer: { type: trigger === 'item' ? 'none' : 'shadow' }
+    };
+  }
+  // the time axis (log of minutes), with ticks at the band edges up to H
+  function timeXAxis(H) {
+    var ticks = TM_TICKS.filter(function (s) { return s <= H; });
+    if (ticks[ticks.length - 1] !== H) { ticks.push(H); }
+    var at = ticks.map(A.timeAxis);
+    return {
+      type: 'value', min: 0, max: A.timeAxis(H),
+      axisLabel: { customValues: at, hideOverlap: true, formatter: function (x) { var s = A.timeAxisInv(x); return s < 1 ? '0' : A.fmtDur(Math.round(s)); } },
+      axisTick: { customValues: at }, splitLine: { show: true }
+    };
+  }
+  function pctAxis(max) {
+    return { type: 'value', min: 0, max: max, axisLabel: { formatter: '{value}%' } };
+  }
+  function chartMsg(box, text) {
+    var c = charts[box.id];
+    if (c) { c.dispose(); delete charts[box.id]; }
+    box.replaceChildren(el('p', 'muted small ech-msg', text));
+  }
+
+  // ---- the parts of the tab ----
+
+  function tmCounts(all, calls, withData, notTimed, hz) {
+    var dl = $('tm-counts');
+    dl.replaceChildren();
+    stat(dl, 'Calls', fmtInt(calls));
+    stat(dl, 'With data (' + hz + ')', fmtInt(withData), 'Calls with a return for the window');
+    stat(dl, 'Timed', fmtInt(all.n), 'With data and their timing computed: the n of this tab');
+    stat(dl, 'Timing not computed', fmtInt(notTimed), 'With data but no timing yet: left out');
+    stat(dl, 'Reached 2×', all.n ? fmtInt(all.reached) + ' (' + (all.reached / all.n * 100).toFixed(1) + '%)' : DASH,
+      fmtInt(all.reached) + ' of ' + fmtInt(all.n) + ' timed calls touched 2× the entry within the window');
+    stat(dl, 'Still at 2× at the end', fmtInt(all.cens), 'Reached 2× and had not closed under it when the window ended (censored)');
+    stat(dl, 'Touch and drop', fmtInt(all.touch), 'Touched 2× but never closed at or above it: 0 held');
+    stat(dl, 'Rugged in the window', fmtInt(all.rugIn.length), 'Event rug times within the window (at-the-call and detected rugs are counted apart, below)');
+    $('tm-counts-note').textContent = 'n timed = ' + fmtInt(all.n) + ': first calls priced in USD with a ' + hz + ' return whose timing is computed. ' +
+      (notTimed ? fmtInt(notTimed) + ' calls with a ' + hz + ' return have no timing yet (tracked before the timing existed, or the candles did not match the stored peak) and are left out. ' : '') +
+      'Repeat calls are never counted (first calls only).';
+  }
+
+  // The five distributions: one small bar chart each (shares of its n).
+  var TM_DIST = [
+    { key: 'peak', title: 'Time to peak' },
+    { key: 't2x', title: 'Time to first 2×' },
+    { key: 'held', title: 'Time held at 2× (on closes)' },
+    { key: 'fall', title: 'Time to fall back below 2×' },
+    { key: 'rug', title: 'Time to rug (event rug times in the window)' }
+  ];
+  function distCards() {
+    var box = $('tm-dist');
+    if (box.childElementCount === TM_DIST.length) { return; }
+    disposeCharts();
+    box.replaceChildren();
+    TM_DIST.forEach(function (d, i) {
+      var card = el('div', 'ana-multiple');
+      card.appendChild(el('h4', null, d.title));
+      var c = el('div', 'ech');
+      c.id = 'ch-tm-d' + i;
+      c.setAttribute('role', 'img');
+      card.appendChild(c);
+      box.appendChild(card);
+    });
+  }
+
+  function drawTmDist(all, hz) {
+    distCards();
+    var cards = $('tm-dist').children;
+    var bandLabels = A.TIME_BANDS.map(function (b) { return b.label; });
+    var narrow = $('tm-dist').clientWidth < 520;
+    TM_DIST.forEach(function (d, i) {
+      var cats = bandLabels.slice();
+      var series;
+      var n;
+      if (d.key === 'held') {
+        // 0 first: the calls that never reached 2× (counted as 0 held) and the
+        // ones that reached it but held 0; then the bands above 0
+        cats = ['0'].concat(bandLabels);
+        n = all.helds.length;
+        var reachedCounts = [0].concat(A.timeHistogram(all.heldsReached.filter(function (v) { return v > 0; })));
+        reachedCounts[0] = all.heldsReached.filter(function (v) { return v === 0; }).length;
+        var never = cats.map(function (c, j) { return j === 0 ? all.n - all.reached : 0; });
+        series = [
+          { name: 'Never reached 2× (counted as 0)', counts: never, sw: 'sw-never', color: cssVar('--muted') },
+          { name: 'Reached 2×', counts: reachedCounts, sw: 'sw-acc', color: cssVar('--accent') }
+        ];
+      } else {
+        var list = d.key === 'peak' ? all.peaks : d.key === 't2x' ? all.t2xs : d.key === 'fall' ? all.falls : all.rugIn;
+        n = list.length;
+        series = [{ name: d.title, counts: A.timeHistogram(list), sw: 'sw-acc', color: cssVar('--accent') }];
+      }
+      var card = cards[i];
+      var few = n < MIN_N;
+      card.className = 'ana-multiple' + (few ? ' is-few' : '');
+      card.firstChild.textContent = d.title + ' · n ' + fmtInt(n);
+      var box = card.children[1];
+      if (!chartsReady()) { return; }
+      var maxShare = 0;
+      cats.forEach(function (c, j) {
+        var tot = 0;
+        series.forEach(function (s) { tot += s.counts[j]; });
+        if (n && tot / n > maxShare) { maxShare = tot / n; }
+      });
+      var yMax = Math.min(100, Math.max(10, Math.ceil(maxShare * 100 / 10) * 10));
+      var title = d.title + ' (' + hz + ')';
+      draw(box, {
+        animation: animate(),
+        aria: { enabled: true, label: { description: title + ', share of ' + fmtInt(n) + ' calls per band: ' + cats.map(function (c, j) {
+          var k = 0;
+          series.forEach(function (s) { k += s.counts[j]; });
+          return c + ' ' + (n ? (k / n * 100).toFixed(1) : '0') + '%';
+        }).join(', ') } },
+        grid: { left: 36, right: 6, top: 8, bottom: narrow ? 42 : 30 },
+        xAxis: { type: 'category', data: cats, axisLabel: { interval: 0, rotate: narrow ? 40 : 30, fontSize: 10 } },
+        yAxis: pctAxis(yMax),
+        tooltip: tooltipBase(function (params) {
+          var p = Array.isArray(params) ? params : [params];
+          var j = p.length ? p[0].dataIndex : 0;
+          return tipBox(d.title + ', ' + cats[j], series.map(function (s) {
+            var k = s.counts[j];
+            return [s.sw, (series.length > 1 ? s.name + ': ' : '') + (n ? (k / n * 100).toFixed(1) : '0.0') + '% (' + fmtInt(k) + ' of ' + fmtInt(n) + ')'];
+          }));
+        }),
+        series: series.map(function (s) {
+          return {
+            type: 'bar', name: s.name, stack: 'all', barCategoryGap: '20%',
+            itemStyle: { color: few ? cssVar('--muted') : s.color, opacity: s.sw === 'sw-never' ? 0.55 : 0.8 },
+            emphasis: { itemStyle: { opacity: 1 } },
+            data: s.counts.map(function (k) { return n ? Math.round(k / n * 1000) / 10 : 0; })
+          };
+        })
+      });
+    });
+    $('h-tm-dist').textContent = 'How long it took (' + hz + ' window)';
+    $('cap-tm-dist').textContent = 'Bands: < 5m, 5–15m, 15–60m, 1–4h, 4–24h, 1–3d, 3–7d, 7–30d after the post; a time on a boundary goes to the band above it. ' +
+      'Each bar is a share of the n of its chart. Time to peak: every timed call. Time to first 2×: the calls that reached 2×. ' +
+      'Time held at 2×: every timed call; the ' + fmtInt(all.n - all.reached) + ' calls that never reached 2× count as 0 held (grey part of the 0 bar), ' +
+      'and so do the ' + fmtInt(all.touch) + ' that touched 2× but never closed at or above it. ' +
+      'Time to fall back below 2×: the calls that reached 2× and fell back within the window (' + fmtInt(all.cens) + ' still at 2× at the end are left out). ' +
+      'Time to rug: the event rug times within the window; rugs at the call and rugs only detected at the end of tracking are in the table below, not here. Grey: n under ' + MIN_N + '.';
+  }
+
+  function fillTmRugs(all, hz) {
+    var med = function (list) { return A.median(list.filter(isNum)); };
+    var rows = [
+      ['Event, within the window', all.rugIn, 'Exact (rug block). In the histogram and the "share rugged by t" curve.'],
+      ['Event, after the window', all.rugLater, 'Exact, but later than ' + hz + ': not in this window\'s charts.'],
+      ['At the call (at or before the post)', all.atCall, 'Drained at or before the post: no time after the call. Never in the charts.'],
+      ['Detected at the end of tracking', all.detected, 'Found only by the end-of-tracking check; the time is that check\'s (approximate: an upper bound). Never in the charts.']
+    ];
+    var frag = document.createDocumentFragment();
+    frag.appendChild(headRow('Kind of rug time', [
+      ['Calls', 'Timed calls with this kind of rug time'], ['Of timed', 'Share of the timed calls'],
+      ['Median time', 'Median rug time after the post (negative: before the post)'], ['In the charts', '']
+    ]));
+    var tbody = el('tbody');
+    function row(label, k, medTxt, note) {
+      var tr = el('tr');
+      var th = el('th', 'tok', label);
+      th.scope = 'row';
+      tr.appendChild(th);
+      tr.appendChild(el('td', 'num', fmtInt(k)));
+      tr.appendChild(rateCell(k, all.n, 'timed calls'));
+      tr.appendChild(el('td', 'num', medTxt));
+      tr.appendChild(el('td', null, note));
+      tbody.appendChild(tr);
+    }
+    rows.forEach(function (x) {
+      var m = med(x[1]);
+      var txt = isNum(m) ? (x[1] === all.detected ? '≈ ' : '') + A.fmtDur(m) : DASH;
+      row(x[0], x[1].length, txt, x[2]);
+    });
+    if (all.other) { row('Other kind', all.other, DASH, 'A kind of rug time this page does not know. Never in the charts.'); }
+    row('Rugged, no rug time stored', all.noTime, DASH, 'Flagged rugged by the tracker (as of now) without a rug block time. Never in the charts.');
+    frag.appendChild(tbody);
+    $('tbl-tm-rugs').replaceChildren(frag);
+    $('cap-tm-rugs').textContent = 'Over the ' + fmtInt(all.n) + ' timed calls. Only event rug times are exact; the three other kinds are kept apart, as the owner decided.';
+  }
+
+  var TM_HEADS = [
+    ['Timed', 'Calls with a return for the window and their timing computed: the n of the row'],
+    ['Reached 2×', 'Share whose price touched 2× the entry within the window'],
+    ['Time to peak', 'Median, the mean under it, n'],
+    ['First 2×', 'Time to the first 2×: median and mean over the calls that reached 2×'],
+    ['Held at 2×', 'Time at or above 2× on closes: median and mean over every timed call (never reached 2× = 0)'],
+    ['Fell below 2×', 'Time to fall back below 2×, from the post: median and mean over the calls that reached 2× and fell back'],
+    ['Still at 2× at end', 'Of the calls that reached 2×: still at 2× when the window ended (censored)'],
+    ['Half fell back by', 'Kaplan–Meier median of the time held after the first 2× (censored calls counted)'],
+    ['Rugged in window', 'Event rug times within the window'],
+    ['Time to rug', 'Median and mean of the event rug times within the window']
+  ];
+
+  // a cell with the median duration, the mean under it and n
+  function durCell(list, what) {
+    var td = el('td', 'num');
+    if (!list.length) { td.textContent = DASH; return td; }
+    var md = A.median(list), mn = A.mean(list);
+    td.appendChild(el('span', 'ana-rate', A.fmtDur(md)));
+    td.appendChild(el('span', 'ana-n', 'mean ' + A.fmtDur(mn)));
+    td.appendChild(el('span', 'ana-n', 'n ' + fmtInt(list.length)));
+    td.title = what + ': median ' + Math.round(md).toLocaleString('en-US') + ' s, mean ' + Math.round(mn).toLocaleString('en-US') + ' s over ' + fmtInt(list.length) + ' calls';
+    if (list.length < MIN_N) { td.classList.add('ana-few'); }
+    return td;
+  }
+
+  function tmRow(label, a) {
+    var tr = el('tr');
+    var th = el('th', 'tok', label);
+    th.scope = 'row';
+    tr.appendChild(th);
+    if (a.n < MIN_N) {
+      tr.className = 'ana-few';
+      th.title = 'Fewer than ' + MIN_N + ' timed calls';
+    }
+    tr.appendChild(el('td', 'num', fmtInt(a.n)));
+    tr.appendChild(rateCell(a.reached, a.n, 'timed calls reached 2×'));
+    tr.appendChild(durCell(a.peaks, 'Time to peak'));
+    tr.appendChild(durCell(a.t2xs, 'Time to first 2×'));
+    tr.appendChild(durCell(a.helds, 'Time held at 2× (never reached = 0)'));
+    tr.appendChild(durCell(a.falls, 'Time to fall back below 2×'));
+    tr.appendChild(rateCell(a.cens, a.reached, 'calls that reached 2× were still at 2× at the end'));
+    var km = A.kaplanMeier(a.holds);
+    var kmTd = el('td', 'num', km.n ? (isNum(km.median) ? A.fmtDur(km.median) : 'not reached') : DASH);
+    kmTd.title = km.n ? (isNum(km.median) ? 'Half of the ' + fmtInt(km.n) + ' calls that reached 2× had fallen back ' + A.fmtDur(km.median) + ' after the first 2×'
+      : 'Fewer than half of the ' + fmtInt(km.n) + ' calls that reached 2× fell back within the window') : 'No call reached 2×';
+    tr.appendChild(kmTd);
+    tr.appendChild(rateCell(a.rugIn.length, a.n, 'timed calls rugged within the window (event rug times)'));
+    tr.appendChild(durCell(a.rugIn, 'Time to rug'));
+    return tr;
+  }
+
+  function fillTmGroups(all, gr, hz) {
+    var g = gr.def;
+    $('tm-k-box').hidden = g.kind === 'cat' || g.kind === 'period' || g.kind === 'family' || g.kind === 'dex';
+    var frag = document.createDocumentFragment();
+    frag.appendChild(headRow(g.kind === 'period' ? (state.period === 'month' ? 'Month' : 'Week') : g.label, TM_HEADS));
+    var tbody = el('tbody');
+    tbody.appendChild(tmRow('All timed calls', all));
+    gr.groups.forEach(function (x) { tbody.appendChild(tmRow(x.label, x.acc)); });
+    frag.appendChild(tbody);
+    $('tbl-tm-group').replaceChildren(frag);
+    $('t-tm-group').textContent = 'Mean and median by group (' + hz + ')';
+    $('tm-group-note').textContent = g.label + (g.kind !== 'cat' && g.kind !== 'period' && g.kind !== 'family' && g.kind !== 'dex'
+      ? ', ' + gr.groups.length + ' groups of about the same number of timed calls' : '') + '. ' +
+      (gr.noValue ? fmtInt(gr.noValue) + ' of ' + fmtInt(all.n) + ' timed calls have no value for it and are left out of the groups (not of "All").' : '');
+    $('cap-tm-group').textContent = 'Each cell: the median, the mean under it, and n. Time held at 2× counts the calls that never reached 2× as 0 (so its median is often 0). ' +
+      'Fell below 2× is counted from the post and leaves out the calls still at 2× at the end; "Half fell back by" counts them (Kaplan–Meier). Grey: fewer than ' + MIN_N + ' calls.';
+  }
+
+  // The series of a step chart: All (when more than one group) and each group.
+  function curveSeries(all, gr, pick) {
+    var list = [{ name: 'All timed calls', acc: all, sw: 'sw-all', color: cssVar('--text-2'), width: 2.5 }];
+    gr.groups.forEach(function (x, i) {
+      list.push({ name: x.label, acc: x.acc, sw: 'c' + (i % 10), color: cssVar('--c' + (i % 10)), width: 1.8 });
+    });
+    return list.map(function (s) { var c = pick(s.acc); s.curve = c.points; s.n = c.n; s.end = c.end; s.label = c.label; return s; });
+  }
+
+  // yMax: the top of the share axis (percent)
+  function drawStep(boxId, keyId, H, series, unit, aria, yMax) {
+    var key = $(keyId);
+    key.replaceChildren();
+    series.forEach(function (s) { keyItem(key, 'sw-line ' + s.sw, s.name + ': ' + s.label); });
+    var box = $(boxId);
+    if (!chartsReady()) { return; }
+    if (!series.some(function (s) { return s.n > 0; })) { chartMsg(box, 'No calls for this curve.'); return; }
+    var tip = tooltipBase(function (params) {
+      // the value at the pointer, not at the nearest point of each line
+      var p = Array.isArray(params) ? params : [params];
+      var t = A.timeAxisInv(p.length ? p[0].axisValue : 0);
+      return tipBox(A.fmtDur(t) + ' after ' + unit, series.map(function (s) {
+        var v = s.n && t <= s.end + 1e-6 ? A.stepAt(s.curve, t) : NaN;
+        return [s.sw, s.name + ': ' + (isNum(v) ? (v * 100).toFixed(1) + '%' : DASH) + ' (n ' + fmtInt(s.n) + ')'];
+      }));
+    });
+    tip.axisPointer = { type: 'line', snap: false };
+    draw(box, {
+      animation: animate(),
+      aria: { enabled: true, label: { description: aria } },
+      grid: { left: 40, right: 14, top: 10, bottom: 26 },
+      xAxis: timeXAxis(H),
+      yAxis: pctAxis(yMax || 100),
+      tooltip: tip,
+      series: series.filter(function (s) { return s.n > 0; }).map(function (s) {
+        var pts = s.curve.map(function (p) { return [A.timeAxis(p.t), Math.round(p.s * 1000) / 10]; });
+        var last = s.curve[s.curve.length - 1];
+        pts.push([A.timeAxis(Math.max(s.end, last.t)), Math.round(last.s * 1000) / 10]);
+        return {
+          type: 'line', name: s.name, step: 'end', showSymbol: false, data: pts,
+          lineStyle: { color: s.color, width: s.width, type: s.n < MIN_N ? 'dashed' : 'solid' }, itemStyle: { color: s.color },
+          emphasis: { disabled: true }
+        };
+      })
+    });
+  }
+  function drawTmKM(all, gr, H, hz) {
+    var series = curveSeries(all, gr, function (a) {
+      var km = A.kaplanMeier(a.holds);
+      return { points: km.points, n: km.n, end: km.end,
+        label: 'n ' + fmtInt(km.n) + ', ' + fmtInt(km.censored) + ' still at 2× at the end' + (isNum(km.median) ? ', half fell back by ' + A.fmtDur(km.median) : '') };
+    });
+    var aKM = A.kaplanMeier(all.holds);
+    drawStep('ch-tm-km', 'key-tm-km', H, series, 'the first 2×',
+      'Share still at 2× after the first 2×, Kaplan–Meier, ' + fmtInt(aKM.n) + ' calls that reached 2× in the ' + hz + ' window' +
+      (isNum(aKM.median) ? '; half had fallen back by ' + A.fmtDur(aKM.median) : '; fewer than half fell back'));
+    $('h-tm-km').textContent = 'Still at 2× after t (from the first 2×, ' + hz + ' window)';
+    $('cap-tm-km').textContent = 'Kaplan–Meier over the ' + fmtInt(aKM.n) + ' timed calls that reached 2×; t counts from the first 2× (the start of its candle). ' +
+      'A call that fell back counts at the time it held on closes, at most until its first close under 2×: a touch and drop (' + fmtInt(all.touch) + ') falls at 0. ' +
+      'The ' + fmtInt(aKM.censored) + ' calls still at 2× when the window ended are censored: counted as at 2× up to then, not as a fall. ' +
+      'Across: log scale of time. Dashed: fewer than ' + MIN_N + ' calls. Calls that never reached 2× are not in this curve.';
+  }
+
+  function drawTmRug(all, gr, H, hz) {
+    var series = curveSeries(all, gr, function (a) {
+      var pts = A.cumulativeShare(a.rugIn, a.n);
+      return { points: pts, n: a.n, end: H, label: 'n ' + fmtInt(a.n) + ', ' + fmtInt(a.rugIn.length) + ' rugged (' + (a.n ? (a.rugIn.length / a.n * 100).toFixed(1) : '0.0') + '%)' };
+    });
+    drawStep('ch-tm-rug', 'key-tm-rug', H, series, 'the post',
+      'Share of the ' + fmtInt(all.n) + ' timed calls rugged within t of the post (event rug times), ' + hz + ' window: ' +
+      (all.n ? (all.rugIn.length / all.n * 100).toFixed(1) : '0') + '% by the end',
+      // the axis up to the highest curve (rugs are a small share): steps of 10%
+      Math.min(100, Math.max(10, Math.ceil(Math.max.apply(null, series.map(function (s) {
+        return s.n ? s.curve[s.curve.length - 1].s * 100 : 0;
+      })) / 10) * 10)));
+    $('h-tm-rug').textContent = 'Share rugged by t (from the post, ' + hz + ' window)';
+    $('cap-tm-rug').textContent = 'Of the timed calls, the share whose pool was drained within t of the post (event rug times only, exact to the block). ' +
+      fmtInt(all.atCall.length) + ' rugged at the call and ' + fmtInt(all.detected.length) + ' only detected at the end of tracking are not in this curve (see the table above). ' +
+      'Every timed call was followed for the whole window, so nothing is censored here. Across: log scale of time.';
+  }
+
+  function renderTiming(rows, hIdx) {
+    var hz = state.horizon, H = data.horizon_seconds[hIdx];
+    var iRet = col['ret_' + hz];
+    var all = newTm();
+    var withData = 0, notTimed = 0;
+    var timed = [];
+    rows.forEach(function (r) {
+      if (classify(r, hIdx, iRet) !== 'data') { return; }
+      withData++;
+      var tm = timingOf(r, hIdx, hz);
+      if (!tm) { notTimed++; return; }
+      var rug = rugOf(r);
+      timed.push({ r: r, tm: tm, rug: rug });
+      addTm(all, tm, rug, H);
+    });
+    var err = $('tm-chart-error');
+    err.hidden = chartsReady();
+    if (!chartsReady()) { err.textContent = 'The charts could not be loaded (the chart library did not load). The counts and tables still show every number.'; }
+    tmCounts(all, rows.length, withData, notTimed, hz);
+    drawTmDist(all, hz);
+    fillTmRugs(all, hz);
+    var gr = tmGroups(timed, H);
+    fillTmGroups(all, gr, hz);
+    drawTmKM(all, gr, H, hz);
+    drawTmRug(all, gr, H, hz);
+  }
+
   // ---- render -----------------------------------------------------------------
 
   function render() {
@@ -1238,6 +1796,12 @@
     var hIdx = data.horizons.indexOf(state.horizon);
     if (hIdx < 0) { hIdx = 1; state.horizon = data.horizons[hIdx]; }
     $('ana-body').hidden = false;
+    // the two group-count pickers (By factor, Timing) share one choice
+    ['ana-k', 'tm-k'].forEach(function (id) {
+      Array.prototype.forEach.call($(id).querySelectorAll('button[data-k]'), function (b) {
+        b.setAttribute('aria-pressed', b.getAttribute('data-k') === state.k ? 'true' : 'false');
+      });
+    });
     // filters: family and verdict for everything; quiet inside each view
     var base = [], quietOnly = [];
     data.rows.forEach(function (r) {
@@ -1251,7 +1815,13 @@
     } else {
       var rows = base.filter(passQuiet);
       shown = rows.length;
-      if (state.tab === 'factor') { renderFactor(rows, hIdx); } else { renderPeak(rows); }
+      if (state.tab === 'factor') {
+        renderFactor(rows, hIdx);
+      } else if (state.tab === 'timing') {
+        renderTiming(rows, hIdx);
+      } else {
+        renderPeak(rows);
+      }
     }
     $('ana-msg').hidden = shown > 0;
     if (shown === 0) { $('ana-msg').textContent = 'No calls match this choice.'; }
@@ -1366,6 +1936,7 @@
   segmented('ana-quiet', 'data-quiet', 'quiet');
   segmented('ana-period', 'data-period', 'period');
   segmented('ana-k', 'data-k', 'k');
+  segmented('tm-k', 'data-k', 'k');
   segmented('ana-path', 'data-path', 'path');
   function selectControl(id, key) {
     $(id).addEventListener('change', function (ev) { state[key] = ev.target.value; render(); });
@@ -1373,6 +1944,7 @@
   selectControl('ana-family', 'family');
   selectControl('ana-verdict', 'verdict');
   selectControl('ana-factor', 'factor');
+  selectControl('tm-group', 'tmGroup');
   (function () {
     var sel = $('ana-factor');
     FACTORS.forEach(function (f) {
@@ -1381,7 +1953,19 @@
       sel.appendChild(o);
     });
     sel.value = state.factor;
+    var tg = $('tm-group');
+    TM_GROUPS.forEach(function (g) {
+      var o = el('option', null, g.label);
+      o.value = g.key;
+      tg.appendChild(o);
+    });
+    tg.value = state.tmGroup;
   }());
+  // the charts follow the colour scheme (their theme is made from the CSS
+  // variables of the scheme in use): drawn again when it changes
+  if (darkMQ && darkMQ.addEventListener) {
+    darkMQ.addEventListener('change', function () { disposeCharts(); render(); });
+  }
   $('ana-reload').addEventListener('click', load);
   lazyTips('ch-scatter');
   lazyTips('ch-peak');

@@ -1714,7 +1714,10 @@ const (
 // that the "By factor" tab groups by (post metrics and the hour before the
 // call, scout_call_precall; the dataset view's expressions), and the token
 // supply the tracker read from the chain (for the price-based market cap at
-// the call; not in the dataset view). It reads the
+// the call; not in the dataset view), and the timing after the call (the
+// "Timing" tab: per window the timing columns of done rows whose timing_at
+// is set, which windows have it, above_2x_censored, and the rug time
+// relative to entry_at with its kind; outcomes, never model inputs). It reads the
 // tables directly (not scout_call_dataset_v, whose per-row lookups the website
 // does not need). Ordered by call id. The first calls are a common table
 // expression (fc), read once and used both for the list and for the verdict
@@ -1734,7 +1737,9 @@ var webRowsSQL = `WITH fc AS ` + webFirstCallsSQL + `
 	m.holders, m.proof_elite, m.proof_good, m.live_buys_elite_count, m.live_buys_good_count,
 	m.live_buys_elite_usd::float8, m.live_buys_good_usd::float8,
 	pre.buy_vol_60m::float8, pre.sell_vol_60m::float8, pre.swaps_60m, pre.price_chg_60m_pct::float8, pre.vol_unit,
-	t.token_supply::float8
+	t.token_supply::float8,
+	` + webTimingPivotSQL("r.") + `, COALESCE(r.timed, 0), COALESCE(r.cens_2x, 0),
+	round(extract(epoch FROM t.rug_at - t.entry_at))::int8, t.rug_at_kind
 	FROM fc
 	JOIN scout_calls c ON c.id = fc.id
 	JOIN ` + webCallCountsSQL + ` n ON n.ca = fc.ca
@@ -1742,7 +1747,10 @@ var webRowsSQL = `WITH fc AS ` + webFirstCallsSQL + `
 	LEFT JOIN scout_call_tracking t ON t.call_id = fc.id
 	LEFT JOIN scout_call_precall pre ON pre.call_id = fc.id
 	LEFT JOIN (SELECT call_id, ` + webReturnsPivotSQL("") + `,
-		` + webNoDataSQL() + ` AS no_data, bool_or(horizon = '1d') AS has_1d
+		` + webNoDataSQL() + ` AS no_data, bool_or(horizon = '1d') AS has_1d,
+		` + webTimingPivotSQL("") + `,
+		` + webHorizonBitsSQL(webTimedSQL) + ` AS timed,
+		` + webHorizonBitsSQL(webTimedSQL+` AND above_2x_censored`) + ` AS cens_2x
 		FROM scout_call_returns GROUP BY call_id) r ON r.call_id = fc.id` + webPerceptorJoinSQL + webPerceptorTodayJoinSQL + webSAlphaJoinSQL + webVerdictAtCallJoinSQL + `
 	ORDER BY c.id`
 
@@ -1768,14 +1776,46 @@ func webReturnsPivotSQL(prefix string) string {
 // webNoDataSQL is the aggregate over scout_call_returns whose bit h is set
 // when window h of ScoutWebHorizons is stored with status no_data
 // (ScoutWebRow.NoData).
-func webNoDataSQL() string {
+func webNoDataSQL() string { return webHorizonBitsSQL("status = 'no_data'") }
+
+// webHorizonBitsSQL is the aggregate over scout_call_returns whose bit h is
+// set when the row of window h of ScoutWebHorizons meets cond (an SQL
+// condition over its columns; a constant of this file, never user input).
+func webHorizonBitsSQL(cond string) string {
 	var b strings.Builder
-	b.WriteString("bit_or(CASE WHEN status = 'no_data' THEN CASE horizon")
+	b.WriteString("bit_or(CASE WHEN " + cond + " THEN CASE horizon")
 	for i, h := range ScoutWebHorizons {
 		fmt.Fprintf(&b, " WHEN '%s' THEN %d", h, 1<<i)
 	}
 	b.WriteString(" END END)")
 	return b.String()
+}
+
+// webTimedSQL: a scout_call_returns row whose timing the website shows: done
+// and computed (timing_at set; NULL = not computed yet, -backfill-timing).
+const webTimedSQL = `status = 'done' AND timing_at IS NOT NULL`
+
+// webTimingColumns: the timing columns of scout_call_returns in the order of
+// ScoutWebRow.Timing within a window.
+var webTimingColumns = [webTimingPerHorizon]string{"peak_late_after_s", "first_2x_after_s", "above_2x_s", "fall_below_2x_after_s"}
+
+// webTimingPivotSQL lists the 20 timing columns (window × webTimingColumns) in
+// the order of ScoutWebRow.Timing: with prefix "" as the aggregates over
+// scout_call_returns (rows with their timing only, webTimedSQL), otherwise as
+// the columns of that subquery.
+func webTimingPivotSQL(prefix string) string {
+	var cols []string
+	for _, h := range ScoutWebHorizons {
+		for _, c := range webTimingColumns {
+			name := "tm_" + c + "_" + h
+			if prefix != "" {
+				cols = append(cols, prefix+name)
+				continue
+			}
+			cols = append(cols, "max("+c+") FILTER (WHERE "+webTimedSQL+" AND horizon = '"+h+"')::int4 AS "+name)
+		}
+	}
+	return strings.Join(cols, ", ")
 }
 
 // SelectWebRows returns every row of the website's list (one per token: its
@@ -1798,7 +1838,9 @@ func (st *ScoutStore) SelectWebRows(ctx context.Context) ([]ScoutWebRow, int, er
 	defer rows.Close()
 	out := []ScoutWebRow{}
 	var perf [len(ScoutWebHorizons) * 3]pgtype.Float8
-	var noData int32
+	var timing [len(ScoutWebHorizons) * webTimingPerHorizon]pgtype.Int4
+	var noData, timed, cens2x int32
+	var rugAfter *int64
 	for rows.Next() {
 		var r ScoutWebRow
 		dest := []any{&r.CallID, &r.MessageID, &r.MessageDate, &r.ChannelUsername, &r.ContractAddress,
@@ -1814,10 +1856,25 @@ func (st *ScoutStore) SelectWebRows(ctx context.Context) ([]ScoutWebRow, int, er
 			&r.LiveBuysEliteUSD, &r.LiveBuysGoodUSD,
 			&r.PreBuyVol60, &r.PreSellVol60, &r.PreSwaps60, &r.PreChg60, &r.PreVolUnit,
 			&r.TokenSupply)
+		for i := range timing {
+			dest = append(dest, &timing[i])
+		}
+		dest = append(dest, &timed, &cens2x, &rugAfter, &r.RugAtKind)
 		if err := rows.Scan(dest...); err != nil {
 			return nil, 0, err
 		}
 		r.NoData = uint8(noData)
+		r.Timed, r.Censored2x = uint8(timed), uint8(cens2x)
+		for i, v := range timing {
+			if v.Valid {
+				r.Timing[i] = v.Int32
+				r.HasTiming |= 1 << i
+			}
+		}
+		if rugAfter != nil {
+			s := int(*rugAfter)
+			r.RugAfterS = &s
+		}
 		for i, v := range perf {
 			if v.Valid {
 				r.Perf[i] = v.Float64

@@ -672,6 +672,23 @@ td.hm-n3 .ana-n, td.hm-n2 .ana-n, td.hm-n1 .ana-n, td.hm-z .ana-n, td.hm-p1 .ana
 .ana-multiple.is-few .hist-bar { fill: var(--muted); }
 .ana-figure { margin: 0; }
 .ana-figure figcaption { margin-top: 4px; }
+/* ECharts boxes (Timing tab): the library draws on a canvas as wide as the
+   box; the height is fixed here. Its tooltip is built by the page with
+   textContent (never markup) and styled by these classes. */
+.ech { position: relative; width: 100%; height: 170px; }
+.ech.ech-lg { height: 280px; }
+.ech-msg { margin: 0; padding: 8px 0; }
+.ech-tip { font-size: 12px; line-height: 1.4; color: var(--text); max-width: 280px; white-space: normal; }
+.ech-tip-h { font-weight: 600; margin: 0 0 2px; }
+.ech-tip-row { display: flex; align-items: center; gap: 6px; }
+.ech-tip-row .sw { flex: none; }
+.ech-tip-n { color: var(--muted); }
+.sw.sw-all { --c: var(--text-2); }
+.sw.sw-never { --c: var(--muted); opacity: .6; }
+.sw.sw-acc { --c: var(--accent); }
+@media (max-width: 520px) {
+  .ech.ech-lg { height: 240px; }
+}
 @media (max-width: 520px) {
   .ana-tabs button { padding: 0 10px; }
   .ana-multiples { grid-template-columns: 1fr; }

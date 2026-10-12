@@ -408,6 +408,174 @@ func TestWebAnalyticsFactorsDB(t *testing.T) {
 	}
 }
 
+// TestWebTimingDB: the load query reads the timing after the call for the
+// Analytics page's Timing tab: per window the four timing columns of done
+// rows whose timing_at is set (the timed bit; NULL timing_at = not computed:
+// no bit, no values even when the columns hold numbers; a no_data row never
+// counts), above_2x_censored, and the rug time relative to entry_at with its
+// kind (event, at_call before the post, detected, none); and the body of GET
+// /api/analytics carries them.
+func TestWebTimingDB(t *testing.T) {
+	st := testStore(t)
+	ctx := context.Background()
+	if err := st.Migrate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	base := time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
+	ip := func(v int) *int { return &v }
+	bp := func(v bool) *bool { return &v }
+	seed := func(msg int, ca string) int {
+		return seedWebCall(t, st, base, webSeed{Msg: msg, CA: ca, PostSym: "S", Status: TrackDone, Unit: "usd", Entry: 1, Late: 1})
+	}
+	timed := seed(1, "0x1100000000000000000000000000000000000001")     // 1h and 1d timed, 1d censored at 2x; event rug
+	untimed := seed(2, "0x1200000000000000000000000000000000000002")   // 1h done, timing_at NULL; rug at the call
+	detected := seed(3, "0x1300000000000000000000000000000000000003")  // 1h timed, touch and drop; detected rug
+	noRug := seed(4, "0x1400000000000000000000000000000000000004")     // 1h timed, never reached 2x; no rug
+	noDataRow := seed(5, "0x1500000000000000000000000000000000000005") // 1h stored as no_data with timing_at set
+	entry := func(msg int) time.Time { return base.Add(time.Duration(msg) * time.Hour) }
+	g, r, dd := 150.0, 20.0, -10.0
+	now := time.Now().UTC()
+	store := func(id int, h string, res horizonResult) {
+		t.Helper()
+		d, err := parseHorizon(h)
+		if err != nil {
+			t.Fatal(err)
+		}
+		res.Horizon, res.DueAt = h, entry(map[int]int{timed: 1, untimed: 2, detected: 3, noRug: 4, noDataRow: 5}[id]).Add(d)
+		if res.Status == "" {
+			res.Status, res.PriceUSD, res.ReturnLatePct, res.MaxGainLatePct, res.MaxDDLatePct = "done", 1, &r, &g, &dd
+		}
+		if err := st.UpsertReturn(ctx, id, horizon{Name: h, Dur: d}, res); err != nil {
+			t.Fatal(err)
+		}
+	}
+	store(timed, "1h", horizonResult{PeakLateAfterS: ip(1500), First2xAfterS: ip(600), Above2xS: ip(1200), FallBelow2xAfterS: ip(2100),
+		Above2xCensored: bp(false), TimingAt: &now})
+	store(timed, "1d", horizonResult{PeakLateAfterS: ip(40000), First2xAfterS: ip(600), Above2xS: ip(1200), FallBelow2xAfterS: nil,
+		Above2xCensored: bp(true), TimingAt: &now})
+	// columns filled but timing_at NULL: not computed, so not sent
+	store(untimed, "1h", horizonResult{PeakLateAfterS: ip(300), Above2xS: ip(0), Above2xCensored: bp(false)})
+	store(detected, "1h", horizonResult{PeakLateAfterS: ip(0), First2xAfterS: ip(300), Above2xS: ip(0), FallBelow2xAfterS: ip(600),
+		Above2xCensored: bp(false), TimingAt: &now})
+	store(noRug, "1h", horizonResult{PeakLateAfterS: ip(3300), Above2xS: ip(0), Above2xCensored: bp(false), TimingAt: &now})
+	store(noDataRow, "1h", horizonResult{Status: "no_data"})
+	if _, err := st.Pool.Exec(ctx, `UPDATE scout_call_returns SET timing_at = now(), peak_late_after_s = 60 WHERE call_id = $1`, noDataRow); err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range []struct {
+		id   int
+		at   time.Time
+		kind string
+	}{
+		{timed, entry(1).Add(26*time.Hour + 500*time.Millisecond), rugAtEvent}, // rounds to 93,601 s
+		{untimed, entry(2).Add(-90 * time.Second), rugAtAtCall},
+		{detected, entry(3).Add(31 * 24 * time.Hour), rugAtDetected},
+	} {
+		if err := st.SetRugAt(ctx, c.id, c.at, c.kind); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	rows, _, err := st.SelectWebRows(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	byID := map[int]*ScoutWebRow{}
+	for i := range rows {
+		byID[rows[i].CallID] = &rows[i]
+	}
+	type want struct {
+		timed, cens uint8
+		has         uint32
+		vals        map[int]int32 // Timing index → value
+		rugS        *int
+		rugKind     *string
+	}
+	for _, c := range []struct {
+		name string
+		id   int
+		want want
+	}{
+		// has: 1h all four values (bits 0–3), 1d without the fall (censored; bits 4–6)
+		{"timed 1h and 1d, event rug", timed, want{timed: 3, cens: 2, has: 0x7f, vals: map[int]int32{0: 1500, 1: 600, 2: 1200, 3: 2100, 4: 40000, 5: 600, 6: 1200},
+			rugS: ip(26*3600 + 1), rugKind: sp(rugAtEvent)}},
+		{"timing_at NULL, rug at the call", untimed, want{rugS: ip(-90), rugKind: sp(rugAtAtCall)}},
+		{"touch and drop, detected rug", detected, want{timed: 1, has: 0xf, vals: map[int]int32{0: 0, 1: 300, 2: 0, 3: 600},
+			rugS: ip(31 * 86400), rugKind: sp(rugAtDetected)}},
+		{"never reached 2x, no rug", noRug, want{timed: 1, has: 0x5, vals: map[int]int32{0: 3300, 2: 0}}},
+		{"no_data with timing_at", noDataRow, want{}},
+	} {
+		row := byID[c.id]
+		if row == nil {
+			t.Fatalf("%s: call %d not listed", c.name, c.id)
+		}
+		w := c.want
+		if row.Timed != w.timed || row.Censored2x != w.cens || row.HasTiming != w.has {
+			t.Errorf("%s: timed %b cens %b has %b, want %b %b %b", c.name, row.Timed, row.Censored2x, row.HasTiming, w.timed, w.cens, w.has)
+		}
+		for j, v := range w.vals {
+			if row.Timing[j] != v {
+				t.Errorf("%s: Timing[%d] = %d, want %d", c.name, j, row.Timing[j], v)
+			}
+		}
+		if dumpFactors(row.RugAfterS) != dumpFactors(w.rugS) || dumpFactors(row.RugAtKind) != dumpFactors(w.rugKind) {
+			t.Errorf("%s: rug %s %s, want %s %s", c.name, dumpFactors(row.RugAfterS), dumpFactors(row.RugAtKind), dumpFactors(w.rugS), dumpFactors(w.rugKind))
+		}
+	}
+
+	// through the website: the body carries them (and nulls for the rest)
+	static, err := fs.Sub(frontendFS, "frontend")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ws := mustWebServer(t, st, webConfig{GMGNTemplate: defaultGMGNTemplate}, static)
+	rec := getWeb(ws, "/api/analytics")
+	if rec.Code != 200 {
+		t.Fatalf("got %d: %s", rec.Code, rec.Body)
+	}
+	body := decodeAnalytics(t, rec.Body.Bytes())
+	col := map[string]int{}
+	for i, c := range body.Columns {
+		col[c] = i
+	}
+	got := map[int][]*float64{}
+	for _, row := range body.Rows {
+		got[int(*row[0])] = row
+	}
+	val := func(id int, c string) string { return dumpFactors(got[id][col[c]]) }
+	for _, c := range []struct {
+		id         int
+		column     string
+		want       string
+		comparison string
+	}{
+		{timed, "tpeak_1h", "1500", "time to peak"},
+		{timed, "t2x_1d", "600", "first 2x"},
+		{timed, "held_1d", "1200", "held"},
+		{timed, "tfall_1d", "null", "censored: no fall"},
+		{timed, "timed", "3", "timed bits"},
+		{timed, "cens_2x", "2", "censored bits"},
+		{timed, "rug_s", "93601", "rug time"},
+		{untimed, "tpeak_1h", "null", "timing_at NULL"},
+		{untimed, "timed", "0", "timing_at NULL"},
+		{untimed, "rug_s", "-90", "rug before the post"},
+		{detected, "held_1h", "0", "touch and drop"},
+		{noRug, "rug_s", "null", "no rug"},
+		{noRug, "rug_kind", "-1", "no rug"},
+		{noDataRow, "tpeak_1h", "null", "no_data"},
+	} {
+		if g := val(c.id, c.column); g != c.want {
+			t.Errorf("call %d %s (%s): got %s, want %s", c.id, c.column, c.comparison, g, c.want)
+		}
+	}
+	for id, kind := range map[int]string{timed: rugAtEvent, untimed: rugAtAtCall, detected: rugAtDetected} {
+		k := got[id][col["rug_kind"]]
+		if k == nil || *k < 0 || body.RugKinds[int(*k)] != kind {
+			t.Errorf("call %d: rug kind %s, want %s", id, dumpFactors(k), kind)
+		}
+	}
+}
+
 func dumpFactors(f any) string {
 	b, err := json.Marshal(f)
 	if err != nil {

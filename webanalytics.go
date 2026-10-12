@@ -23,7 +23,7 @@ import (
 
 // ---------------------------------------------------------------------------
 // Analytics page (frontend/analytics.html), section "Call performance" with
-// its tabs Overview, By factor and Peak vs final: one compact row per first
+// its tabs Overview, By factor, Peak vs final and Timing: one compact row per first
 // call, built once per snapshot and served as is by GET /api/analytics. The
 // page groups, filters and draws the rows itself (by week or month, Perceptor
 // verdict at the call, pool family, posted DEX, quote asset, and the values
@@ -35,8 +35,12 @@ const (
 	// webAnalyticsFormat: the shape of the body (field "format"); raise it
 	// when the columns change (or what one means), so the page can tell.
 	// 3: "mcap" is the price-based market cap at the call (webAnaMcap), no
-	// longer the market cap as posted.
-	webAnalyticsFormat = 3
+	// longer the market cap as posted. 4: the timing columns after the
+	// factors (webAnalyticsTimingColumns) and the "rug_kinds" dictionary.
+	webAnalyticsFormat = 4
+	// webTimingPerHorizon: the timing values per window in ScoutWebRow.Timing
+	// (webTimingColumns).
+	webTimingPerHorizon = 4
 	// webQuietTrades: a call with fewer swaps than this in the 24 hours after
 	// it counts as "quiet after the call" on the Analytics page. For Uniswap v2
 	// pools the tracker counts Sync events, which liquidity changes also emit.
@@ -65,16 +69,41 @@ var webAnalyticsFactors = []string{"mcap", "holders", "proof_elite", "proof_good
 	"buys_elite_n", "buys_good_n", "buys_elite_usd", "buys_good_usd",
 	"pre_buy_usd", "pre_sell_usd", "pre_swaps", "pre_chg"}
 
+// webAnalyticsTimingColumns names the timing values that follow
+// webAnalyticsFactors in each row (the "Timing" tab; outcomes after the call,
+// never model inputs; see timing.go and ScoutWebRow.Timing). Per window of
+// ScoutWebHorizons, in whole seconds after the post (entry_at), null when not
+// stored: tpeak (peak_late_after_s), t2x (first_2x_after_s; null = never
+// reached 2×), held (above_2x_s), tfall (fall_below_2x_after_s; null = never
+// reached 2×, or censored). Then "timed", bit h set when window h has its
+// timing (timing_at set; the values of the other windows are null);
+// "cens_2x", bit h = above_2x_censored of window h; "rug_s", the rug time
+// (rug_at − entry_at, seconds; ≤ 0 possible for a rug at the call; null =
+// none stored); "rug_kind", an index into webAnalyticsRugKinds (−1 = none).
+var webAnalyticsTimingColumns = func() []string {
+	var cols []string
+	for _, h := range ScoutWebHorizons {
+		cols = append(cols, "tpeak_"+h, "t2x_"+h, "held_"+h, "tfall_"+h)
+	}
+	return append(cols, "timed", "cens_2x", "rug_s", "rug_kind")
+}()
+
+// webAnalyticsRugKinds: the values of the "rug_kind" column (an index into
+// this list): scout_call_tracking.rug_at_kind; "other" = a rug time with a
+// kind this website does not know (or none).
+var webAnalyticsRugKinds = []string{rugAtEvent, rugAtAtCall, rugAtDetected, "other"}
+
 // webAnalyticsColumns names the values of each row of GET /api/analytics, in
 // order; after the first nine come, per window of ScoutWebHorizons, its
 // return, peak and worst drop (late entry, USD, percent; null when missing),
-// then webAnalyticsFactors.
+// then webAnalyticsFactors, then webAnalyticsTimingColumns.
 var webAnalyticsColumns = func() []string {
 	cols := []string{"call_id", "t", "flags", "verdict", "family", "dex", "quote", "trades_24h", "no_data"}
 	for _, h := range ScoutWebHorizons {
 		cols = append(cols, "ret_"+h, "peak_"+h, "dd_"+h)
 	}
-	return append(cols, webAnalyticsFactors...)
+	cols = append(cols, webAnalyticsFactors...)
+	return append(cols, webAnalyticsTimingColumns...)
 }()
 
 // Bits of the "flags" column.
@@ -101,6 +130,7 @@ type webAnalyticsBody struct {
 	HorizonSeconds []int           `json:"horizon_seconds"`
 	QuietBelow     int             `json:"quiet_below"`
 	Verdicts       []string        `json:"verdicts"`
+	RugKinds       []string        `json:"rug_kinds"`
 	Families       []string        `json:"families"`
 	Dexes          []string        `json:"dexes"`
 	Quotes         []string        `json:"quotes"`
@@ -294,6 +324,45 @@ func appendAnaFactors(out []byte, r *ScoutWebRow) []byte {
 	return appendAnaNum(out, *r.PreChg60)
 }
 
+// webAnalyticsRugKindIndex: the "rug_kind" column of a row (an index into
+// webAnalyticsRugKinds; −1 = no rug time and no kind).
+func webAnalyticsRugKindIndex(r *ScoutWebRow) int {
+	if r.RugAtKind == nil {
+		if r.RugAfterS == nil {
+			return -1
+		}
+		return len(webAnalyticsRugKinds) - 1 // other
+	}
+	if i := slices.Index(webAnalyticsRugKinds[:len(webAnalyticsRugKinds)-1], *r.RugAtKind); i >= 0 {
+		return i
+	}
+	return len(webAnalyticsRugKinds) - 1
+}
+
+// appendAnaTiming appends the webAnalyticsTimingColumns of a row, each after
+// a comma: the values of a window only when it has its timing (Timed).
+func appendAnaTiming(out []byte, r *ScoutWebRow) []byte {
+	for h := range ScoutWebHorizons {
+		for k := range webTimingPerHorizon {
+			j := h*webTimingPerHorizon + k
+			out = append(out, ',')
+			if r.Timed&(1<<h) == 0 || r.HasTiming&(1<<j) == 0 {
+				out = append(out, "null"...)
+				continue
+			}
+			out = strconv.AppendInt(out, int64(r.Timing[j]), 10)
+		}
+	}
+	out = append(out, ',')
+	out = strconv.AppendInt(out, int64(r.Timed), 10)
+	out = append(out, ',')
+	out = strconv.AppendInt(out, int64(r.Censored2x&r.Timed), 10)
+	out = append(out, ',')
+	out = appendAnaInt(out, r.RugAfterS)
+	out = append(out, ',')
+	return strconv.AppendInt(out, int64(webAnalyticsRugKindIndex(r)), 10)
+}
+
 // webAnalyticsVerdictIndex: the "verdict" column of a row.
 func webAnalyticsVerdictIndex(v *string) int {
 	if v == nil {
@@ -330,7 +399,7 @@ func buildWebAnalytics(rows []ScoutWebRow, prev *webAnalytics) (*webAnalytics, e
 	dexes.freeze()
 	quotes.freeze()
 
-	out := make([]byte, 0, 64+len(rows)*180)
+	out := make([]byte, 0, 64+len(rows)*260)
 	out = append(out, '[')
 	for i := range rows {
 		r := &rows[i]
@@ -385,13 +454,14 @@ func buildWebAnalytics(rows []ScoutWebRow, prev *webAnalytics) (*webAnalytics, e
 			out = appendAnaNum(out, r.anaPerf[j])
 		}
 		out = appendAnaFactors(out, r)
+		out = appendAnaTiming(out, r)
 		out = append(out, ']')
 	}
 	out = append(out, ']')
 
 	body := webAnalyticsBody{
 		Format: webAnalyticsFormat, Horizons: ScoutWebHorizons[:], HorizonSeconds: webHorizonSeconds[:],
-		QuietBelow: webQuietTrades, Verdicts: webAnalyticsVerdicts,
+		QuietBelow: webQuietTrades, Verdicts: webAnalyticsVerdicts, RugKinds: webAnalyticsRugKinds,
 		Families: fams.names, Dexes: dexes.names, Quotes: quotes.names,
 		Columns: webAnalyticsColumns, Rows: out,
 	}

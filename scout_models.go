@@ -370,6 +370,23 @@ type ScoutWebRow struct {
 	// when not read or none. With PostPrice it gives the Analytics page's
 	// market cap at the call (webAnaMcap). Not an ML feature.
 	TokenSupply *float64
+	// Timing after the call, for the Analytics page's "Timing" tab (outcomes,
+	// never model inputs; see timing.go): per window h of ScoutWebHorizons
+	// whose scout_call_returns row is done and has its timing (timing_at set:
+	// bit h of Timed), Timing[h*webTimingPerHorizon+k] holds, in seconds after
+	// entry_at, k = 0 peak_late_after_s, 1 first_2x_after_s, 2 above_2x_s,
+	// 3 fall_below_2x_after_s; bit h*webTimingPerHorizon+k of HasTiming is set
+	// when that value is not NULL. Bit h of Censored2x is above_2x_censored.
+	// RugAfterS is scout_call_tracking.rug_at − entry_at in whole seconds
+	// (can be ≤ 0 for a rug at the call), RugAtKind its rug_at_kind (event |
+	// at_call | detected); both nil when not stored. Sent for every row; the
+	// page uses them for calls priced in USD only, like every number.
+	Timing     [len(ScoutWebHorizons) * webTimingPerHorizon]int32
+	HasTiming  uint32
+	Timed      uint8
+	Censored2x uint8
+	RugAfterS  *int
+	RugAtKind  *string
 
 	// worked out by the website when it builds its snapshot (websnapshot.go)
 	usd     bool  // priced in USD: only then are the numbers shown

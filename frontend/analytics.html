@@ -8,6 +8,7 @@
 <title>Scout analytics</title>
 <link rel="icon" href="favicon.svg" type="image/svg+xml">
 <link rel="stylesheet" href="style.css">
+<script src="vendor/echarts-6.1.0.custom.min.js" defer></script>
 <script src="analytics-stats.js" defer></script>
 <script src="analytics.js" defer></script>
 </head>
@@ -92,6 +93,7 @@
         <button type="button" role="tab" id="tab-overview" data-tab="overview" aria-controls="panel-overview" aria-selected="true">Overview</button>
         <button type="button" role="tab" id="tab-factor" data-tab="factor" aria-controls="panel-factor" aria-selected="false" tabindex="-1">By factor</button>
         <button type="button" role="tab" id="tab-peak" data-tab="peak" aria-controls="panel-peak" aria-selected="false" tabindex="-1">Peak vs final</button>
+        <button type="button" role="tab" id="tab-timing" data-tab="timing" aria-controls="panel-timing" aria-selected="false" tabindex="-1">Timing</button>
       </div>
 
       <div id="panel-overview" class="ana-panel" role="tabpanel" aria-labelledby="tab-overview">
@@ -217,6 +219,55 @@
           <figcaption id="cap-peak" class="muted small"></figcaption>
         </figure>
       </div>
+
+      <div id="panel-timing" class="ana-panel" role="tabpanel" aria-labelledby="tab-timing" hidden>
+        <p class="muted small note">When things happened after the call, within the window: results, never used to score calls. Counted from the post, from the stored candles (5-minute steps on the first day, hourly after). Only calls with a return for the window <strong>and</strong> their timing computed are counted (n timed).</p>
+        <dl id="tm-counts" class="stats"></dl>
+        <p id="tm-counts-note" class="muted small note"></p>
+        <p id="tm-chart-error" class="notice error" role="alert" hidden></p>
+
+        <h3 class="ana-h" id="h-tm-dist">How long it took</h3>
+        <div id="tm-dist" class="ana-multiples"></div>
+        <p id="cap-tm-dist" class="muted small note"></p>
+
+        <h3 class="ana-h" id="t-tm-rugs">Rugs by kind of rug time</h3>
+        <div class="ana-wrap" tabindex="0" role="region" aria-labelledby="t-tm-rugs"><table id="tbl-tm-rugs" aria-labelledby="t-tm-rugs"></table></div>
+        <p id="cap-tm-rugs" class="muted small note"></p>
+
+        <div class="controls ana-controls ana-sub">
+          <div class="window-pick">
+            <label for="tm-group">Group by</label>
+            <select id="tm-group" class="ana-select"></select>
+          </div>
+          <div class="window-pick" id="tm-k-box">
+            <span id="tm-k-label">Groups</span>
+            <div id="tm-k" class="segmented compact" role="group" aria-labelledby="tm-k-label">
+              <button type="button" data-k="4" aria-pressed="false">4</button>
+              <button type="button" data-k="5" aria-pressed="true">5</button>
+              <button type="button" data-k="10" aria-pressed="false">10</button>
+            </div>
+          </div>
+        </div>
+        <p id="tm-group-note" class="muted small"></p>
+
+        <h3 class="ana-h" id="t-tm-group">Mean and median by group</h3>
+        <div class="ana-wrap" tabindex="0" role="region" aria-labelledby="t-tm-group"><table id="tbl-tm-group" aria-labelledby="t-tm-group"></table></div>
+        <p id="cap-tm-group" class="muted small note"></p>
+
+        <h3 class="ana-h" id="h-tm-km">Still at 2× after t (from the first 2×)</h3>
+        <figure class="ana-figure">
+          <div id="ch-tm-km" class="ech ech-lg" role="img"></div>
+          <ul id="key-tm-km" class="ana-key"></ul>
+          <figcaption id="cap-tm-km" class="muted small"></figcaption>
+        </figure>
+
+        <h3 class="ana-h" id="h-tm-rug">Share rugged by t (from the post)</h3>
+        <figure class="ana-figure">
+          <div id="ch-tm-rug" class="ech ech-lg" role="img"></div>
+          <ul id="key-tm-rug" class="ana-key"></ul>
+          <figcaption id="cap-tm-rug" class="muted small"></figcaption>
+        </figure>
+      </div>
     </div>
 
     <details class="legend" open>
@@ -248,6 +299,14 @@
         <div><dt>Scales</dt><dd>Returns, peaks and drops are drawn on a symmetric log scale (−100%, −50%, 0, +100%, +1,000% …), so a few huge winners do not flatten the rest. Dollar amounts and counts are drawn on a log scale that keeps 0.</dd></div>
         <div><dt>Typical path</dt><dd>The mean or median of the metric at 1h, 1d, 3d, 7d and 30d after the call, per group. "All with data at each point" uses every call with data at that point (n changes from point to point: the table under the chart gives it); "Same calls at every point" uses only the calls with data at all five.</dd></div>
         <div><dt>Peak vs final</dt><dd>Each call with data: its peak within the window against its return at the end of it. A call "gave back more than half" when its peak was above 0% and its return is less than half of the peak.</dd></div>
+        <div><dt>Timing</dt><dd>When things happened after the call, measured from the stored price candles: 5-minute steps on the first day, hourly after, so a time is known to about 5 minutes (1 hour after the first day). Times are counted from the post. Only first calls, priced in USD, with a return for the window and their timing computed ("n timed"); calls whose timing is not computed yet (tracked before it existed, until the owner's backfill runs) are left out and counted. These are results, never used as inputs of the model.</dd></div>
+        <div><dt>Time to peak</dt><dd>When the highest price within the window (from the late entry) was first reached; 0 when the entry itself was the peak.</dd></div>
+        <div><dt>Reached 2×</dt><dd>A trade within the window touched twice the entry price (a candle's high). Time to first 2×: when that happened, over the calls that reached it.</dd></div>
+        <div><dt>Time held at 2×</dt><dd>How long the price stayed at or above 2× the entry, measured on candle closes (the last close carried across quiet stretches). <strong>Calls that never reached 2× count as 0 held</strong>, and so does a call that touched 2× but never closed at or above it (touch and drop).</dd></div>
+        <div><dt>Time to fall below 2×</dt><dd>When the price first closed under 2× the entry after reaching it (or the rug, when the pool was drained while it was at 2×), counted from the post. Calls still at 2× when the window ended have no fall time: they are "censored".</dd></div>
+        <div><dt>Still at 2× after t</dt><dd>A Kaplan–Meier curve over the calls that reached 2×: the share still at 2× t after the first 2×. A call that fell back counts at the time it held on closes (at most until its first close under 2×; a touch and drop falls at 0); a call still at 2× when the window ended counts as at 2× up to then and drops out of the count after it, without counting as a fall.</dd></div>
+        <div><dt>Rug times</dt><dd>"Event": the pool was seen drained by a scan, at the exact time of the rug block; only these are in the time-to-rug histogram and the "share rugged by t" curve, and only when the rug came within the window. "At the call": drained at or before the post (no time after the call). "Detected": found only by the check at the end of tracking; its time is that check's, so it is only an upper bound. Both are counted beside the histogram, never in it.</dd></div>
+        <div><dt>Share rugged by t</dt><dd>Of the timed calls, the share whose pool was drained (event rug times only) within t of the post. Every timed call was followed for the whole window, so this is a plain running share.</dd></div>
         <div><dt>Rounding</dt><dd>Every return, peak and drop is rounded to 0.1% before the thresholds above are applied: a return of +0.04% counts as 0.0% (not a win), −49.96% as −50.0% (a collapse), a peak of +99.96% as +100.0%.</dd></div>
         <div><dt>–</dt><dd>No call in the group has a value for this number.</dd></div>
       </dl>

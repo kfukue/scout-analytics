@@ -26,6 +26,7 @@ type webAnalyticsJSON struct {
 	HorizonSeconds []int        `json:"horizon_seconds"`
 	QuietBelow     int          `json:"quiet_below"`
 	Verdicts       []string     `json:"verdicts"`
+	RugKinds       []string     `json:"rug_kinds"`
 	Families       []string     `json:"families"`
 	Dexes          []string     `json:"dexes"`
 	Quotes         []string     `json:"quotes"`
@@ -262,6 +263,10 @@ func TestWebAnalyticsRows(t *testing.T) {
 			t.Fatal("no rugged call with a peak in the test data")
 		}
 		checkAnaFactors(t, a, raw)
+		checkAnaTiming(t, a, raw)
+		if !slices.Equal(a.RugKinds, []string{"event", "at_call", "detected", "other"}) {
+			t.Errorf("n=%d: rug kinds %v", n, a.RugKinds)
+		}
 		// the dictionaries: most frequent first, no empty or unclean names
 		for _, d := range [][]string{a.Dexes, a.Quotes, a.Families} {
 			for _, s := range d {
@@ -343,6 +348,108 @@ func checkAnaFactors(t *testing.T, a webAnalyticsJSON, raw []ScoutWebRow) {
 				t.Errorf("call %d: %s = %v, want %v", r.CallID, c.name, got, w)
 			}
 		}
+	}
+}
+
+// checkAnaTiming: the timing columns of every row as it was read: per window
+// the four values in seconds only when the window has its timing (else
+// null), the timed and censored bits, the rug time and the index of its kind.
+func checkAnaTiming(t *testing.T, a webAnalyticsJSON, raw []ScoutWebRow) {
+	t.Helper()
+	col := map[string]int{}
+	for i, c := range a.Columns {
+		col[c] = i
+	}
+	sawTimed, sawNull, sawCens, sawRug := false, false, false, false
+	for i, row := range a.Rows {
+		r := &raw[i]
+		for h, hz := range ScoutWebHorizons {
+			for k, name := range []string{"tpeak_", "t2x_", "held_", "tfall_"} {
+				j := h*webTimingPerHorizon + k
+				got := row[col[name+hz]]
+				if r.Timed&(1<<h) == 0 || r.HasTiming&(1<<j) == 0 {
+					if got != nil {
+						t.Errorf("call %d: %s%s = %v, want null (timed %b, has %b)", r.CallID, name, hz, *got, r.Timed, r.HasTiming)
+					}
+					sawNull = sawNull || r.Timed&(1<<h) != 0
+					continue
+				}
+				sawTimed = true
+				if got == nil || *got != float64(r.Timing[j]) {
+					t.Errorf("call %d: %s%s = %v, want %d", r.CallID, name, hz, dumpFactors(got), r.Timing[j])
+				}
+			}
+		}
+		num := func(c string) *float64 { return row[col[c]] }
+		if got := num("timed"); got == nil || int(*got) != int(r.Timed) {
+			t.Errorf("call %d: timed %v, want %d", r.CallID, dumpFactors(got), r.Timed)
+		}
+		if got := num("cens_2x"); got == nil || int(*got) != int(r.Censored2x&r.Timed) {
+			t.Errorf("call %d: cens_2x %v, want %d", r.CallID, dumpFactors(got), r.Censored2x&r.Timed)
+		}
+		sawCens = sawCens || r.Censored2x != 0
+		got := num("rug_s")
+		switch {
+		case r.RugAfterS == nil && got != nil:
+			t.Errorf("call %d: rug_s %v, want null", r.CallID, *got)
+		case r.RugAfterS != nil && (got == nil || *got != float64(*r.RugAfterS)):
+			t.Errorf("call %d: rug_s %v, want %d", r.CallID, dumpFactors(got), *r.RugAfterS)
+		}
+		wantKind := "-"
+		if r.RugAtKind != nil || r.RugAfterS != nil {
+			wantKind = "other"
+			if r.RugAtKind != nil && slices.Contains([]string{"event", "at_call", "detected"}, *r.RugAtKind) {
+				wantKind = *r.RugAtKind
+			}
+			sawRug = true
+		}
+		gotKind := "-"
+		if k := num("rug_kind"); k == nil {
+			t.Errorf("call %d: rug_kind null", r.CallID)
+		} else if *k >= 0 {
+			gotKind = a.RugKinds[int(*k)]
+		}
+		if gotKind != wantKind {
+			t.Errorf("call %d: rug kind %q, want %q (rug_at_kind %v)", r.CallID, gotKind, wantKind, dumpFactors(r.RugAtKind))
+		}
+	}
+	if len(a.Rows) >= 600 && !(sawTimed && sawNull && sawCens && sawRug) {
+		t.Errorf("test data lacks a case: timed %v, null in a timed window %v, censored %v, rug %v", sawTimed, sawNull, sawCens, sawRug)
+	}
+}
+
+// TestAppendAnaTiming: the timing columns of single rows, as encoded.
+func TestAppendAnaTiming(t *testing.T) {
+	ip := func(v int) *int { return &v }
+	nulls := strings.Repeat(",null", len(ScoutWebHorizons)*webTimingPerHorizon)
+	for _, c := range []struct {
+		name string
+		row  ScoutWebRow
+		want string
+	}{
+		{"nothing", ScoutWebRow{}, nulls + ",0,0,null,-1"},
+		{"values without timing_at are not sent", ScoutWebRow{Timing: [20]int32{5, 6, 7, 8}, HasTiming: 0xf, Censored2x: 1}, nulls + ",0,0,null,-1"},
+		{"1d timed, never reached 2x", func() ScoutWebRow {
+			r := ScoutWebRow{Timed: 2, HasTiming: 0x50}
+			r.Timing[4], r.Timing[6] = 3600, 0
+			return r
+		}(), ",null,null,null,null,3600,null,0,null" + strings.Repeat(",null", 12) + ",2,0,null,-1"},
+		{"1h censored, event rug", func() ScoutWebRow {
+			r := ScoutWebRow{Timed: 1, HasTiming: 0x7, Censored2x: 1 | 4, RugAfterS: ip(90000), RugAtKind: sp(rugAtEvent)}
+			r.Timing[0], r.Timing[1], r.Timing[2] = 900, 600, 2700
+			return r
+		}(), ",900,600,2700,null" + strings.Repeat(",null", 16) + ",1,1,90000,0"},
+		{"rug at the call", ScoutWebRow{RugAfterS: ip(-120), RugAtKind: sp(rugAtAtCall)}, nulls + ",0,0,-120,1"},
+		{"detected", ScoutWebRow{RugAfterS: ip(2600000), RugAtKind: sp(rugAtDetected)}, nulls + ",0,0,2600000,2"},
+		{"unknown kind", ScoutWebRow{RugAfterS: ip(5), RugAtKind: sp("new")}, nulls + ",0,0,5,3"},
+		{"time without kind", ScoutWebRow{RugAfterS: ip(5)}, nulls + ",0,0,5,3"},
+		{"kind without time", ScoutWebRow{RugAtKind: sp(rugAtEvent)}, nulls + ",0,0,null,0"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			if got := string(appendAnaTiming(nil, &c.row)); got != c.want {
+				t.Errorf("appendAnaTiming(%+v)\n got %s\nwant %s", c.row, got, c.want)
+			}
+		})
 	}
 }
 
@@ -481,6 +588,28 @@ func TestWebAnalyticsVersion(t *testing.T) {
 		{"rugged call's peak", func(r *ScoutWebRow) bool {
 			return usd(r) && r.Rugged != nil && *r.Rugged && r.HasPerf&peakBit != 0 && !math.IsNaN(r.Perf[1*webPerfPerHorizon+webPerfPeak])
 		}, func(r *ScoutWebRow) { r.Perf[1*webPerfPerHorizon+webPerfPeak] += 1000 }},
+		// the timing after the call (the Timing tab)
+		{"timing computed", func(r *ScoutWebRow) bool { return r.Timed&1 == 0 && r.HasPerf&1 != 0 }, func(r *ScoutWebRow) {
+			r.Timed |= 1
+			r.Timing[0], r.HasTiming = 300, r.HasTiming|1
+		}},
+		{"time to peak", func(r *ScoutWebRow) bool { return r.Timed&1 != 0 && r.HasTiming&1 != 0 },
+			func(r *ScoutWebRow) { r.Timing[0] += 300 }},
+		{"first 2x", func(r *ScoutWebRow) bool { return r.Timed&2 != 0 && r.HasTiming&(1<<5) == 0 }, func(r *ScoutWebRow) {
+			r.Timing[5], r.HasTiming = 600, r.HasTiming|1<<5
+		}},
+		{"held at 2x", func(r *ScoutWebRow) bool { return r.Timed&2 != 0 && r.HasTiming&(1<<6) != 0 },
+			func(r *ScoutWebRow) { r.Timing[6] += 3600 }},
+		{"fall below 2x", func(r *ScoutWebRow) bool { return r.Timed&2 != 0 && r.HasTiming&(1<<7) != 0 },
+			func(r *ScoutWebRow) { r.Timing[7] += 300 }},
+		{"censored", func(r *ScoutWebRow) bool { return r.Timed&2 != 0 && r.Censored2x&2 == 0 },
+			func(r *ScoutWebRow) { r.Censored2x |= 2 }},
+		{"rug time", func(r *ScoutWebRow) bool { return r.RugAfterS != nil }, func(r *ScoutWebRow) { r.RugAfterS = ip(*r.RugAfterS + 1) }},
+		{"rug kind", func(r *ScoutWebRow) bool { return r.RugAtKind != nil && *r.RugAtKind == rugAtEvent },
+			func(r *ScoutWebRow) { r.RugAtKind = sp(rugAtDetected) }},
+		{"rug stored", func(r *ScoutWebRow) bool { return r.RugAfterS == nil }, func(r *ScoutWebRow) {
+			r.RugAfterS, r.RugAtKind = ip(7200), sp(rugAtEvent)
+		}},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -516,8 +645,8 @@ func TestWebAnalyticsEndpoint(t *testing.T) {
 		!strings.Contains(h.Get("Vary"), "Accept-Encoding") {
 		t.Fatalf("headers %v", h)
 	}
-	if etag := h.Get("ETag"); !strings.HasSuffix(etag, `-a3"`) {
-		t.Errorf("analytics ETag %s, want the format suffix -a3\"", etag)
+	if etag := h.Get("ETag"); !strings.HasSuffix(etag, `-a4"`) {
+		t.Errorf("analytics ETag %s, want the format suffix -a4\"", etag)
 	}
 	plain := rec.Body.Bytes()
 	if !bytes.Equal(plain, snap.analytics.plain) {
@@ -840,10 +969,10 @@ func TestAnalyticsPageFiles(t *testing.T) {
 	if !strings.Contains(js, "'api/analytics'") || !strings.Contains(js, "If-None-Match") {
 		t.Error("analytics.js does not read /api/analytics with its ETag")
 	}
-	// The page understands the body's format: 3 since "mcap" became the
-	// price-based market cap (price at the post × token supply).
-	if webAnalyticsFormat != 3 {
-		t.Errorf("webAnalyticsFormat = %d, want 3", webAnalyticsFormat)
+	// The page understands the body's format: 4 since the timing columns
+	// (3: "mcap" became the price-based market cap).
+	if webAnalyticsFormat != 4 {
+		t.Errorf("webAnalyticsFormat = %d, want 4", webAnalyticsFormat)
 	}
 	if want := fmt.Sprintf("var FORMAT = %d;", webAnalyticsFormat); !strings.Contains(js, want) {
 		t.Errorf("analytics.js: missing %q (the page must understand the server's format)", want)
@@ -854,8 +983,36 @@ func TestAnalyticsPageFiles(t *testing.T) {
 	if !strings.Contains(html, "price at the post × the token's total supply read from the chain") {
 		t.Error("analytics.html: the By factor help does not explain the market cap at the call")
 	}
+	// the Timing tab: its panel, the 0-held rule said on the page, and the
+	// vendored chart library loaded (deferred) before the page's scripts, with
+	// its licence and notice, and nothing in it that the CSP would need
+	// 'unsafe-eval' or 'unsafe-inline' for
+	for _, want := range []string{`id="panel-timing"`, `id="tab-timing"`, "Calls that never reached 2× count as 0 held"} {
+		if !strings.Contains(html, want) {
+			t.Errorf("analytics.html: missing %q", want)
+		}
+	}
+	const echartsTag = `<script src="vendor/echarts-6.1.0.custom.min.js" defer></script>`
+	if i, j := strings.Index(html, echartsTag), strings.Index(html, `<script src="analytics.js" defer></script>`); i < 0 || i > j {
+		t.Errorf("analytics.html must load %s before analytics.js", echartsTag)
+	}
+	vendor := read("vendor/echarts-6.1.0.custom.min.js")
+	for _, banned := range []string{"new Function", "eval(", "<style"} {
+		if strings.Contains(vendor, banned) {
+			t.Errorf("the vendored ECharts build contains %q", banned)
+		}
+	}
+	if lic, notice := read("vendor/ECHARTS-LICENSE.txt"), read("vendor/ECHARTS-NOTICE.txt"); !strings.Contains(lic, "Apache License") ||
+		!strings.Contains(lic, "zrender") || !strings.Contains(notice, "Apache ECharts") {
+		t.Error("vendor: the ECharts licence or notice is incomplete")
+	}
+	// the Timing tab's tooltips are elements made by the page, never the
+	// library's markup (whose style attributes the CSP blocks)
+	if !strings.Contains(js, "confine: true") || !strings.Contains(js, "formatter: formatter") {
+		t.Error("analytics.js: the chart tooltips must be confined and built by a formatter")
+	}
 	ws := benchWebServer(t, 3)
-	for _, p := range []string{"/analytics.html", "/analytics.js", "/analytics-stats.js"} {
+	for _, p := range []string{"/analytics.html", "/analytics.js", "/analytics-stats.js", "/vendor/echarts-6.1.0.custom.min.js", "/vendor/ECHARTS-LICENSE.txt"} {
 		if rec := getWeb(ws, p); rec.Code != 200 {
 			t.Errorf("%s: got %d, want 200", p, rec.Code)
 		}
