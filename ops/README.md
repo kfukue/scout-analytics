@@ -8,6 +8,11 @@ the write, C = check, D/E = optional follow-ups); its own `README.md` has the
 steps. The program never executes anything under `ops/`. Every new folder gets
 a distinct name and a row with its status in this table.
 
+Not a folder and not in the table: `scout-model.service` and `scout-model.md`
+are a systemd unit draft and its runbook for the scoring service
+(`ml/serve.py`, DEPLOY.md 2.4). They are not pgAdmin scripts and never touch
+the database.
+
 | Folder                          | Status                    | Date run | What it does                                                                                   | Run next?          |
 |---------------------------------|---------------------------|----------|------------------------------------------------------------------------------------------------|--------------------|
 | `2026-10-rug-retrack`           | DONE (151 calls)          | 6 Oct    | Re-tracks first calls tracked under the old rug rules (low liquidity or impossible numbers)    | No, never run B again |

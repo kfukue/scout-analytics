@@ -256,6 +256,41 @@ when the token count changes or a read is slow. Problems show as
 `web: could not refresh the snapshot: …` or
 `web: live updates: cannot listen for database events: … — retrying`.
 
+### 2.4 Scoring service: `scout-model`
+
+Optional. The listener calls it only when `SCOUT_MODEL_URL` is set (2.1). Unit
+draft and install steps: [`ops/scout-model.service`](ops/scout-model.service),
+[`ops/scout-model.md`](ops/scout-model.md) (DRAFT, not installed).
+
+| | |
+|---|---|
+| Command | `~/scout-ml/venv/bin/uvicorn serve:app --app-dir <repo>/ml --host 127.0.0.1 --port 8601` (the unit writes the paths out in full) |
+| Runs as | the account that runs `ml/run_training.sh` (the owner's), not `scout`: the models are written with umask 077 |
+| Needs | the venv `~/scout-ml/venv` and the models `~/scout-ml/models` (`LATEST` and the version directories) from `ml/run_training.sh` (`ml/RUNBOOK.md`). No `.env`, no database, no nodes, no Telegram, no secrets. |
+| Key vars | `SCOUT_MODEL_DIR` (models directory; default `ml/models`), `SCOUT_MODEL_LINE` (`passed` by default; **prod: `all`**, owner decision 12 Oct 2026: the delivery line shows every bucket with a model, the ones that did not pass their gates marked `(not validated)`; set in the unit, not in `.env`). Listener side (2.1): `SCOUT_MODEL_URL` (off), `SCOUT_MODEL_TIMEOUT` (`10s`). |
+| Writes | nothing. The listener stores the scores in `scout_call_predictions` (`assetdb`, shared with the main API). |
+
+Unlike the three Go processes it runs from the checkout's `ml/` directory, not
+the repo root, and never reads `.env`; the unit hides `.env`,
+`scout.session.json` and `scoutanalytics_data/` from it. It listens on
+`127.0.0.1:8601` only. Scores never filter deliveries, in either line mode.
+
+**Restart cost:** a call that arrives while it is down (or slower than
+`SCOUT_MODEL_TIMEOUT`) is delivered without the model line; nothing else is
+lost. A retrain needs no restart: it reads `models/LATEST` on every request.
+Restart it only after the `ml/` code changed (pulling `main`), or after
+changing `SCOUT_MODEL_LINE` in the unit (`systemctl daemon-reload` first). The
+listener keeps running in both cases.
+
+**Start limit:** after 5 failed starts within 10 minutes systemd refuses to
+start it (`start-limit-hit`). Fix the cause (`journalctl -u scout-model`),
+then `sudo systemctl reset-failed scout-model && sudo systemctl start scout-model`.
+
+**Log after a restart:** `journalctl -u scout-model` shows uvicorn's
+`Uvicorn running on http://127.0.0.1:8601`, then one access line per request
+(`POST /score 200`). The listener logs `score <CA>: Model … (precall 3.2s)` per
+new call, or why it delivered without a score.
+
 ## 3. Deploy checklist per kind of change
 
 ### 3.0 Common steps
@@ -444,7 +479,9 @@ sudo install -d -o scout -g scout /opt/scoutanalytics       # EDIT: user
 go build -o /opt/scoutanalytics/scoutanalytics .
 ```
 
-Notes for all three:
+Notes for all three (the optional fourth unit, the scoring service, is
+[`ops/scout-model.service`](ops/scout-model.service) with its own steps in
+`ops/scout-model.md`; see 2.4):
 
 - `WorkingDirectory` = the repo root, because `.env`, `scout.session.json` and
   `scoutanalytics_data/` are read there, and `database.SetupDatabase` needs
@@ -585,9 +622,10 @@ Daily use:
 ```bash
 sudo systemctl restart scout-web           # website change
 sudo systemctl restart scout-track         # tracker change (waits for calls in progress)
+sudo systemctl restart scout-model         # ml/ code or SCOUT_MODEL_LINE change (daemon-reload first); not after a retrain
 sudo systemctl stop scout-listener                       # listener change: stop first,
 pgrep -af listen-only || sudo systemctl start scout-listener   # start only if none is left
-systemctl status scout-track scout-web scout-listener
+systemctl status scout-track scout-web scout-listener scout-model
 ```
 
 ## 5. Reverse proxy (optional): nginx for `-web`
@@ -648,6 +686,7 @@ server { listen 80; server_name scout.example.com; return 301 https://$host$requ
 | Tracker alive | `journalctl -u scout-track --since "3 min ago" \| grep 'tracking:'` (or the terminal) | at least one `tracking:` line per `SCOUT_TRACK_INTERVAL` (1 min), also when idle |
 | Latest prices | the same log, `grep 'latest prices:'` | `waiting` falls over time; failures are counted on the line |
 | Listener alive | its log; in pgAdmin, read-only: `SELECT max(message_date) FROM scout_calls;` | a `post …` line for each new channel post; `max(message_date)` follows the channel |
+| Scoring service | `curl -s http://127.0.0.1:8601/health` (once scout-model is enabled, 2.4) | HTTP 200 and `{"ok":true,"model_version":"…"}` with the version in `~/scout-ml/models/LATEST`. 503 = the process runs but finds no usable model (systemd does not restart for that; the text names the directory). The listener logs `score <CA>: Model …` per new call; `no score within SCOUT_MODEL_TIMEOUT` lines mean the 10 s budget ran out. |
 | Nitro head advancing | run twice, a few seconds apart: `curl -s -X POST -H 'Content-Type: application/json' --data '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}' http://localhost:8540` | the number grows by about 10 per second |
 | Erigon reachable | the same `eth_blockNumber` against `$SCOUT_MAINNET_RPC_URL` (from the environment; do not paste it) | grows by about 1 per 12 s |
 | Postgres connections | `SELECT count(*) FROM pg_stat_activity WHERE datname = 'assetdb';` | well below `max_connections` (shared with the main API) |
