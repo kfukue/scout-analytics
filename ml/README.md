@@ -32,6 +32,21 @@ column). So is `trades_24h` (trading in the 24 h after the call; any
 families" below). Their levels (and `quote_asset`, `perceptor_verdict`) are matched
 without regard to case and surrounding spaces, and are learned from the
 training rows of each split only; a level not seen there is treated as missing.
+That also holds when serving: a value the model was not trained with (for
+example Perceptor's `insufficient` verdict, "not enough data yet", for a model
+trained before it existed) is scored exactly as if `perceptor_verdict` were
+null, without an error. At training, `insufficient` is its own level, separate
+from `unknown` (the view passes `verdict_level` through unchanged), once it has
+at least `MIN_CATEGORY_COUNT` (20) rows in the training part; rarer, it is
+missing. After the relabel of the historical Perceptor reports from `unknown`
+to `insufficient` ships, retrain before trusting the scores: older models
+learned those reports as `unknown`.
+The timing and rug outcomes the tracker stores (`peak_late_after_s`,
+`first_2x_after_s`, `above_2x_s`, `fall_below_2x_after_s`, `above_2x_censored`,
+`timing_at`, `rug_at`, `rug_at_kind`) are not in the view yet; when they are
+added they are outcomes, never features: the guard refuses them and any
+per-horizon variant (`TIMING_RUG_OUTCOMES` and `FORBIDDEN_PREFIXES` in
+`scout_ml/config.py`).
 An older model whose `meta.json` has one flat set of levels is still served
 with the exact, case-sensitive matching it was trained with, and a model whose
 feature list has raw `dex` (trained before `dex_family`) is still served with it.
@@ -423,15 +438,27 @@ uncalibrated (the report says so).
 
     GET  /health  -> {"ok": true, "model_version": "20261002-1530"}
     POST /score   <- {"row": { ...one scout_call_dataset_v row as JSON... }}
-                  -> {"model_version": "...", "line": "Model ... · short: runner 31%, collapse 44% · ...",
-                      "buckets": [{"bucket": "short", "runner_prob": 0.31,
+                  -> {"model_version": "...", "line": "Model ... · 7d: runner 12%, collapse 64%",
+                      "buckets": [{"bucket": "short", "passed": false, "runner_prob": 0.31,
                                    "collapse_prob": 0.44, "runner_rank_pct": 92.5}, ...]}
 
 Nulls, missing columns and unknown keys are fine (treated as missing).
-Outcome columns in the row are ignored. Only buckets with a trained runner
-model appear (a skipped bucket, e.g. `long` before its data has matured, has
-no line); without a collapse model `collapse_prob` is null. Each bucket is
-scored with the category levels its models were trained with (stored per
+Outcome columns in the row are ignored. `buckets` has every bucket with a
+trained runner model (a skipped bucket, e.g. `long` before its data has
+matured, is left out), whether or not it passed its gates, so all scores can be
+stored and checked live; `passed` is true only when `meta.json` records
+`metrics.<bucket>.gates.passed = true` (a missing entry, e.g. an older
+`meta.json` without gate info, counts as not passed). Without a collapse model
+`collapse_prob` is null.
+
+`line` names only the buckets that passed their gates, by horizon (`1d`, `3d`,
+`7d`, `30d`), after the model version, e.g. with only `medium` passed:
+
+    Model 20261010-0621 · 7d: runner 12%, collapse 64%
+
+When no bucket passed, `line` is `""` and the listener appends nothing.
+
+Each bucket is scored with the category levels its models were trained with (stored per
 bucket in `meta.json`).
 `runner_rank_pct` is where the runner score falls among the scores of the
 test-period calls at training time (0-100). Both endpoints return 503 while
@@ -443,7 +470,9 @@ Start the service, then run the listener with
 
     SCOUT_MODEL_URL=http://127.0.0.1:8601
 
-It posts the row of a new call to `/score` and can append `line` to its message.
+It posts the row of a new call to `/score` and can append `line` to its message
+(nothing when `line` is empty, i.e. no bucket passed its gates). Scores never
+filter deliveries.
 
 ## Retrain
 
@@ -463,8 +492,9 @@ roll back, write an older version name into `models/LATEST`. Compare the new
     scout_ml/report.py    report.md
     train.py  serve.py  make_synthetic.py  tests/
 
-    python -m pytest tests -q        # 148 passed, about 2.5 minutes
+    python -m pytest tests -q        # 179 passed, about 2.5 minutes
 
 `build_features` raises if an outcome or bookkeeping column (anything starting
-with `ret_`, `max_gain_`, `max_dd_`, `trades_`, plus `rugged`, `tracking_status`,
-`trades_24h`, ...) would become a model input.
+with `ret_`, `max_gain_`, `max_dd_`, `trades_`, `peak_late_after_`, `peak_after_`,
+`first_2x_`, `above_2x_`, `fall_below_2x_`, `timing_`, `rug_at`, plus `rugged`,
+`tracking_status`, `trades_24h`, ...) would become a model input.
