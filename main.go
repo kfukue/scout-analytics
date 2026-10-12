@@ -97,7 +97,7 @@ type config struct {
 
 	// Model scoring (see score.go). Off unless SCOUT_MODEL_URL is set.
 	ModelURL     string        // base URL of the scoring service, e.g. http://127.0.0.1:8601
-	ModelTimeout time.Duration // per request; delivery never waits longer than this
+	ModelTimeout time.Duration // overall budget for scoring a new call (live pre-call stats + feature row + scoring request); the delivery waits at most this, plus up to 5 s to store a score that arrived
 }
 
 func env(key, def string) string {
@@ -160,7 +160,7 @@ func loadConfig(envFile string) (*config, error) {
 		DatabaseURL:    os.Getenv("SCOUT_DATABASE_URL"),
 		DBAutoMigrate:  !strings.EqualFold(env("SCOUT_DB_AUTO_MIGRATE", "true"), "false"),
 		ModelURL:       strings.TrimRight(env("SCOUT_MODEL_URL", ""), "/"),
-		ModelTimeout:   envDur("SCOUT_MODEL_TIMEOUT", 5*time.Second),
+		ModelTimeout:   envDur("SCOUT_MODEL_TIMEOUT", 10*time.Second),
 	}
 	c.DeliverLevels = map[string]bool{}
 	for _, l := range splitList(env("SCOUT_DELIVER_LEVELS", levelClean+","+levelCaution)) {

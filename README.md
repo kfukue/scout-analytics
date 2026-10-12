@@ -749,14 +749,37 @@ backfill-timing (dry run): 290 rugged horizon(s) wait for those lookups; 0 rugge
 Off by default. With `SCOUT_MODEL_URL` set (for example `http://127.0.0.1:8601`,
 the service in `ml/serve.py`), the listener sends each new call's dataset row to
 the service, stores the scores in `scout_call_predictions` and adds one line to
-the delivered message:
+the delivered message. The line lists, by horizon, only the buckets that passed
+their gates:
 
 ```
-Model 20261002-1530 · short: runner 31%, collapse 44% · 3-day: runner 22% · medium: runner 18% · long: up at 30d 6%
+Model 20261010-0621 · 7d: runner 12%, collapse 64%
 ```
 
-Scores never filter deliveries. If the service is down or slower than
-`SCOUT_MODEL_TIMEOUT` (default `5s`), the call is delivered without the line.
+When no bucket passed its gates, the line is left out.
+
+Scores never filter deliveries. Reading the call's pre-call trades from the node,
+its feature row and the scoring request share one budget, `SCOUT_MODEL_TIMEOUT`
+(default `10s`). If it runs out or the service is down, the call is delivered
+without the line. A score that did arrive is still stored (taking up to 5 s
+more). The log line of each outcome shows how long the pre-call part took
+(`score <ca>: … (precall 3.2s)`), to help tune the budget.
+
+Until the tracker reaches a call, its dataset row has no `quote_asset`. The
+listener fills it in, in the row it scores (and stores with the scores), from the
+pool it found live while reading the pre-call trades. That is normally the value
+the dataset view shows once the tracker has run (the tracker's later pool
+discovery can occasionally pick a different pool). `scout_call_tracking` is
+still written only by the tracker. To see how often the two differ (read-only):
+
+```sql
+SELECT count(*) FILTER (WHERE p.features->>'quote_asset' <> t.onchain->>'quote_sym') AS differ,
+       count(*) AS both_known
+FROM scout_call_predictions p
+JOIN scout_call_tracking t ON t.call_id = p.call_id
+WHERE p.features->>'quote_asset' IS NOT NULL AND t.onchain->>'quote_sym' IS NOT NULL;
+```
+
 `scout_call_predictions_v` shows each score next to the real outcome.
 
 ### Latest price (the return as of now)
