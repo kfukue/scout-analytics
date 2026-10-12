@@ -193,3 +193,48 @@ def test_owner_dex_list_maps_to_the_agreed_families():
     # every configured family is reached by some posted name, except plain "uniswap"
     families = {f for _, f in C.DEX_FAMILY_RULES}
     assert families - set(got.values()) == {"uniswap"}
+
+
+# Timing / rug outcomes stored by the tracker (scout_call_returns, scout_call_tracking):
+# the exact names, and per-horizon / entry ("late") variants the view may use later
+# (same pattern as ret_late_1d, max_gain_1h).
+TIMING_RUG_NAMES = [
+    "peak_late_after_s", "first_2x_after_s", "above_2x_s", "fall_below_2x_after_s",
+    "above_2x_censored", "timing_at", "rug_at", "rug_at_kind",
+    "peak_late_after_s_1h", "peak_after_s_1d", "first_2x_after_s_1h", "first_2x_after_late_1d",
+    "first_2x_late_after_s", "above_2x_s_1d", "above_2x_late_s_7d", "above_2x_censored_30d",
+    "fall_below_2x_after_s_3d", "fall_below_2x_late_after_s", "timing_at_1d", "timing_version",
+    "rug_at_1d", "rug_at_kind_24h"]
+
+
+@pytest.mark.parametrize("col", TIMING_RUG_NAMES)
+def test_timing_and_rug_outcomes_are_never_features(col, synthetic_df):
+    assert C.is_forbidden(col) and col not in C.FEATURES, col
+    with pytest.raises(ValueError, match="forbidden"):
+        assert_no_leakage(["liq_usd", col])
+    with pytest.raises(ValueError, match="forbidden"):
+        build_features(synthetic_df.head(5).assign(**{col: 1.0}), {},
+                       columns=C.FEATURES[:3] + [col])
+
+
+def test_timing_rug_guard_leaves_inputs_known_at_the_call_allowed():
+    assert set(C.TIMING_RUG_OUTCOMES) <= C.FORBIDDEN_COLUMNS
+    assert_no_leakage(C.FEATURES)
+    for col in ("pre_first_trade_age_s", "age_seconds", "perceptor_verdict", "liq_usd"):
+        assert not C.is_forbidden(col), col
+
+
+def test_perceptor_insufficient_is_its_own_level_when_frequent_enough():
+    """'insufficient' (Perceptor: not enough data yet) is learned as a level of its
+    own, separate from 'unknown', once it has MIN_CATEGORY_COUNT training rows;
+    rarer, it is missing like any rare level."""
+    df = pd.DataFrame({"perceptor_verdict": ["clean"] * 20 + ["unknown"] * 20
+                       + ["Insufficient "] * 10 + ["insufficient"] * 10})
+    levels = learn_cat_levels(df)
+    assert levels["perceptor_verdict"] == ["clean", "insufficient", "unknown"]
+    X = build_features([{"perceptor_verdict": v} for v in ("insufficient", "unknown", "INSUFFICIENT")],
+                       levels)
+    assert X["perceptor_verdict"].tolist() == [1.0, 2.0, 1.0]
+    rare = learn_cat_levels(df.iloc[:59])                     # 19 'insufficient' rows
+    assert rare["perceptor_verdict"] == ["clean", "unknown"]
+    assert np.isnan(build_features({"perceptor_verdict": "insufficient"}, rare)["perceptor_verdict"][0])
