@@ -1,0 +1,96 @@
+# DRAFT - review before installing. Install steps: ops/scout-model.md.
+# /etc/systemd/system/scout-model.service
+#
+# Scoring service (ml/serve.py, FastAPI under uvicorn) on 127.0.0.1:8601.
+# Owner decision 12 Oct 2026: prod runs SCOUT_MODEL_LINE=all (below), so the
+# delivery line shows every bucket with a model, the ones that did not pass
+# their gates marked "(not validated)". Scores never filter deliveries.
+#
+# EDIT: replace every __USER__ with the account that runs ml/run_training.sh
+# (the owner's account) and every __REPO__ with the absolute path of the
+# deployed checkout (no ~, no trailing /), e.g.
+#   REPO=/path/to/scout-analytics   # <<< EDIT
+#   sed -e "s|__REPO__|$REPO|g" -e "s/__USER__/$(id -un)/g" ops/scout-model.service | sudo tee /etc/systemd/system/scout-model.service >/dev/null
+# It is not the `scout` user of the DEPLOY.md drafts: run_training.sh writes
+# ~/scout-ml/models with umask 077, so only that account can read the models
+# and the venv. If the home directory is not /home/<user>, fix the scout-ml
+# paths too.
+# systemd does not expand ~, and %h is /root in a system unit, so the paths
+# are written out in full.
+#
+# Unlike the Go units, WorkingDirectory is the checkout's ml/ directory, not
+# the repo root, and there is no EnvironmentFile: the service needs no secrets
+# and must not see the bot's .env (InaccessiblePaths below hides it).
+
+[Unit]
+Description=scoutanalytics scoring service (ml/serve.py on 127.0.0.1:8601)
+After=network.target
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Service]
+# Type=exec, not Type=simple like the DEPLOY.md units, on purpose: a wrong
+# venv or uvicorn path then fails at `systemctl start` instead of only showing
+# up later in the journal.
+Type=exec
+# No Group=: systemd uses the primary group of User=.
+User=__USER__
+WorkingDirectory=__REPO__/ml
+# Models: the directory run_training.sh trains into. serve.py follows its
+# LATEST file on every request, so a retrain needs no restart.
+Environment=SCOUT_MODEL_DIR=/home/__USER__/scout-ml/models
+# Delivery line: "all" = every bucket, failing ones marked "(not validated)"
+# (owner decision 12 Oct 2026: he is the only reader of the delivery group).
+# "passed" (the default when unset) = only buckets that passed their gates.
+# To switch: edit this line, systemctl daemon-reload, restart scout-model only
+# (no retrain, no LATEST change, no listener restart). ops/scout-model.md.
+Environment=SCOUT_MODEL_LINE=all
+# No __pycache__ writes into the checkout (it is read-only here anyway);
+# log lines reach the journal at once.
+Environment=PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
+# Shared box with the tracker (and the nodes): LightGBM's OpenMP pool would
+# otherwise take one thread per core. One /score call predicts a single row,
+# so 2 threads are plenty.
+Environment=OMP_NUM_THREADS=2
+ExecStart=/home/__USER__/scout-ml/venv/bin/uvicorn serve:app --app-dir __REPO__/ml --host 127.0.0.1 --port 8601
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=15
+StandardInput=null
+UMask=0077
+
+# Hardening. The service only reads (code, venv, models) and only talks to
+# loopback; nothing below is needed to run it, so a line can be removed if it
+# ever gets in the way.
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+# Whole file system read-only for this service; /home stays readable because
+# the venv, the code and the models live there (ProtectHome=yes would hide them).
+ProtectSystem=strict
+ProtectHome=read-only
+# The bot's secrets are never visible to this service ("-": fine if missing).
+InaccessiblePaths=-__REPO__/.env
+InaccessiblePaths=-__REPO__/scout.session.json
+InaccessiblePaths=-__REPO__/scoutanalytics_data
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+CapabilityBoundingSet=
+SystemCallArchitectures=native
+# Network: loopback only. The listener reaches it on 127.0.0.1; the service
+# itself never connects out. (No MemoryDenyWriteExecute or SystemCallFilter:
+# LightGBM and OpenMP make those risky without a test on the server.)
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+IPAddressDeny=any
+IPAddressAllow=localhost
+
+[Install]
+WantedBy=multi-user.target

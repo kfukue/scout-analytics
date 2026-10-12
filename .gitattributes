@@ -2,3 +2,6 @@
 *.sh text eol=lf
 # deploy drafts (systemd units, env files, Dockerfile, .gcloudignore, YAML, JSON): always LF
 deploy/gcp/** text eol=lf
+# scoring-service unit draft and its runbook (used from the checkout on the Linux prod server): always LF
+ops/*.service text eol=lf
+ops/scout-model.md text eol=lf
