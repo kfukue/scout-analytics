@@ -5,15 +5,16 @@ trains the four bucket models and produces `report.md`. The commands are
 exact; replace only the two paths in step 0.
 
 What it does NOT do: it does not start the scoring service and does not wire
-scores into deliveries. `SCOUT_MODEL_URL` stays unset until the product
-manager has read the report and said the gates passed. Scores never filter
-deliveries in any case.
+scores into deliveries. The scoring service may run and the listener may use
+it (`SCOUT_MODEL_URL`); which buckets the delivery line shows is set by
+`SCOUT_MODEL_LINE` on the scoring service (prod is to run `all` once the
+scoring service is installed, the owner's decision of 12 Oct 2026; step 9). Scores never filter deliveries in any case.
 
 ## Quick way: one script
 
 `ml/run_training.sh` runs steps 1, 2, 4, 5 (with `--variants`: 5b instead of 5) and 6 below in one go, with the
 same commands and flags, plus the step 9 check (`SCOUT_MODEL_URL` in `.env`:
-it warns, without showing the value, and goes on). It stops at the first
+it says whether it is set, without showing the value, and goes on). It stops at the first
 failure and says which step failed; when a command inside a step failed, it
 also shows the last 20 lines of that command's output to paste. It always
 deletes `$ML/data/calls.csv` when it exits, also on an error or Ctrl+C. It
@@ -467,17 +468,21 @@ on one or two weeks of calls.
 
 Never paste the CSV, rows of it, or anything from `.env`.
 
-## 9. Scores stay off
+## 9. Scores on deliveries
 
-Until the product manager says the gates passed:
-
-- `SCOUT_MODEL_URL` stays unset for the listener. To check without showing
-  the value: `grep -c '^SCOUT_MODEL_URL=' .env` must print `0` (run in the
-  listener's directory);
-- do not start `serve.py`.
-
-Even after a PASS, scores are only appended to the delivered message; they
-never decide whether a call is delivered.
+- The scoring service (`serve.py`) may run, and the listener may use it
+  (`SCOUT_MODEL_URL` in its `.env`). To see whether it is set without showing
+  the value: `grep -c '^SCOUT_MODEL_URL=' .env` (run in the listener's
+  directory; `0` means no score line).
+- Which buckets the delivery line shows is set by `SCOUT_MODEL_LINE` on the
+  scoring service: `passed` (the default) or `all` (failing buckets marked
+  "(not validated)"). The owner decided on 12 Oct 2026 to run prod with
+  `all` (he is the only reader of the delivery group). Changing it needs a
+  restart of the scoring service only.
+- Scores are only appended to the delivered message; they never decide
+  whether a call is delivered.
+- After each retrain, send the report's verdict to the product manager
+  (step 8).
 
 ## Cleanup (when done with the worktree)
 

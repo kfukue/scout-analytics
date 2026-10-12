@@ -34,9 +34,11 @@ of doing it. Go code and the website belong to `coder`.
   in one part, walk-forward by week. No random splits.
 - `train.py` exits 0 even when the gates fail. Quote the PASS/FAIL verdict and
   the gate values from `models/<version>/report.md` in your report.
-- Project rule (not in the README): scores never filter deliveries. They may
-  only be appended to a message, and only once the product manager says the
-  gates passed.
+- Project rule: scores never filter deliveries; they are only appended to the
+  message. Which buckets appear is `SCOUT_MODEL_LINE` on the scoring service:
+  default `passed` (only gate-passing buckets); prod is to run `all` once the
+  scoring service is installed (failing buckets marked "(not validated)"),
+  decided 12 Oct 2026 because only he reads the group. Keep `passed` as the code default.
 
 ## Practices
 

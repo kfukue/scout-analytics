@@ -1,159 +1,325 @@
 # Scout analytics: handoff to Claude Code
 
-## Session state at restart (10 October 2026, ~06:15 UTC)
+## Session state (12 October 2026, after the owner merged items #1-#5 and #7 (PRs #18-#23) and deployed 68a4954)
 
-**main is at f072467** (PR #15, ML walk-forward min, merged 10 Oct; it only
-touches `ml/`). Prod still runs dc0a42d, which is fine: nothing in PR #15
-needs a Go restart.
+**Main and prod:** main is at **c31d859** on GitHub (PR #23 merged 12 Oct,
+`ml/` only). Prod still runs **68a4954** (deployed 12 Oct); the Go
+processes need nothing from #23, only the checkout the scoring service runs
+`serve.py` from. This 12 Oct handoff itself was never merged until this PR
+(`work/2026-10-12-handoff`). Merged since dc0a42d (session item → PR, merge
+commit, branch head):
 
-**Where the current docs live:**
+- PR #15 (f072467, 10 Oct): ML walk-forward minimum, weeks with fewer than
+  1000 training rows are not counted (`WF_MIN_TRAIN_ROWS`); `ml/` only.
+- PR #16 (ad00645): agent setup.
+- PR #17 (f611cda): handoff pause.
+- #5 GCP site draft → PR #18 (4245939; head 59d0a31): `deploy/gcp/**`,
+  DEPLOY.md 7.5, `.gitattributes`, `.gitignore`. Draft only (see "GCP
+  site" below).
+- #1 ML score gating → PR #19 (7228325; head a5cb7a4): `ml/` only.
+- #3 Perceptor re-check → PR #20 (5f9350e; head e4d5b2c): `insufficient`
+  level + 12-minute re-check (`recheck.go`), schema relabel.
+- #2 score live fixes → PR #21 (aab3e3c; head be0cddd, plus ea454a8 "Merge
+  branch 'main'"): `quote_asset` from the live pre-call, one
+  `SCOUT_MODEL_TIMEOUT` budget (default 10s).
+- #4 Analytics Timing tab → PR #22 (68a4954; head b4149ff):
+  `/api/analytics` format 4, ECharts 6.1.0 custom build vendored (sha256
+  `11c0d37dd643ce90816bb4825e557658b3a37a887c494cb49e8c79aed8678ba8`,
+  provenance in `frontend/vendor/README.md`).
+- #7 delivery model line → PR #23 (c31d859; head 65baa2b): scoring-service
+  env var `SCOUT_MODEL_LINE=passed|all` (default `passed`; with `all`,
+  failing buckets are marked "(not validated)"); `ml/` only.
+- Docs for the 12 Oct decision → this PR (`work/2026-10-12-handoff`): the
+  seven docs `README.md` ("Scoring new calls"), `ml/README.md`,
+  `ml/RUNBOOK.md` (step 9 "Scores on deliveries"), `ml/run_training.sh`
+  (echoed notes only), `.claude/agents/ml-coder.md`,
+  `.claude/skills/scout-product-manager/SKILL.md` and this file now state the
+  `SCOUT_MODEL_LINE` rule. Done.
 
-- The up-to-date HANDOFF.md, SKILL.md, agent files, `tester.md` and
-  `TESTING.md` are committed (79b98f0; the testing pause note and these
-  session-state updates are an uncommitted `HANDOFF.md` change for a second
-  commit, which the owner makes) on branch `work/2026-10-09-agent-setup` in worktree
-  `.claude/worktrees/agent-a42a71ec2e3703f1b`, not yet pushed or merged. main's copies are older until this branch is merged.
-- Next PM: read this file from that worktree first.
+**Prod runs main 68a4954 (deployed by the owner 12 Oct):** listener
+`-listen-only`, tracker `-track` and `-web` restarted by the owner on
+68a4954, so #2, #3 and #4 are live. The listener start applied
+`scoutanalytics.sql`, including the relabel of the 54 Perceptor rows from
+`unknown` to `insufficient` ("not enough data yet"); the dataset view now
+excludes re-check reports. Earlier (dc0a42d, 9 Oct 22:34 PDT) it ran the
+timing backend. Verified on prod 10 Oct: clock synchronised (NTP);
+timing backfill complete (every first call timed in every horizon; the ~149
+untimed rows per horizon are all `repeat` calls; all 245 rugged calls have
+rug times; 0 negative values). First numbers (timed / reached 2× / median s
+to 2× / still ≥ 2× at end): 1h 5247/1365/434/229; 1d 5196/1863/850/81; 3d
+5058/1924/1002/66; 7d 4884/1905/1051/50; 30d 2982/1247/1021/28. C: has
+~318 GB free (12 Oct); Go builds and throwaway Postgres work again.
 
-**Owner rules learnt this session:**
+**Owner rules:** agents never push (`git push` is denied in
+`.claude/settings.json`) and agents' `git commit` isn't allowed either: the
+PM gives exact commit/push commands and the owner runs them; never commit to
+main. Reviewer runs on `fable`, researcher on `opus` (the owner asked for
+`fable` for one ML-planning research task). Up to 10 coding agents. The
+testing setup (tester agent, `verify` in the new setup, testdb scripts, CI)
+stays PAUSED (re-confirmed by the owner 12 Oct); coders run DB
+tests themselves with the manual throwaway-Postgres steps in `TESTING.md`.
+Paused work (both worktrees at dc0a42d, untracked files; keep them):
+`agent-afcf62469a29564cf` (`scripts/testdb.sh`, `scripts/testdb.ps1`;
+review-fix state unknown, a real PowerShell 5.1 run is still a must-fix;
+commit with `git add --chmod=+x scripts/testdb.sh` on
+`work/2026-10-09-testdb-scripts`) and `agent-aa31691b57e3bc7ff` (CI:
+`.github/workflows/test.yml` + README, `.github/dependabot.yml`, modified
+`.gitattributes`; re-review the token handling before committing on
+`work/2026-10-09-ci-tests`).
 
-- `.claude/settings.json` denies `git push` for agents. The owner approved
-  agents committing on `work/...` branches in principle, but `git commit` is
-  not in `.claude/settings.json`'s allow list, so background agents' commits
-  are denied. Until the owner adds `Bash(git commit:*)` /
-  `PowerShell(git commit:*)` (his decision; agents never edit that file), the
-  PM prepares the exact commit commands and the owner commits. The owner
-  pushes; after the push an agent may open the PR with `gh pr create` (or the
-  PM gives the compare URL + body). Never commit to main.
-- Reviewer runs on `fable`; researcher on `opus` (Opus 5.5). Coding agents
-  up to 10 at once.
-- New agent files (tester) load only after a restart once the setup-docs
-  branch is merged.
+**12 Oct deploy: DONE** (owner pulled 68a4954 and restarted the listener,
+tracker and `-web`; `onchainStateVersion` unchanged, no history re-run; the
+54-row `insufficient` relabel happened on the listener start). **Owner
+checks still open from it:**
 
-### Testing setup: paused (owner, 10 October)
+1. Analytics → Timing on real data, and record the real gzipped
+   `/api/analytics` size in README (the "Size:" bullet under
+   `GET /api/analytics`; estimate 250-320 KB), e.g.
+   `curl -s -H 'Accept-Encoding: gzip' -o /dev/null -w '%{size_download}\n' http://<SCOUT_WEB_ADDR>/api/analytics`.
+2. The 2-minute browser look planned for #3: the new "not enough data yet"
+   label at 1280/390 px, light/dark, no CSP errors in DevTools.
+3. Watch the listener: a live call whose Perceptor report says "not enough
+   data yet" is held and re-checked ~12 min after the call: `clean`/`caution`
+   → delivered then (`🔁 Perceptor re-checked …` header line); `red_flags`
+   → not delivered; still no verdict → delivered then with the
+   `⏳ … not enough data yet` label (README "Re-checking “not enough data
+   yet”").
+4. After any tracker restart, check the `latest prices on:` line (every
+   1h0m0s for older ones, at most 400 per cycle; section 3 "Lesson" on
+   `.env`).
 
-The owner paused the testing setup; resume later. Reason: owner's call;
-drive C: is nearly full (see "Disk" below), which breaks Go builds and
-throwaway Postgres in the scratchpad.
+**Then switch scores on** (owner decision 12 Oct: the delivery score line
+shows the model numbers even when buckets fail, clearly marked; see "Owner
+decision 12 Oct" below; scores never filter deliveries):
 
-- **Paused:** the `tester` agent (do not use it yet, even though
-  `.claude/agents/tester.md` and `TESTING.md` are in the agent-setup commit),
-  the throwaway-Postgres scripts and the CI workflow. Until resumed, coders
-  run DB tests with the manual throwaway-Postgres steps in `TESTING.md`.
-- **Scripts** (worktree `agent-afcf62469a29564cf`): untracked
-  `scripts/testdb.sh` (tested end to end in Git Bash: 313 tests, 0 DB
-  skipped) and `scripts/testdb.ps1` (never executed; the worktree hook blocks
-  powershell). Review: no unsafe deletion path; must-fix = a real PowerShell
-  5.1 run. When paused, a coder was applying review fixes (empty-arg guard in
-  `Invoke-Stop`, tolerant port probes in bash, refuse drive roots/links,
-  require `port=` in testdb.info, `SCOUT_TESTDB_PGBIN` README line) and
-  attempting the PowerShell run; state unknown, so check
-  `git -C <wt> status`/diff before resuming. Commit with
-  `git add --chmod=+x scripts/testdb.sh`.
-- **CI** (worktree `agent-aa31691b57e3bc7ff`, HEAD dc0a42d): untracked
-  `.github/workflows/test.yml`, `.github/workflows/README.md`,
-  `.github/dependabot.yml`, modified `.gitattributes`. All first-review fixes
-  applied (no rerun on panic/timeout/build failure, `-timeout 25m`, job 40
-  min, GOPRIVATE narrowed, token via a repo-scoped git `extraheader` instead
-  of `insteadOf`, `set -euo pipefail`, gofmt step, dependabot). A focused
-  re-review of the token handling was running when paused; re-run it before
-  committing. Repo appears public, so Actions minutes are free; owner to
-  confirm visibility.
-- **Resume steps:** free disk space on C: first; then finish the scripts
-  (PowerShell run by the owner or an agent), re-review the CI token handling,
-  commit each on `work/2026-10-09-testdb-scripts` /
-  `work/2026-10-09-ci-tests`, owner pushes, PRs; then start using the tester
-  per SKILL.md.
+1. Done: retrain on prod after the deploy (model 20261012-1917; all buckets
+   FAIL, see "Latest model report" below).
+2. Done: the line-all change is merged (PR #23, c31d859): scoring-service
+   env var `SCOUT_MODEL_LINE=passed|all` (default `passed`); with `all`,
+   failing buckets are marked "(not validated)".
+3. Finish the review of the scoring-service unit #6 (worktree
+   agent-ab0f0dba0692e4540, at c31d859; updated by infra 12 Oct, review in
+   progress), then the owner commits/pushes it on
+   `work/2026-10-12-scoring-service`.
+4. The checkout the unit runs `serve.py` from must be at c31d859 or later
+   (68a4954's `serve.py` ignores `SCOUT_MODEL_LINE`).
+5. Install `ops/scout-model.service` per `ops/scout-model.md`, with
+   `Environment=SCOUT_MODEL_LINE=all` in the unit.
+6. `SCOUT_MODEL_URL=http://127.0.0.1:8601` in the prod `.env`
+   (`SCOUT_MODEL_TIMEOUT` default is now 10s).
+7. Restart the listener; watch the logs for `precall Xs` times and "no score
+   within SCOUT_MODEL_TIMEOUT".
+8. Later, after the tracker has caught up, run the README's read-only
+   `quote_asset` agreement SQL (it counts bucket rows; use
+   `count(DISTINCT p.call_id)` for calls).
 
-**Disk:** C: had ~100 MB free (837 of 838 GB used) on 10 Oct. Cause not yet
-found (agent leftovers are < 1 GB); the owner is investigating (WizTree /
-folder sizes). Agents' Go builds (linker) and throwaway Postgres fail until
-this is fixed. Option for the owner: allow agents to use `<tmp>`
-for `GOTMPDIR`/`TMP`/`TEMP` and for Postgres data dirs (denied by
-permissions on 10 Oct).
+**Owner decision 12 Oct (model line on deliveries):** show the model numbers
+on deliveries even when buckets fail, clearly marked ("(not validated)"),
+because the owner is the only reader of the private delivery group. Prod
+plan: `SCOUT_MODEL_LINE=all` in the scout-model unit. Scores still never
+filter deliveries. This supersedes the earlier rule "scores only appended
+once gates pass" for this owner-only group. The code is merged (PR #23);
+the docs (README, `ml/README.md`, `ml/RUNBOOK.md`, `ml/run_training.sh`,
+`ml-coder.md`, the PM skill, this file) are updated in this PR.
 
-**Leftover throwaway Postgres servers:** agents' test servers run as
-separate processes and survive a Claude restart. Two were seen on 10 Oct, on
-`127.0.0.1:55461` and `127.0.0.1:55970`; leftover data dirs `scratchpad\pg`
-(~143 MB) and `scratchpad\timing` (~128 MB) are in the old session's
-scratchpad. Clean-up (owner, PowerShell):
+**Not merged (agent worktrees under `.claude/worktrees/`):**
 
-1. `Get-CimInstance Win32_Process -Filter "name='postgres.exe'" | Select-Object ProcessId, CommandLine`
-2. For each server whose `-D` is under `...\AppData\Local\Temp\claude\...`:
-   `& "<postgres dir>\17\bin\pg_ctl.exe" -D "<path>" stop -m fast`, then
-   delete that folder.
-3. Never touch the server whose data dir is the owner's own.
+| # | Worktree | Branch to create/use | State | Files | Notes |
+|---|---|---|---|---|---|
+| 6 | agent-ab0f0dba0692e4540 (locked; at c31d859, fast-forwarded 12 Oct) | `work/2026-10-12-scoring-service` | uncommitted; updated by infra 12 Oct, review in progress | untracked `ops/scout-model.service`, `ops/scout-model.md`; modified `DEPLOY.md` (new section 2.4 scoring service, health-check row, daily-use restart line), `ops/README.md` | systemd unit + runbook for `ml/serve.py` (uvicorn 127.0.0.1:8601, runs as the owner's account because models are umask 077, no secrets, hardened, follows `LATEST`). The unit sets `Environment=SCOUT_MODEL_LINE=all` (owner decision 12 Oct). Validated with `systemd-analyze verify` and `systemd-analyze security` (3.0 OK) in a local ubuntu:24.04 container. Finish the review before committing. |
+| — | agent-ae167c3d46439a04d | `worktree-agent-ae167c3d46439a04d` (work branch not named yet) | sAlpha re-ask; uncommitted, at d5d96ac (29 commits behind 68a4954) | — | See "Still to do". |
+| — | agent-afcf62469a29564cf, agent-aa31691b57e3bc7ff | `work/2026-10-09-testdb-scripts`, `work/2026-10-09-ci-tests` (to create) | testdb scripts, CI; paused, untracked | — | See "Owner rules" above. |
+| — | agent-setup-20261012 (at c31d859) | `work/2026-10-12-agent-setup` | owner's subagent-setup change; built and reviewed (PASS, no must-fix), uncommitted | `.claude/agents/*` (7 deleted, 5 new, `product-manager.md`), new `.claude/skills/scout-*/`, the PM skill, HANDOFF.md, README.md, TESTING.md | Replaces the 7 role agents (coder, ml-coder, react-coder, infra, tester, reviewer, researcher) with 5 function agents (`investigate` on opus, `implement`, `simplify`, `verify` (paused), `review` on fable) plus skills `scout-rules`, `scout-go`, `scout-web`, `scout-ml`, `scout-infra`; React dropped. Rebase onto main AFTER this handoff branch merges (both edit HANDOFF.md and the PM skill; this branch's `SCOUT_MODEL_LINE` rule in `ml-coder.md` moves into `scout-ml`), short re-review, then the owner commits/merges and restarts Claude Code. |
+| — | timing-touchdrop-20261012 (at c31d859) | `work/2026-10-12-timing-touch-drop` | in progress, uncommitted | `frontend/analytics*`, `testdata/analytics-stats.test.js`, `webanalytics_test.go`, README.md | New "reached 2×" rule (owner decision 12 Oct, section 3 "Decisions 12 October"); no data change, no re-track. |
 
-**In-flight work** (state at restart; each worktree under
-`.claude/worktrees/`):
+**GCP site (#5): merged as PR #18 (4245939)**, a draft only (`deploy/gcp/`,
+`deploy/gcp/INTERFACE.md`); no Go export and no GCP resources yet, so
+nothing is public until the Go export exists and the owner creates the GCP
+resources. As merged, the draft PUBLISHES sAlpha report text (scrubbed) and
+Perceptor report links (`perceptor.info` allowlist); this file's earlier
+default (section 4 item 8) was verdict labels only. Owner to confirm (b)
+publish, or ask for (a) labels only (text/links behind an opt-in in
+`deploy/gcp/INTERFACE.md`) before the Go export is written.
 
-| Worktree | Work | State | Next step |
-|---|---|---|---|
-| agent-a42a71ec2e3703f1b | Agent setup docs + tester agent + TESTING.md + HANDOFF updates | Owner committed the prepared message as 79b98f0 (10 Oct); the pause note + session-state updates in `HANDOFF.md` are uncommitted, for a second commit by the owner; owner pushes; PR. | After merge restart Claude Code so the model settings load (tester.md loads too, but the tester stays paused). |
-| agent-aa31691b57e3bc7ff | GitHub Actions CI draft `.github/workflows/test.yml` + README + dependabot + `.gitattributes` | Paused (owner, 10 Oct) | See "Testing setup: paused" above. |
-| agent-afcf62469a29564cf | `scripts/testdb.sh` + `scripts/testdb.ps1` (throwaway Postgres for DB tests) | Paused (owner, 10 Oct) | See "Testing setup: paused" above. |
-| agent-a8cd1f54c100d5817 | Analytics Timing tab (`/api/analytics` format 4 + frontend), based on dc0a42d | Unknown at restart (coder likely stopped by the full disk) | First check `git -C <wt> status`/diff before continuing; check its tests; if unfinished, a new coder continues in that worktree; then reviewer (tester paused, see above); commit `work/2026-10-09-timing-tab`. Spec: section 4 item 7; touch-and-drop option (a) pending owner confirmation. |
-| agent-a8c7da1f9ff6a0cce | Perceptor `insufficient` level + 12-min re-check | Reviewed, no must-fix. Branch still `worktree-agent-a8c7da1f9ff6a0cce`. Fast-forwarded to dc0a42d; one conflict in `scout_models.data.go` resolved keeping both sections (timing first, then re-check). 18 files UNCOMMITTED in the working tree (15 modified + `recheck.go`, `recheck_db_test.go`, `recheck_test.go`). `go build`/`go vet` OK, gofmt clean; full `go test -race -p 1 ./...` NOT run (linker failed: C: full). `onchainStateVersion` unchanged (2). Stash trap: see "Perceptor re-check" below the table. | Once C: has space: rebase onto current main (f072467, only adds `ml/`, should fast-forward cleanly); run the full tests with DB tests; exclude `HANDOFF.md` from the commit (`git checkout <main> -- HANDOFF.md` in that worktree; its only change is an "In progress (coder)" paragraph already covered here); commit as `work/2026-10-09-perceptor-recheck` (owner commits while agents' `git commit` is denied); owner pushes; PR with the deploy note below; after merge owner restarts prod listener. Deferred should-fix: recheck.go `paceWait` should only lower `nextLook`. |
-| agent-af53dbd18b713cb60 | ML walk-forward min 1000 training rows (`WF_MIN_TRAIN_ROWS`) + calibration | `work/2026-10-09-ml-wf-min` (0043e95) pushed and merged by the owner on 10 Oct (PR #15, f072467) | Owner retrains on prod (`--variants` optional) and sends the report's PASS/FAIL lines. |
-| agent-ae1d8c7d8de93a35b | GCP public site draft (Cloud Run, `deploy/gcp/`, INTERFACE.md) | Reviewed and fixed; not committed | Commit `work/2026-10-09-gcp-site` (infra agent), owner pushes, PR. No cloud resources without owner approval. |
-| agent-ae167c3d46439a04d | sAlpha re-ask | Not finished | After the Perceptor re-check merges: update onto main, add `notify_message_id` for re-check deliveries, treat `sending` as not sent in `FirstSentDelivery`, live-path Bot API 429 pause, then review. `notify_message_id`, `FirstSentDelivery` and `botAPIRedact` exist only on this re-ask branch; the `sending` status exists only on the Perceptor re-check branch (agent-a8c7da1f9ff6a0cce), so the `FirstSentDelivery` item waits for the re-check merge and re-ask being updated onto it. |
-| agent-adc7b7e6c79d4bb23 | Timing backend | MERGED (PR #14, dc0a42d) | Owner can remove the worktree. |
+**Retrain in progress (owner, 12 Oct, after 20261012-1917):** report to
+come.
 
-**Perceptor re-check (worktree `agent-a8c7da1f9ff6a0cce`): trap and PR
-deploy note.**
+**Latest model report (20261012-1917, trained on prod 12 Oct after the
+deploy; 4,755 rows, data to 12 Oct): ALL buckets FAIL.** short (1d): lift
+1.04, collapses removed 0.50, WF 2/6, top-10% −20.5% vs all −18.3%. 3day:
+lift 1.51, collapses removed 0.52, WF 6/6, top-10% +2.5% vs all −28.6%.
+medium (7d): lift 1.88 [1.09, 3.09] (was 2.60 PASS two days earlier),
+collapses removed 0.49, WF 4/4 counted, top-10% +1.6% vs all −42.2% (first
+positive). long skipped (2,931 rows over 46 days). Variant "raw dex +
+dex_family" passes 3day on the test part only (WF mean lift 1.92 < baseline
+2.02), so it is not adopted (test-period overfitting). Lesson: the medium
+pass was within noise; stability work is the next ML priority.
 
-- **Stash trap:** `stash@{0}` ("recheck") is only a BACKUP copy of the same
-  uncommitted changes. Do NOT `stash pop` it (it would double-apply); drop
-  it only after the commit exists. Never touch `stash@{1}` (GitHub Desktop,
-  ml-variants).
-- **Deploy note for its PR:** its `scoutanalytics.sql` contains a bulk
-  `UPDATE scout_investigations SET verdict_level='insufficient' WHERE verdict_level='unknown' AND report_text ILIKE '%not enough data yet%'`
-  that runs automatically at every Go start (repeat-safe). Before merging,
-  the owner runs the read-only count
-  `SELECT count(*) FROM scout_investigations WHERE verdict_level='unknown' AND report_text ILIKE '%not enough data yet%';`
-  and the number goes in the PR's Deploy notes.
-- The migration also adds `AND i.details->>'recheck' IS NULL` to
-  `scout_call_dataset_v`: re-check reports are excluded from training
-  (leakage rule).
+**Previous model report (20261010-0621, trained on prod 10 Oct, 4,727 usable
+first calls; history):** short (1d) FAIL (runner AUC 0.47 = no signal; lift 1.00;
+collapses removed 0.49; WF 2/6); 3day FAIL (lift 1.73; collapses removed
+0.52; WF 5/5); medium (7d) PASS (lift 2.60 [1.67, 3.91]; collapses removed
+0.46; WF 4/4 counted, 3 not counted); long skipped (needs 120 days). Money
+sim medium: top 10% −8.8% vs all −43.5% (loses less, doesn't make money).
+Two of four medium variants fail (raw dex; runners must be tradeable). The
+dead-score proposal would pass for LightGBM but is driven by one uniswap_v4
+wave (136/148), so it stays report-only.
 
-**Verified on prod 10 October (owner-run checks):**
+**ML research (fable, 10 Oct): next ML plan, report-only variants; the
+prod retrain is done (20261012-1917) and the line-all change is merged
+(PR #23); the first variants are not started; the owner's subagent-setup
+change is built and reviewed, awaiting merge; the variants start after it
+merges and Claude Code is restarted (see "Still to do"):**
+(1) seed stability (3 seeds) +
+stronger regularisation;
+(2) regime diagnostics: adversarial validation, pooled walk-forward with
+week-block bootstrap CI, rolling-window WF; (3) re-evaluate medium without
+dead calls (knob `EVAL_EXCLUDE_DEAD`; research expects lift ~2.0); (4)
+time-decay weights; (5) rank-blend with logistic; (6) combined
+runner×(1−collapse) / expected-return rule; (7) monotone constraints; (8)
+CatBoost last. Each needs a new `VARIANT_KNOBS` entry + late-bound config
+reads (model.py/validate.py bind some config at import). Evaluation issues
+found: the sim gate is a strict `>` on as few as 5 calls; "every counted
+week" is noisy; the lift CI treats the base rate as fixed; WF refits reuse
+round counts chosen with later data (mild look-ahead); collapse
+miscalibration is base-rate drift (show rank tiers, or refit the Platt
+intercept weekly). Proposed gate changes for the OWNER to decide: pooled WF
+lift with bootstrap CI; ≥ 75% of counted weeks + pooled sim beats buy-all;
+absolute check (pooled top-10% mean net return > 0) before showing scores
+(today's 7d would fail that). PM leaned (a) keep current gates + run the
+stability checks. The 20261012-1917 report (medium fell from lift 2.60 PASS
+to 1.88 FAIL in two days) makes the (b)-style pooled WF / bootstrap-CI
+gates more relevant; the ML stability variants (seeds, pooled WF +
+bootstrap CI, no-dead re-evaluation) are not started; they start after the
+subagent-setup change (built and reviewed, awaiting merge) merges and
+Claude Code is restarted.
 
-- Prod checkout at dc0a42d; listener (`-listen-only`), tracker (`-track`)
-  and `-web` started 9 Oct 22:34 PDT, after the pull, so all run the timing
-  backend.
-- `timedatectl`: clock synchronized, NTP active.
-- Timing backfill verified: every first call has timing in every horizon;
-  rows without timing (~149 per horizon) are all `repeat` calls; all 245
-  rugged calls have rug times (65 `event`, 7 `at_call`, 173
-  `detected`/approximate); 0 rows re-stored after timing; 0 negative values.
-- First numbers (horizon: timed / reached 2× / median s to 2× / still ≥ 2×
-  at end): 1h 5247/1365/434/229; 1d 5196/1863/850/81; 3d
-  5058/1924/1002/66; 7d 4884/1905/1051/50; 30d 2982/1247/1021/28.
+**Owner decisions still open:** ML gates (a) keep current + stability
+checks / (b) stricter pooled-WF/bootstrap-CI gates (see the 12 Oct note
+above); GCP public site content: (b) publish scrubbed sAlpha text +
+Perceptor links as merged, or (a) verdict labels only with an opt-in (PM
+recommends (a): both are paid bots); Perceptor re-scan 250/day + 1440 h max
+age (current 100/day, 30 days); public-site stopgap; price providers; DNS
+manager for lylelabs.io; the public-repo items (a)-(c) in section 3
+"Decisions 12 October" (commit-email metadata, PR text skim, prod database
+name in the docs). Optional: fix PC PATH `<postgres dir>\bin` ->
+`<postgres dir>\17\bin`.
 
-**Owner decisions still open:**
+**Stash (owner):** the Perceptor re-check is committed and merged (PR #20),
+so its backup stash can go: `git stash list`, confirm `stash@{0}` is still
+"On worktree-agent-a8c7da1f9ff6a0cce: recheck" (it was on 12 Oct), then
+`git stash drop stash@{0}`. Never pop it, and never touch the GitHub
+Desktop stash ("On work/2026-10-09-ml-variants: !!GitHub_Desktop<…>",
+`stash@{1}` today, `stash@{0}` after the drop).
 
-- touch-and-drop option (a) (touch 2× then drop = reached 2×, 0 held; the
-  Timing tab uses (a) by default);
-- is the GitHub repo meant to be public;
-- Perceptor re-scan 250/day + 1440 h max age (current 100/day, 30 days);
-- public-site stopgap;
-- price providers;
-- DNS manager for lylelabs.io.
-- Optional: fix PC PATH `<postgres dir>\bin` -> `<postgres dir>\17\bin`.
+**Worktree and branch clean-up (owner, when convenient; from the main
+checkout):** on 12 Oct every local `work/*` branch (21) was in
+`git branch --merged 68a4954`, and the merged worktrees below had an empty
+`git status --short`.
 
-**Planned later:**
+1. `git fetch --prune`
+2. Remove the merged worktrees (check `git -C <wt> status --short` is empty
+   first; a worktree shown as `locked` by `git worktree list` needs
+   `git worktree unlock <wt>` first). A branch checked out in a worktree
+   can't be deleted until its worktree is removed:
+   `git worktree remove .claude\worktrees\agent-a2c801320bb03ae6b` (#1
+   ml-score-gating), `...\agent-a0bdbe5e67a6d0034` (#2 score-live-fixes),
+   `...\agent-a8c7da1f9ff6a0cce` (#3 perceptor-recheck),
+   `...\agent-a8cd1f54c100d5817` (#4 timing-tab),
+   `...\agent-ae1d8c7d8de93a35b` (#5 gcp-site),
+   `...\agent-adc7b7e6c79d4bb23` (timing-backend),
+   `...\agent-af53dbd18b713cb60` (ml-wf-min),
+   `...\agent-a91f7f4e909abfd02` (#7 ml-line-all, PR #23; clean on 12 Oct),
+   and `...\agent-af197a4c6cbe0f7db` (this handoff update, after its PR
+   merges).
+3. `git branch -d` every merged branch: `work/2026-10-08-ml-pool-web`,
+   all `work/2026-10-09-*` (agent-setup, analytics-charts, analytics-page,
+   flaky-pacing-test, gcp-site, handoff-queue, mcap-supply,
+   ml-dead-dex-calib, ml-dead-score, ml-variants, ml-wf-min,
+   perceptor-recheck, perceptor-rescan, perceptor-today-label,
+   salpha-capture, timing-backend) and all `work/2026-10-10-*`
+   (handoff-pause, ml-score-gating, score-live-fixes, timing-tab);
+   `work/2026-10-12-ml-line-all` (merged as PR #23; remove its worktree
+   first if it still has one); later `work/2026-10-12-handoff` once merged.
+   Note: GitHub Desktop shows its
+   stash only on `work/2026-10-09-ml-variants`; deleting that branch keeps
+   the stash in `git stash list` but hides it in Desktop, so the owner may
+   keep that one branch until he has decided about the stash.
+4. `git push origin --delete` the same ones that exist on origin (all of
+   them except `work/2026-10-08-ml-pool-web`, which has no remote branch).
 
-- test-DB safety guard (DB tests refuse any URL that is not `scout_test` on
-  localhost) after the Perceptor and sAlpha branches merge;
-- ML timing outcome columns (`timing_` forbidden prefix);
-- GCP export in Go per INTERFACE.md;
-- the owner's settings allow-list could add initdb/pg_ctl/createdb,
-  `go tool cover`, `node testdata/...`, `scripts/testdb.*` so the tester
-  avoids prompts (owner's file; agents never edit it).
+Keep: `agent-ab0f0dba0692e4540` (#6, locked), `agent-ae167c3d46439a04d`
+(sAlpha re-ask), `agent-afcf62469a29564cf` and `agent-aa31691b57e3bc7ff`
+(paused testing), `agent-setup-20261012` (`work/2026-10-12-agent-setup`,
+awaiting merge after this PR) and `timing-touchdrop-20261012`
+(`work/2026-10-12-timing-touch-drop`, in progress), the
+`worktree-agent-*` branches of the first four, and the GitHub Desktop stash. No agent test Postgres servers were
+running on 12 Oct (only the owner's own Windows service). Old agent
+scratchpads take ~5.5 GB under `...\AppData\Local\Temp\claude\...`; the
+owner may delete old session folders there (not the current session's).
+Never touch the owner's own Postgres server.
+
+**Still to do:**
+
+- Subagent-setup change (worktree `agent-setup-20261012`): after this
+  handoff PR merges, rebase it onto main, short re-review, then the owner
+  commits/merges and restarts Claude Code.
+- Timing tab "reached 2×" rule (≥ 1 h at or above 2×; section 3
+  "Decisions 12 October"): in progress in worktree
+  `timing-touchdrop-20261012`.
+- sAlpha re-ask (worktree `agent-ae167c3d46439a04d`, at d5d96ac, 29
+  commits behind main 68a4954): update onto main (which now has the
+  Perceptor re-check and its `sending` delivery status), then
+  `notify_message_id` for re-check deliveries, treat `sending` as not sent
+  in `FirstSentDelivery`, live-path Bot API 429 pause, review.
+- Persist the ML `passed` flag in `scout_call_predictions` (schema change;
+  unblocked now that #1-#3 are on main).
+- ML timing outcome columns in the dataset view (the `timing_`/rug leakage
+  guard is on main since PR #19).
+- GCP Go export per `deploy/gcp/INTERFACE.md` (after the publish decision).
+- ML stability variants (ml-coder; research plan above): not started;
+  they start after the owner's subagent-setup change (built and reviewed,
+  awaiting merge) merges and Claude Code is restarted (the worktrees could
+  not be created on 12 Oct: "Could not read the repository git config to
+  neutralize filter drivers", likely a transient git lock; the owner then
+  asked to change the subagent setup first). Task: seeds (3) plus a
+  stronger-regularisation knob; pooled walk-forward with a week-block
+  bootstrap CI; re-evaluation without dead calls (`EVAL_EXCLUDE_DEAD`);
+  adversarial validation; late-bound config reads (model.py/validate.py
+  bind some config at import); report-only, no gate change. The prod
+  retrain is done (20261012-1917).
+- Scoring-service unit #6: updated by infra 12 Oct (worktree
+  agent-ab0f0dba0692e4540, at c31d859), review in progress; then the
+  "switch scores on" steps above.
+- Perceptor re-check deliveries carry no score line today: `recheck.go`
+  builds its own header without `scoreCall`, and `main.go` drops
+  `scoreLine` when it defers a call for the re-check (the score is still
+  stored). Not started; starts after the owner's subagent-setup change
+  (built and reviewed, awaiting merge) merges and Claude Code is restarted
+  (its worktree could not be created on 12 Oct, same git error as above). Task
+  (coder): keep the score line computed at the first pass and append it to
+  the re-check delivery; no recomputation from re-check data. If the change
+  touches `main.go`, also fix the Bot API byte split (next item).
+- Bot API chunking (`botAPISend` in `main.go`) splits by bytes
+  (`chunk[:limit]`, limit 4000) and can cut a multi-byte rune
+  (pre-existing; small fix).
+- Small fixes: `recheck.go` `paceWait` should only lower `nextLook` (now on
+  main); Timing tab KM caption wording and the unused `ech-tip-box` class;
+  narrow `isNoSuchValue`, "0 red flags" parser, `reply_to_msg_id`
+  filtering, wait-group hardening on reconnect, `scout_models_db_test.go:18`
+  5432 example; test-DB safety guard (DB tests refuse any URL that is not
+  `scout_test` on localhost) after the sAlpha branch merges.
+- When testing resumes: verify whether aa60a3b really fixed
+  `TestLatestPriceInterruptedLeavesRowUntouched`; the CI rerun guard must
+  require every top-level `=== RUN` to have a `--- PASS/FAIL/SKIP` line; CI
+  token handling re-review; the scripts' PowerShell run. The owner's
+  settings allow-list could add initdb/pg_ctl/createdb, `go tool cover`,
+  `node testdata/...`, `scripts/testdb.*` so the tester avoids prompts
+  (owner's file; agents never edit it).
 
 ## Introduction
 
-Up to date as of 10 October 2026 (main at f072467). Start Claude
+Up to date as of 12 October 2026 (main at c31d859; prod at 68a4954). Start Claude
 Code in the repo root; `.claude/settings.json` makes the session the product
 manager, which delegates to the agents in `.claude/agents/` (see "Agent setup").
 
@@ -173,30 +339,35 @@ matter are in section 5. Package `main` is at the repo root: `go run .`.
 ## Deferred / open
 
 Kept current by the PM whenever an item is deferred or an owner check is
-pending (9 October 2026). Items marked "on branch" are not on `main` yet.
+pending (12 October 2026). Items marked "on branch" are not on `main` yet.
+The Perceptor re-check (PR #20), the GCP site draft (PR #18), ML score
+gating (PR #19), the score live fixes (PR #21) and the Timing tab (PR #22)
+are on `main` (68a4954) and deployed on prod (owner, 12 Oct); the owner
+checks still open from that deploy are at the top. `SCOUT_MODEL_LINE`
+(PR #23, `ml/` only) is on `main` (c31d859); it takes effect once the
+scoring service runs from a checkout that has it.
 
-- **Awaiting owner commit/merge** (not on `main`; each item exists as
-  uncommitted changes, or a local commit not yet pushed, in an agent worktree
-  under `.claude/worktrees/` — see the Session state table at the top):
-  - Perceptor re-check: `insufficient` level for "not enough data yet" reports
-    plus an automatic re-check about 12 minutes later.
-  - GCP public site draft (`deploy/gcp/`).
+- **Not on `main`** (each item exists as uncommitted changes in an agent
+  worktree under `.claude/worktrees/` — see the Session state at the top):
+  - Scoring service unit + runbook `ops/scout-model.*`
+    (agent-ab0f0dba0692e4540, at c31d859; untracked `ops/scout-model.*`,
+    modified `DEPLOY.md` and `ops/README.md`; updated by infra 12 Oct,
+    review in progress; branch `work/2026-10-12-scoring-service`).
   - Throwaway-Postgres scripts `scripts/testdb.ps1` / `scripts/testdb.sh`
     (agent-afcf62469a29564cf) (paused, see Session state).
   - CI draft `.github/workflows/test.yml` (agent-aa31691b57e3bc7ff; owner
     approval) (paused, see Session state).
   - sAlpha re-ask (re-ask when the first answer was declined, empty or timed
-    out; section 3 "Decisions 9 October"): after the Perceptor re-check
-    merges, rebase. Still to do on that branch: store `notify_message_id` for
-    re-check deliveries; treat the `sending` status as not sent in
-    `FirstSentDelivery`; Bot API 429 pause on the live path; then review.
-    `notify_message_id`, `FirstSentDelivery` and `botAPIRedact` exist only on
-    the re-ask branch (worktree `agent-ae167c3d46439a04d`); the `sending`
-    delivery status exists only on the Perceptor re-check branch
-    (`agent-a8c7da1f9ff6a0cce`), so the `FirstSentDelivery` item can only be
-    done after the re-check merges and re-ask is updated onto it.
-- **Should-fix, deferred:** in `recheck.go` (re-check branch), the `paceWait`
-  branch should only lower `nextLook`:
+    out; section 3 "Decisions 9 October"): update onto main first (the
+    worktree is 29 commits behind 68a4954). Still to do on that branch: store
+    `notify_message_id` for re-check deliveries; treat the `sending` status
+    as not sent in `FirstSentDelivery`; Bot API 429 pause on the live path;
+    then review. `notify_message_id`, `FirstSentDelivery` and `botAPIRedact`
+    exist only on the re-ask branch (worktree `agent-ae167c3d46439a04d`); the
+    `sending` delivery status is on `main` since PR #20, so the
+    `FirstSentDelivery` item can be done once re-ask is updated onto main.
+- **Should-fix, deferred:** in `recheck.go` (on `main` since PR #20), the
+  `paceWait` branch should only lower `nextLook`:
   `if at := now.Add(wait); at.Before(l.nextLook) { l.nextLook = at }`.
 - **Small fixes:**
   - narrow `isNoSuchValue` (`onchain.go`);
@@ -207,40 +378,52 @@ pending (9 October 2026). Items marked "on branch" are not on `main` yet.
   - wait-group hardening: the listener goroutines on a Telegram reconnect;
   - test-DB safety guard: make DB tests refuse any `SCOUT_TEST_DATABASE_URL`
     that is not database `scout_test` on localhost/127.0.0.1 (touches many
-    `*_db_test.go` files; do it after the Perceptor re-check and sAlpha
-    branches merge).
+    `*_db_test.go` files; do it after the sAlpha re-ask branch merges; the
+    Perceptor re-check is merged).
   - `scout_models_db_test.go:18`: the example DSN in the comment still uses
-    `localhost:5432`; change it to a throwaway port as in README/TESTING.md.
+    `localhost:5432`; change it to a throwaway port as in README/TESTING.md;
+  - Timing tab (PR #22 review notes): the Kaplan–Meier caption wording, and
+    the unused `ech-tip-box` CSS class.
 - **Owner checks:**
-  - disk space: free space on C: (Go build cache `go clean -cache`, temp
-    files); ~100 MB free on 10 Oct blocks Go builds and the testing setup;
+  - GCP publish: the merged draft publishes sAlpha report text (scrubbed)
+    and Perceptor report links; confirm (b) publish, or ask for (a) labels
+    only with an opt-in in `deploy/gcp/INTERFACE.md`, before the Go export
+    is written (section 4 item 8; PM recommends (a): both are paid bots);
+  - ML gates: (a) keep current + stability checks, or (b) stricter
+    pooled-WF/bootstrap-CI gates (Session state, "ML research");
+  - disk space: ~318 GB free on C: (12 Oct; was ~100 MB before the
+    owner's 10 Oct clean-up, which blocked Go builds); old agent
+    scratchpads under `...\AppData\Local\Temp\claude\...` (~5.5 GB) may be
+    deleted by the owner;
   - price providers: confirm which external USD price sources may be used as
     a fallback;
   - DNS manager: who hosts DNS for lylelabs.io, needed to point
     `scout-analytics.lylelabs.io` at Cloud Run (section 4 item 8);
-  - touch-and-drop option (a): how a token that touches 2× and immediately
-    falls back is shown in the Timing analytics; option (a) counts it as
-    reaching 2×, with time held 0 (section 4 item 7); owner to confirm;
+  - public repo (decided public, 12 Oct): items (a)-(c) in section 3
+    "Decisions 12 October";
   - stopgap decision: whether to ship an interim version of the public site
     before the full GCP export exists (section 4 item 8);
   - re-scan 250/day and 1440 h max age: a proposed raise from the current
     Perceptor re-scan defaults (100/day, 30 days; section 3 "Prod
     settings"); the owner decides.
-- **Later:** Timing tab frontend (`/api/analytics` format 4): in progress
-  (worktree agent-a8cd1f54c100d5817); ML timing outcome columns: extend the
+- **Later:** Timing tab frontend (`/api/analytics` format 4): merged (PR
+  #22) and deployed 12 Oct; the owner still records the real gzipped size
+  (top); ML timing outcome columns: the
   leakage guard (`FORBIDDEN_PREFIXES`/`FORBIDDEN_COLUMNS`) for the timing and
   rug columns (`peak_late_after_s`, `first_2x_after_s`, `above_2x_s`,
   `fall_below_2x_after_s`, `above_2x_censored`, `timing_at`, `rug_at`,
-  `rug_at_kind`) BEFORE adding them to `scout_call_dataset_v`; GCP export in Go per `deploy/gcp/INTERFACE.md` (not on `main` yet); the mcap
-  comparison query.
+  `rug_at_kind`) is on `main` since PR #19, so they can now be added to
+  `scout_call_dataset_v`; GCP export in Go per `deploy/gcp/INTERFACE.md`
+  (the interface is merged, PR #18; the export itself is not written yet,
+  waits for the publish decision); the mcap comparison query.
 - **Paused:** multi-source calls (section 4 item 6).
 
 ## What the system is
 
 Repo `kfukue/scout-analytics`, branch `main` (the only branch carried over).
 Production runs from a checkout of this repo since the cut-over (section 5,
-owner confirmed 8 October); prod runs `main` at **dc0a42d** (listener,
-tracker and `-web` started 9 Oct 22:34 PDT after the pull; section 3).
+owner confirmed 8 October); prod runs `main` at **68a4954** (listener,
+tracker and `-web` restarted by the owner 12 Oct after the pull; section 3).
 
 - Listener: reads @scoutrobinhood, tells real calls from "hit 3X" update posts
   (`postkind.go`), sends new tokens to @perceptor0xBot and @salpha_research_bot,
@@ -413,6 +596,13 @@ tracker and `-web` restarted 9 Oct 22:34 PDT after the pull (they run the
 timing backend); `timedatectl` shows the clock synchronized (NTP active);
 the timing negative-values check returned 0.
 
+Done 12 October (owner): prod checkout at **68a4954**; listener, tracker
+and `-web` restarted on it (Perceptor re-check, score live fixes, Timing
+tab). The listener start relabelled the 54 "not enough data yet" Perceptor
+rows to `insufficient`. Model 20261012-1917 trained on prod after the
+deploy (all buckets FAIL; Session state at the top). Owner checks from the
+deploy are listed at the top.
+
 Still to confirm in prod:
 
 - the `latest prices: … waiting` count falling over the first 1–2 hours;
@@ -469,9 +659,44 @@ Decisions 9 October (owner):
 - The Analytics Timing tab (section 4 item 7): the backend is merged to
   `main` (PR #14, dc0a42d); `-backfill-timing` was run on prod on 9 October
   and checked with owner-run read-only SQL (results in section 4 item 7;
-  the negative-values sanity check is done: 0). Prod runs dc0a42d (owner
-  confirmed 10 October). The tab itself (frontend,
-  format 4) comes next. Public website on GCP Cloud Run (item 8).
+  the negative-values sanity check is done: 0). The tab itself (frontend,
+  format 4) is merged (PR #22, 68a4954) and deployed 12 Oct (prod runs
+  68a4954). Public website on GCP Cloud Run (item 8).
+
+Decisions 12 October (owner):
+
+- Model line on deliveries: show the model numbers on deliveries even when
+  buckets fail, clearly marked ("(not validated)"), because the owner is
+  the only reader of the private delivery group. Scoring-service env var
+  `SCOUT_MODEL_LINE=passed|all` (default `passed`); prod sets
+  `SCOUT_MODEL_LINE=all` in the scout-model unit. Scores still never filter
+  deliveries. Supersedes the earlier rule "scores only appended once gates
+  pass" for this owner-only group. Code merged (PR #23, c31d859); docs
+  updated in the 12 Oct handoff PR (`work/2026-10-12-handoff`). Changing
+  the value needs a restart of the scoring service only.
+- The GitHub repo is meant to be PUBLIC. Public-repo audit (12 Oct): no
+  live credential and no secret file in any commit, stash or remote ref;
+  infra details scrubbed from the docs in the 12 Oct handoff PR. Still open
+  for the owner: (a) personal email in the commit author metadata of the 57
+  commits since 8 Oct: set `user.email` to the GitHub noreply address in
+  the checkouts and enable GitHub's "Block command line pushes that expose
+  my email"; rewrite history or accept (owner decision); (b) skim the 23 PR
+  descriptions/comments on GitHub for infra detail (or install `gh` so an
+  agent can scan them); (c) whether to also remove the prod database name
+  and "shared with the main API" from DEPLOY.md/README.md.
+- Timing tab touch-and-drop: option (a) is rejected. A call counts as
+  "reached 2×" only if its total time at or above 2× (`above_2x_s`) is at
+  least 1 hour. A call that touched 2× but held less than 1 h counts as
+  "did not reach 2×": it stays in the totals/denominators and is left out of
+  the time-to-2×, time-held, fell-back and "still at 2× after t" figures.
+  Being implemented in `timing-touchdrop-20261012`; no data change, no
+  re-track.
+- Relabel re-check: the owner's read-only count of `unknown` + "not enough
+  data yet" Perceptor rows returned 0 (consistent with the 54-row relabel
+  at the 68a4954 listener start).
+- Disk: C: has ~318 GB free; Go builds and throwaway Postgres work again.
+  The testing setup stays PAUSED (`verify` agent, testdb scripts, CI).
+- ML: the owner is retraining on prod (after 20261012-1917); report to come.
 
 **Prod settings** (for reference):
 
@@ -485,14 +710,9 @@ Decisions 9 October (owner):
 - Nitro runs with `--execution.rpc.log-history=0` (full log index; a full
   node, not an archive). Keep it, or old ranges slow down again.
 
-**Firewall** (prod server, 8 October):
-
-- ufw: 8090 is allowed on tailscale0. 5432 is restricted to 10.0.0.0/24;
-  the LAN rule for 8090 may still need adding.
-- The Nitro node runs in Docker (`offchainlabs/nitro-node:v3.11.2`,
-  container cool_allen, bridge network) and publishes 8540/8541 on 0.0.0.0.
-  Docker-published ports bypass ufw. Optional later: publish on 127.0.0.1
-  only, which needs a node restart.
+Server firewall and network exposure: kept out of this public repo; the
+owner keeps them in local notes (reviewed and tightened by the owner on
+12 Oct).
 
 ## 4. Next work, in order (owner's decision)
 
@@ -500,8 +720,14 @@ Decisions 9 October (owner):
    `ml/RUNBOOK.md` ("Quick way"). No GPU needed: CPU only. The long (30d)
    horizon is skipped until it has 2,000 matured rows over 120 days, about
    25 December 2026; the owner chose on 8 October to wait rather than
-   loosen the threshold. The gates are strict; scores stay out of
-   deliveries until a report passes.
+   loosen the threshold. The gates are strict. Scores never filter
+   deliveries; they are only appended as one line. Which buckets it shows
+   is `SCOUT_MODEL_LINE` on the scoring service: `passed` (code default,
+   gate-passing buckets only) or `all` (failing buckets marked "(not
+   validated)"); prod is to run `all` once the scoring service is
+   installed (owner decision 12 Oct, section 3
+   "Decisions 12 October"; only he reads the delivery group). Latest
+   report: 20261012-1917, all buckets FAIL (Session state at the top).
    - **First training on prod, 8 October:** model 20261008-1852, all four
      buckets FAIL. 4,709 first calls after exclusions. Train time 6 s.
      Python 3.11 was installed alongside the system 3.10 (Ubuntu 22.04);
@@ -737,7 +963,8 @@ Decisions 9 October (owner):
        half of the peak.
      - Shared filters: window, metric, mean/median, quiet calls, week/month,
        pool family, verdict. Charts are hand-built SVG (the PM's task said
-       no chart library), not ECharts as `coder.md` planned.
+       no chart library), not ECharts as `coder.md` planned. (ECharts 6.1.0
+       was vendored later for the Timing tab, PR #22.)
      - Review follow-ups (9 October): number factors with a zero group now
        cut the values below and above 0 separately (no group spans 0;
        matters for the pre-call price change); "$100 on every call":
@@ -775,14 +1002,18 @@ Decisions 9 October (owner):
      - Call Analyser delivery: first post per token, or every caller.
    - Phase plan: 0 pin the readers to Scout; 1 Robinhood sources; 2 store
      Base; 3 track Base.
-7. **Analytics Timing tab** (backend merged; frontend next). Results
+7. **Analytics Timing tab** (backend and frontend merged). Results
    after the call: never model inputs.
    - Status (9 October): the backend (the timing function, the columns
      below and `-backfill-timing`) is **merged to `main` (40fb014, PR #14,
-     merge dc0a42d)**. Prod's listener, tracker and `-web` run dc0a42d
-     (started 9 Oct 22:34 PDT; owner confirmed 10 October). The Timing tab
-     frontend (`/api/analytics` format 4) comes
-     next ("Deferred / open").
+     merge dc0a42d)**. Prod's listener, tracker and `-web` ran dc0a42d
+     from 9 Oct 22:34 PDT (owner confirmed 10 October) until the 12 Oct
+     deploy of 68a4954.
+   - Status (12 October): the Timing tab frontend (`/api/analytics` format
+     4, ECharts 6.1.0 vendored) is **merged (b4149ff, PR #22, merge
+     68a4954) and deployed 12 Oct** (`-web` restarted by the owner on
+     68a4954); the owner still records the real `/api/analytics` size
+     (owner checks at the top).
    - Backfill (prod, 9 October): the owner ran `-backfill-timing` (dry run
      and real run) and checked it with read-only SQL:
      - every first call has timing in every horizon (5,247 calls);
@@ -793,7 +1024,7 @@ Decisions 9 October (owner):
        check);
      - 0 rows re-stored after timing;
      - negative-values sanity check (10 October): 0 negative values;
-     - first numbers are in "Session state at restart" at the top.
+     - first numbers are in "Session state" at the top.
    - What it shows:
      - time to peak: how long after the call the best price came;
      - how long it held +100%: when it first reached 2×, total time at or
@@ -829,7 +1060,9 @@ Decisions 9 October (owner):
      - the website reads them in the load query (format bump;
        `hashWebRows`).
    - Owner decisions (9 October):
-     - "reached 2×" = the price TOUCHED 2× (candle high); time held at 2×
+     - (superseded 12 Oct for the Timing tab: "reached 2×" needs
+       `above_2x_s` ≥ 1 h; section 3 "Decisions 12 October")
+       "reached 2×" = the price TOUCHED 2× (candle high); time held at 2×
        is measured on closes, the last close carried across gaps; calls
        that never reached 2× count as 0 minutes held;
      - past rug times exact: one `blockTime` lookup per rugged call on the
@@ -841,11 +1074,12 @@ Decisions 9 October (owner):
        forbidden as inputs (add a `timing_` forbidden prefix), so later
        report-only scores can predict e.g. "fast runner: 2× within 1 h",
        "early rug: rug within 24 h", "holds 2× ≥ 6 h".
-8. **Public cloud website on GCP** (Cloud Run; draft not on `main` yet).
+8. **Public cloud website on GCP** (Cloud Run; draft merged, PR #18,
+   4245939; Go export not written yet).
    - Owner decisions (9 October): GCP; the site is public (anyone with the
      link). GCP Cloud Run for the public read-only site
-     `scout-analytics.lylelabs.io` (draft in `deploy/gcp/`, not on `main`
-     yet, pending commit/merge). Options A-C below are superseded and kept for history.
+     `scout-analytics.lylelabs.io` (draft in `deploy/gcp/`, merged as PR
+     #18; no GCP resources yet). Options A-C below are superseded and kept for history.
    - Plan: the prod server exports the website's numbers (built from the
      existing in-memory snapshot) to GCP when data changes. The public
      site never connects to Postgres or the node.
@@ -857,7 +1091,11 @@ Decisions 9 October (owner):
    - Never export: the private delivery group invite link, links into the
      private group, any secrets. Paid bots' full report text and report
      links are left out by default (verdict labels are fine) unless the
-     owner decides otherwise.
+     owner decides otherwise. Open (12 October): the merged draft
+     publishes sAlpha report text (scrubbed) and Perceptor report links
+     (`perceptor.info`); the owner confirms (b) publish, or asks for (a)
+     labels only with an opt-in in `deploy/gcp/INTERFACE.md`, before the Go
+     export is written.
    - The infra agent drafts only; the owner creates the GCP resources and
      approves costs. The service account key stays on the prod server,
      outside the repo.
@@ -865,7 +1103,9 @@ Decisions 9 October (owner):
 Later:
 
 - ML label issues: the 30d collapse uses the `rugged` set after day 30;
-  train/serve skew in `quote_asset` and `perceptor_verdict`.
+  train/serve skew in `perceptor_verdict`. (`quote_asset` skew: fixed for
+  new calls by PR #21, live scoring fills it from the pre-call; verify with
+  the README's agreement SQL once scores are on.)
 - GCP Pub/Sub for live updates when scaling (owner's plan).
 - Resolved by 2b: `MaxConns` for `SCOUT_DATABASE_URL` was hard-coded to 4.
 - Website summary strip ("now" medians and shares); it changes the summary
