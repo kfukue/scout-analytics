@@ -749,14 +749,29 @@ backfill-timing (dry run): 290 rugged horizon(s) wait for those lookups; 0 rugge
 Off by default. With `SCOUT_MODEL_URL` set (for example `http://127.0.0.1:8601`,
 the service in `ml/serve.py`), the listener sends each new call's dataset row to
 the service, stores the scores in `scout_call_predictions` and adds one line to
-the delivered message. The line lists, by horizon, only the buckets that passed
-their gates:
+the delivered message. The line lists buckets by horizon. Which ones is set on
+the scoring service by `SCOUT_MODEL_LINE`:
 
-```
-Model 20261010-0621 · 7d: runner 12%, collapse 64%
-```
+- `passed` (the default): only the buckets that passed their gates. The line is
+  left out when no bucket passed.
 
-When no bucket passed its gates, the line is left out.
+  ```
+  Model 20261010-0621 · 7d: runner 12%, collapse 64%
+  ```
+
+- `all`: every bucket that has a model; a bucket that did not pass is marked
+  `(not validated)` after its horizon. The line is left out only when no bucket
+  has a model.
+
+  ```
+  Model 20261010-0621 · 1d (not validated): runner 31%, collapse 44% · 3d (not validated): runner 9%, collapse 71% · 7d: runner 12%, collapse 64% · 30d (not validated): up 55%, collapse 20%
+  ```
+
+Any other value counts as `passed`. Changing it needs a restart of the scoring
+service only (not the listener). Prod is to run `all` once the scoring
+service is installed (the owner's decision of 12 October 2026: he is the
+only reader of the delivery group). See
+`ml/README.md`.
 
 Scores never filter deliveries. Reading the call's pre-call trades from the node,
 its feature row and the scoring request share one budget, `SCOUT_MODEL_TIMEOUT`

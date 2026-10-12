@@ -435,6 +435,8 @@ uncalibrated (the report says so).
 
 `SCOUT_MODEL_DIR` selects the model directory (default `models/` next to
 `serve.py`); the service follows `LATEST` and re-reads it on each request.
+`SCOUT_MODEL_LINE` (`passed`, the default, or `all`) selects which buckets the
+delivery line names (below).
 
     GET  /health  -> {"ok": true, "model_version": "20261002-1530"}
     POST /score   <- {"row": { ...one scout_call_dataset_v row as JSON... }}
@@ -477,9 +479,10 @@ changing it takes a restart of the scoring service only (no retrain, no
 score or `passed`, and scores never filter deliveries in either mode. The
 marker and the values are in `scout_ml/config.py` (`LINE_*`).
 
-On 12 Oct 2026 the owner chose `SCOUT_MODEL_LINE=all` on prod: he is the only
-reader of the private delivery group, so he sees every bucket's numbers, with
-the unvalidated ones marked. The default stays `passed` for any other setup.
+The owner decided on 12 Oct 2026 to run prod with `SCOUT_MODEL_LINE=all`: he
+is the only reader of the private delivery group, so he sees every bucket's
+numbers, with the unvalidated ones marked. The default stays `passed` for any
+other setup.
 
 Each bucket is scored with the category levels its models were trained with (stored per
 bucket in `meta.json`).

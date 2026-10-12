@@ -18,9 +18,9 @@ the `ops/*/README.md` files (pgAdmin scripts).
 ```
  prod server (a single Linux server)                             separate machine
  ┌──────────────────────────────────────────────────────────┐    ┌─────────────────────┐
- │ docker: offchainlabs/nitro-node:v3.11.2                   │    │ Ethereum Erigon      │
+ │ Nitro node (SCOUT_RPC_URL)                                │    │ Ethereum Erigon      │
  │   Robinhood Chain full node, full log index               │    │ archive node         │
- │   --execution.rpc.log-history=0, host 8540 → 8547        │    │ (SCOUT_MAINNET_      │
+ │   --execution.rpc.log-history=0                          │    │ (SCOUT_MAINNET_      │
  │                                                           │    │  RPC_URL)            │
  │ Postgres 17, database assetdb (SHARED with the main API)  │    └─────────▲───────────┘
  │                                                           │              │ eth_call /

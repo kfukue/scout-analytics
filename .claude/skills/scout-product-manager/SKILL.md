@@ -37,10 +37,12 @@ anything non-trivial (`DEPLOY.md` and `ml/RUNBOOK.md` for deploy and training).
 - **Model** (`ml/`): LightGBM plus a logistic baseline, buckets `short`, `3day`,
   `medium`, `long`; first calls only. A bucket passes only if top-10% lift >= 2,
   skipping the 30% highest collapse scores removes >= 40% of (plain) collapses,
-  and the top-10% simulation beats buy-everything in every walk-forward week
-  (a pending branch limits this to weeks with at least 1000 training rows,
-  `WF_MIN_TRAIN_ROWS`; not on main yet). Scores are NOT added to deliveries
-  until a report passes. The `long` bucket waits for matured data until about
+  and the top-10% simulation beats buy-everything in every counted
+  walk-forward week (weeks with at least 1000 training rows,
+  `WF_MIN_TRAIN_ROWS`; on main since PR #15, f072467, 10 Oct). Scores never filter deliveries; they
+  are only appended as one line, whose buckets are set by `SCOUT_MODEL_LINE` on
+  the scoring service (default `passed`; prod is to run `all` once the
+  scoring service is installed, failing buckets marked "(not validated)"). The `long` bucket waits for matured data until about
   25 December 2026. Trained on the prod server with `ml/run_training.sh` into
   `~/scout-ml` (Python 3.11 venv; never replace the system python3). Reports
   copied to the PC go in `ml-results/` (gitignored).
@@ -188,7 +190,7 @@ From the repo root on the server:
 
 Every Go start applies `scoutanalytics.sql` unless `SCOUT_DB_AUTO_MIGRATE=false`.
 
-## Owner decisions in force (8-9 October 2026)
+## Owner decisions in force (8-12 October 2026)
 
 - The `long` model waits for data (about 25 December) rather than loosening the
   threshold.
@@ -213,6 +215,11 @@ Every Go start applies `scoutanalytics.sql` unless `SCOUT_DB_AUTO_MIGRATE=false`
   sAlpha reports for all sources, one scan per token reused across sources,
   scout first in the queue. All sources deliver to the same private group,
   labelled by channel, with the same `clean,caution` filter.
+- 12 Oct: the delivery score line may show model numbers even when buckets
+  fail their gates, marked "(not validated)", because the owner is the only
+  reader of the private delivery group. Prod is to run the scoring service
+  with `SCOUT_MODEL_LINE=all`; the code default stays `passed`. Scores never filter
+  deliveries. Supersedes "scores only after a report passes" for this group.
 
 ## Working on the owner's PC from a cloud session
 

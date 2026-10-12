@@ -291,7 +291,7 @@ echo "running the test suite (synthetic data only)"
 run_logged step2-pytest "$VENV_PY" -m pytest tests -q -p no:cacheprovider
 
 # ---------------------------------------------------------------------------
-STEP="9 (scores stay off)"; LOG=""
+STEP="9 (scores on deliveries)"; LOG=""
 echo
 echo "== Step 9 check: SCOUT_MODEL_URL in $REPO/.env"
 [ -f "$REPO/.env" ] || die "$REPO/.env not found; the export must run where the listener's .env is"
@@ -301,14 +301,16 @@ n_url="$(grep -cE '^[[:space:]]*(export[[:space:]]+)?SCOUT_MODEL_URL[[:space:]]*
 if [ "$grep_rc" -ge 2 ] || [ -z "$n_url" ]; then
     echo "WARNING: $REPO/.env could not be read, so SCOUT_MODEL_URL could not be checked. Check it yourself (RUNBOOK.md step 9)." >&2
 elif [ "$n_url" = "0" ]; then
-    echo "OK: SCOUT_MODEL_URL is not set in .env (scores stay off)"
+    echo "OK: SCOUT_MODEL_URL is not set in .env (the listener adds no score line)"
 else
-    echo "WARNING: .env has ${n_url} line(s) setting SCOUT_MODEL_URL (value not shown). Scores must stay off until the product manager" >&2
-    echo "         says the gates passed (RUNBOOK.md step 9): tell the product manager. Training continues; it does not use it." >&2
+    echo "NOTE: .env has ${n_url} line(s) setting SCOUT_MODEL_URL (value not shown): the listener appends a score line to deliveries." >&2
+    echo "      Scores never filter deliveries. Which buckets appear in the delivery line is set by SCOUT_MODEL_LINE on the scoring" >&2
+    echo "      service (default: passed only; RUNBOOK.md step 9). Training continues; it does not use it." >&2
 fi
 if [ -n "${SCOUT_MODEL_URL:-}" ]; then
-    echo "WARNING: SCOUT_MODEL_URL is set in this shell's environment (value not shown). A listener started from this" >&2
-    echo "         shell would use it; scores must stay off until the product manager says the gates passed (RUNBOOK.md step 9)." >&2
+    echo "NOTE: SCOUT_MODEL_URL is set in this shell's environment (value not shown). A listener started from this" >&2
+    echo "      shell would use it. Scores never filter deliveries. Which buckets appear in the delivery line is set by" >&2
+    echo "      SCOUT_MODEL_LINE on the scoring service (default: passed only; RUNBOOK.md step 9)." >&2
 fi
 
 # ---------------------------------------------------------------------------
@@ -373,8 +375,9 @@ echo "Next:"
 echo "  - read it:  cat \"$REPORT\""
 echo "  - paste the whole report.md to the product manager, with the train time"
 echo "    (and the step 3 query results if you ran them; RUNBOOK.md step 3)."
-echo "  - do NOT set SCOUT_MODEL_URL and do NOT start serve.py until the product"
-echo "    manager says the gates passed. A FAIL verdict is a normal outcome."
+echo "  - Scores never filter deliveries. Which buckets appear in the delivery line"
+echo "    is set by SCOUT_MODEL_LINE on the scoring service (default: passed only)."
+echo "    A FAIL verdict is a normal outcome."
 echo "  - the worktree $ML/src and the venv stay for the next weekly retrain."
 echo "    To remove the worktree (RUNBOOK.md, Cleanup):"
 echo "      git -C \"$REPO\" worktree remove --force \"$ML/src\""
