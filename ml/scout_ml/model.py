@@ -232,26 +232,43 @@ class Bundle:
                               exact_levels=self.flat_levels,
                               dex_rules=self.meta.get("dex_family_rules"))
 
+    def passed(self, bucket: str) -> bool:
+        """True only when meta.json records that the bucket passed its gates
+        (`metrics[bucket]["gates"]["passed"]`, written by train.py). Fails
+        closed: a skipped bucket, an older meta.json without gate info, or any
+        value other than true counts as not passed."""
+        metrics = self.meta.get("metrics")
+        entry = metrics.get(bucket) if isinstance(metrics, dict) else None
+        gates = entry.get("gates") if isinstance(entry, dict) else None
+        return isinstance(gates, dict) and gates.get("passed") is True
+
     def score(self, row: dict) -> dict:
-        """Score one raw view row -> the /score response body. A bucket
-        without a runner model (skipped at training) is left out."""
-        buckets, parts = [], [f"Model {self.version}"]
+        """Score one raw view row -> the /score response body.
+
+        `buckets` has every bucket with a runner model (a bucket skipped at
+        training is left out), each with `passed`. `line` names only the
+        buckets that passed their gates, by horizon (e.g. "7d"), and is "" when
+        none passed: the listener then appends nothing to the message."""
+        buckets, parts = [], []
         for b, cfg in BUCKETS.items():
             if f"{b}_runner" not in self.models:
                 continue
             X = self.features(row, b)
             runner = float(predict(self.models[f"{b}_runner"], X)[0])
             collapse = None
-            text = f"{cfg['title']}: {cfg['runner_word']} {runner * 100:.0f}%"
+            text = f"{cfg['horizon_days']}d: {cfg['runner_word']} {runner * 100:.0f}%"
             if f"{b}_collapse" in self.models:
                 collapse = float(predict(self.models[f"{b}_collapse"], X)[0])
                 text += f", collapse {collapse * 100:.0f}%"
-            parts.append(text)
+            passed = self.passed(b)
+            if passed:
+                parts.append(text)
             buckets.append({
-                "bucket": b, "runner_prob": round(runner, 4),
+                "bucket": b, "passed": passed, "runner_prob": round(runner, 4),
                 "collapse_prob": None if collapse is None else round(collapse, 4),
                 "runner_rank_pct": round(rank_pct(runner, self.meta["runner_reference"][b]), 1)})
-        return {"model_version": self.version, "line": " · ".join(parts), "buckets": buckets}
+        line = " · ".join([f"Model {self.version}", *parts]) if parts else ""
+        return {"model_version": self.version, "line": line, "buckets": buckets}
 
 
 def resolve_version_dir(model_dir) -> Path:

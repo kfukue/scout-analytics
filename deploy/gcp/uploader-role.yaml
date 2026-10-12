@@ -1,0 +1,27 @@
+# DRAFT - custom IAM role for the prod-server uploader (deploy/gcp/README.md, step 4).
+#   gcloud iam roles create scoutSnapshotWriter --project=PROJECT_ID \
+#     --file=deploy/gcp/uploader-role.yaml
+# Bound on the one bucket only (not the project), with an IAM condition on the
+# object prefix public/ (README.md, step 4).
+#
+# Why these permissions:
+#   storage.objects.create  upload a new part object and the pointer.
+#   storage.objects.delete  needed to OVERWRITE an existing object: the pointer
+#                           (public/current.json) every upload, and the current
+#                           parts once every 12 h (keep-alive, so the 30-day
+#                           lifecycle rule does not delete them).
+#                           roles/storage.objectCreator has create only and "does
+#                           not give permission to view, delete, or overwrite
+#                           objects"
+#                           (https://cloud.google.com/storage/docs/access-control/iam-roles).
+#   storage.objects.get     read the pointer at start: "skip if same" via its
+#                           content_sha256, and its generation for preconditions.
+# No list, no IAM changes, no bucket settings. Predefined fallback with more
+# permissions: roles/storage.objectUser (create, read, update, delete, list).
+title: scout snapshot writer
+description: Upload website snapshot parts and overwrite the pointer object in one bucket.
+stage: GA
+includedPermissions:
+  - storage.objects.create
+  - storage.objects.delete
+  - storage.objects.get

@@ -82,6 +82,10 @@ type config struct {
 
 	Rescan rescanConfig // SCOUT_RESCAN_*: Perceptor re-scans of first calls without a report (rescan.go)
 
+	// SCOUT_PERCEPTOR_RECHECK*: live calls whose Perceptor answer is "not
+	// enough data yet" or unreadable are re-checked later (recheck.go)
+	Recheck recheckConfig
+
 	StateDir string
 	DryRun   bool
 
@@ -178,6 +182,9 @@ func loadConfig(envFile string) (*config, error) {
 		return nil, err
 	}
 	if c.Rescan, err = loadRescanConfig(); err != nil {
+		return nil, err
+	}
+	if c.Recheck, err = loadRecheckConfig(); err != nil {
 		return nil, err
 	}
 	if c.NotifyBotToken != "" && c.NotifyChatID == "" {
@@ -386,6 +393,10 @@ type scanner struct {
 	// rescan is the rescan lane (rescan.go); nil when it is off. Set before
 	// the worker starts.
 	rescan *rescanLane
+
+	// recheck is the live Perceptor re-check (recheck.go); nil when it is off
+	// (and in -scan / -post runs). Set before the worker starts.
+	recheck *recheckLane
 
 	listOnly bool // -list-chats: don't resolve the delivery target
 
@@ -628,7 +639,8 @@ func (s *scanner) sourceLink(msgID int) string {
 	return fmt.Sprintf("https://t.me/%s/%d", s.cfg.SourceChannel, msgID)
 }
 
-var levelIcon = map[string]string{levelClean: "✅", levelCaution: "🟡", levelRedFlags: "🚩", levelUnknown: "❔"}
+var levelIcon = map[string]string{levelClean: "✅", levelCaution: "🟡", levelRedFlags: "🚩", levelUnknown: "❔",
+	levelInsufficient: "⏳"}
 
 // deliveryHeader summarises every tool's result for one CA.
 func (s *scanner) deliveryHeader(j job, results []*toolResult) string {
@@ -645,6 +657,17 @@ func (s *scanner) deliveryHeader(j job, results []*toolResult) string {
 		label := v.Label
 		if label == "" {
 			label = v.Level
+		}
+		// no real verdict (a live call delivered after its Perceptor re-check):
+		// "Perceptor: not enough data yet", "Perceptor: no readable verdict" or
+		// "Perceptor: no report (timeout)"
+		switch {
+		case gate.Status != investigationCompleted:
+			label = gate.Spec.Name + ": no report (" + gate.Status + ")"
+		case v.Level == levelInsufficient:
+			label = gate.Spec.Name + ": " + labelInsufficient
+		case v.Level == levelUnknown:
+			label = gate.Spec.Name + ": no readable verdict"
 		}
 		fmt.Fprintf(&b, "%s %s", levelIcon[v.Level], strings.TrimSpace(v.Ticker+" "+label))
 	} else {
@@ -704,9 +727,23 @@ func (s *scanner) botAPIText(header string, j job, results []*toolResult) string
 	return text
 }
 
+// deliveryNotSentError is a delivery error after which nothing was sent for
+// certain: ctx was already done before the first message (the header). The
+// live Perceptor re-check (recheck.go) does not record such a delivery and
+// delivers again later. A send cut by a stop while in flight may have reached
+// Telegram, so its error is never this type (it is recorded as failed: no
+// double send).
+type deliveryNotSentError struct{ err error }
+
+func (e *deliveryNotSentError) Error() string { return e.err.Error() }
+func (e *deliveryNotSentError) Unwrap() error { return e.err }
+
 // deliver sends, in order: the summary header, the original call post from the
 // source channel, then every attachable tool's report.
 func (s *scanner) deliver(ctx context.Context, j job, header string, results []*toolResult) error {
+	if err := ctx.Err(); err != nil {
+		return &deliveryNotSentError{fmt.Errorf("not sent: %w", err)}
+	}
 	if s.cfg.NotifyBotToken != "" {
 		return botAPISend(ctx, s.cfg.NotifyBotToken, s.cfg.NotifyChatID, s.botAPIText(header, j, results))
 	}
@@ -861,13 +898,17 @@ func (s *scanner) worker(ctx context.Context) {
 			continue
 		default:
 		}
+		// the live Perceptor re-check (recheck.go) before the rescan lane
+		if s.recheck != nil && s.recheck.step(ctx, func() int { return len(s.queue) }) {
+			continue
+		}
 		if lane != nil && lane.step(ctx, s.db, func() int { return len(s.queue) }) {
 			continue
 		}
-		var tick <-chan time.Time // nil (never ready) with the lane off
+		var tick <-chan time.Time // nil (never ready) with both lanes off
 		var timer *time.Timer
-		if lane != nil {
-			timer = time.NewTimer(rescanTick)
+		if lane != nil || s.recheck != nil {
+			timer = time.NewTimer(min(rescanTick, recheckTick))
 			tick = timer.C
 		}
 		select {
@@ -995,6 +1036,10 @@ func (s *scanner) process(ctx context.Context, j job, deliver bool) []*toolResul
 
 	rec.Deliver = s.shouldDeliver(results)
 	if !rec.Deliver {
+		// "not enough data yet" / unreadable: held back for the re-check (recheck.go)
+		if s.deferToRecheck(ctx, j, results, invIDs[recheckTool]) {
+			return results
+		}
 		log.Printf("%s: gate verdict not in SCOUT_DELIVER_LEVELS — not delivering", j.CA)
 		return results
 	}
@@ -1864,6 +1909,12 @@ func main() {
 
 	// Long-running mode with reconnect/backoff.
 	s.rescan = s.newRescanLane(cfg.Rescan) // nil when off (logs one line when on)
+	// the live Perceptor re-check (recheck.go); nil when off. The rescan lane
+	// leaves the calls it may still re-check alone.
+	s.recheck = s.newRecheckLane(cfg.Recheck)
+	if s.rescan != nil && s.recheck != nil {
+		s.rescan.holdBack = cfg.Recheck.horizon()
+	}
 	backoff := 5 * time.Second
 	for {
 		start := time.Now()

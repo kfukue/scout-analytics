@@ -329,6 +329,9 @@ td[title] { cursor: help; }
 .pv-caution { color: var(--b-orange); background: var(--b-orange-bg); }
 .pv-red { color: var(--b-red); background: var(--b-red-bg); box-shadow: inset 0 0 0 1px currentColor; }
 a.pv:hover { text-decoration: underline; text-underline-offset: 2px; }
+/* Perceptor "not enough data yet" (insufficient): no verdict, so no fill;
+   muted words in a thin outline (the filter counts it as "not scanned") */
+.pv-insufficient { color: var(--muted); background: transparent; box-shadow: inset 0 0 0 1px currentColor; font-weight: 600; }
 /* "sA": the token has an sAlpha report (open the row to read it) */
 .sa-badge { margin-left: 6px; padding: 0 6px; font-size: 11px; color: var(--b-blue); background: var(--b-blue-bg); cursor: help; }
 .badge-rug { color: var(--b-rug); background: var(--b-rug-bg); cursor: help; }

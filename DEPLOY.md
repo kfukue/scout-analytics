@@ -66,6 +66,48 @@ overrides them (see 7.4); `SCOUT_DB=off` disables recording;
 | Key vars | `SCOUT_SOURCE_CHANNEL` (scoutrobinhood), `SCOUT_NOTIFY_PEER` (default `me`), `SCOUT_DELIVER_LEVELS` (`clean,caution`), `SCOUT_TOOLS` (`perceptor,salpha`) and `SCOUT_TOOL_<CODE>_*`, `SCOUT_POLL_INTERVAL` (`20s`; with `0` the catch-up and requeue still run once at start, not retried), `SCOUT_CATCHUP_MAX` (`100`), `SCOUT_CATCHUP_MAX_AGE` (`24h`), `SCOUT_SCAN_GAP` (`3s`), `SCOUT_MODEL_URL` (off), `SCOUT_MODEL_TIMEOUT` (`10s`), `SCOUT_RESCAN` (`off`) and `SCOUT_RESCAN_*` (below) |
 | Writes | `scout_calls`, `scout_investigations`, `scout_deliveries`, …; queues new calls for tracking; sends `pg_notify('scout_events', …)` for each new real call and report; with `SCOUT_RESCAN=on` also `scout_investigations` rows with `scan_kind = 'rescan'`, and a completed rescan notifies too (`"kind":"report"` with `"scan_kind":"rescan"`; a call's own report carries `"scan_kind":"live"`) |
 
+**Perceptor re-check (`SCOUT_PERCEPTOR_RECHECK_AFTER`, on by default).** A
+live call whose Perceptor answer is "not enough data yet" (`insufficient`) or
+unreadable (`unknown`) is not delivered at once: the listener asks Perceptor
+again `SCOUT_PERCEPTOR_RECHECK_AFTER` (default `12m`; `5m`–`60m`; `0` = off)
+after the call and delivers then unless it finds red flags; a second re-check
+`SCOUT_PERCEPTOR_RECHECK2_AFTER` (default `2h`; `0` = off; at most `24h`)
+updates the website only (README "Re-checking “not enough data yet”").
+
+- Only calls the listener held back are re-checked: it marks their live
+  Perceptor row (`details` `{"held_for_recheck":true}`). Calls an older
+  binary dropped before the deploy have no marker and are **not** re-checked
+  (they stay undelivered); neither are calls another gate stopped, calls
+  delivered at the call, `-scan`/`-post` calls, or a dry run's (`-dry-run`
+  turns the re-check off).
+- Due re-checks are read from the database, so a restart keeps the schedule,
+  but it drops the in-memory retries: a re-check whose window passes while the
+  listener is down (the first: 60 minutes after the call by default), even one
+  that was being retried, is skipped and logged, and that call stays
+  undelivered.
+- Load: usually two extra Perceptor requests per such call (more when a
+  re-check gets no report: it is tried again every 5 minutes inside its
+  window), on the same account as live calls, run after the live queue and
+  only when the Perceptor runner's pacing (2m5s) has passed (no sleeping or
+  rate-limit retries in the worker; a live call right after a re-check
+  request still waits the normal pacing, as after any request).
+- The re-check records its delivery as `scout_deliveries.status = 'sending'`
+  before sending, then `sent`/`failed`. A row left at `sending` means the
+  outcome was not recorded: that call is never sent again (it may or may not
+  have reached Telegram). To list them (read-only):
+  `SELECT id, call_id, contract_address, created_at FROM scout_deliveries WHERE status = 'sending' ORDER BY id;`
+- Retrain the model after this deploy: `perceptor_verdict` gains the value
+  `insufficient` (README "Re-checking “not enough data yet”").
+- An invalid value stops every mode at startup (`-track` and `-web` read the
+  same `.env`).
+- Check the log for `perceptor re-check: on — …` at start, then one
+  `perceptor re-check 1: call …` / `perceptor re-check 2: call …` line per
+  re-check.
+- `scoutanalytics.sql` relabels, at every start, old Perceptor rows stored as
+  `unknown` whose text says "not enough data yet" to `insufficient`. Rolling
+  back to an older binary is safe for the database (it reads them as not
+  scanned), but the older website shows them as "verdict not readable".
+
 **Rescan lane (`SCOUT_RESCAN`, off by default).** Perceptor re-scans of first
 calls that have no Perceptor report, run inside this listener when the live
 queue is idle (README "Re-scanning calls without a Perceptor report").
@@ -704,3 +746,45 @@ For deployment it changes:
   path, plus 1 `LISTEN` connection for `-web`, plus the main API and pgAdmin.
   Keep the total below Postgres `max_connections`, which matters most on a
   small managed Postgres tier.
+
+### 7.5 Public website on GCP (draft, owner decisions 9 Oct 2026)
+
+Drafts only. Nothing is created and the Go side is not written yet. Everything
+is in [`deploy/gcp/`](deploy/gcp/README.md):
+
+- **Shape:** prod `-web` keeps reading `assetdb` and also uploads the public
+  snapshot to a private GCS bucket in `us-central1`, split into three parts by
+  change rate (reports, rows, latest prices), at most once a minute and only
+  the parts that changed. A Cloud Run service (min instances 0) runs `-web`
+  with `SCOUT_WEB_SOURCE=gcs`: no database, node or Telegram. It serves the
+  site publicly behind a Firebase Hosting rewrite at `__HOSTNAME__` (default
+  `scout-analytics.lylelabs.io`, owner decision), polls instead of using SSE, and
+  does not offer "Refresh now".
+- **What is public:** everything the LAN site shows. Never: the private
+  delivery group's invite link or links into it, the notify target
+  (`SCOUT_NOTIFY_PEER` / `SCOUT_NOTIFY_CHAT_ID` as handle or invite hash),
+  secrets, server/DB/node addresses. Every exported string is scrubbed (with a
+  lenient percent/HTML decoder that a stray `%` cannot defeat), and the
+  exporter refuses to upload if the final export still matches a private-link
+  pattern, the notify target, a configured secret value (`API_HASH`,
+  `TG_PASSWORD`, `PHONE`, `SCOUT_NOTIFY_BOT_TOKEN`, `SCOUT_PRICE_API_KEY`, the
+  DB password) or a server address (including `SCOUT_WEB_ADDR` and a private
+  `SCOUT_PRICE_API_BASE`). The refusal log names the variable, never the value.
+- **Freshness and alerting:** with unchanged data the exporter rewrites the
+  pointer every 2 minutes (heartbeat), so a quiet but healthy prod never shows
+  as stale; no heartbeat while an upload is refused or failing, or while prod
+  cannot read `assetdb` (each heartbeat needs a fresh read with the same
+  content). Prod needs NTP.
+  The uptime check targets `/api/summary` (`"stale":false`, timeout 20 s),
+  not `/api/health`, which never triggers a snapshot check.
+- **`assetdb` (shared with the main API):** no extra reads or connections. The
+  export reuses the snapshot `-web` already reads.
+- [`deploy/gcp/README.md`](deploy/gcp/README.md): the owner runbook (org-policy
+  pre-checks and the key exception, gcloud and Firebase steps with cost notes,
+  rollback, teardown, cost and upload-volume tables, open questions).
+- [`deploy/gcp/INTERFACE.md`](deploy/gcp/INTERFACE.md): the spec for the Go
+  coder (export/read modes, split format, allowlist, scrub and deny check,
+  `/api/health`, banner data).
+- New secret on prod: the uploader credential
+  `/etc/scoutanalytics/gcp-export.json` (root:scout 0640, never in git), like
+  `.env`. Keyless alternative: X.509 Workload Identity Federation.

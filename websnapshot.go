@@ -30,7 +30,7 @@ const (
 	webBucketClean uint8 = iota
 	webBucketCaution
 	webBucketRedFlags
-	webBucketNotScanned // no completed report, or one without a readable verdict
+	webBucketNotScanned // no completed report, or one without a readable verdict or with "not enough data yet" (insufficient)
 	webBuckets
 )
 
@@ -193,7 +193,8 @@ type webSnapshot struct {
 }
 
 // webTodayVerdict codes a "Perceptor today" verdict for webSnapshot.todayVerd:
-// 0 = no re-scan, then clean, caution, red_flags, and anything else.
+// 0 = no re-scan, then clean, caution, red_flags, anything else, and
+// insufficient ("not enough data yet").
 func webTodayVerdict(v *string) uint8 {
 	if v == nil {
 		return 0
@@ -205,6 +206,8 @@ func webTodayVerdict(v *string) uint8 {
 		return 2
 	case "red_flags":
 		return 3
+	case levelInsufficient:
+		return 5
 	}
 	return 4
 }
@@ -225,7 +228,7 @@ type webReport struct {
 	id        int
 	tool      string
 	at        time.Time
-	verdict   string  // Perceptor: clean | caution | red_flags | unknown
+	verdict   string  // Perceptor: clean | caution | red_flags | insufficient | unknown
 	label     *string // Perceptor: verdict_label
 	summary   *string // Perceptor: verdict_summary
 	text      string  // sAlpha: report_text
@@ -262,7 +265,7 @@ func newWebReport(r *ScoutWebReport) *webReport {
 	switch r.Tool {
 	case webToolPerceptor:
 		w.verdict = r.Verdict
-		if _, ok := webVerdictBuckets[w.verdict]; !ok || w.verdict == "not_scanned" {
+		if _, ok := webVerdictBuckets[w.verdict]; (!ok && w.verdict != levelInsufficient) || w.verdict == "not_scanned" {
 			w.verdict = levelUnknown
 		}
 		w.label, w.summary = cut(r.Label), cut(r.Summary)

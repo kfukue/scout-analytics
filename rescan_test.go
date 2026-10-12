@@ -192,6 +192,8 @@ type fakeRescanStore struct {
 	inserted  []*ScoutInvestigation
 	candSince time.Time
 	insertErr error // when set, InsertScoutInvestigation fails (nothing stored)
+	// candBefore: the before the lane passed (zero = no limit)
+	candBefore time.Time
 }
 
 func (f *fakeRescanStore) RescanStats(ctx context.Context, since time.Time) (int, *time.Time, error) {
@@ -201,11 +203,12 @@ func (f *fakeRescanStore) RescanStats(ctx context.Context, since time.Time) (int
 	return f.today, f.last, nil
 }
 
-func (f *fakeRescanStore) NextRescanCandidate(ctx context.Context, statuses []string, since time.Time, maxFailed int) (*RescanCandidate, error) {
+func (f *fakeRescanStore) NextRescanCandidateBefore(ctx context.Context, statuses []string, since, before time.Time, maxFailed int) (*RescanCandidate, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.candN++
 	f.candSince = since
+	f.candBefore = before
 	return f.cand, nil
 }
 
@@ -442,6 +445,71 @@ func TestRescanLaneStep(t *testing.T) {
 			t.Errorf("paused after a plain send error, want no pause")
 		}
 	})
+}
+
+// holdBack: with the live Perceptor re-check on, the lane asks only for calls
+// posted before now - holdBack; without it, there is no such limit.
+func TestRescanLaneHoldBack(t *testing.T) {
+	now := time.Date(2026, 10, 9, 12, 0, 0, 0, time.UTC)
+	cfg := rescanConfig{Enabled: true, MaxAge: 720 * time.Hour, MaxPerDay: 100, Gap: 10 * time.Minute, Idle: 5 * time.Minute,
+		Statuses: []string{"scanned"}}
+	cases := []struct {
+		name     string
+		holdBack time.Duration
+		want     time.Time // the before passed to the store (zero = no limit)
+	}{
+		{"re-check on", 3 * time.Hour, now.Add(-3 * time.Hour)},
+		{"re-check off", 0, time.Time{}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			var sent []string
+			l := &rescanLane{cfg: cfg, runner: newToolRunner(testPerceptorSpec()), toolID: 7, now: func() time.Time { return now },
+				send: replyingSend("x", nil, &sent), holdBack: c.holdBack,
+				judge:  func(ctx context.Context, spec ToolSpec, res *toolResult) verdict { return verdict{Level: levelClean} },
+				errLog: logLimiter{every: time.Minute}}
+			l.noteLive(now.Add(-time.Hour))
+			st := &fakeRescanStore{} // no candidate: nothing is scanned
+			if l.step(context.Background(), st, func() int { return 0 }) || st.candN != 1 {
+				t.Fatalf("step: candidate queries %d, sent %q; want one query and no scan", st.candN, sent)
+			}
+			if !st.candBefore.Equal(c.want) {
+				t.Errorf("holdBack %s: candidate query before %s, want %s", c.holdBack, st.candBefore, c.want)
+			}
+		})
+	}
+}
+
+// While the Perceptor runner's pacing still runs (a live re-check was just
+// sent: it is no live call for SCOUT_RESCAN_IDLE) the lane neither reads the
+// database nor sends, and never sleeps in the worker; once the pacing has
+// passed it scans.
+func TestRescanLaneWaitsForPacing(t *testing.T) {
+	now := time.Date(2026, 10, 9, 12, 0, 0, 0, time.UTC)
+	ca := "0x1818181818181818181818181818181818181818"
+	cfg := rescanConfig{Enabled: true, MaxAge: 720 * time.Hour, MaxPerDay: 100, Gap: 10 * time.Minute, Idle: 5 * time.Minute,
+		Statuses: []string{"scanned"}}
+	spec := testPerceptorSpec()
+	spec.MinInterval = builtinTools["perceptor"].MinInterval // production: 2m5s
+	var sent []string
+	l := &rescanLane{cfg: cfg, runner: newToolRunner(spec), toolID: 7, now: func() time.Time { return now },
+		send:   replyingSend("✅ No red flags found", nil, &sent),
+		judge:  func(ctx context.Context, spec ToolSpec, res *toolResult) verdict { return verdict{Level: levelClean} },
+		errLog: logLimiter{every: time.Minute}}
+	l.noteLive(now.Add(-time.Hour))
+	st := &fakeRescanStore{cand: &RescanCandidate{CallID: 42, ContractAddress: ca, MessageDate: now.Add(-24 * time.Hour), Status: "scanned"}}
+	l.runner.lastSent = time.Now().Add(-time.Minute) // a re-check request a minute ago
+	start := time.Now()
+	if l.step(context.Background(), st, func() int { return 0 }) || len(sent) != 0 || st.statsN+st.candN != 0 {
+		t.Errorf("step during the pacing: sent %q, stats %d, candidate %d; want nothing", sent, st.statsN, st.candN)
+	}
+	if d := time.Since(start); d > 10*time.Second {
+		t.Errorf("step during the pacing took %s, want no sleep", d)
+	}
+	l.runner.lastSent = time.Now().Add(-3 * time.Minute)
+	if !l.step(context.Background(), st, func() int { return 0 }) || len(sent) != 1 {
+		t.Errorf("step after the pacing: sent %q, want one /scan", sent)
+	}
 }
 
 // The worker runs live calls first and, with the lane off, never looks at it.

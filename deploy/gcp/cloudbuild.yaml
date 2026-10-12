@@ -1,0 +1,34 @@
+# DRAFT - Cloud Build config for the website image (deploy/gcp/README.md, step 6).
+# Run from a clean clone at the repo root:
+#   gcloud builds submit --config=deploy/gcp/cloudbuild.yaml \
+#     --ignore-file=deploy/gcp/.gcloudignore \
+#     --substitutions=_REGION=REGION,_REPO=scout,_TAG=$(git rev-parse --short HEAD) .
+# Builds and pushes REGION-docker.pkg.dev/PROJECT_ID/scout/scout-web:TAG.
+# Deploying stays a separate, manual step (step 7).
+# Default pool, e2-standard-2: covered by the Cloud Build free build-minutes
+# (https://cloud.google.com/build/pricing).
+
+substitutions:
+  _REGION: us-central1
+  _REPO: scout
+  _IMAGE: scout-web
+  _TAG: manual
+
+steps:
+  - id: build
+    name: gcr.io/cloud-builders/docker
+    env:
+      - DOCKER_BUILDKIT=1
+    args:
+      - build
+      - --file=deploy/gcp/Dockerfile
+      - --tag=${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPO}/${_IMAGE}:${_TAG}
+      - .
+
+images:
+  - ${_REGION}-docker.pkg.dev/${PROJECT_ID}/${_REPO}/${_IMAGE}:${_TAG}
+
+options:
+  logging: CLOUD_LOGGING_ONLY
+
+timeout: 900s

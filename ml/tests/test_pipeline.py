@@ -137,19 +137,49 @@ def _client(monkeypatch, model_dir):
 
 
 def _check_shape(body, version, buckets=BUCKET_KEYS):
+    """Every bucket with a runner model is in `buckets`; `line` names exactly
+    the passed ones, by horizon, in BUCKETS order ("" when none passed)."""
     assert set(body) == {"model_version", "line", "buckets"}
     assert body["model_version"] == version
     assert [b["bucket"] for b in body["buckets"]] == buckets
     for b in body["buckets"]:
-        assert set(b) == {"bucket", "runner_prob", "collapse_prob", "runner_rank_pct"}
+        assert set(b) == {"bucket", "passed", "runner_prob", "collapse_prob", "runner_rank_pct"}
+        assert isinstance(b["passed"], bool)
         assert 0.0 <= b["runner_prob"] <= 1.0 and 0.0 <= b["runner_rank_pct"] <= 100.0
         assert b["collapse_prob"] is None or 0.0 <= b["collapse_prob"] <= 1.0
-    assert body["line"].startswith(f"Model {version} · ")
+    shown = [f"{C.BUCKETS[b['bucket']]['horizon_days']}d" for b in body["buckets"] if b["passed"]]
+    if not shown:
+        assert body["line"] == ""
+        return
+    parts = body["line"].split(" · ")
+    assert parts[0] == f"Model {version}"
+    assert [p.split(":")[0] for p in parts[1:]] == shown, body["line"]
 
 
-def test_serve_health_and_score_shape(trained, synthetic_df, monkeypatch):
-    root, vdir = trained
-    client = _client(monkeypatch, root)
+def _with_gates(vdir, dest_root, passed=None, drop=None):
+    """Copy a version dir under dest_root (and point LATEST at it) with the
+    gate verdicts in meta.json overridden: `passed` = {bucket: value} sets
+    metrics[bucket].gates.passed (a bucket not in it is set to False);
+    drop="metrics" removes the metrics, drop="gates" each bucket's gates."""
+    dest = dest_root / vdir.name
+    shutil.copytree(vdir, dest)
+    meta = json.loads((dest / "meta.json").read_text())
+    for b, m in meta["metrics"].items():
+        if "gates" in m:
+            m["gates"]["passed"] = (passed or {}).get(b, False)
+            if drop == "gates":
+                del m["gates"]
+    if drop == "metrics":
+        del meta["metrics"]
+    (dest / "meta.json").write_text(json.dumps(meta))
+    (dest_root / "LATEST").write_text(vdir.name)
+    return dest
+
+
+def test_serve_health_and_score_shape(trained, synthetic_df, tmp_path, monkeypatch):
+    _, fixture = trained
+    vdir = _with_gates(fixture, tmp_path, passed={b: True for b in BUCKET_KEYS})
+    client = _client(monkeypatch, tmp_path)
     assert client.get("/health").json() == {"ok": True, "model_version": vdir.name}
 
     full = json.loads(synthetic_df.iloc[[5]].to_json(orient="records"))[0]   # NaN -> null
@@ -158,18 +188,19 @@ def test_serve_health_and_score_shape(trained, synthetic_df, monkeypatch):
     body = r.json()
     _check_shape(body, vdir.name)
     parts = body["line"].split(" · ")
-    assert [p.split(":")[0] for p in parts[1:]] == ["short", "3-day", "medium", "long"]
+    assert [p.split(":")[0] for p in parts[1:]] == ["1d", "3d", "7d", "30d"]
+    assert all(b["passed"] for b in body["buckets"])
     short = body["buckets"][0]
     # the line formats the unrounded probability p (f"{p * 100:.0f}%"), runner_prob is p
     # rounded to 4 decimals: p lies in [prob - 0.00005, prob + 0.00005], and the same
     # (monotonic) formatting of both ends must bracket the printed percent exactly
     import re
-    got = re.fullmatch(r"short: runner (\d+)%, collapse (\d+)%", parts[1])
+    got = re.fullmatch(r"1d: runner (\d+)%, collapse (\d+)%", parts[1])
     assert got, parts[1]
     for pct, prob in zip(got.groups(), (short["runner_prob"], short["collapse_prob"])):
         lo, hi = (int(f"{(prob + d) * 100:.0f}") for d in (-0.00005, 0.00005))
         assert lo <= int(pct) <= hi, (parts[1], prob)
-    assert parts[4].startswith("long: up at 30d ")
+    assert re.fullmatch(r"30d: up \d+%(, collapse \d+%)?", parts[4]), parts[4]
 
     # Outcomes in the request must not change the score (they are not inputs).
     leaky = {**full, "ret_late_1d": 9999, "max_gain_late_1d": 9999, "rugged": True}
@@ -193,17 +224,75 @@ def test_score_survives_nulls_unknown_keys_and_junk(trained, monkeypatch):
 def test_missing_models_are_left_out(trained, tmp_path, monkeypatch):
     """No collapse model -> null + omitted from the line; no runner model -> no bucket."""
     _, vdir = trained
-    copy = tmp_path / vdir.name
-    shutil.copytree(vdir, copy)
+    copy = _with_gates(vdir, tmp_path, passed={b: True for b in BUCKET_KEYS})
     meta = json.loads((copy / "meta.json").read_text())
     meta["models"] = [m for m in meta["models"] if m not in ("3day_collapse", "long_runner")]
     (copy / "meta.json").write_text(json.dumps(meta))
-    (tmp_path / "LATEST").write_text(vdir.name)
     body = _client(monkeypatch, tmp_path).post("/score", json={"row": {"mcap_usd": 5e4}}).json()
     _check_shape(body, vdir.name, ["short", "3day", "medium"])
     assert body["buckets"][1]["collapse_prob"] is None
     part = body["line"].split(" · ")[2]
-    assert part.startswith("3-day: runner ") and "collapse" not in part and "long" not in body["line"]
+    assert part.startswith("3d: runner ") and "collapse" not in part and "30d" not in body["line"]
+
+
+def _score(monkeypatch, root, row):
+    r = _client(monkeypatch, root).post("/score", json={"row": row})
+    assert r.status_code == 200, r.text
+    return r.json()
+
+
+def test_line_shows_only_buckets_that_passed_their_gates(trained, synthetic_df, tmp_path, monkeypatch):
+    """Only medium passed (as in prod 20261010-0621): the line has the 7d part
+    alone, while `buckets` still has every bucket (stored for live checking)
+    with its own `passed` and the same scores as when all passed."""
+    _, vdir = trained
+    row = json.loads(synthetic_df.iloc[[5]].to_json(orient="records"))[0]
+    only = _with_gates(vdir, tmp_path / "only", passed={"medium": True})
+    body = _score(monkeypatch, tmp_path / "only", row)
+    _check_shape(body, vdir.name)
+    assert [b["passed"] for b in body["buckets"]] == [False, False, True, False]
+    parts = body["line"].split(" · ")
+    assert parts[0] == f"Model {vdir.name}" and len(parts) == 2
+    import re
+    got = re.fullmatch(r"7d: runner (\d+)%, collapse (\d+)%", parts[1])
+    assert got, body["line"]
+    for word in ("1d", "3d", "30d", "short", "3-day", "medium", "long"):
+        assert word not in body["line"], word
+    everything = _with_gates(vdir, tmp_path / "all", passed={b: True for b in BUCKET_KEYS})
+    every = _score(monkeypatch, tmp_path / "all", row)
+    strip = lambda bs: [{k: v for k, v in b.items() if k != "passed"} for b in bs]
+    assert strip(body["buckets"]) == strip(every["buckets"])       # passing changes no score
+    assert every["line"].split(" · ")[3] == parts[1]
+    assert only.name == everything.name == vdir.name
+
+
+def test_line_is_empty_when_no_bucket_passed(trained, synthetic_df, tmp_path, monkeypatch):
+    _, vdir = trained
+    _with_gates(vdir, tmp_path, passed={})
+    for row in (json.loads(synthetic_df.iloc[[5]].to_json(orient="records"))[0], {}):
+        body = _score(monkeypatch, tmp_path, row)
+        _check_shape(body, vdir.name)
+        assert body["line"] == "" and not any(b["passed"] for b in body["buckets"])
+
+
+@pytest.mark.parametrize("case", ["no metrics", "no gates", "not a bool", "skipped bucket"])
+def test_missing_gate_info_fails_closed(trained, synthetic_df, tmp_path, monkeypatch, case):
+    """An older meta.json without gate info, or anything but passed == true,
+    counts as not passed: no line, every bucket still scored."""
+    _, vdir = trained
+    drop = {"no metrics": "metrics", "no gates": "gates"}.get(case)
+    dest = _with_gates(vdir, tmp_path, passed={b: True for b in BUCKET_KEYS}, drop=drop)
+    if case in ("not a bool", "skipped bucket"):
+        meta = json.loads((dest / "meta.json").read_text())
+        for b in BUCKET_KEYS:
+            if case == "not a bool":
+                meta["metrics"][b]["gates"]["passed"] = ["true", 1, "PASS", None][BUCKET_KEYS.index(b)]
+            else:
+                meta["metrics"][b] = {"skipped": "made up for the test"}
+        (dest / "meta.json").write_text(json.dumps(meta))
+    body = _score(monkeypatch, tmp_path, json.loads(synthetic_df.iloc[[5]].to_json(orient="records"))[0])
+    _check_shape(body, vdir.name)
+    assert body["line"] == "" and [b["passed"] for b in body["buckets"]] == [False] * 4
 
 
 def test_no_model_dir_gives_503_not_a_crash(tmp_path, monkeypatch):
@@ -300,8 +389,8 @@ def test_long_is_skipped_until_its_30d_data_has_matured(synthetic_df, tmp_path, 
     client = _client(monkeypatch, tmp_path)
     body = client.post("/score", json={"row": json.loads(df.iloc[[3]].to_json(orient="records"))[0]})
     assert body.status_code == 200, body.text
-    _check_shape(body.json(), "v", ["short"])
-    assert "long" not in body.json()["line"] and "up at 30d" not in body.json()["line"]
+    _check_shape(body.json(), "v", ["short"])                # long: not in buckets either
+    assert "30d" not in body.json()["line"]
 
 
 def test_maturity_rule_needs_rows_and_span(monkeypatch):
@@ -498,6 +587,8 @@ def test_old_flat_meta_still_serves_with_exact_levels(trained, synthetic_df, tmp
         joblib.dump({"model": models[f"{b}_runner"]["model"], "calibrator": None},
                     old / f"{b}_runner.joblib")
     meta.update(category_levels=flat, features=old_cols, models=sorted(models))
+    for b in ("short", "long"):                                   # shown in the line
+        meta["metrics"][b]["gates"]["passed"] = True
     (old / "meta.json").write_text(json.dumps(meta))
     (tmp_path / "LATEST").write_text("old")
 
@@ -519,7 +610,7 @@ def test_old_flat_meta_still_serves_with_exact_levels(trained, synthetic_df, tmp
         assert r.status_code == 200, r.text
         body = r.json()
         _check_shape(body, meta["version"], ["short", "long"])
-        assert " · long: up at 30d " in body["line"]
+        assert " · 30d: up " in body["line"]
         X_ref = build_features(rec, {}, old_cols)                  # numerics; categoricals by hand
         for c in OLD_CATEGORICAL:
             v = rec.get(c)
@@ -784,3 +875,80 @@ def test_serving_uses_the_dex_family_rules_stored_at_training(trained, synthetic
     assert bundle.score(rec) == before
     # without the stored rules the edited table would have changed the input
     assert np.isnan(build_features(rec, bundle.levels("short"))["dex_family"][0])
+
+
+def test_unseen_perceptor_verdict_scores_as_missing(trained, synthetic_df, tmp_path, monkeypatch):
+    """A model trained before Perceptor's 'insufficient' verdict existed gets a row
+    with perceptor_verdict = 'insufficient': /score answers 200 and the verdict is
+    treated as missing (the same probabilities as perceptor_verdict = null), as
+    for any level the model was not trained with. The model here does split on
+    perceptor_verdict, so the categorical path is really exercised."""
+    import joblib
+    import pandas as pd
+    from scout_ml.features import build_features, learn_cat_levels
+    from scout_ml.labels import build_labels
+    from scout_ml.model import Bundle, fit_lgbm, predict
+    root, vdir = trained
+    fixture_meta = json.loads((vdir / "meta.json").read_text())
+    for b, lv in fixture_meta["category_levels"].items():
+        assert "insufficient" not in lv.get("perceptor_verdict", []), b
+
+    new = tmp_path / "v"
+    shutil.copytree(vdir, new)
+    for p in new.glob("*.joblib"):
+        p.unlink()
+    meta = json.loads((new / "meta.json").read_text())
+    df = synthetic_df.copy()
+    df["message_date"] = pd.to_datetime(df["message_date"], utc=True, format="ISO8601")
+    df = df.sort_values("message_date").reset_index(drop=True)
+    L = build_labels(df)
+    use = L["usable_short"].to_numpy()
+    rows = df[use].reset_index(drop=True)
+    y_run = L["runner_short"][use].to_numpy().astype(int)
+    y_col = L["collapse_short"][use].to_numpy().astype(int)
+    # every row gets one of the four pre-'insufficient' verdicts; plant a signal
+    rng = np.random.default_rng(5)
+    verdict = rng.choice(["clean", "caution", "red_flags", "unknown"], len(rows))
+    verdict[(y_run == 1) & (rng.random(len(rows)) < 0.7)] = "clean"
+    verdict[(y_col == 1) & (rng.random(len(rows)) < 0.7)] = "red_flags"
+    rows["perceptor_verdict"] = verdict
+    levels = learn_cat_levels(rows)
+    assert levels["perceptor_verdict"] == ["caution", "clean", "red_flags", "unknown"]
+    X = build_features(rows, levels)
+    fitted = {}
+    for label, y in (("runner", y_run), ("collapse", y_col)):
+        fitted[label] = fit_lgbm(X, y, n_estimators=20)
+        booster = fitted[label]["model"].booster_
+        imp = dict(zip(booster.feature_name(), booster.feature_importance()))
+        assert imp["perceptor_verdict"] > 0, label            # the model uses the verdict
+        joblib.dump({"model": fitted[label]["model"], "calibrator": None},
+                    new / f"short_{label}.joblib")
+    meta.update(models=["short_collapse", "short_runner"], category_levels={"short": levels})
+    (new / "meta.json").write_text(json.dumps(meta))
+    (tmp_path / "LATEST").write_text("v")
+
+    bundle = Bundle(new)
+    codes = bundle.features([{"perceptor_verdict": v} for v in
+                             ("insufficient", " Insufficient ", "unknown", "clean", None)],
+                            "short")["perceptor_verdict"]
+    assert np.isnan(codes[0]) and np.isnan(codes[1]) and np.isnan(codes[4])
+    assert codes[2:4].tolist() == [3.0, 1.0]
+
+    client = _client(monkeypatch, tmp_path)
+    base = json.loads(df.iloc[[7]].assign(message_date="2026-09-01T12:00:00Z")
+                      .to_json(orient="records"))[0]
+    got = {}
+    for v in ("insufficient", None, "unknown", "clean", "red_flags"):
+        r = client.post("/score", json={"row": {**base, "perceptor_verdict": v}})
+        assert r.status_code == 200, r.text
+        body = r.json()
+        _check_shape(body, meta["version"], ["short"])
+        got[v] = (body["buckets"][0]["runner_prob"], body["buckets"][0]["collapse_prob"])
+    assert got["insufficient"] == got[None]                    # unseen level = missing
+    want = build_features({**base, "perceptor_verdict": None}, levels)
+    assert got[None] == tuple(round(float(predict(fitted[k], want)[0]), 4)
+                              for k in ("runner", "collapse"))
+    assert len(set(got.values())) > 1                          # the verdict does move the score
+    # the fixture model (trained without 'insufficient' too) also scores it without error
+    r = _client(monkeypatch, root).post("/score", json={"row": {**base, "perceptor_verdict": "insufficient"}})
+    assert r.status_code == 200, r.text

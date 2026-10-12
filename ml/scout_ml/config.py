@@ -5,7 +5,8 @@ from contextlib import contextmanager
 # --- Label definitions -----------------------------------------------------
 # Each label is (outcome column, comparison, threshold in percent). The outcome
 # is first netted of buy+sell tax (see labels.net_pct). `ret_col` is the return
-# used by the money simulation; `horizon_days` drives the embargo.
+# used by the money simulation; `horizon_days` drives the embargo and names the
+# bucket in the delivery line ("7d: runner 12%, collapse 64%", with `runner_word`).
 BUCKETS = {
     "short": {"title": "short", "runner_word": "runner", "horizon_days": 1,
               "runner": ("max_gain_late_1d", ">=", 100.0),
@@ -19,7 +20,7 @@ BUCKETS = {
                "runner": ("ret_late_7d", ">=", 50.0),
                "collapse": ("ret_late_7d", "<=", -70.0),
                "collapse_or_rugged": False, "ret_col": "ret_late_7d"},
-    "long": {"title": "long", "runner_word": "up at 30d", "horizon_days": 30,
+    "long": {"title": "long", "runner_word": "up", "horizon_days": 30,
              "runner": ("ret_late_30d", ">", 0.0),
              "collapse": ("ret_late_30d", "<=", -90.0),
              "collapse_or_rugged": True, "ret_col": "ret_late_30d"},
@@ -130,12 +131,26 @@ LATEST = ["latest_price_usd", "latest_return_pct", "latest_checked_at", "latest_
 TRACKER_DISCOVERY = ["rugged", "current_liquidity_usd", "current_price_usd",
                      "entry_price_source", "pool_dex", "pool_address", "pool_name",
                      "pool_created_at"]
+# Timing and rug outcomes the tracker stores after the call (scout_call_returns:
+# peak_late_after_s ... timing_at; scout_call_tracking: rug_at, rug_at_kind).
+# Not in scout_call_dataset_v yet; when the view gets them they are OUTCOMES
+# (report-only scores such as "2x within 1 h", "rug within 24 h"), never inputs.
+# Per-horizon variants (e.g. above_2x_s_1h, first_2x_after_late_1d, rug_at_1d,
+# following the ret_late_1d naming) are caught by the prefixes below.
+TIMING_RUG_OUTCOMES = ["peak_late_after_s", "first_2x_after_s", "above_2x_s",
+                       "fall_below_2x_after_s", "above_2x_censored", "timing_at",
+                       "rug_at", "rug_at_kind"]
 FORBIDDEN_COLUMNS = (set(BOOKKEEPING) - {"quote_asset"} | set(IDENTITY)
                      | {"pre_vol_unit", "token_name", "post_kind"} | set(LATEST)
-                     | set(TRACKER_DISCOVERY) | set(AFTER_CALL_VIEW))
+                     | set(TRACKER_DISCOVERY) | set(AFTER_CALL_VIEW)
+                     | set(TIMING_RUG_OUTCOMES))
 # trades_*: trading counted AFTER the call (trades_24h, any later trades_7d ...).
-# Trading before the call is pre_* and stays allowed.
-FORBIDDEN_PREFIXES = ("ret_", "max_gain_", "max_dd_", "latest_", "current_", "pool_", "trades_")
+# Trading before the call is pre_* and stays allowed (pre_first_trade_age_s too).
+# peak_* / first_2x_* / above_2x_* / fall_below_2x_* / timing_* / rug_at*: the
+# timing and rug outcomes above and any per-horizon or entry ("_late") variant.
+FORBIDDEN_PREFIXES = ("ret_", "max_gain_", "max_dd_", "latest_", "current_", "pool_", "trades_",
+                      "peak_late_after_", "peak_after_", "first_2x_", "above_2x_",
+                      "fall_below_2x_", "timing_", "rug_at")
 
 # --- Extreme outcomes ------------------------------------------------------
 # A drained or broken pool can give absurd outcomes (e.g. +3.9e47 %). A row

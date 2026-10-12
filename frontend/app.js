@@ -49,6 +49,13 @@
   };
   var TODAY_UNKNOWN = { text: 'no readable verdict', cls: 'pv-today pv-today-unknown' };
 
+  // Perceptor's "not enough data yet" (verdict insufficient: a token too new to
+  // judge). Shown with its own words, but no verdict: the Perceptor filter and
+  // its counts put it under "not scanned" (verdictBucket), like a report
+  // without a readable verdict.
+  VERDICT_TEXT.insufficient = { text: 'not enough data yet', cls: 'pv pv-insufficient' };
+  TODAY_TEXT.insufficient = { text: 'not enough data yet', cls: 'pv-today pv-today-unknown' };
+
   // verdicts: the Perceptor buckets to show, in VERDICT_FILTERS order; [] = all.
   // days: only calls from the last that many days (one of DAY_CHOICES; 0 = all).
   var state = { q: '', sort: 'date', dir: 'desc', horizon: '1d', verdicts: [], days: 0, page: 1 };
@@ -467,6 +474,10 @@
     if (pv) {
       var pvNode = linkOrText(c.perceptor_url, pv.text, pv.cls);
       if (pvNode.tagName === 'A') { pvNode.title = 'Open the Perceptor report'; }
+      if (c.perceptor_verdict === 'insufficient') {
+        pvNode.title = 'Perceptor: not enough data yet (the token was too new to judge; counted as not scanned)' +
+          (pvNode.tagName === 'A' ? '. Opens the Perceptor report' : '');
+      }
       tdPerc.appendChild(pvNode);
     } else {
       tdPerc.appendChild(document.createTextNode(DASH));

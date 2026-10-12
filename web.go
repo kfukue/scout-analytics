@@ -1185,7 +1185,7 @@ type webCallDetail struct {
 // webPerceptorDetail: the token's latest completed Perceptor report.
 type webPerceptorDetail struct {
 	ID        int       `json:"id"`
-	Verdict   string    `json:"verdict"` // clean | caution | red_flags | unknown
+	Verdict   string    `json:"verdict"` // clean | caution | red_flags | insufficient | unknown
 	Label     *string   `json:"label"`   // verdict_label, e.g. "No red flags found"
 	Summary   *string   `json:"summary"` // verdict_summary
 	URL       *string   `json:"url"`     // https only
