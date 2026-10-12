@@ -45,6 +45,11 @@ const (
 const (
 	DeliveryStatusSent   = "sent"
 	DeliveryStatusFailed = "failed"
+	// DeliveryStatusSending: recorded by the live Perceptor re-check
+	// (recheck.go) before it sends, then updated to sent or failed. A row left
+	// at sending (the update failed, or the process died while sending) means
+	// "attempted": that call is never delivered again. Only sent counts as sent.
+	DeliveryStatusSending = "sending"
 )
 
 const scoutDBUser = "scoutanalytics"
@@ -290,12 +295,12 @@ type ScoutWebRow struct {
 	TrackingStatus  *string
 	Perf            [15]float64
 	HasPerf         uint16
-	PerceptorVerd   *string // clean | caution | red_flags | unknown
+	PerceptorVerd   *string // clean | caution | red_flags | insufficient | unknown
 	PerceptorURL    *string
 	PerceptorID     *int
 	// "Perceptor today": the token's latest completed rescan (scan_kind
 	// 'rescan', run long after the call by the rescan lane): its verdict
-	// (clean | caution | red_flags | unknown), link and time (completed_at,
+	// (clean | caution | red_flags | insufficient | unknown), link and time (completed_at,
 	// else requested_at); all nil without one. Never mixed into the fields
 	// above, which come from live scans only.
 	PerceptorTodayVerd *string
@@ -419,7 +424,7 @@ type ScoutWebCall struct {
 	Return30dPct   *float64  `json:"return_30d_pct"`
 	Rugged         *bool     `json:"rugged"`
 	TrackingStatus *string   `json:"tracking_status"`
-	PerceptorVerd  *string   `json:"perceptor_verdict"` // clean | caution | red_flags | unknown
+	PerceptorVerd  *string   `json:"perceptor_verdict"` // clean | caution | red_flags | insufficient | unknown
 	PerceptorURL   *string   `json:"perceptor_url"`     // report link (https only)
 	CallCount      int       `json:"call_count"`        // calls of this token in total (≥ 1)
 	LastCallDate   time.Time `json:"last_call_date"`    // most recent call of this token

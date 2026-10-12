@@ -25,6 +25,33 @@ const (
 	levelUnknown  = "unknown"
 )
 
+// Perceptor's answer for a token too new to judge is a fourth one:
+//
+//	"$SNIFF on-chain check: not enough data yet. Full breakdown via @0xPerceptor"
+//
+// It is no verdict: it never passes the gate unless SCOUT_DELIVER_LEVELS names
+// it, and on the website it counts as "not scanned". A live call that gets it
+// is re-checked later (recheck.go).
+const (
+	levelInsufficient = "insufficient"
+	// labelInsufficient: the verdict_label of every insufficient row, the one
+	// scoutanalytics.sql also writes when it relabels old rows.
+	labelInsufficient = "not enough data yet"
+)
+
+// verdictUsable reports whether level is a real Perceptor verdict (clean,
+// caution or red flags), as opposed to insufficient or unknown.
+func verdictUsable(level string) bool {
+	switch level {
+	case levelClean, levelCaution, levelRedFlags:
+		return true
+	}
+	return false
+}
+
+// insufficientTickerRe finds the ticker in "$SNIFF on-chain check: not enough data yet".
+var insufficientTickerRe = regexp.MustCompile(`(?i)(\$[^\s$]+)\s+on-chain check`)
+
 type verdict struct {
 	Level   string `json:"level"`
 	Label   string `json:"label,omitempty"`   // e.g. "No red flags found"
@@ -54,6 +81,8 @@ func levelFromLabel(s string) string {
 		return levelRedFlags
 	case strings.Contains(t, "caution"), strings.Contains(t, "warning"):
 		return levelCaution
+	case strings.Contains(t, labelInsufficient):
+		return levelInsufficient
 	}
 	return levelUnknown
 }
@@ -140,6 +169,18 @@ func parsePerceptorPage(body string) verdict {
 	v.Level = levelFromLabel(v.Label)
 
 	desc := firstMatch(body, ogDescRe, ogDescRe2)
+	if v.Level == levelUnknown && levelFromLabel(desc) == levelInsufficient {
+		// "$SNIFF on-chain check: not enough data yet. Full breakdown via @0xPerceptor"
+		v.Level = levelInsufficient
+	}
+	if v.Level == levelInsufficient {
+		v.Label = labelInsufficient
+		if v.Ticker == "" {
+			if m := insufficientTickerRe.FindStringSubmatch(desc); m != nil {
+				v.Ticker = m[1]
+			}
+		}
+	}
 	desc = strings.TrimSpace(strings.TrimSuffix(desc, "Full breakdown via @0xPerceptor"))
 	// "$NH on-chain check: red flags. Top 10 hold 40%; Liquidity PULLED."
 	if i := strings.Index(desc, ". "); i > 0 && strings.Contains(strings.ToLower(desc[:i]), "on-chain check") {
@@ -198,7 +239,8 @@ func fetchPerceptorVerdict(ctx context.Context, id string) (verdict, error) {
 // from the Telegram message itself.
 func textVerdict(text string, markers, safe []string) verdict {
 	v := verdict{Source: "telegram_text"}
-	if lvl := levelFromLabel(text); lvl == levelClean {
+	lvl := levelFromLabel(text)
+	if lvl == levelClean {
 		// Explicit "no red flags" — still make sure there is no caution/warning marker elsewhere.
 		if flagged, m := classify(text, markers, safe); flagged {
 			v.Level, v.Label = levelFromLabel(m), m
@@ -208,6 +250,15 @@ func textVerdict(text string, markers, safe []string) verdict {
 			return v
 		}
 		v.Level, v.Label = levelClean, "No red flags found"
+		return v
+	}
+	if lvl == levelInsufficient {
+		// Perceptor's own "not enough data yet" (no red flag, caution or
+		// warning phrase in the text): it wins over the generic markers.
+		v.Level, v.Label = levelInsufficient, labelInsufficient
+		if m := insufficientTickerRe.FindStringSubmatch(text); m != nil {
+			v.Ticker = m[1]
+		}
 		return v
 	}
 	if flagged, m := classify(text, markers, safe); flagged {

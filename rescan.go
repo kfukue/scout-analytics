@@ -1,7 +1,8 @@
 package main
 
 // Rescan lane: Perceptor re-scans of first calls that have no Perceptor
-// report, run inside the listener (one Telegram session; never a second
+// report (or only ones without a real verdict: "not enough data yet" or
+// unreadable), run inside the listener (one Telegram session; never a second
 // process) when the live queue is idle. Off unless SCOUT_RESCAN=on.
 //
 // A rescan writes one scout_investigations row with scan_kind 'rescan' and
@@ -16,7 +17,10 @@ package main
 // take one candidate (NextRescanCandidate) and scan it, synchronously, with
 // no rate-limit retry. A live call that arrives meanwhile waits for it: at
 // most Perceptor's MaxWait (180 s) plus the report page fetch, after which the
-// runner's 2m5s pacing has already passed.
+// runner's 2m5s pacing has already passed. The lane does not start while that
+// pacing still runs (after a live Perceptor re-check, recheck.go, which does
+// not count as a live call for SCOUT_RESCAN_IDLE), so it never sleeps in the
+// worker.
 
 import (
 	"context"
@@ -211,6 +215,10 @@ type rescanLane struct {
 	// completed report (the scanner's own by default; tests use fakes).
 	send  func(ctx context.Context, r *toolRunner, text string) error
 	judge func(ctx context.Context, spec ToolSpec, res *toolResult) verdict
+	// holdBack: first calls younger than this are not taken (0 = none): the
+	// live Perceptor re-check (recheck.go) may still ask about them. Set
+	// before the worker starts.
+	holdBack time.Duration
 
 	mu               sync.Mutex
 	lastLive         time.Time
@@ -299,7 +307,7 @@ func (l *rescanLane) logErr(err error) {
 // rescanStore is the part of ScoutStore the lane uses.
 type rescanStore interface {
 	RescanStats(ctx context.Context, since time.Time) (int, *time.Time, error)
-	NextRescanCandidate(ctx context.Context, statuses []string, since time.Time, maxFailed int) (*RescanCandidate, error)
+	NextRescanCandidateBefore(ctx context.Context, statuses []string, since, before time.Time, maxFailed int) (*RescanCandidate, error)
 	InsertScoutInvestigation(ctx context.Context, r *ScoutInvestigation) (*int, error)
 }
 
@@ -307,6 +315,11 @@ type rescanStore interface {
 // empty) and runs at most one rescan, synchronously. It reports whether it
 // ran one (then the worker looks at the live queue again at once).
 func (l *rescanLane) step(ctx context.Context, st rescanStore, queueLen func() int) bool {
+	if paceWait(l.runner) > 0 {
+		// the runner's pacing still runs (after a live Perceptor re-check,
+		// recheck.go): never sleep in the worker, look again later
+		return false
+	}
 	now := l.now()
 	in := l.inputs(now, queueLen())
 	reason := rescanDecide(l.cfg, in)
@@ -330,8 +343,13 @@ func (l *rescanLane) step(ctx context.Context, st rescanStore, queueLen func() i
 	if reason != rescanGo {
 		return false
 	}
+	var before time.Time // zero: no limit
+	if l.holdBack > 0 {
+		// calls this young may still get a live Perceptor re-check (recheck.go)
+		before = now.Add(-l.holdBack)
+	}
 	qctx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	c, err := st.NextRescanCandidate(qctx, l.cfg.Statuses, now.Add(-l.cfg.MaxAge), rescanFailedLimit)
+	c, err := st.NextRescanCandidateBefore(qctx, l.cfg.Statuses, now.Add(-l.cfg.MaxAge), before, rescanFailedLimit)
 	cancel()
 	if err != nil {
 		l.logErr(err)

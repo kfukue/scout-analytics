@@ -697,7 +697,7 @@ type RescanPoolRow struct {
 	Status          string
 	Rugged          bool // scout_call_tracking.rugged
 	Wiped           bool // latest_return_pct ≤ −99 (NULL = not wiped)
-	FailedRescans   int  // rescans of the token that ended failed or timeout
+	FailedRescans   int  // rescans of the token that ended failed or timeout, or completed without a real verdict
 }
 
 // rescanWipedPct: a first call whose latest return is at or below this
@@ -706,35 +706,52 @@ const rescanWipedPct = -99
 
 // rescanPoolSQL lists the first calls (the website's rule, webFirstCallsSQL:
 // lowest message_date, then lowest id, per lower(contract_address); update
-// posts left out) whose status is in $1 and whose token has no completed
-// Perceptor investigation of any scan kind, with the columns of RescanPoolRow
-// (and the contract address). A failed rescan is one that ended failed or
-// timeout: rate_limited says nothing about the token (the lane pauses). $2 =
-// rescanWipedPct.
+// posts left out) whose status is in $1 and whose token has no usable
+// Perceptor report (a completed investigation of any scan kind with a real
+// verdict: clean, caution or red_flags; "not enough data yet" and unreadable
+// ones are no report), with the columns of RescanPoolRow (and the contract
+// address). A failed rescan is one that ended failed or timeout, or completed
+// without a real verdict (insufficient or unknown, so a token Perceptor keeps
+// calling too new is not asked about again and again): rate_limited says
+// nothing about the token (the lane pauses). $2 = rescanWipedPct.
 const rescanPoolSQL = `SELECT c.id, c.contract_address, c.message_date, c.status,
 		COALESCE(t.rugged, false) AS rugged,
 		COALESCE(t.latest_return_pct <= $2, false) AS wiped,
 		(SELECT count(*) FROM scout_investigations i
 			JOIN scout_investigation_tools pt ON pt.id = i.tool_id AND pt.code = 'perceptor'
 			WHERE lower(i.contract_address) = fc.ca AND i.scan_kind = 'rescan'
-			  AND i.status IN ('failed', 'timeout'))::int AS failed_rescans
+			  AND (i.status IN ('failed', 'timeout')
+				OR (i.status = 'completed' AND i.verdict_level NOT IN ('clean', 'caution', 'red_flags'))))::int AS failed_rescans
 	FROM ` + webFirstCallsSQL + ` fc
 	JOIN scout_calls c ON c.id = fc.id
 	LEFT JOIN scout_call_tracking t ON t.call_id = fc.id
 	WHERE c.status = ANY($1)
 	  AND NOT EXISTS (SELECT 1 FROM scout_investigations i
 			JOIN scout_investigation_tools pt ON pt.id = i.tool_id AND pt.code = 'perceptor'
-			WHERE lower(i.contract_address) = fc.ca AND i.status = 'completed')`
+			WHERE lower(i.contract_address) = fc.ca AND i.status = 'completed'
+			  AND i.verdict_level IN ('clean', 'caution', 'red_flags'))`
 
 // NextRescanCandidate returns the newest first call the rescan lane may
 // re-scan (nil when there is none): from rescanPoolSQL, posted at or after
 // since, not rugged, latest return above rescanWipedPct (or none yet), and
 // fewer than maxFailed failed rescans. Ties on the time go to the higher id.
 func (st *ScoutStore) NextRescanCandidate(ctx context.Context, statuses []string, since time.Time, maxFailed int) (*RescanCandidate, error) {
+	return st.NextRescanCandidateBefore(ctx, statuses, since, time.Time{}, maxFailed)
+}
+
+// NextRescanCandidateBefore is NextRescanCandidate for first calls posted
+// before before only (zero = no limit): the rescan lane leaves the calls the
+// live Perceptor re-check (recheck.go) may still ask about to it.
+func (st *ScoutStore) NextRescanCandidateBefore(ctx context.Context, statuses []string, since, before time.Time, maxFailed int) (*RescanCandidate, error) {
 	var c RescanCandidate
+	var until *time.Time
+	if !before.IsZero() {
+		until = &before
+	}
 	err := st.Pool.QueryRow(ctx, `SELECT id, contract_address, message_date, status FROM (`+rescanPoolSQL+`) p
 		WHERE message_date >= $3 AND NOT rugged AND NOT wiped AND failed_rescans < $4
-		ORDER BY message_date DESC, id DESC LIMIT 1`, statuses, rescanWipedPct, since, maxFailed).
+		  AND ($5::timestamptz IS NULL OR message_date < $5::timestamptz)
+		ORDER BY message_date DESC, id DESC LIMIT 1`, statuses, rescanWipedPct, since, maxFailed, until).
 		Scan(&c.CallID, &c.ContractAddress, &c.MessageDate, &c.Status)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil
@@ -824,6 +841,32 @@ func (st *ScoutStore) InsertScoutDelivery(ctx context.Context, d *ScoutDelivery)
 	}
 	d.ID = &id
 	return &id, nil
+}
+
+// FinishScoutDelivery sets the outcome of a delivery recorded before it was
+// sent (status sending, by the live Perceptor re-check): status sent or
+// failed, delivered_at and error. It fails when no sending row has that id.
+func (st *ScoutStore) FinishScoutDelivery(ctx context.Context, id int, status string, deliveredAt *time.Time, errText *string) error {
+	tag, err := st.Pool.Exec(ctx, `UPDATE scout_deliveries SET status = $2, delivered_at = $3, error = $4,
+		updated_by = $5, updated_at = now() WHERE id = $1 AND status = $6`,
+		id, status, deliveredAt, errText, scoutDBUser, DeliveryStatusSending)
+	if err != nil {
+		return fmt.Errorf("finishing delivery %d: %w", id, err)
+	}
+	if tag.RowsAffected() != 1 {
+		return fmt.Errorf("finishing delivery %d: no sending delivery with that id", id)
+	}
+	return nil
+}
+
+// DeleteSendingDelivery removes a delivery still at status sending (and its
+// links): the live Perceptor re-check recorded it, then stopped before sending
+// anything, so the call may be delivered later.
+func (st *ScoutStore) DeleteSendingDelivery(ctx context.Context, id int) error {
+	if _, err := st.Pool.Exec(ctx, `DELETE FROM scout_deliveries WHERE id = $1 AND status = $2`, id, DeliveryStatusSending); err != nil {
+		return fmt.Errorf("deleting delivery %d: %w", id, err)
+	}
+	return nil
 }
 
 // SelectScoutDeliveries returns deliveries newest first, optionally for one call.
@@ -1583,21 +1626,24 @@ const (
 		FROM scout_calls WHERE ` + webRealCallSQL + ` GROUP BY lower(contract_address))`
 	// webPerceptorSQL: each token's latest completed Perceptor investigation
 	// (by contract address without regard to letter case, whichever post of the
-	// token it was run for). verdict is one of clean | caution | red_flags | unknown.
+	// token it was run for). verdict is one of clean | caution | red_flags |
+	// insufficient | unknown. A real verdict (clean, caution, red_flags) comes
+	// before an insufficient or unknown one, however old (a live call's
+	// Perceptor re-check, recheck.go, over its first "not enough data yet").
 	// Live scans only (scan_kind 'live'): a late re-scan is today's verdict,
 	// not the one at the time of the call (webPerceptorTodaySQL has those).
 	webPerceptorSQL = `(SELECT DISTINCT ON (lower(i.contract_address)) lower(i.contract_address) AS ca,
-		CASE WHEN i.verdict_level IN ('clean', 'caution', 'red_flags') THEN i.verdict_level ELSE 'unknown' END AS verdict,
+		CASE WHEN i.verdict_level IN ('clean', 'caution', 'red_flags', 'insufficient') THEN i.verdict_level ELSE 'unknown' END AS verdict,
 		i.report_url, i.id
 		FROM scout_investigations i JOIN scout_investigation_tools pt ON pt.id = i.tool_id AND pt.code = 'perceptor'
 		WHERE i.status = 'completed' AND i.scan_kind = 'live'
-		ORDER BY lower(i.contract_address), i.requested_at DESC, i.id DESC)`
+		ORDER BY lower(i.contract_address), (i.verdict_level IN ('clean', 'caution', 'red_flags')) DESC, i.requested_at DESC, i.id DESC)`
 	webPerceptorJoinSQL = ` LEFT JOIN ` + webPerceptorSQL + ` p ON p.ca = fc.ca`
 	// webPerceptorTodaySQL: each token's latest completed Perceptor re-scan
 	// (scan_kind 'rescan', by the rescan lane), by the same rule: "Perceptor
 	// today". at is completed_at, else requested_at.
 	webPerceptorTodaySQL = `(SELECT DISTINCT ON (lower(i.contract_address)) lower(i.contract_address) AS ca,
-		CASE WHEN i.verdict_level IN ('clean', 'caution', 'red_flags') THEN i.verdict_level ELSE 'unknown' END AS verdict,
+		CASE WHEN i.verdict_level IN ('clean', 'caution', 'red_flags', 'insufficient') THEN i.verdict_level ELSE 'unknown' END AS verdict,
 		i.report_url, COALESCE(i.completed_at, i.requested_at) AS at
 		FROM scout_investigations i JOIN scout_investigation_tools pt ON pt.id = i.tool_id AND pt.code = 'perceptor'
 		WHERE i.status = 'completed' AND i.scan_kind = 'rescan'
@@ -1623,7 +1669,10 @@ const (
 	// webVerdictAtCallJoinSQL: the Perceptor verdict known at the time of the
 	// first call (Analytics page), by the rule of scout_call_dataset_v: the
 	// call's own completed live scan, else the latest completed live scan of
-	// the same contract address requested at or before the call. Unlike the
+	// the same contract address requested at or before the call (insufficient
+	// is written as unknown here, the Analytics page knows no other). As in the
+	// view, a live Perceptor re-check (details {"recheck":…}, recheck.go) is
+	// never used: it was made after the call. Unlike the
 	// list's verdict (webPerceptorSQL, the token's latest scan from any post,
 	// which can be a later repeat call's) it never looks ahead. The address is
 	// compared exactly, as in the view; the list compares without regard to
@@ -1640,13 +1689,15 @@ const (
 		FROM (SELECT i.call_id, true AS own, i.requested_at, i.id, i.verdict_level AS level
 			FROM scout_investigations i JOIN scout_investigation_tools pit ON pit.id = i.tool_id AND pit.code = 'perceptor'
 			WHERE i.status = 'completed' AND i.scan_kind = 'live' AND i.call_id IS NOT NULL
+			  AND i.details->>'recheck' IS NULL
 		UNION ALL
 		SELECT c2.id, false, i.requested_at, i.id, i.verdict_level
 			FROM fc f2
 			JOIN scout_calls c2 ON c2.id = f2.id
 			JOIN scout_investigations i ON i.contract_address = c2.contract_address AND i.requested_at <= c2.message_date
 			JOIN scout_investigation_tools pit ON pit.id = i.tool_id AND pit.code = 'perceptor'
-			WHERE i.status = 'completed' AND i.scan_kind = 'live' AND i.call_id IS DISTINCT FROM c2.id) x
+			WHERE i.status = 'completed' AND i.scan_kind = 'live' AND i.call_id IS DISTINCT FROM c2.id
+			  AND i.details->>'recheck' IS NULL) x
 		ORDER BY x.call_id, x.own DESC, x.requested_at DESC, x.id DESC) vac ON vac.call_id = fc.id`
 )
 
@@ -1832,7 +1883,7 @@ func (st *ScoutStore) SelectWebReports(ctx context.Context, ids []int) (map[int]
 		return out, nil
 	}
 	rows, err := st.Pool.Query(ctx, `SELECT i.id, t.code, COALESCE(i.completed_at, i.requested_at),
-		CASE WHEN i.verdict_level IN ('clean', 'caution', 'red_flags') THEN i.verdict_level ELSE 'unknown' END,
+		CASE WHEN i.verdict_level IN ('clean', 'caution', 'red_flags', 'insufficient') THEN i.verdict_level ELSE 'unknown' END,
 		left(i.verdict_label, $2), left(i.verdict_summary, $2),
 		CASE WHEN t.code = 'salpha' THEN left(i.report_text, $2) ELSE '' END,
 		i.report_url
@@ -2035,6 +2086,100 @@ func (st *ScoutStore) RugAtBackfillRows(ctx context.Context) ([]rugAtBackfillRow
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("rugged calls without a rug time: %w", err)
+	}
+	return out, nil
+}
+
+// ---------------------------------------------------------------------------
+// Live Perceptor re-check (recheck.go): live calls whose Perceptor answer was
+// "not enough data yet" (insufficient) or unreadable (unknown)
+// ---------------------------------------------------------------------------
+
+// PerceptorRecheckRow is a call whose first live Perceptor result had no real
+// verdict, with what decides whether (and which) re-check it still needs.
+type PerceptorRecheckRow struct {
+	CallID          int
+	ContractAddress string
+	MessageID       int
+	MessageDate     time.Time
+	MessageText     string
+	FirstID         int       // the call's first completed live Perceptor investigation
+	FirstLevel      string    // its verdict_level: insufficient | unknown
+	FirstAt         time.Time // its requested_at
+	Recheck1        bool      // a first re-check (details {"recheck":1}) is stored, any status
+	Recheck1ID      *int      // the newest stored first re-check (nil without one)
+	Recheck1Status  string    // its status
+	Recheck1Level   string    // its verdict_level
+	Recheck2        bool      // a second re-check (details {"recheck":2}) is stored, any status
+	Usable          bool      // the call has a completed Perceptor investigation with a real verdict (any scan kind)
+	Delivered       bool      // the call has a scout_deliveries row (sent, failed or sending: attempted)
+}
+
+// heldForRecheckKey is the details key the listener sets (to true) on the
+// live Perceptor investigation of a call it held back for a re-check
+// (recheck.go). Only calls with it are re-checked.
+const heldForRecheckKey = "held_for_recheck"
+
+// MarkHeldForRecheck sets details.held_for_recheck = true on investigation
+// id, keeping its other keys; nothing else of the row changes. Repeat-safe.
+func (st *ScoutStore) MarkHeldForRecheck(ctx context.Context, id int) error {
+	tag, err := st.Pool.Exec(ctx, `UPDATE scout_investigations
+		SET details = COALESCE(details, '{}'::jsonb) || jsonb_build_object($2::text, true) WHERE id = $1`, id, heldForRecheckKey)
+	if err != nil {
+		return fmt.Errorf("marking investigation %d held for a re-check: %w", id, err)
+	}
+	if tag.RowsAffected() != 1 {
+		return fmt.Errorf("marking investigation %d held for a re-check: no such investigation", id)
+	}
+	return nil
+}
+
+// SelectPerceptorRechecks returns the calls posted at or after since that the
+// listener held back for a re-check: their first completed live Perceptor
+// investigation marked held_for_recheck (MarkHeldForRecheck; requested at or
+// after since; not a re-check itself) has verdict insufficient or unknown.
+// Oldest call first. A call without the marker (another gate said no, it was
+// delivered at the call, -scan / -post, a dry run, or an older binary) is
+// never returned. recheckDecide says what each still needs.
+func (st *ScoutStore) SelectPerceptorRechecks(ctx context.Context, since time.Time) ([]PerceptorRecheckRow, error) {
+	rows, err := st.Pool.Query(ctx, `SELECT c.id, c.contract_address, c.message_id, c.message_date, c.message_text,
+		o.id, o.verdict_level, o.requested_at,
+		r1.id IS NOT NULL, r1.id, COALESCE(r1.status, ''), COALESCE(r1.verdict_level, ''),
+		EXISTS (SELECT 1 FROM scout_investigations r JOIN scout_investigation_tools rt ON rt.id = r.tool_id AND rt.code = 'perceptor'
+			WHERE r.call_id = c.id AND r.details->>'recheck' = '2'),
+		EXISTS (SELECT 1 FROM scout_investigations u JOIN scout_investigation_tools ut ON ut.id = u.tool_id AND ut.code = 'perceptor'
+			WHERE u.call_id = c.id AND u.status = 'completed' AND u.verdict_level IN ('clean', 'caution', 'red_flags')),
+		EXISTS (SELECT 1 FROM scout_deliveries d WHERE d.call_id = c.id)
+		FROM (SELECT DISTINCT ON (i.call_id) i.call_id, i.id, i.verdict_level, i.requested_at
+			FROM scout_investigations i JOIN scout_investigation_tools t ON t.id = i.tool_id AND t.code = 'perceptor'
+			WHERE i.scan_kind = 'live' AND i.status = 'completed' AND i.call_id IS NOT NULL
+			  AND i.verdict_level IN ('insufficient', 'unknown') AND i.details->>'recheck' IS NULL
+			  AND i.details->>'held_for_recheck' = 'true'
+			  AND i.requested_at >= $1
+			ORDER BY i.call_id, i.requested_at, i.id) o
+		JOIN scout_calls c ON c.id = o.call_id
+		LEFT JOIN LATERAL (SELECT r.id, r.status, r.verdict_level
+			FROM scout_investigations r JOIN scout_investigation_tools rt ON rt.id = r.tool_id AND rt.code = 'perceptor'
+			WHERE r.call_id = c.id AND r.details->>'recheck' = '1'
+			ORDER BY r.requested_at DESC, r.id DESC LIMIT 1) r1 ON true
+		WHERE c.message_date >= $1
+		ORDER BY c.message_date, c.id`, since)
+	if err != nil {
+		return nil, fmt.Errorf("reading the calls to re-check with Perceptor: %w", err)
+	}
+	defer rows.Close()
+	var out []PerceptorRecheckRow
+	for rows.Next() {
+		var r PerceptorRecheckRow
+		if err := rows.Scan(&r.CallID, &r.ContractAddress, &r.MessageID, &r.MessageDate, &r.MessageText,
+			&r.FirstID, &r.FirstLevel, &r.FirstAt, &r.Recheck1, &r.Recheck1ID, &r.Recheck1Status, &r.Recheck1Level,
+			&r.Recheck2, &r.Usable, &r.Delivered); err != nil {
+			return nil, fmt.Errorf("scanning a call to re-check with Perceptor: %w", err)
+		}
+		out = append(out, r)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("reading the calls to re-check with Perceptor: %w", err)
 	}
 	return out, nil
 }
