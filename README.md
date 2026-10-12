@@ -965,6 +965,8 @@ SCOUT_STATE_DIR=scoutanalytics_data
 SCOUT_CATCHUP_MAX=100    # after a restart: missed posts (and calls still queued) handled live, newest first, 0-250; older ones stored only
 SCOUT_CATCHUP_MAX_AGE=24h # missed posts / queued calls older than this are stored only (0 = no age limit; invalid = startup error)
 SCOUT_RESCAN=off         # Perceptor re-scans of first calls without a report; SCOUT_RESCAN_* in "Re-scanning calls without a Perceptor report"
+SCOUT_PERCEPTOR_RECHECK_AFTER=12m   # live call with Perceptor "not enough data yet"/unreadable: re-check this long after the call (5m-60m; 0 = off); see "Re-checking “not enough data yet”"
+SCOUT_PERCEPTOR_RECHECK2_AFTER=2h   # a second re-check for the website only (0 = off; at least the first re-check's window, at most 24h)
 ```
 
 ## Investigation tools
@@ -1087,12 +1089,19 @@ also `-track` and `-web` sharing the same `.env`) with an error naming the setti
   then lowest id, per contract address with upper/lower case ignored; update posts are never
   a first call), posted within `SCOUT_RESCAN_MAX_AGE`, with a status in
   `SCOUT_RESCAN_STATUSES`;
-- the token has **no completed Perceptor report of either kind** (live or re-scan, any post
-  of the token);
+- the token has **no usable Perceptor report of either kind** (live or re-scan, any post
+  of the token): no completed one with a real verdict (`clean`, `caution` or `red_flags`).
+  A report that says "not enough data yet" (`insufficient`) or has no readable verdict
+  (`unknown`) is no report, so such first calls are candidates too;
 - **not rugged** (`scout_call_tracking.rugged`), and `latest_return_pct` is `NULL` (no latest
   price yet) or above −99;
-- **fewer than 2 failed re-scans** of the token (`failed` or `timeout`; a `rate_limited` one
-  does not count). After the second failure the token is not tried again.
+- **fewer than 2 failed re-scans** of the token (`failed` or `timeout`, or completed as
+  `insufficient` or `unknown`; a `rate_limited` one does not count; the 2-hour re-check below
+  is a re-scan and counts too). After the second failure the token is not tried again;
+- with the live re-check on (`SCOUT_PERCEPTOR_RECHECK_AFTER`), posted **longer ago than the
+  re-check's last window** (3 h with the defaults: the 2-hour re-check plus its hour), so the
+  lane never asks about a call the re-check may still take. The dry run does not apply this
+  rule.
 
 **How it runs.** Live calls always come first. The scan worker looks at the lane only when
 the live queue is empty, the last live call finished at least `SCOUT_RESCAN_IDLE` ago (a
@@ -1150,22 +1159,116 @@ SELECT status, count(*) FROM scout_investigations WHERE scan_kind = 'rescan' GRO
 
 ## How it decides "warning / red flag"
 
-Perceptor gives every report one of three verdicts (shown in the report page title):
+Perceptor gives every report one of three verdicts (shown in the report page title), or
+says the token is too new to judge:
 
 | Perceptor verdict | Level | Delivered? |
 |---|---|---|
 | `$ANYR: No red flags found` | `clean` | **yes** |
 | `$DARKCOMP: Caution` | `caution` | **yes** (🟡) |
 | `$NH: Red flags` (e.g. "Top 10 hold 40%; Liquidity PULLED") | `red_flags` | no |
+| `$SNIFF on-chain check: not enough data yet` | `insufficient` (label `not enough data yet`) | after a re-check (below) |
 
 1. The bot's reply is searched (text, links, link preview, inline buttons) for a
    `perceptor.info/r/<id>` or `?investigation=<id>` link. The public report page is
-   fetched and its title verdict is used. That's the authoritative check.
+   fetched and its title verdict is used (or "not enough data yet" in its description).
+   That's the authoritative check.
 2. If there's no link, or the page can't be fetched, it falls back to the message
-   text: "no red flags" → clean; "caution"/⚠️/"warning" → caution; "red flag"/🚩 → red_flags.
-3. If there's still no verdict (e.g. "token not found", rate-limit reply) → `unknown`, not delivered.
+   text: "no red flags" → clean; "caution"/⚠️/"warning" → caution; "red flag"/🚩 → red_flags;
+   otherwise "not enough data yet" (any letter case) → insufficient.
+3. If there's still no verdict (e.g. "token not found", rate-limit reply) → `unknown`, not delivered
+   at once (a live call is re-checked, below).
+
+`insufficient` is no verdict: it never passes the gate unless `SCOUT_DELIVER_LEVELS` names it,
+and on the website it shows as "not enough data yet" but counts as "Not scanned" in the
+Perceptor filter. Rows stored as `unknown` before this level existed are relabelled from
+their stored text by `scoutanalytics.sql` at every start (completed Perceptor rows still
+`unknown` whose `report_text` contains "not enough data yet"; only `verdict_level` and
+`verdict_label` change).
+
+### Re-checking "not enough data yet"
+
+A **live** call whose Perceptor scan completed with `insufficient` or `unknown` (and that
+`SCOUT_DELIVER_LEVELS` does not deliver) is **not delivered yet**. The listener asks
+Perceptor again:
+
+- **`SCOUT_PERCEPTOR_RECHECK_AFTER` (12m) after the call**: the delivery decision.
+  `clean`/`caution` → delivered then, with a second header line `🔁 Perceptor re-checked 13m
+  after the call` (the original call post and the call's sAlpha report are included as
+  usual; there is no model score line, the call was scored when it came in); `red_flags` →
+  not delivered; still `insufficient`, `unknown` or no report → delivered then, headed
+  `⏳ $TICKER Perceptor: not enough data yet` (or `❔ Perceptor: no readable verdict` /
+  `no report (timeout)`). Stored as a live investigation (`scan_kind = 'live'`, `details`
+  `{"recheck":1,"call_age_s":…}`). The website takes it (a real verdict over an
+  `insufficient`/`unknown` one of the same call); the dataset view (`perceptor_verdict`, a
+  model input) and the Analytics "verdict at call" never use a re-check: they keep the
+  answer known when the call came in, as live scoring sees it. A first re-check that gets
+  no report (timeout, failed, rate-limited) stores nothing and is tried again 5 minutes
+  later while its window lasts; the last try that fits the window is stored and delivered
+  with the label, so the call is not lost (a try pushed past the window by a busy queue, a
+  pause or a reconnect still runs once; only a restart of the listener drops it).
+- **`SCOUT_PERCEPTOR_RECHECK2_AFTER` (2h) after the call**, only while there is still no
+  real verdict: website only, never delivered. Stored as `scan_kind = 'rescan'` (`details`
+  `{"recheck":2,…}`), so it shows as "Perceptor today" and never feeds the model. After
+  that the rescan lane covers the call (if `SCOUT_RESCAN=on`).
+
+A Perceptor scan that did not complete (timeout, failed, rate-limited after its retries) is
+not held back: the call stays undelivered, as before. Only calls the listener itself held
+back are re-checked: when it holds a call it marks the call's live Perceptor row
+(`details` `{"held_for_recheck":true}`; nothing else of the row changes), and the re-check
+looks for that marker. So a call is **never** re-checked (nor delivered by the re-check) when
+another gate said no, when it was delivered at the call (`SCOUT_DELIVER_LEVELS` naming
+`insufficient`/`unknown`, even if storing that delivery failed), when it was handled by
+`-scan`/`-post` (an insufficient answer is simply not delivered there) or by a dry run
+(`-dry-run` turns the re-check off: nothing is held, re-checked or stored), or when an
+**older binary dropped it before this version was deployed** (those rows have no marker:
+they stay undelivered). A call handled live after its first window has passed (a catch-up
+after a long stop) is logged as past the window and not delivered.
+
+What is due is read from the database (marked calls only), so a restart keeps the schedule:
+a held call with no re-check and no delivery yet gets the first re-check from 12 minutes
+after the call up to max(60 min, AFTER + 30 min) after it; the second from 2 h up to 3 h. A
+restart does drop the in-memory retries described above: a call whose window passes while
+the listener is down, even one whose re-check was being retried, is skipped and logged as
+past its window, and stays undelivered. Re-checks run in the scan worker after the live queue
+(live calls first) and ask Perceptor only when its runner is free: while the runner's pacing
+(2m5s after the last request, live or re-check) still runs, or after a rate-limit notice
+(not waited out: no retries in the runner; asked again 5 minutes later, inside the window),
+the re-check waits for a later look instead of sleeping in the worker, so a live call never
+waits behind a sleep or retry of the re-check (a live call that comes right after a re-check
+request still waits Perceptor's normal 2m5s pacing, as after any request). Delivering a stored re-check does not ask Perceptor and is not held back by
+either. A Telegram `FLOOD_WAIT` stores nothing and pauses all re-checks for the time asked.
+A stop or reconnect during a re-check stores nothing (it runs again).
+
+The re-check's delivery is recorded in `scout_deliveries` with `status = 'sending'` **before**
+it is sent, then updated to `sent` or `failed`. Any delivery row of a call (`sending`
+included) means it is never delivered again, so a failed update cannot send it twice after a
+restart; a row left at `sending` (the update failed, or the listener died mid-send) counts
+as not sent everywhere else (only `sent` does, e.g. `scout_investigations_v.delivered`).
+When recording it fails nothing is sent (tried again 30 seconds later). A stop before
+anything was sent removes that row, and the stored re-check is delivered on a later step
+without asking Perceptor again (a stop in the middle of a send is recorded as failed, never
+sent twice). Live calls record their delivery after sending, as before (`sent`/`failed`).
+Settings (invalid values stop the start):
+
+```
+SCOUT_PERCEPTOR_RECHECK_AFTER=12m    # 5m-60m; 0 or off = no re-check (insufficient/unknown are simply not delivered)
+SCOUT_PERCEPTOR_RECHECK2_AFTER=2h    # 0 or off = no second re-check; from max(60m, AFTER+30m) to 24h
+```
+
+One log line per re-check, e.g. `perceptor re-check 1: call 5120 (0x…, 12m after the call):
+clean — delivered (2 report(s))`, `…: red_flags — not delivered (not in SCOUT_DELIVER_LEVELS)`,
+`perceptor re-check 2: …: insufficient — website only`, and once per call
+`perceptor re-check 1: call 5120 (0x…) is 2h old, past its window — skipped, not delivered`.
+The 2-hour re-checks count towards the rescan lane's daily cap and gap (they are
+`scan_kind = 'rescan'` rows).
 
 To get only No-red-flags reports again: `SCOUT_DELIVER_LEVELS=clean`.
+
+**Retrain the model** after deploying this: `perceptor_verdict` (a categorical model input
+from `scout_call_dataset_v`) gains the value `insufficient`, both for new calls and for old
+rows relabelled at startup. A model trained before knows no such level and scores it as
+missing until it is retrained.
 
 sAlpha (and any tool using the `text` parser) gets a best-effort keyword verdict,
 stored in the DB for reference; it doesn't affect delivery unless you make it a gate.
@@ -1818,7 +1921,7 @@ returned and cannot be found by its own name or symbol:
 | `dir` | `desc`, `asc` | `desc` | |
 | `horizon` | `1h`, `1d`, `3d`, `7d`, `30d` | `1d` | which window `return_pct` / `peak_pct` / `drawdown_pct` (and `sort=return` / `peak`) are for; the page sets it with its Peak / worst drop selector |
 | `usd_only` | `1`, `0` | `1` for every `sort` but `date`, else `0` | `1` = only tokens whose first call has `price_unit = usd` |
-| `verdict` | `clean`, `caution`, `red_flags`, `not_scanned`, or several separated by commas (`verdict=clean,caution`) | *(none = all)* | the token's Perceptor verdict (see below); with several, a token with any of them. The parameter may also be repeated (`verdict=clean&verdict=caution`); all values add up, repeats and empty items are ignored, so `verdict=` = all, and so do all four. `clean` = no red flags found; `not_scanned` = no completed Perceptor report, or one whose verdict is `unknown`. The order does not matter: `caution,clean` is the same question, with the same `ETag`, as `clean,caution` |
+| `verdict` | `clean`, `caution`, `red_flags`, `not_scanned`, or several separated by commas (`verdict=clean,caution`) | *(none = all)* | the token's Perceptor verdict (see below); with several, a token with any of them. The parameter may also be repeated (`verdict=clean&verdict=caution`); all values add up, repeats and empty items are ignored, so `verdict=` = all, and so do all four. `clean` = no red flags found; `not_scanned` = no completed Perceptor report, or one whose verdict is `unknown` or `insufficient` ("not enough data yet"). The order does not matter: `caution,clean` is the same question, with the same `ETag`, as `clean,caution` |
 | `days` | 1 – 3650 (whole days) | *(none = all)* | only tokens whose first call was posted within the last `days` × 24 hours, counted back from the snapshot time (`snapshot_at`), not the time of the request; `days=0` is a 400 (leave it out for all) |
 | `page` | 1 … | `1` | |
 | `per` | 1 – 200 | `50` | |
@@ -1891,9 +1994,9 @@ finite, or when the result is not finite. `latest_mcap_usd` is also `null` whene
 `"clean"`; `""` when none or all four), and `verdicts` is the same list as an array (`[]` = all).
 `days` repeats the age filter (`0` = all); `total` then counts only the calls within it.
 `perceptor_verdict` and `perceptor_url` are **per token**: the verdict (`clean`, `caution`,
-`red_flags` or `unknown`) and report link of the latest completed live Perceptor investigation
-(`scout_investigations`, tool `perceptor`, `status = completed`, `scan_kind = 'live'`, newest
-`requested_at`) with that contract address, upper/lower case ignored — not only the listed
+`red_flags`, `insufficient` = "not enough data yet", or `unknown`) and report link of the latest completed live Perceptor investigation
+(`scout_investigations`, tool `perceptor`, `status = completed`, `scan_kind = 'live'`, one
+with a real verdict first, then the newest `requested_at`) with that contract address, upper/lower case ignored — not only the listed
 call's own. Both are `null` when the token was never scanned at the time of a call, which is
 the normal case for calls imported from history (only live calls are scanned).
 `perceptor_url` is also `null` when the stored link does not start with `https://`. This is a
@@ -1902,8 +2005,9 @@ belongs to the single call. The Perceptor filter (`verdict=`) and its counts use
 live verdict.
 
 `perceptor_today_verdict`, `perceptor_today_url` and `perceptor_today_at` are **"Perceptor
-today"**: the token's latest completed Perceptor re-scan by the rescan lane (`scan_kind =
-'rescan'`, see "Re-scanning calls without a Perceptor report"), run long after the call, so
+today"**: the token's latest completed Perceptor re-scan by the rescan lane or the 2-hour
+re-check (`scan_kind = 'rescan'`, see "Re-scanning calls without a Perceptor report" and
+"Re-checking “not enough data yet”"), run long after the call, so
 its verdict is today's, not the one at the time of the call. Same verdict values and link rule
 as above; `perceptor_today_at` = when it ran (`completed_at`, else `requested_at`). All three
 are `null` without a completed re-scan. A re-scan never fills `perceptor_verdict`,
@@ -1935,7 +2039,7 @@ one listed call (`call_id` of a row of `/api/calls`), from memory:
    "at": "2026-10-01T14:31:40Z", "truncated": false}}
 ```
 - `perceptor` = the report of `perceptor_report_id` (`null` when there is none): `verdict` is
-  `clean`, `caution`, `red_flags` or `unknown`; `label` and `summary` are the report's
+  `clean`, `caution`, `red_flags`, `insufficient` or `unknown`; `label` and `summary` are the report's
   `verdict_label` and `verdict_summary` (either may be `null`).
 - `salpha` = the report of `salpha_report_id` (`null` when the token has no sAlpha reply with
   text): `text` is its `report_text`, plain text from a bot (show it as text, never as HTML).

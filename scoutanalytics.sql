@@ -119,7 +119,7 @@ CREATE TABLE IF NOT EXISTS scout_investigations (
     report_urls       TEXT[]       NOT NULL DEFAULT '{}',
     report_url        TEXT,                                -- canonical report link, if any
     external_id       TEXT,                                -- tool's own report id, if any
-    verdict_level     TEXT         NOT NULL DEFAULT 'unknown', -- clean | caution | red_flags | unknown
+    verdict_level     TEXT         NOT NULL DEFAULT 'unknown', -- clean | caution | red_flags | insufficient | unknown
     verdict_label     TEXT,
     ticker            TEXT,
     verdict_summary   TEXT,
@@ -151,7 +151,7 @@ CREATE TABLE IF NOT EXISTS scout_deliveries (
     call_id           INTEGER      REFERENCES scout_calls (id) ON DELETE SET NULL,
     contract_address  TEXT         NOT NULL,
     target            TEXT         NOT NULL,               -- "me", @channel, chat id, "bot API chat …"
-    status            TEXT         NOT NULL,               -- sent | failed
+    status            TEXT         NOT NULL,               -- sent | failed | sending (re-check: before the send)
     header_text       TEXT         NOT NULL DEFAULT '',
     delivered_at      TIMESTAMPTZ,
     error             TEXT,
@@ -428,10 +428,15 @@ LEFT JOIN LATERAL (
 -- Perceptor verdict: this call's own scan, else the latest scan of the same token requested at or
 -- before the call (COALESCE: a manual scan has call_id NULL, and DESC puts NULL first).
 -- Live scans only: a rescan (scan_kind 'rescan') is today's verdict, not one known at call time.
+-- A live Perceptor re-check (scan_kind 'live', details {"recheck":1}, made 12 minutes after the
+-- call by the listener, recheck.go) is never used: perceptor_verdict is a model input and must be
+-- what was known when the call came in (live scoring sees the first answer). The website shows
+-- the re-check; the 2-hour re-check is a 'rescan' and excluded anyway.
 LEFT JOIN LATERAL (
     SELECT i.verdict_level FROM scout_investigations i
     JOIN scout_investigation_tools tt ON tt.id = i.tool_id
     WHERE tt.code = 'perceptor' AND i.status = 'completed' AND i.scan_kind = 'live'
+      AND i.details->>'recheck' IS NULL
       AND (i.call_id = cv.call_id OR (i.contract_address = cv.contract_address AND i.requested_at <= cv.message_date))
     ORDER BY COALESCE(i.call_id = cv.call_id, false) DESC, i.requested_at DESC, i.id DESC LIMIT 1
 ) p ON true
@@ -533,3 +538,18 @@ BEGIN
     END IF;
 END
 $$;
+
+-- ---------------------------------------------------------------------------
+-- Perceptor "not enough data yet" (verdict_level 'insufficient')
+-- ---------------------------------------------------------------------------
+-- Perceptor answers "$TOKEN on-chain check: not enough data yet" for a token too
+-- new to judge. Before that answer had a level of its own it was stored as
+-- 'unknown' ("verdict not readable"). Relabel those rows from their stored text:
+-- completed Perceptor investigations still 'unknown' whose report says "not enough
+-- data yet" (any letter case). Only verdict_level and verdict_label change.
+-- Repeat-safe: a relabelled row no longer matches.
+UPDATE scout_investigations i
+SET verdict_level = 'insufficient', verdict_label = 'not enough data yet'
+FROM scout_investigation_tools t
+WHERE t.id = i.tool_id AND t.code = 'perceptor' AND i.status = 'completed'
+  AND i.verdict_level = 'unknown' AND i.report_text ILIKE '%not enough data yet%';
