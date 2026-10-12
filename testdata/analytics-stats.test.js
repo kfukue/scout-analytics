@@ -248,6 +248,85 @@ check('shortNum rollover', [S.shortNum(999), S.shortNum(999.96), S.shortNum(1000
 check('signedPct', [S.signedPct(0), S.signedPct(0.04), S.signedPct(-0.04), S.signedPct(0.05), S.signedPct(4.1), S.signedPct(-12.3), S.signedPct(999.6), S.signedPct(1234)],
   ['0%', '0%', '0%', '+0.1%', '+4.1%', '−12%', '+1k%', '+1.2k%']);
 
+// ---- Timing tab --------------------------------------------------------------
+
+// time bands: the lower end belongs to the band (exactly 5 minutes is 5–15m)
+check('time band labels', S.TIME_BANDS.map(function (b) { return b.label; }),
+  ['< 5m', '5–15m', '15–60m', '1–4h', '4–24h', '1–3d', '3–7d', '7–30d']);
+[
+  [0, 0], [299, 0], [300, 1], [899, 1], [900, 2], [3599, 2], [3600, 3], [14399, 3], [14400, 4], [86399, 4],
+  [86400, 5], [259199, 5], [259200, 6], [604799, 6], [604800, 7], [2592000, 7], [9e9, 7],
+  [-1, -1], [NaN, -1], [null, -1], [undefined, -1]
+].forEach(function (c) { check('timeBand(' + c[0] + ')', S.timeBand(c[0]), c[1]); });
+check('timeHistogram', S.timeHistogram([0, 300, 301, 3600, 86400, 604800, 2592000, null, -5]), [1, 2, 0, 1, 0, 1, 0, 2]);
+
+// held at 2×: never reached = 0 (the owner's rule), touch and drop = 0 as stored
+check('heldValue', [S.heldValue(null, null), S.heldValue(undefined, 0), S.heldValue(600, 0), S.heldValue(600, 3600), S.heldValue(600, null)],
+  [0, 0, 0, 3600, NaN]);
+// … and the hold from the first cross: censored keeps its held time; a fall
+// counts at most the time from the first cross to the first close under 2×
+check('holdItem: never reached', S.holdItem(null, 0, null, false), null);
+check('holdItem: touch and drop', S.holdItem(600, 0, 900, false), { t: 0, event: true });
+check('holdItem: one stretch', S.holdItem(600, 1200, 2100, false), { t: 1200, event: true });
+check('holdItem: fell back, rose again', S.holdItem(600, 7200, 2100, false), { t: 1500, event: true });
+check('holdItem: censored', S.holdItem(600, 3000, null, true), { t: 3000, event: false });
+check('holdItem: censored, first 2x in the last bucket', S.holdItem(3300, 0, null, true), { t: 0, event: false });
+
+// Kaplan–Meier, worked by hand: times 0 E, 300 E, 300 C, 600 C, 900 E, 1200 C
+//   t=0:   6 at risk, 1 event → S = 5/6
+//   t=300: 5 at risk, 1 event (the censored one at 300 still at risk) → S = 5/6 × 4/5 = 2/3
+//   t=600: censored only → S stays 2/3
+//   t=900: 2 at risk, 1 event → S = 2/3 × 1/2 = 1/3   (median: 900)
+//   t=1200: censored → S stays 1/3
+(function () {
+  var km = S.kaplanMeier([
+    { t: 900, event: true }, { t: 300, event: false }, { t: 0, event: true },
+    { t: 1200, event: false }, { t: 300, event: true }, { t: 600, event: false }
+  ]);
+  check('KM n, events, censored, end', [km.n, km.events, km.censored, km.end], [6, 3, 3, 1200]);
+  check('KM times', km.points.map(function (p) { return p.t; }), [0, 0, 300, 900]);
+  check('KM at risk', km.points.map(function (p) { return p.atRisk; }), [6, 6, 5, 2]);
+  near('KM S(0)', km.points[1].s, 5 / 6);
+  near('KM S(300)', km.points[2].s, 2 / 3);
+  near('KM S(900)', km.points[3].s, 1 / 3);
+  near('KM median', km.median, 900);
+  near('stepAt before the first event', S.stepAt([{ t: 0, s: 1 }, { t: 300, s: 0.5 }], 299), 1);
+  near('stepAt(600) = S after 300', S.stepAt(km.points, 600), 2 / 3);
+  near('stepAt(5000)', S.stepAt(km.points, 5000), 1 / 3);
+  near('stepAt(0) takes the drop at 0', S.stepAt(km.points, 0), 5 / 6);
+  // no events: flat at 1, no median; all censored at once
+  var none = S.kaplanMeier([{ t: 100, event: false }, { t: 100, event: false }]);
+  check('KM all censored', [none.points.length, none.events, none.censored], [1, 0, 2]);
+  near('KM all censored: no median', none.median, NaN);
+  check('KM empty', [S.kaplanMeier([]).n, S.kaplanMeier([]).points], [0, [{ t: 0, s: 1, atRisk: 0, d: 0 }]]);
+  // every call an event (nothing censored): the curve is 1 − the share fallen
+  var all = S.kaplanMeier([{ t: 10, event: true }, { t: 20, event: true }, { t: 20, event: true }, { t: 40, event: true }]);
+  check('KM no censoring', all.points.map(function (p) { return p.s; }), [1, 0.75, 0.25, 0]);
+  near('KM no censoring: median', all.median, 20);
+}());
+
+// share rugged by t: of n calls; ties make one step; times below 0 count at 0
+check('cumulativeShare', S.cumulativeShare([3600, 300, 300, -20, null], 10),
+  [{ t: 0, s: 0.1, k: 1 }, { t: 300, s: 0.3, k: 3 }, { t: 3600, s: 0.4, k: 4 }]);
+check('cumulativeShare: none', S.cumulativeShare([], 5), [{ t: 0, s: 0, k: 0 }]);
+check('cumulativeShare: n 0', S.cumulativeShare([5], 0), [{ t: 0, s: 0, k: 0 }]);
+
+// means and medians of times, with the 0-held rule: 4 timed calls, two never
+// reached 2× (0 held), one touch and drop (0), one held 2 hours
+(function () {
+  var held = [[null, 0], [null, 0], [600, 0], [900, 7200]].map(function (x) { return S.heldValue(x[0], x[1]); });
+  check('held with the 0 rule', held, [0, 0, 0, 7200]);
+  near('mean held', S.mean(held), 1800);
+  near('median held', S.median(held), 0);
+}());
+
+// the time axis and durations
+near('timeAxis(0)', S.timeAxis(0), 0);
+near('timeAxis(9 minutes)', S.timeAxis(540), 1);
+near('timeAxisInv(timeAxis(86400))', S.timeAxisInv(S.timeAxis(86400)), 86400, 1e-6);
+check('fmtDur', [S.fmtDur(0), S.fmtDur(29), S.fmtDur(300), S.fmtDur(3599), S.fmtDur(5400), S.fmtDur(86399), S.fmtDur(86400),
+  S.fmtDur(2592000), S.fmtDur(-120), S.fmtDur(NaN)], ['0m', '0m', '5m', '1h', '1.5h', '1d', '1d', '30d', '−2m', '–']);
+
 if (failures) {
   console.error(failures + ' of ' + count + ' checks failed');
   process.exit(1);

@@ -38,6 +38,7 @@ func syntheticWebRows(n int, seed int64) []ScoutWebRow {
 	lrng := rand.New(rand.NewSource(seed + 1000)) // the latest price has its own source, so the rest stays as it was
 	mrng := rand.New(rand.NewSource(seed + 2000)) // so do the market caps
 	srng := rand.New(rand.NewSource(seed + 3000)) // and the sAlpha reports
+	trng := rand.New(rand.NewSource(seed + 4000)) // and the timing after the call
 	// a market cap from the post: mostly one of few values (many ties), now and
 	// then missing, zero, negative or a number JSON cannot carry
 	mcap := func() *float64 {
@@ -160,8 +161,55 @@ func syntheticWebRows(n int, seed int64) []ScoutWebRow {
 			id := 2000000 + i
 			r.SAlphaID = &id
 		}
+		syntheticTiming(r, trng)
 	}
 	return rows
+}
+
+// syntheticTiming fills the timing after the call of a synthetic row (its own
+// random source, so the other fields stay as they were): most windows with a
+// return have their timing; a few reached 2× (some censored, some touch and
+// drop: held 0); rugged rows mostly have a rug time of one of the kinds (a
+// rug at the call before the post), now and then one of a kind the website
+// does not know.
+func syntheticTiming(r *ScoutWebRow, rng *rand.Rand) {
+	for h, secs := range webHorizonSeconds {
+		if r.HasPerf&(1<<(h*webPerfPerHorizon)) == 0 || rng.Intn(8) == 0 {
+			continue // no return for the window, or its timing not computed yet
+		}
+		r.Timed |= 1 << h
+		set := func(k int, v int32) {
+			r.Timing[h*webTimingPerHorizon+k] = v
+			r.HasTiming |= 1 << (h*webTimingPerHorizon + k)
+		}
+		set(0, int32(rng.Intn(secs/300+1)*300))
+		set(2, 0)
+		if rng.Intn(4) != 0 {
+			continue // never reached 2×
+		}
+		first := rng.Intn(secs/300) * 300
+		set(1, int32(first))
+		switch rng.Intn(4) {
+		case 0: // touch and drop: held 0, fell back at the end of the bucket
+			set(3, int32(first+300))
+		case 1: // still at 2× at the end of the window
+			set(2, int32(secs-first-300))
+			r.Censored2x |= 1 << h
+		default:
+			held := rng.Intn((secs-first)/300+1) * 300
+			set(2, int32(held))
+			set(3, int32(min(first+300+held, secs)))
+		}
+	}
+	if r.Rugged != nil && *r.Rugged && rng.Intn(5) != 0 {
+		kinds := []string{rugAtEvent, rugAtEvent, rugAtEvent, rugAtDetected, rugAtDetected, rugAtAtCall, "later_kind"}
+		k := kinds[rng.Intn(len(kinds))]
+		s := 60 + rng.Intn(40*86400)
+		if k == rugAtAtCall {
+			s = -rng.Intn(600)
+		}
+		r.RugAfterS, r.RugAtKind = &s, &k
+	}
 }
 
 // syntheticWebReports makes the report of every id rows refer to, the way

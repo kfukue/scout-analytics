@@ -1,0 +1,3 @@
+# Vendored builds are kept byte for byte as built (their sha256 is recorded):
+# no line-ending conversion on checkout (core.autocrlf would change them).
+* -text

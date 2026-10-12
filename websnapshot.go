@@ -826,6 +826,14 @@ func hashWebRows(rows []ScoutWebRow, updatePosts int, gmgn string) string {
 		optInt(r.PreSwaps60)
 		optFlt(r.PreChg60)
 		opt(r.PreVolUnit)
+		// and the timing after the call (the "Timing" tab), as read
+		buf = binary.LittleEndian.AppendUint32(buf, r.HasTiming)
+		for _, v := range r.Timing {
+			buf = binary.LittleEndian.AppendUint32(buf, uint32(v))
+		}
+		buf = append(buf, r.Timed, r.Censored2x)
+		optInt(r.RugAfterS)
+		opt(r.RugAtKind)
 		h.Write(buf)
 	}
 	return hex.EncodeToString(h.Sum(nil)[:12])

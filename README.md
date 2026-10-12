@@ -1626,13 +1626,18 @@ other sites):
   a system font stack). `style.css` only; no web fonts or other sites are loaded.
 
 **Analytics page** (`/analytics.html`; "Analytics" in the top bar of the list, "Calls" back).
-Section 1, **Call performance**, is built, in three tabs (**Overview**, **By factor**, **Peak vs
-final**); section 2, "Model insights", is an empty heading for now. Everything on it is **first
+Section 1, **Call performance**, is built, in four tabs (**Overview**, **By factor**, **Peak vs
+final**, **Timing**); section 2, "Model insights", is an empty heading for now. Everything on it is **first
 calls only, late entry (60 s after the post), in USD, before tax; values rounded to 0.1**,
 worked out in the browser from one compact feed (`GET /api/analytics`, below), so every choice
-is instant and no request reads the database. The charts are SVG drawn by the page's own script
-(`frontend/analytics.js`, no chart library); the pure calculations (mean and median,
-equal-count groups, histogram bands, symmetric-log scale, UTC weeks, "$100 on every call") are
+is instant and no request reads the database. The charts of the first three tabs are SVG drawn
+by the page's own script (`frontend/analytics.js`); the Timing tab draws on a canvas with
+**Apache ECharts 6.1.0**, vendored as one custom build in `frontend/vendor/` (served by the
+program like the page's other files; nothing is loaded from other sites; how it was built, its
+sha256 and its licences: `frontend/vendor/README.md`, `ECHARTS-LICENSE.txt`,
+`ECHARTS-NOTICE.txt`). The pure calculations (mean and median, equal-count groups, histogram
+bands, symmetric-log scale, UTC weeks, "$100 on every call", and for the Timing tab the time
+bands, the 0-held rule, Kaplan–Meier and the share rugged by t) are
 in `frontend/analytics-stats.js`, tested by `node testdata/analytics-stats.test.js` (no
 dependencies; `go test` runs it when `node` is on the PATH). Only the visible tab is drawn
 (under 0.2 s per tab change on 5,600 calls in headless Edge).
@@ -1679,6 +1684,51 @@ dependencies; `go test` runs it when `node` is on the PATH). Only the visible ta
 - **Peak vs final tab:** every call's peak against its return at the window (both symmetric
   log, a dashed "return = peak" line) and the share of calls with a peak above 0% that gave back
   more than half of it (return < peak ÷ 2).
+- **Timing tab:** when things happened after the call, within the chosen window (the timing
+  columns of "Timing after the call" above; results after the call, never model inputs). It
+  counts the **timed** calls: first calls priced in USD with a return for the window **and**
+  their timing computed (`timing_at` set); calls with a return but no timing yet are left out
+  and counted ("Timing not computed"). Times are counted from the post; their resolution is 5
+  minutes on the first day and 1 hour after. The window, Pool family, Verdict and Quiet choices
+  apply as on the other tabs.
+  - **Counts:** calls, with data, timed, timing not computed, reached 2× (touched twice the
+    late entry price), still at 2× at the end (censored), touch and drop, rugged in the window.
+  - **How long it took:** five histograms in log bands (< 5m, 5–15m, 15–60m, 1–4h, 4–24h,
+    1–3d, 3–7d, 7–30d; a time on a boundary goes to the band above it), each bar a share of its
+    chart's n: **time to peak** (every timed call), **time to the first 2×** (the calls that
+    reached 2×), **time held at 2×** on closes (every timed call), **time to fall back below
+    2×** (the calls that reached 2× and fell back within the window; the censored ones are left
+    out) and **time to rug** (event rug times within the window).
+  - **The 0-held rule:** a call that never reached 2× counts as **0 held** (owner decision;
+    the grey part of the "0" bar). A **touch and drop**, a call whose price touched 2× (a
+    candle high) but never closed at or above it (`first_2x_after_s` set, `above_2x_s` 0,
+    not censored), counts as reaching 2× with 0 held (option (a); the tab's default, pending
+    the owner's confirmation).
+  - **Rugs by kind of rug time** (a table): event rug times within the window, event rug
+    times after it, rugs **at the call** (drained at or before the post), rugs only
+    **detected** at the end of tracking (their time is that check's, an upper bound), any
+    other kind, and calls flagged rugged without a rug time. Only event rug times within the
+    window are in the time-to-rug histogram and the "share rugged by t" curve; at-the-call and
+    detected rugs are always shown **separately**, never in a histogram or curve.
+  - **Mean and median by group:** a table grouped by the Perceptor verdict at the call, the
+    week or month (the Period choice), the pool family, the DEX named in the post, or any
+    number factor of the By factor tab in 4, 5 or 10 equal-count groups (the same choice as
+    on By factor). Per group: timed calls, the share that reached 2×, and the median and mean
+    (with n) of the time to peak, to the first 2×, held at 2× (0 for calls that never reached
+    it), to fall below 2× and to rug; the share still at 2× at the end; and the Kaplan–Meier
+    median of the time held ("half fell back by").
+  - **Still at 2× after t:** a Kaplan–Meier curve per group (and all timed calls) over the
+    calls that reached 2×, t counted from the first 2×. A call that fell back counts at the
+    time it held on closes, at most until its first close under 2× (a touch and drop falls at
+    0); a call still at 2× when the window ended is censored (it counts as at 2× up to then,
+    not as a fall).
+  - **Share rugged by t:** per group, the share of the timed calls whose pool was drained
+    (event rug times) within t of the post: a plain running share, as every timed call was
+    followed for the whole window.
+  - Both curves have a log time axis; a group with fewer than 20 calls is greyed out
+    (dashed in the curves). The tooltips are built by the page from text only (the page's
+    Content-Security-Policy blocks the chart library's own tooltip markup). When the chart
+    library cannot be loaded the tab says so, and the counts and tables still show.
 - **Counts** of the selection for the window: calls, with data, not due yet (called less than
   the window ago), due but no data (stored as `no_data`), waiting for the tracker (due, tracked
   in USD, not recorded yet), not tracked / no USD price.
@@ -1967,15 +2017,19 @@ the list's other fields move, such as latest prices), `If-None-Match` → `304`,
 clients that take it; `503` before the first snapshot.
 
 ```json
-{"format": 3, "horizons": ["1h","1d","3d","7d","30d"], "horizon_seconds": [3600,86400,259200,604800,2592000],
+{"format": 4, "horizons": ["1h","1d","3d","7d","30d"], "horizon_seconds": [3600,86400,259200,604800,2592000],
  "quiet_below": 50, "verdicts": ["clean","caution","red_flags","unknown","none"],
+ "rug_kinds": ["event","at_call","detected","other"],
  "families": ["v4","v2","pons","v3","gecko","untracked"], "dexes": ["Uniswap V4","Pons V2","…"], "quotes": ["WETH","USDG"],
  "columns": ["call_id","t","flags","verdict","family","dex","quote","trades_24h","no_data",
              "ret_1h","peak_1h","dd_1h","ret_1d","peak_1d","dd_1d","…","dd_30d",
              "mcap","holders","proof_elite","proof_good","buys_elite_n","buys_good_n",
-             "buys_elite_usd","buys_good_usd","pre_buy_usd","pre_sell_usd","pre_swaps","pre_chg"],
+             "buys_elite_usd","buys_good_usd","pre_buy_usd","pre_sell_usd","pre_swaps","pre_chg",
+             "tpeak_1h","t2x_1h","held_1h","tfall_1h","tpeak_1d","…","tfall_30d",
+             "timed","cens_2x","rug_s","rug_kind"],
  "rows": [[812, 1790000000, 5, 0, 1, 3, 0, 214, 0, 12.5, 40.1, -3.2, -20, 100, -50, null, null, null, …,
-           45700, 812, 3, 11, 2, 5, 1230, 20000, 15000, 9000, 31, -12.3]]}
+           45700, 812, 3, 11, 2, 5, 1230, 20000, 15000, 9000, 31, -12.3,
+           1500, 600, 1200, 2100, 40000, 600, 1200, null, …, 3, 2, 93601, 0]]}
 ```
 
 - `t` = the call's time (Unix seconds). `flags`: 1 = priced in USD (only these rows have
@@ -2006,10 +2060,29 @@ clients that take it; `503` before the first snapshot.
   `null` without a row). Dollar amounts are whole dollars, 3 significant digits from $1,000 up.
   `format` was 1 before these columns; an open page with the old script says "unexpected
   format; reload the page".
+- Then the timing after the call (the Timing tab; format 4, with `rug_kinds`; outcomes after
+  the call, never model inputs), from the columns of "Timing after the call": per window,
+  `tpeak_<h>` (`peak_late_after_s`), `t2x_<h>` (`first_2x_after_s`), `held_<h>`
+  (`above_2x_s`) and `tfall_<h>` (`fall_below_2x_after_s`), whole seconds after the post.
+  They are sent only for a window whose row is `done` and has its timing computed
+  (`timing_at` set; bit *i* of `timed`); otherwise all four are `null`, even when the
+  columns hold numbers. Within a timed window, `null` means what `NULL` means in the column:
+  `t2x` `null` = never reached 2×; `tfall` `null` = never reached 2×, or still at 2× when the
+  window ended. `held` is `0` for a call that never reached 2× or touched it and never
+  closed at or above it.
+  - `timed`: bit *i* set = window *i* of `horizons` has its timing; `cens_2x`: bit *i* =
+    `above_2x_censored` of a timed window *i* (still at 2× at the end, no rug).
+  - `rug_s` = `scout_call_tracking.rug_at` − `entry_at` in whole seconds (`0` or negative
+    for a rug at or before the post), `null` = no rug time stored. `rug_kind` = an index
+    into `rug_kinds` (`rug_at_kind`: `event`, `at_call`, `detected`; `other` = a kind
+    this version does not know, or a time without a kind), `-1` = none. The page keeps
+    `at_call` and `detected` apart from `event` (see the Timing tab).
 - Size: about 158 bytes a row, about 50 compressed (5,600 synthetic rows: 883 KB, 283 KB
   gzipped; without the factor columns the same rows are 640 KB, 209 KB gzipped; the real data
   was 117 / 39 bytes a row before, so expect about 160 / 53 now: about 960 KB, 320 KB gzipped
-  for 6,000 rows).
+  for 6,000 rows). These figures are from before format 4: the timing columns add 24 values a
+  row (mostly `null` or short whole numbers); 600 synthetic rows of format 4 were 253 bytes a
+  row, 45 gzipped (not measured on real data yet).
 - The fields behind it are part of the list's snapshot version, so a change to any of them also
   changes the `ETag` of `/api/calls`.
 
