@@ -1,12 +1,17 @@
 # Scout analytics: handoff to Claude Code
 
-## Session state (12 October 2026, after the owner merged items #1-#5 and #7 (PRs #18-#23) and deployed 68a4954)
+## Session state (12 October 2026, after the owner merged items #1-#7 (PRs #18-#24) and the 12 Oct handoff (PR #25), and deployed 68a4954)
 
-**Main and prod:** main is at **c31d859** on GitHub (PR #23 merged 12 Oct,
-`ml/` only). Prod still runs **68a4954** (deployed 12 Oct); the Go
-processes need nothing from #23, only the checkout the scoring service runs
-`serve.py` from. This 12 Oct handoff itself was never merged until this PR
-(`work/2026-10-12-handoff`). Merged since dc0a42d (session item → PR, merge
+**12 October: agent setup redone by function** (5 agents + 5 skills; see
+"Agent setup"), committed on branch `work/2026-10-12-agent-setup` (worktree
+`.claude/worktrees/agent-setup-20261012`), rebased onto 41a27b0; takes
+effect only after the merge and a Claude Code restart.
+
+**Main and prod:** main is at **41a27b0** on GitHub (PR #25, the 12 Oct
+handoff, merged 12 Oct; PR #24, the scoring-service unit, merged just
+before it). Prod still runs **68a4954** (deployed 12 Oct); the Go
+processes need nothing from #23-#25, only the checkout the scoring service
+runs `serve.py` from. Merged since dc0a42d (session item → PR, merge
 commit, branch head):
 
 - PR #15 (f072467, 10 Oct): ML walk-forward minimum, weeks with fewer than
@@ -29,10 +34,17 @@ commit, branch head):
 - #7 delivery model line → PR #23 (c31d859; head 65baa2b): scoring-service
   env var `SCOUT_MODEL_LINE=passed|all` (default `passed`; with `all`,
   failing buckets are marked "(not validated)"); `ml/` only.
-- Docs for the 12 Oct decision → this PR (`work/2026-10-12-handoff`): the
-  seven docs `README.md` ("Scoring new calls"), `ml/README.md`,
-  `ml/RUNBOOK.md` (step 9 "Scores on deliveries"), `ml/run_training.sh`
-  (echoed notes only), `.claude/agents/ml-coder.md`,
+- #6 scoring-service unit → PR #24 (77dce3d; head 944ecfd):
+  `ops/scout-model.service`, `ops/scout-model.md`, `DEPLOY.md` (section
+  2.4), `ops/README.md`, `.gitattributes`. Not installed on prod yet: next
+  the owner installs it per `ops/scout-model.md`, then sets
+  `SCOUT_MODEL_URL` in `.env` and restarts the listener ("Then switch
+  scores on" below).
+- Docs for the 12 Oct decision → PR #25 (41a27b0; head 8ed2714,
+  `work/2026-10-12-handoff`): the seven docs `README.md` ("Scoring new
+  calls"), `ml/README.md`, `ml/RUNBOOK.md` (step 9 "Scores on deliveries"),
+  `ml/run_training.sh` (echoed notes only), `.claude/agents/ml-coder.md`
+  (its rule now lives in the `scout-ml` skill),
   `.claude/skills/scout-product-manager/SKILL.md` and this file now state the
   `SCOUT_MODEL_LINE` rule. Done.
 
@@ -53,11 +65,11 @@ to 2× / still ≥ 2× at end): 1h 5247/1365/434/229; 1d 5196/1863/850/81; 3d
 **Owner rules:** agents never push (`git push` is denied in
 `.claude/settings.json`) and agents' `git commit` isn't allowed either: the
 PM gives exact commit/push commands and the owner runs them; never commit to
-main. Reviewer runs on `fable`, researcher on `opus` (the owner asked for
-`fable` for one ML-planning research task). Up to 10 coding agents. The
-testing setup (tester agent, `verify` in the new setup, testdb scripts, CI)
-stays PAUSED (re-confirmed by the owner 12 Oct); coders run DB
-tests themselves with the manual throwaway-Postgres steps in `TESTING.md`.
+main. `review` runs on `fable`, `investigate` on `opus` (the owner asked
+for `fable` for one ML-planning research task). Up to 10 writing agents.
+The testing setup is PAUSED: the `verify` agent, the testdb scripts and CI
+(re-confirmed by the owner 12 Oct); `implement` runs DB tests
+itself with the manual throwaway-Postgres steps in `TESTING.md`.
 Paused work (both worktrees at dc0a42d, untracked files; keep them):
 `agent-afcf62469a29564cf` (`scripts/testdb.sh`, `scripts/testdb.ps1`;
 review-fix state unknown, a real PowerShell 5.1 run is still a must-fix;
@@ -97,10 +109,8 @@ decision 12 Oct" below; scores never filter deliveries):
 2. Done: the line-all change is merged (PR #23, c31d859): scoring-service
    env var `SCOUT_MODEL_LINE=passed|all` (default `passed`); with `all`,
    failing buckets are marked "(not validated)".
-3. Finish the review of the scoring-service unit #6 (worktree
-   agent-ab0f0dba0692e4540, at c31d859; updated by infra 12 Oct, review in
-   progress), then the owner commits/pushes it on
-   `work/2026-10-12-scoring-service`.
+3. Done: the scoring-service unit #6 is merged (PR #24, 77dce3d; head
+   944ecfd, `work/2026-10-12-scoring-service`).
 4. The checkout the unit runs `serve.py` from must be at c31d859 or later
    (68a4954's `serve.py` ignores `SCOUT_MODEL_LINE`).
 5. Install `ops/scout-model.service` per `ops/scout-model.md`, with
@@ -120,17 +130,17 @@ plan: `SCOUT_MODEL_LINE=all` in the scout-model unit. Scores still never
 filter deliveries. This supersedes the earlier rule "scores only appended
 once gates pass" for this owner-only group. The code is merged (PR #23);
 the docs (README, `ml/README.md`, `ml/RUNBOOK.md`, `ml/run_training.sh`,
-`ml-coder.md`, the PM skill, this file) are updated in this PR.
+`ml-coder.md` (now the `scout-ml` skill), the PM skill, this file) were
+updated in PR #25.
 
 **Not merged (agent worktrees under `.claude/worktrees/`):**
 
 | # | Worktree | Branch to create/use | State | Files | Notes |
 |---|---|---|---|---|---|
-| 6 | agent-ab0f0dba0692e4540 (locked; at c31d859, fast-forwarded 12 Oct) | `work/2026-10-12-scoring-service` | uncommitted; updated by infra 12 Oct, review in progress | untracked `ops/scout-model.service`, `ops/scout-model.md`; modified `DEPLOY.md` (new section 2.4 scoring service, health-check row, daily-use restart line), `ops/README.md` | systemd unit + runbook for `ml/serve.py` (uvicorn 127.0.0.1:8601, runs as the owner's account because models are umask 077, no secrets, hardened, follows `LATEST`). The unit sets `Environment=SCOUT_MODEL_LINE=all` (owner decision 12 Oct). Validated with `systemd-analyze verify` and `systemd-analyze security` (3.0 OK) in a local ubuntu:24.04 container. Finish the review before committing. |
 | — | agent-ae167c3d46439a04d | `worktree-agent-ae167c3d46439a04d` (work branch not named yet) | sAlpha re-ask; uncommitted, at d5d96ac (29 commits behind 68a4954) | — | See "Still to do". |
 | — | agent-afcf62469a29564cf, agent-aa31691b57e3bc7ff | `work/2026-10-09-testdb-scripts`, `work/2026-10-09-ci-tests` (to create) | testdb scripts, CI; paused, untracked | — | See "Owner rules" above. |
-| — | agent-setup-20261012 (at c31d859) | `work/2026-10-12-agent-setup` | owner's subagent-setup change; built and reviewed (PASS, no must-fix), uncommitted | `.claude/agents/*` (7 deleted, 5 new, `product-manager.md`), new `.claude/skills/scout-*/`, the PM skill, HANDOFF.md, README.md, TESTING.md | Replaces the 7 role agents (coder, ml-coder, react-coder, infra, tester, reviewer, researcher) with 5 function agents (`investigate` on opus, `implement`, `simplify`, `verify` (paused), `review` on fable) plus skills `scout-rules`, `scout-go`, `scout-web`, `scout-ml`, `scout-infra`; React dropped. Rebase onto main AFTER this handoff branch merges (both edit HANDOFF.md and the PM skill; this branch's `SCOUT_MODEL_LINE` rule in `ml-coder.md` moves into `scout-ml`), short re-review, then the owner commits/merges and restarts Claude Code. |
-| — | timing-touchdrop-20261012 (at c31d859) | `work/2026-10-12-timing-touch-drop` | in progress, uncommitted | `frontend/analytics*`, `testdata/analytics-stats.test.js`, `webanalytics_test.go`, README.md | New "reached 2×" rule (owner decision 12 Oct, section 3 "Decisions 12 October"); no data change, no re-track. |
+| — | agent-setup-20261012 (at 41a27b0) | `work/2026-10-12-agent-setup` | owner's subagent-setup change; rebased onto 41a27b0, committed on `work/2026-10-12-agent-setup`; re-review, then owner pushes/merges and restarts Claude Code | `.claude/agents/*` (7 deleted, 5 new, `product-manager.md`), new `.claude/skills/scout-*/`, the PM skill, HANDOFF.md, README.md, TESTING.md | Replaces the 7 role agents (coder, ml-coder, react-coder, infra, tester, reviewer, researcher) with 5 function agents (`investigate` on opus, `implement`, `simplify`, `verify` (paused), `review` on fable) plus skills `scout-rules`, `scout-go`, `scout-web`, `scout-ml`, `scout-infra`; React dropped. The `SCOUT_MODEL_LINE` rule from `ml-coder.md` (PR #25) is in `scout-ml`. |
+| — | timing-touchdrop-20261012 (at c31d859) | `work/2026-10-12-timing-touch-drop` | built, in review; owner to choose how the 1h window is handled | `frontend/analytics*`, `testdata/analytics-stats.test.js`, `webanalytics_test.go`, README.md | New "reached 2×" rule (owner decision 12 Oct, section 3 "Decisions 12 October"); no data change, no re-track. |
 
 **GCP site (#5): merged as PR #18 (4245939)**, a draft only (`deploy/gcp/`,
 `deploy/gcp/INTERFACE.md`); no Go export and no GCP resources yet, so
@@ -168,8 +178,8 @@ wave (136/148), so it stays report-only.
 **ML research (fable, 10 Oct): next ML plan, report-only variants; the
 prod retrain is done (20261012-1917) and the line-all change is merged
 (PR #23); the first variants are not started; the owner's subagent-setup
-change is built and reviewed, awaiting merge; the variants start after it
-merges and Claude Code is restarted (see "Still to do"):**
+change is committed and rebased, awaiting re-review and merge; the variants
+start after it merges and Claude Code is restarted (see "Still to do"):**
 (1) seed stability (3 seeds) +
 stronger regularisation;
 (2) regime diagnostics: adversarial validation, pooled walk-forward with
@@ -191,8 +201,8 @@ stability checks. The 20261012-1917 report (medium fell from lift 2.60 PASS
 to 1.88 FAIL in two days) makes the (b)-style pooled WF / bootstrap-CI
 gates more relevant; the ML stability variants (seeds, pooled WF +
 bootstrap CI, no-dead re-evaluation) are not started; they start after the
-subagent-setup change (built and reviewed, awaiting merge) merges and
-Claude Code is restarted.
+subagent-setup change (committed and rebased, awaiting re-review and merge)
+merges and Claude Code is restarted.
 
 **Owner decisions still open:** ML gates (a) keep current + stability
 checks / (b) stricter pooled-WF/bootstrap-CI gates (see the 12 Oct note
@@ -204,6 +214,9 @@ manager for lylelabs.io; the public-repo items (a)-(c) in section 3
 "Decisions 12 October" (commit-email metadata, PR text skim, prod database
 name in the docs). Optional: fix PC PATH `<postgres dir>\bin` ->
 `<postgres dir>\17\bin`.
+
+**Owner note (PC):** PowerShell on the owner's PC may not have git on PATH;
+`$env:Path += ";C:\Program Files\Git\cmd"` fixes it for the session.
 
 **Stash (owner):** the Perceptor re-check is committed and merged (PR #20),
 so its backup stash can go: `git stash list`, confirm `stash@{0}` is still
@@ -230,8 +243,9 @@ checkout):** on 12 Oct every local `work/*` branch (21) was in
    `...\agent-adc7b7e6c79d4bb23` (timing-backend),
    `...\agent-af53dbd18b713cb60` (ml-wf-min),
    `...\agent-a91f7f4e909abfd02` (#7 ml-line-all, PR #23; clean on 12 Oct),
-   and `...\agent-af197a4c6cbe0f7db` (this handoff update, after its PR
-   merges).
+   `...\agent-ab0f0dba0692e4540` (#6 scoring-service, PR #24; locked, so
+   unlock it first) and `...\agent-af197a4c6cbe0f7db` (12 Oct handoff,
+   PR #25).
 3. `git branch -d` every merged branch: `work/2026-10-08-ml-pool-web`,
    all `work/2026-10-09-*` (agent-setup, analytics-charts, analytics-page,
    flaky-pacing-test, gcp-site, handoff-queue, mcap-supply,
@@ -240,7 +254,8 @@ checkout):** on 12 Oct every local `work/*` branch (21) was in
    salpha-capture, timing-backend) and all `work/2026-10-10-*`
    (handoff-pause, ml-score-gating, score-live-fixes, timing-tab);
    `work/2026-10-12-ml-line-all` (merged as PR #23; remove its worktree
-   first if it still has one); later `work/2026-10-12-handoff` once merged.
+   first if it still has one); `work/2026-10-12-scoring-service` (PR #24)
+   and `work/2026-10-12-handoff` (PR #25).
    Note: GitHub Desktop shows its
    stash only on `work/2026-10-09-ml-variants`; deleting that branch keeps
    the stash in `git stash list` but hides it in Desktop, so the owner may
@@ -248,12 +263,12 @@ checkout):** on 12 Oct every local `work/*` branch (21) was in
 4. `git push origin --delete` the same ones that exist on origin (all of
    them except `work/2026-10-08-ml-pool-web`, which has no remote branch).
 
-Keep: `agent-ab0f0dba0692e4540` (#6, locked), `agent-ae167c3d46439a04d`
+Keep: `agent-ae167c3d46439a04d`
 (sAlpha re-ask), `agent-afcf62469a29564cf` and `agent-aa31691b57e3bc7ff`
 (paused testing), `agent-setup-20261012` (`work/2026-10-12-agent-setup`,
-awaiting merge after this PR) and `timing-touchdrop-20261012`
-(`work/2026-10-12-timing-touch-drop`, in progress), the
-`worktree-agent-*` branches of the first four, and the GitHub Desktop stash. No agent test Postgres servers were
+committed, awaiting re-review, push and merge) and `timing-touchdrop-20261012`
+(`work/2026-10-12-timing-touch-drop`, in review), the
+`worktree-agent-*` branches of the first three, and the GitHub Desktop stash. No agent test Postgres servers were
 running on 12 Oct (only the owner's own Windows service). Old agent
 scratchpads take ~5.5 GB under `...\AppData\Local\Temp\claude\...`; the
 owner may delete old session folders there (not the current session's).
@@ -261,12 +276,13 @@ Never touch the owner's own Postgres server.
 
 **Still to do:**
 
-- Subagent-setup change (worktree `agent-setup-20261012`): after this
-  handoff PR merges, rebase it onto main, short re-review, then the owner
-  commits/merges and restarts Claude Code.
+- Subagent-setup change (worktree `agent-setup-20261012`): rebased onto
+  41a27b0, committed on `work/2026-10-12-agent-setup`; re-review, then the
+  owner pushes/merges and restarts Claude Code.
 - Timing tab "reached 2×" rule (≥ 1 h at or above 2×; section 3
-  "Decisions 12 October"): in progress in worktree
-  `timing-touchdrop-20261012`.
+  "Decisions 12 October"): built, in review in worktree
+  `timing-touchdrop-20261012`; owner to choose how the 1h window is
+  handled.
 - sAlpha re-ask (worktree `agent-ae167c3d46439a04d`, at d5d96ac, 29
   commits behind main 68a4954): update onto main (which now has the
   Perceptor re-check and its `sending` delivery status), then
@@ -277,9 +293,10 @@ Never touch the owner's own Postgres server.
 - ML timing outcome columns in the dataset view (the `timing_`/rug leakage
   guard is on main since PR #19).
 - GCP Go export per `deploy/gcp/INTERFACE.md` (after the publish decision).
-- ML stability variants (ml-coder; research plan above): not started;
-  they start after the owner's subagent-setup change (built and reviewed,
-  awaiting merge) merges and Claude Code is restarted (the worktrees could
+- ML stability variants (`implement` with `scout-ml`; research plan
+  above): not started; they start after the owner's subagent-setup change
+  (committed and rebased, awaiting re-review and merge) merges and Claude
+  Code is restarted (the worktrees could
   not be created on 12 Oct: "Could not read the repository git config to
   neutralize filter drivers", likely a transient git lock; the owner then
   asked to change the subagent setup first). Task: seeds (3) plus a
@@ -288,17 +305,17 @@ Never touch the owner's own Postgres server.
   adversarial validation; late-bound config reads (model.py/validate.py
   bind some config at import); report-only, no gate change. The prod
   retrain is done (20261012-1917).
-- Scoring-service unit #6: updated by infra 12 Oct (worktree
-  agent-ab0f0dba0692e4540, at c31d859), review in progress; then the
-  "switch scores on" steps above.
+- Scoring-service unit #6: merged (PR #24, 77dce3d). Next the owner
+  installs it per `ops/scout-model.md`, then sets `SCOUT_MODEL_URL` in
+  `.env` and restarts the listener (the "switch scores on" steps above).
 - Perceptor re-check deliveries carry no score line today: `recheck.go`
   builds its own header without `scoreCall`, and `main.go` drops
   `scoreLine` when it defers a call for the re-check (the score is still
   stored). Not started; starts after the owner's subagent-setup change
-  (built and reviewed, awaiting merge) merges and Claude Code is restarted
-  (its worktree could not be created on 12 Oct, same git error as above). Task
-  (coder): keep the score line computed at the first pass and append it to
-  the re-check delivery; no recomputation from re-check data. If the change
+  (committed and rebased, awaiting re-review and merge) merges and Claude
+  Code is restarted (its worktree could not be created on 12 Oct, same git
+  error as above). Task (`implement` with `scout-go`): keep the score line
+  computed at the first pass and append it to the re-check delivery; no recomputation from re-check data. If the change
   touches `main.go`, also fix the Bot API byte split (next item).
 - Bot API chunking (`botAPISend` in `main.go`) splits by bytes
   (`chunk[:limit]`, limit 4000) and can cut a multi-byte rune
@@ -314,12 +331,12 @@ Never touch the owner's own Postgres server.
   require every top-level `=== RUN` to have a `--- PASS/FAIL/SKIP` line; CI
   token handling re-review; the scripts' PowerShell run. The owner's
   settings allow-list could add initdb/pg_ctl/createdb, `go tool cover`,
-  `node testdata/...`, `scripts/testdb.*` so the tester avoids prompts
+  `node testdata/...`, `scripts/testdb.*` so `verify` avoids prompts
   (owner's file; agents never edit it).
 
 ## Introduction
 
-Up to date as of 12 October 2026 (main at c31d859; prod at 68a4954). Start Claude
+Up to date as of 12 October 2026 (main at 41a27b0; prod at 68a4954). Start Claude
 Code in the repo root; `.claude/settings.json` makes the session the product
 manager, which delegates to the agents in `.claude/agents/` (see "Agent setup").
 
@@ -345,14 +362,17 @@ gating (PR #19), the score live fixes (PR #21) and the Timing tab (PR #22)
 are on `main` (68a4954) and deployed on prod (owner, 12 Oct); the owner
 checks still open from that deploy are at the top. `SCOUT_MODEL_LINE`
 (PR #23, `ml/` only) is on `main` (c31d859); it takes effect once the
-scoring service runs from a checkout that has it.
+scoring service runs from a checkout that has it. The scoring-service unit
+and runbook `ops/scout-model.*` (PR #24, 77dce3d) are on `main` (41a27b0)
+but not installed on prod yet ("Then switch scores on" at the top).
 
-- **Not on `main`** (each item exists as uncommitted changes in an agent
-  worktree under `.claude/worktrees/` — see the Session state at the top):
-  - Scoring service unit + runbook `ops/scout-model.*`
-    (agent-ab0f0dba0692e4540, at c31d859; untracked `ops/scout-model.*`,
-    modified `DEPLOY.md` and `ops/README.md`; updated by infra 12 Oct,
-    review in progress; branch `work/2026-10-12-scoring-service`).
+- **Not on `main`** (each item exists as uncommitted changes, or a local
+  commit not yet pushed, in an agent worktree under `.claude/worktrees/` —
+  see the Session state at the top):
+  - Agent setup redone by function on 12 October (5 agents + 5 skills),
+    committed on branch `work/2026-10-12-agent-setup` (worktree
+    `agent-setup-20261012`), rebased onto 41a27b0; takes effect only after
+    the merge and a Claude Code restart.
   - Throwaway-Postgres scripts `scripts/testdb.ps1` / `scripts/testdb.sh`
     (agent-afcf62469a29564cf) (paused, see Session state).
   - CI draft `.github/workflows/test.yml` (agent-aa31691b57e3bc7ff; owner
@@ -1115,8 +1135,8 @@ Later:
 - `internal/database/database.go` discards the `pgx5.Connect` /
   `NewWithConfig` errors, keeps 2 connections outside the pool per process,
   and fatally requires `.env` in the working directory.
-- Scatter plot with ECharts 6.1 after the model report (rules in `coder.md`,
-  "Charts").
+- Scatter plot with ECharts 6.1 after the model report (rules in the
+  `scout-web` skill, "Charts").
 - Other launchpads (about 46 unpriced calls); the launchpad query results are
   pending from the owner.
 - Other call sources (Call Analyser channels): paused, section 4 item 6.
@@ -1213,7 +1233,7 @@ Later:
 - Agents never push (`git push` is denied in `.claude/settings.json`); with
   the owner's approval they commit on `work/...` branches, never on `main`;
   the owner pushes and merges.
-- Wait for all checks (tests, reviewer) before committing; separate clean
+- Wait for all checks (tests, `review`) before committing; separate clean
   commits per change.
 - Say "tested locally" unless it ran on the prod server. Flag anything that
   makes the tracker redo history or adds ongoing node load before shipping it.
@@ -1300,27 +1320,49 @@ Checks after deploying `work/2026-10-08-ml-pool-web` (deployed 8 October in
 
 ## Agent setup
 
-- `.claude/agents/` (committed in bde6d81 in the old repo; copied here in the
-  standalone commit with paths for this layout): `coder` (Go + plain JS website,
-  with the Go, JS, CSP and Charts rules), `ml-coder`, `react-coder`, `infra`
-  (approval-gated), `reviewer`, `researcher`, `product-manager`, and `tester`
-  (added 9 October: runs and writes unit and integration tests in a coder's
-  worktree, test files only). All 8 are defined; the tester is paused
-  (owner, 10 Oct; see Session state).
+- Redone by function on 12 October 2026 (replacing the role-based `coder`,
+  `ml-coder`, `react-coder`, `infra`, `tester`, `reviewer` and `researcher`).
+  An agent exists only to isolate context, restrict tools or give fresh eyes.
+  `.claude/agents/`:
+  - `product-manager`: the main session (`"agent"` in
+    `.claude/settings.json`); delegates only, to the five below.
+  - `investigate`: read-only answers about code, data, model reports and
+    outside sources; drafts plans and specs (`model: opus`).
+  - `implement`: changes files in a worktree to the PM's spec, any area.
+  - `simplify`: after `implement`, same worktree; simplifies the changed code
+    without changing behaviour (no Write tool).
+  - `verify`: runs and writes unit and integration tests in the implementer's
+    worktree, test files only; paused (owner, 10 Oct; see Session state).
+  - `review`: read-only critic of the uncommitted diff, PASS/FAIL verdict
+    (`model: fable`).
+  No subagent has the `Agent` tool; none sets `isolation` or `effort`
+  (worktrees are chosen per call). Tools: `investigate` (Read, Grep, Glob,
+  WebSearch, WebFetch, Skill) and `review` (Read, Grep, Glob, Bash, Skill)
+  deny Write/Edit; `simplify` has Edit but not Write; `implement` and
+  `verify` have Read, Write, Edit, Bash, Glob, Grep, Skill. Models:
+  `investigate` on `opus`, `review` on `fable`, the others inherit the
+  session model. Each subagent lists `skills: [scout-rules]`.
+- Project rules live in skills (`.claude/skills/`): `scout-rules` (shared hard
+  rules, reporting basics, code map; preloaded by every agent), and the area
+  skills `scout-go`, `scout-web` (website, CSP, Charts), `scout-ml` and
+  `scout-infra`, which the PM names in each brief. `scout-product-manager` is
+  the PM's own skill. No React agent or skill (no React project exists).
 - Testing rules for all agents: `TESTING.md` (repo root).
-- The tester (verify mode) runs after the coder when a change touches
-  `scoutanalytics.sql`, tracker/on-chain code, delivery/notify/re-check/re-ask,
-  the web snapshot/API or `ml/` (rule in the PM skill), once the testing
-  setup is resumed; the reviewer runs before every commit.
-- At most 10 coding agents in parallel (owner's limit, raised 9 Oct 2026).
+- Flow (PM skill "How to work"): `implement` → `simplify` (non-trivial code
+  changes) → `verify` when a change touches `scoutanalytics.sql`,
+  tracker/on-chain code, delivery/notify/re-check/re-ask, the web
+  snapshot/API or `ml/`, once the testing setup is resumed → `review` before
+  every commit (at most 3 fix rounds, then the owner decides).
+- One writer at a time per worktree. At most 10 writing agents in parallel
+  (owner's limit, raised 9 Oct 2026).
 - `settings.json`: read-only git, `node --check` and the ml venv pytest
   (`ml/.venv`, or `.venv` from inside `ml/`) are allowed; secrets are denied in
   any folder; `git push` is denied for both Bash and PowerShell. Binaries,
   secrets, state, CSVs and the venv are in `.gitignore`.
-- New or changed agents load only after a Claude Code restart.
+- New or changed agents and skills load only after a Claude Code restart.
 - Lessons:
-  - Parallel coders must have disjoint files (parallel README edits got mixed
-    before).
+  - Parallel writing agents must have disjoint files (parallel README edits
+    got mixed before).
   - Usage limits cut agents off mid-task, so a restarted agent must first check
     `git status` and the files for partial work.
   - Each throwaway Postgres gets its own scratchpad directory and port and is

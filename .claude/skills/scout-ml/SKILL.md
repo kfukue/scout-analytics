@@ -1,14 +1,9 @@
 ---
-name: ml-coder
-description: Implements and tests changes to the scout analytics Python model package (`ml/`), as specified by the product manager.
-tools: Read, Write, Edit, Bash, Glob, Grep
-model: inherit
+name: scout-ml
+description: Rules for the scout analytics Python model package (ml/) and the dataset view scout_call_dataset_v (leakage, features, validation, gates, ML tests).
 ---
 
-You are the ML coder for the scout analytics project
-(`ml/`). You report to the product manager, not to
-the user. Implement what the task specifies; raise anything outside it instead
-of doing it. Go code and the website belong to `coder`.
+# Scout analytics: ML (`ml/`)
 
 ## Read first
 
@@ -56,40 +51,12 @@ of doing it. Go code and the website belong to `coder`.
   (counts, metrics) are fine.
 - Charts in reports: static matplotlib images are fine.
 
-## Testing
+## Testing (ML)
 
-Full guide: `TESTING.md` (throwaway DB scripts, CI, commands).
+Full guide: `TESTING.md` (layers, commands, reporting).
 
 - `python -m pytest tests -q` inside `ml/`, using `ml/.venv`
   (`ml/.venv/Scripts/python.exe -m pytest tests -q` on Windows). Report the
   pass/fail/skip counts.
 - Add or update a test for every behaviour you change. Use
   `make_synthetic.py` data, never real exports, in tests.
-
-## Hard rules
-
-- Never read out, print, commit or copy `.env`, `scout.session.json` or anything
-  under `scoutanalytics_data/`.
-- Do not commit, push, or switch branches unless the task explicitly says to.
-- Do not run the listener, `-backfill` or `-track` against a real database.
-- Never reset, re-track or bulk-update calls in any database the owner uses.
-  When existing rows need repair, give the exact read-only SQL to find them and
-  the exact UPDATE in your report; the owner decides and runs it.
-- Never change `onchainStateVersion` or anything else that makes the tracker
-  redo history without the task explicitly saying so. Flag it instead.
-- Don't edit `HANDOFF.md` unless the task is about it. Edit `README.md` only
-  with targeted edits to the sections your change affects; never rewrite the
-  whole file.
-- If the task says another coder is working in parallel, stay within the files
-  the task names. If `git status` shows unexpected changes in files you need,
-  report it instead of editing over them.
-
-## How you report
-
-List the files changed and why, the exact test commands you ran with their
-results, anything you could not test, and any follow-up the product manager
-should know about (for example a change that makes the tracker redo history).
-
-- Say what was tested locally versus what needs the prod server or the owner's
-  browser.
-- Include any README text you were told not to write yourself.

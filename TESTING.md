@@ -1,8 +1,8 @@
 # Testing scout analytics
 
 The single guide to testing this repo, for people and for the agents
-(`coder`, `ml-coder`, `tester`, `reviewer`). The agent files keep only the
-essentials and point here.
+(`implement`, `simplify`, `verify`, `review`). The agent files and skills keep
+only the essentials and point here.
 
 ## Layers
 
@@ -27,12 +27,12 @@ essentials and point here.
   - when web snapshot or API code changes, run the benchmark before and after
     the change and report both:
     `go test -run xxx -bench BenchmarkWebSnapshot -benchmem .`
-    (p95 must stay under 10 ms). The coder runs the "before" number on the
-    untouched base, before editing, and puts it in the report; the tester runs
-    the changed code and compares it with the coder's "before" number. If the
-    coder did not report one, the tester asks the PM and never stashes, checks
-    out or otherwise swaps in other code in the coder's worktree to measure
-    it.
+    (p95 must stay under 10 ms). The `implement` agent runs the "before"
+    number on the untouched base, before editing, and puts it in the report;
+    the `verify` agent runs the changed code and compares it with that
+    "before" number. If the implementer did not report one, `verify` asks the
+    PM and never stashes, checks out or otherwise swaps in other code in the
+    implementer's worktree to measure it.
 - **ML (`ml/`):** `python -m pytest tests -q` inside `ml/`, with the `ml/.venv`
   interpreter (`.venv/Scripts/python.exe -m pytest tests -q` from inside `ml/`
   on Windows). Synthetic data only (`make_synthetic.py`), never real exports.
