@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"os"
 	"strings"
 	"testing"
 	"time"
@@ -13,16 +12,15 @@ import (
 )
 
 // Integration tests. They run only when SCOUT_TEST_DATABASE_URL points at a
-// THROWAWAY Postgres database (they drop and recreate the scout_* tables), e.g.
+// THROWAWAY Postgres database named scout_test on this machine (they drop and
+// recreate the scout_* tables; testDatabaseURL refuses anything else), on its
+// own port (see TESTING.md), never the shared server on 5432, e.g.
 //
-//	SCOUT_TEST_DATABASE_URL=postgres://postgres@localhost:5432/scout_test?sslmode=disable go test -p 1 .
+//	SCOUT_TEST_DATABASE_URL=postgres://postgres@127.0.0.1:55123/scout_test?sslmode=disable go test -p 1 .
 
 func testStore(t *testing.T) *ScoutStore {
 	t.Helper()
-	dsn := os.Getenv("SCOUT_TEST_DATABASE_URL")
-	if dsn == "" {
-		t.Skip("SCOUT_TEST_DATABASE_URL not set")
-	}
+	dsn := testDatabaseURL(t)
 	ctx := context.Background()
 	st, err := NewScoutStore(ctx, dsn, 8)
 	if err != nil {
@@ -333,10 +331,7 @@ func TestOpenScoutStoreSelection(t *testing.T) {
 	if _, _, err := openScoutStore(ctx, &config{DBMode: "bogus"}); err == nil {
 		t.Fatal("unknown SCOUT_DB should error")
 	}
-	dsn := os.Getenv("SCOUT_TEST_DATABASE_URL")
-	if dsn == "" {
-		t.Skip("SCOUT_TEST_DATABASE_URL not set")
-	}
+	dsn := testDatabaseURL(t)
 	// explicit DSN overrides the repo database
 	st, src, err := openScoutStore(ctx, &config{DBMode: "repo", DatabaseURL: dsn})
 	if err != nil || src != "SCOUT_DATABASE_URL" || !strings.Contains(st.Describe(ctx), `database "scout_test"`) {

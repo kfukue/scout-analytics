@@ -1596,6 +1596,10 @@ on 5432:
 SCOUT_TEST_DATABASE_URL=postgres://postgres@127.0.0.1:<port>/scout_test?sslmode=disable go test -p 1 .
 ```
 
+The DB tests refuse (fail before connecting) any `SCOUT_TEST_DATABASE_URL` whose database is not
+`scout_test` or whose host is not `localhost`, `127.0.0.1`, `::1` or a local unix socket, or that
+uses TCP port 5432 (a URL without a port defaults to 5432, so always give the throwaway port).
+
 Full testing guide (throwaway Postgres, every command, known flaky tests): `TESTING.md`.
 
 ## Website
