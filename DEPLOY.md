@@ -63,8 +63,8 @@ overrides them (see 7.4); `SCOUT_DB=off` disables recording;
 |---|---|
 | Command | `go run . -listen-only` |
 | Needs | Telegram (`API_ID`, `API_HASH`, `PHONE`, `TG_PASSWORD` if 2FA; session `SCOUT_SESSION_FILE`, default `scout.session.json`), database, `SCOUT_STATE_DIR` (default `scoutanalytics_data`). It does not need the nodes. |
-| Key vars | `SCOUT_SOURCE_CHANNEL` (scoutrobinhood), `SCOUT_NOTIFY_PEER` (default `me`), `SCOUT_DELIVER_LEVELS` (`clean,caution`), `SCOUT_TOOLS` (`perceptor,salpha`) and `SCOUT_TOOL_<CODE>_*`, `SCOUT_POLL_INTERVAL` (`20s`; with `0` the catch-up and requeue still run once at start, not retried), `SCOUT_CATCHUP_MAX` (`100`), `SCOUT_CATCHUP_MAX_AGE` (`24h`), `SCOUT_SCAN_GAP` (`3s`), `SCOUT_MODEL_URL` (off), `SCOUT_MODEL_TIMEOUT` (`10s`), `SCOUT_RESCAN` (`off`) and `SCOUT_RESCAN_*` (below) |
-| Writes | `scout_calls`, `scout_investigations`, `scout_deliveries`, …; queues new calls for tracking; sends `pg_notify('scout_events', …)` for each new real call and report; with `SCOUT_RESCAN=on` also `scout_investigations` rows with `scan_kind = 'rescan'`, and a completed rescan notifies too (`"kind":"report"` with `"scan_kind":"rescan"`; a call's own report carries `"scan_kind":"live"`) |
+| Key vars | `SCOUT_SOURCE_CHANNEL` (scoutrobinhood), `SCOUT_NOTIFY_PEER` (default `me`), `SCOUT_DELIVER_LEVELS` (`clean,caution`), `SCOUT_TOOLS` (`perceptor,salpha`) and `SCOUT_TOOL_<CODE>_*`, `SCOUT_POLL_INTERVAL` (`20s`; with `0` the catch-up and requeue still run once at start, not retried), `SCOUT_CATCHUP_MAX` (`100`), `SCOUT_CATCHUP_MAX_AGE` (`24h`), `SCOUT_SCAN_GAP` (`3s`), `SCOUT_MODEL_URL` (off), `SCOUT_MODEL_TIMEOUT` (`10s`), `SCOUT_RESCAN` (`off`) and `SCOUT_RESCAN_*`, `SCOUT_SALPHA_REASK` (`off`) and `SCOUT_SALPHA_REASK_*` (below) |
+| Writes | `scout_calls`, `scout_investigations`, `scout_deliveries`, …; queues new calls for tracking; sends `pg_notify('scout_events', …)` for each new real call and report; with `SCOUT_RESCAN=on` also `scout_investigations` rows with `scan_kind = 'rescan'`, and a completed rescan notifies too (`"kind":"report"` with `"scan_kind":"rescan"`; a call's own report carries `"scan_kind":"live"`); with `SCOUT_SALPHA_REASK=on` also rows with `scan_kind = 'reask'` (`"scan_kind":"reask"`) and follow-up `scout_deliveries` rows |
 
 **Perceptor re-check (`SCOUT_PERCEPTOR_RECHECK_AFTER`, on by default).** A
 live call whose Perceptor answer is "not enough data yet" (`insufficient`) or
@@ -139,6 +139,47 @@ Settings and defaults: `SCOUT_RESCAN_MAX_AGE=720h`,
   `scout_call_dataset_v` would count them as call-time Perceptor verdicts,
   and the old website would show them as the token's Perceptor verdict.
   Retrain or export only with the new binary's view in place.
+
+**Deliveries: sAlpha declines are no longer forwarded** (always on with this
+binary). The header says `• sAlpha: no report (declined: …)` instead, and the
+decline is not linked to the delivery. Each new delivery stores its header's
+message id in `scout_deliveries.notify_message_id` (column added by
+`scoutanalytics.sql` at the next start of any mode; `NULL` for older rows).
+
+**sAlpha re-ask lane (`SCOUT_SALPHA_REASK`, off by default).** Asks sAlpha once
+more, 6 to 24 hours after a first call whose live sAlpha reply declined, came
+back empty, timed out or failed, once per token, inside this listener when the
+live queue is idle (README "Asking sAlpha again"). Settings and defaults:
+`SCOUT_SALPHA_REASK_MIN_AGE=6h`, `SCOUT_SALPHA_REASK_MAX_AGE=24h`,
+`SCOUT_SALPHA_REASK_MAX_PER_DAY=60`, `SCOUT_SALPHA_REASK_GAP=10m`.
+
+- Writes `scout_investigations` rows with `scan_kind = 'reask'` (a completed
+  one notifies the website with `"scan_kind":"reask"`), and, for a real report
+  of a delivered call, a follow-up in the delivery chat (a reply to the
+  delivery's header) recorded as another `scout_deliveries` row. Never read by
+  the dataset view, the Perceptor readers, the requeue or the rescan cap.
+- Deploy the website (3.1) with or before switching it on: an older `-web`
+  binary ignores `reask` rows (its sAlpha query reads `live` only), so late
+  reports would reach the group but not the website.
+- Before switching it on: `go run . -salpha-reask-missing -dry-run` (database
+  only) lists and counts the candidates, and how many older calls a larger
+  `SCOUT_SALPHA_REASK_MAX_AGE` would take (calls missed while the listener was
+  down longer than `MAX_AGE` are skipped otherwise). Like every mode it applies
+  `scoutanalytics.sql` first: run it only as part of the deploy (3.4 order).
+- An invalid `SCOUT_SALPHA_REASK_*` value (or `MAX_AGE` not longer than
+  `MIN_AGE`) stops every mode at startup.
+- Load: at most `SCOUT_SALPHA_REASK_MAX_PER_DAY` sAlpha requests a day, at least
+  `SCOUT_SALPHA_REASK_GAP` apart, only after 5 minutes without a live call. A
+  live call can wait up to about 5 minutes behind a re-ask in progress (sAlpha's
+  300 s `_MAX_WAIT`). Telegram `FLOOD_WAIT` or a rate-limit reply pauses the
+  lane for at least an hour. With the Perceptor re-check or `SCOUT_RESCAN=on`
+  too, the worker runs at most one re-check, rescan or re-ask per look, in that
+  order.
+- To switch it on: add `SCOUT_SALPHA_REASK=on` to `.env` and restart the
+  listener (stop it first). Check for `salpha reask: on — …` in the log; then
+  one `salpha reask: call …` line per re-ask and one for its follow-up. To stop
+  it: `SCOUT_SALPHA_REASK=off` and restart the listener. With `-dry-run` the
+  lane asks but sends no follow-up.
 
 **Restart cost: missed posts and waiting calls are picked up on start, within
 limits.** Polling resumes from a saved cursor (the lower of the newest post in

@@ -277,8 +277,8 @@ func TestScannerRecordingHooks(t *testing.T) {
 		ids = append(ids, *id)
 	}
 	s.setCallStatus(j.CallID, CallStatusScanned)
-	s.recordDelivery(j, s.deliveryHeader(j, results), ids, nil)
-	s.recordDelivery(j, "x", nil, errors.New("flood wait"))
+	s.recordDelivery(j, s.deliveryHeader(j, results), ids, 4242, nil)
+	s.recordDelivery(j, "x", nil, 0, errors.New("flood wait"))
 
 	var queued, dup, scanned int
 	_ = st.Pool.QueryRow(ctx, `SELECT count(*) FILTER (WHERE status='queued'),
@@ -309,10 +309,10 @@ func TestScannerRecordingHooks(t *testing.T) {
 	}
 	var sent, failed int
 	for _, d := range ds {
-		if d.Status == DeliveryStatusSent && len(d.InvestigationIDs) == 2 {
+		if d.Status == DeliveryStatusSent && len(d.InvestigationIDs) == 2 && d.NotifyMessageID != nil && *d.NotifyMessageID == 4242 {
 			sent++
 		}
-		if d.Status == DeliveryStatusFailed && d.Error != nil {
+		if d.Status == DeliveryStatusFailed && d.Error != nil && d.NotifyMessageID == nil {
 			failed++
 		}
 	}

@@ -485,7 +485,9 @@
     // the token has an sAlpha report with text (an empty reply counts as none)
     if (c.has_salpha_report === true) {
       var sa = el('span', 'sa-badge', 'sA');
-      sa.title = 'sAlpha report available: open the row (▸) to read it';
+      var later = reaskHours(c);
+      sa.title = later === null ? 'sAlpha report available: open the row (▸) to read it'
+        : 'sAlpha (asked again ' + later + 'h after the call): open the row (▸) to read it';
       tdPerc.appendChild(sa);
     }
     // "Perceptor today": a re-scan long after the call, on a line of its own
@@ -713,12 +715,26 @@
     return sec;
   }
 
+  // reaskHours: when the row's sAlpha report was not given at the call but
+  // asked again later (re-ask lane), the hours after the call, rounded; null
+  // otherwise.
+  function reaskHours(c) {
+    var s = c.salpha_reask_after_s;
+    if (!isNum(s) || s < 0) { return null; }
+    return Math.round(s / 3600);
+  }
+
   function salphaSection(s) {
     var sec = el('section', 'report');
     sec.appendChild(el('h3', 'report-title', 'sAlpha'));
+    var reask = !!(s && typeof s === 'object' && s.reask === true);
     if (s && typeof s === 'object' && s.declined === true) {
       // sAlpha replied, but only to decline ("Not enough public signals …")
       sec.appendChild(el('p', 'report-declined', 'sAlpha did not generate a report'));
+      if (reask) {
+        // the call's own reply was no report either; the decline is the later answer
+        sec.appendChild(el('p', 'muted small', 'sAlpha gave none at the time of the call; asked again later, it declined.'));
+      }
       var why = [];
       if (typeof s.text === 'string' && s.text.trim() !== '') { why.push('Reason: ' + s.text.trim()); }
       if (typeof s.at === 'string') { why.push(fmtDate(s.at)); }
@@ -728,6 +744,10 @@
     if (!s || typeof s !== 'object' || typeof s.text !== 'string' || s.text.trim() === '') {
       sec.appendChild(el('p', 'muted', 'No sAlpha report'));
       return sec;
+    }
+    if (reask) {
+      // the call's own reply was no report; sAlpha was asked again later
+      sec.appendChild(el('p', 'muted small', 'Later report: sAlpha gave none at the time of the call and was asked again.'));
     }
     if (typeof s.at === 'string') { sec.appendChild(reportMeta([fmtDate(s.at)])); }
     sec.appendChild(el('p', 'report-text', s.text));
@@ -1592,7 +1612,8 @@
     if (kind === 'report' && tool === 'salpha') {
       title = 'sAlpha';
       if (c.has_salpha_report === true) {
-        text = 'report available';
+        var laterH = reaskHours(c);
+        text = laterH === null ? 'report available' : 'report available (asked again ' + laterH + 'h after the call)';
         cls = 'sa-badge';
       } else {
         text = 'did not generate a report';

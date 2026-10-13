@@ -106,6 +106,41 @@ func TestToolResultText(t *testing.T) {
 	}
 }
 
+// A result rebuilt from a stored investigation reads as its stored report
+// text, with or without bot message ids; with none, nothing is forwarded and
+// an sAlpha decline is recognised.
+func TestStoredToolResultText(t *testing.T) {
+	sa := builtinTools["salpha"]
+	for _, tc := range []struct {
+		name         string
+		ids          []int32
+		text         string
+		wantText     string
+		wantDeclined bool
+	}{
+		{"decline with messages", []int32{5, 6}, testDecline, testDecline, true},
+		{"decline without messages", nil, "  " + testDecline + "\n", testDecline, true},
+		{"report without messages", nil, "Smart money: 3 wallets", "Smart money: 3 wallets", false},
+		{"empty reply without messages", nil, " ", "", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := storedToolResult(sa, ScoutInvestigation{Status: investigationCompleted, BotMessageIDs: tc.ids, ReportText: tc.text})
+			if got := r.ReportText(); got != tc.wantText {
+				t.Errorf("ReportText() = %q, want %q", got, tc.wantText)
+			}
+			if len(r.Replies) != len(tc.ids) {
+				t.Errorf("%d replies, want %d (one per stored message id)", len(r.Replies), len(tc.ids))
+			}
+			if got := reportDeclined(r); got != tc.wantDeclined {
+				t.Errorf("reportDeclined = %v, want %v", got, tc.wantDeclined)
+			}
+			if got := forwardable(r); got != (sa.Attach && !tc.wantDeclined) {
+				t.Errorf("forwardable = %v, want %v", got, sa.Attach && !tc.wantDeclined)
+			}
+		})
+	}
+}
+
 // TestReplyDetailsMedia: every reply gets an entry with its time, edit time,
 // the message it replies to, its media type and text length (prod call 10424
 // completed with empty text and nothing under "media"), and media of any type,

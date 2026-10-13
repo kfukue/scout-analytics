@@ -105,7 +105,7 @@ func testRecheckScanner(t *testing.T, lane bool) *scanner {
 	}
 	if lane {
 		s.recheck = &recheckLane{cfg: recheckConfig{After: 12 * time.Minute, After2: 2 * time.Hour}, now: time.Now,
-			hold: func(ctx context.Context, invID int) error { return nil }} // no database: the marker "is written"
+			hold: func(ctx context.Context, invID int, scoreLine string) error { return nil }} // no database: the marker "is written"
 		s.recheck.init()
 	}
 	return s
@@ -161,7 +161,7 @@ func TestRecheckGating(t *testing.T) {
 				t.Errorf("shouldDeliver(%s %s) = %v, want %v", c.status, c.level, got, c.deliver)
 			}
 			if c.holdErr {
-				s.recheck.hold = func(ctx context.Context, invID int) error { return errors.New("database gone") }
+				s.recheck.hold = func(ctx context.Context, invID int, scoreLine string) error { return errors.New("database gone") }
 			}
 			inv := &call // the Perceptor result's investigation id (any id: no database here)
 			if c.unstored {
@@ -361,9 +361,9 @@ func TestDeliverNotSentAfterStop(t *testing.T) {
 	s := testRecheckScanner(t, true)
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	err := s.deliver(ctx, job{CA: "0xA"}, "header", nil)
+	id, err := s.deliver(ctx, job{CA: "0xA"}, "header", nil)
 	var notSent *deliveryNotSentError
-	if !errors.As(err, &notSent) || !errors.Is(err, context.Canceled) {
-		t.Errorf("deliver after a stop = %v, want a deliveryNotSentError wrapping context.Canceled", err)
+	if id != 0 || !errors.As(err, &notSent) || !errors.Is(err, context.Canceled) {
+		t.Errorf("deliver after a stop = %d, %v; want 0 and a deliveryNotSentError wrapping context.Canceled", id, err)
 	}
 }

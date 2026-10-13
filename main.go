@@ -23,8 +23,10 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -40,6 +42,7 @@ import (
 	"github.com/gotd/td/telegram"
 	"github.com/gotd/td/telegram/auth"
 	"github.com/gotd/td/telegram/message"
+	"github.com/gotd/td/telegram/message/unpack"
 	"github.com/gotd/td/telegram/updates"
 	"github.com/gotd/td/tg"
 	"github.com/gotd/td/tgerr"
@@ -81,6 +84,7 @@ type config struct {
 	CatchUpMaxAge time.Duration // SCOUT_CATCHUP_MAX_AGE (0 = no age limit)
 
 	Rescan rescanConfig // SCOUT_RESCAN_*: Perceptor re-scans of first calls without a report (rescan.go)
+	Reask  reaskConfig  // SCOUT_SALPHA_REASK_*: sAlpha asked again after a call without a report (salpha_reask.go)
 
 	// SCOUT_PERCEPTOR_RECHECK*: live calls whose Perceptor answer is "not
 	// enough data yet" or unreadable are re-checked later (recheck.go)
@@ -185,6 +189,9 @@ func loadConfig(envFile string) (*config, error) {
 		return nil, err
 	}
 	if c.Recheck, err = loadRecheckConfig(); err != nil {
+		return nil, err
+	}
+	if c.Reask, err = loadReaskConfig(); err != nil {
 		return nil, err
 	}
 	if c.NotifyBotToken != "" && c.NotifyChatID == "" {
@@ -393,6 +400,9 @@ type scanner struct {
 	// rescan is the rescan lane (rescan.go); nil when it is off. Set before
 	// the worker starts.
 	rescan *rescanLane
+	// reask is the sAlpha re-ask lane (salpha_reask.go); nil when it is off.
+	// Set before the worker starts.
+	reask *reaskLane
 
 	// recheck is the live Perceptor re-check (recheck.go); nil when it is off
 	// (and in -scan / -post runs). Set before the worker starts.
@@ -684,7 +694,11 @@ func (s *scanner) deliveryHeader(j job, results []*toolResult) string {
 		line := fmt.Sprintf("\n• %s: ", r.Spec.Name)
 		switch {
 		case r.Status != investigationCompleted:
-			line += "no report (" + r.Status + ")"
+			line += "no report (" + r.Status + ")" + s.reaskNote(j, r)
+		case reportDeclined(r):
+			line += "no report (declined: " + salphaDeclineReason(r.ReportText()) + ")" + s.reaskNote(j, r)
+		case r.Spec.Code == webToolSAlpha && !hasVisibleText(r.ReportText()):
+			line += "no report (empty reply)" + s.reaskNote(j, r)
 		case v.Level != levelUnknown:
 			line += levelIcon[v.Level] + " " + firstNonEmpty(v.Label, v.Level)
 			if v.Summary != "" {
@@ -720,7 +734,7 @@ func (s *scanner) botAPIText(header string, j job, results []*toolResult) string
 		text += "\n\n━━ Original call (@" + s.cfg.SourceChannel + ") ━━\n" + j.SourceText
 	}
 	for _, r := range results {
-		if r.Spec.Attach && r.Status == investigationCompleted {
+		if forwardable(r) {
 			text += "\n\n━━ " + r.Spec.Name + " ━━\n" + r.ReportText()
 		}
 	}
@@ -738,18 +752,49 @@ type deliveryNotSentError struct{ err error }
 func (e *deliveryNotSentError) Error() string { return e.err.Error() }
 func (e *deliveryNotSentError) Unwrap() error { return e.err }
 
+// reportDeclined reports whether r is an sAlpha reply that only declines to
+// report ("Not enough public signals …"; salphaDeclined, the website's rule).
+// Such a reply is not forwarded, not attached to the delivery and does not
+// count as a report.
+func reportDeclined(r *toolResult) bool {
+	return r.Spec.Code == webToolSAlpha && r.Status == investigationCompleted && salphaDeclined(r.ReportText())
+}
+
+// forwardable reports whether r's report goes with the delivery: its tool is
+// attached, it completed, and it is not a decline.
+func forwardable(r *toolResult) bool {
+	return r.Spec.Attach && r.Status == investigationCompleted && !reportDeclined(r)
+}
+
+// deliveryAttachments returns the investigation ids recorded with a delivery:
+// those of the forwardable results (invIDs maps a tool code to its
+// scout_investigations id; a result without one is left out).
+func deliveryAttachments(results []*toolResult, invIDs map[string]*int) []int {
+	var out []int
+	for _, r := range results {
+		if id := invIDs[r.Spec.Code]; id != nil && forwardable(r) {
+			out = append(out, *id)
+		}
+	}
+	return out
+}
+
 // deliver sends, in order: the summary header, the original call post from the
-// source channel, then every attachable tool's report.
-func (s *scanner) deliver(ctx context.Context, j job, header string, results []*toolResult) error {
+// source channel, then every forwardable tool's report. It returns the id of
+// the header message in the delivery chat (0 when Telegram's answer did not
+// name it); a send error is the delivery's error (a deliveryNotSentError when
+// ctx was done before anything was sent).
+func (s *scanner) deliver(ctx context.Context, j job, header string, results []*toolResult) (int64, error) {
 	if err := ctx.Err(); err != nil {
-		return &deliveryNotSentError{fmt.Errorf("not sent: %w", err)}
+		return 0, &deliveryNotSentError{fmt.Errorf("not sent: %w", err)}
 	}
 	if s.cfg.NotifyBotToken != "" {
-		return botAPISend(ctx, s.cfg.NotifyBotToken, s.cfg.NotifyChatID, s.botAPIText(header, j, results))
+		return botAPISend(ctx, s.cfg.NotifyBotToken, s.cfg.NotifyChatID, s.botAPIText(header, j, results), 0)
 	}
 
-	if err := s.sendNotifyText(ctx, header); err != nil {
-		return fmt.Errorf("send header: %w", err)
+	headerID, err := s.sendNotify(ctx, header, 0)
+	if err != nil {
+		return 0, fmt.Errorf("send header: %w", err)
 	}
 	if j.SourceMsg != 0 && s.sourcePeer != nil {
 		if _, err := s.sender.To(s.notifyPeer).ForwardIDs(s.sourcePeer, j.SourceMsg).Send(ctx); err != nil {
@@ -760,30 +805,42 @@ func (s *scanner) deliver(ctx context.Context, j job, header string, results []*
 				copyText += "\n\n" + j.SourceText
 			}
 			if _, err := s.sender.To(s.notifyPeer).Text(ctx, copyText); err != nil {
-				return fmt.Errorf("send original call: %w", err)
+				return int64(headerID), fmt.Errorf("send original call: %w", err)
 			}
 		}
 	}
 	for _, r := range results {
-		if !r.Spec.Attach || r.Status != investigationCompleted || len(r.Replies) == 0 {
+		if !forwardable(r) {
 			continue
 		}
-		runner := s.runnerFor(r.Spec.Code)
-		ids := make([]int, 0, len(r.Replies))
-		for _, m := range r.Replies {
-			ids = append(ids, m.ID)
+		if err := s.forwardReport(ctx, r); err != nil {
+			return int64(headerID), err
 		}
-		// Forward the bot's messages so formatting, links, buttons and files are preserved.
-		_, err := s.sender.To(s.notifyPeer).ForwardIDs(runner.botPeer, ids[0], ids[1:]...).Send(ctx)
-		if err != nil && len(ids) > 1 && r.Best != nil {
-			// e.g. a "working…" message was deleted by the bot: forward just the report.
-			_, err = s.sender.To(s.notifyPeer).ForwardIDs(runner.botPeer, r.Best.ID).Send(ctx)
-		}
-		if err != nil {
-			log.Printf("[%s] forward failed (%v); sending text copy", r.Spec.Code, err)
-			if _, err := s.sender.To(s.notifyPeer).Text(ctx, "━━ "+r.Spec.Name+" ━━\n"+r.ReportText()); err != nil {
-				return fmt.Errorf("send %s report: %w", r.Spec.Name, err)
-			}
+	}
+	return int64(headerID), nil
+}
+
+// forwardReport forwards one tool's report messages to the delivery chat, so
+// formatting, links, buttons and files are preserved; when that fails it
+// sends a text copy.
+func (s *scanner) forwardReport(ctx context.Context, r *toolResult) error {
+	runner := s.runnerFor(r.Spec.Code)
+	if runner == nil || len(r.Replies) == 0 {
+		return nil
+	}
+	ids := make([]int, 0, len(r.Replies))
+	for _, m := range r.Replies {
+		ids = append(ids, m.ID)
+	}
+	_, err := s.sender.To(s.notifyPeer).ForwardIDs(runner.botPeer, ids[0], ids[1:]...).Send(ctx)
+	if err != nil && len(ids) > 1 && r.Best != nil {
+		// e.g. a "working…" message was deleted by the bot: forward just the report.
+		_, err = s.sender.To(s.notifyPeer).ForwardIDs(runner.botPeer, r.Best.ID).Send(ctx)
+	}
+	if err != nil {
+		log.Printf("[%s] forward failed (%v); sending text copy", r.Spec.Code, err)
+		if _, err := s.sender.To(s.notifyPeer).Text(ctx, "━━ "+r.Spec.Name+" ━━\n"+r.ReportText()); err != nil {
+			return fmt.Errorf("send %s report: %w", r.Spec.Name, err)
 		}
 	}
 	return nil
@@ -879,36 +936,211 @@ func splitMessage(text string, limit int) []string {
 	return chunks
 }
 
-func botAPISend(ctx context.Context, token, chatID, text string) error {
-	for _, chunk := range splitMessage(text, botAPILimit) {
-		body, _ := json.Marshal(map[string]any{
-			"chat_id":                  chatID,
-			"text":                     chunk,
-			"disable_web_page_preview": true,
-		})
-		req, _ := http.NewRequestWithContext(ctx, http.MethodPost,
-			"https://api.telegram.org/bot"+token+"/sendMessage", bytes.NewReader(body))
-		req.Header.Set("Content-Type", "application/json")
-		resp, err := http.DefaultClient.Do(req)
-		if err != nil {
-			return err
+// botAPIBase is the Bot API's address (tests point it at a fake server).
+var botAPIBase = "https://api.telegram.org"
+
+// Bot API 429 (Too Many Requests) on a send: the chunk is sent again after
+// Telegram's retry_after, at most botAPIRetryMax times per chunk and while the
+// waits of one botAPISend add up to at most botAPIRetryBudget. The wait runs
+// in the caller (the scan worker for a delivery: live calls wait meanwhile),
+// so it is short. A 429 without retry_after, or one asking for longer, is
+// returned: the delivery is then recorded as failed with that error and
+// logged, never dropped silently.
+const (
+	botAPIRetryBudget = 60 * time.Second
+	botAPIRetryMax    = 3
+)
+
+// botAPISleep waits d, or until ctx is done (its error then). Tests replace
+// it so that they never sleep.
+var botAPISleep = func(ctx context.Context, d time.Duration) error {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-t.C:
+		return nil
+	}
+}
+
+// botAPIError is a Bot API answer other than 200 OK. RetryAfter is how long
+// Telegram asks to wait (parameters.retry_after, else the Retry-After header;
+// 0 when neither is given), set with a 429.
+type botAPIError struct {
+	Status      string // "429 Too Many Requests"
+	Code        int
+	Description string // Telegram's description, when the answer could be read
+	RetryAfter  time.Duration
+}
+
+func (e *botAPIError) Error() string {
+	s := "bot API sendMessage: " + e.Status
+	if e.Description != "" {
+		s += " (" + e.Description + ")"
+	}
+	if e.RetryAfter > 0 {
+		s += "; retry after " + e.RetryAfter.String()
+	}
+	return s
+}
+
+// botAPIRetryAfter reports whether err is a Bot API 429 (Too Many Requests)
+// and how long Telegram asks to wait (0 when it does not say).
+func botAPIRetryAfter(err error) (time.Duration, bool) {
+	var e *botAPIError
+	if errors.As(err, &e) && e.Code == http.StatusTooManyRequests {
+		return e.RetryAfter, true
+	}
+	return 0, false
+}
+
+// botAPIRedacted is an error whose text had the bot token removed.
+type botAPIRedacted struct {
+	msg string
+	err error
+}
+
+func (e *botAPIRedacted) Error() string { return e.msg }
+func (e *botAPIRedacted) Unwrap() error { return e.err }
+
+// botAPIRedact returns err without the bot token: the request URL
+// (".../bot<token>/sendMessage") is in the text of every *url.Error (net/http
+// and url.Parse), and these errors reach the logs and scout_deliveries.error.
+// The *url.Error is replaced by its operation and its inner error; any token
+// left in the text is replaced by "<token>". errors.Is/As still see the inner
+// error (a context error, a *botAPIError).
+func botAPIRedact(err error, token string) error {
+	if err == nil {
+		return nil
+	}
+	var ue *url.Error
+	if errors.As(err, &ue) {
+		err = fmt.Errorf("bot API sendMessage: %s: %w", ue.Op, ue.Err)
+	} else if _, ok := err.(*botAPIError); !ok {
+		err = fmt.Errorf("bot API sendMessage: %w", err)
+	}
+	if token == "" {
+		return err
+	}
+	msg := err.Error()
+	for _, t := range []string{token, url.PathEscape(token), url.QueryEscape(token)} {
+		msg = strings.ReplaceAll(msg, t, "<token>")
+	}
+	if msg == err.Error() {
+		return err
+	}
+	return &botAPIRedacted{msg: msg, err: err}
+}
+
+// botAPISend sends text to chatID with the Bot API, in the chunks of
+// splitMessage(text, botAPILimit); the first chunk replies to message replyTo
+// when it is not 0 (and is sent without the reply when that message is gone).
+// A chunk answered with a 429 is sent again after Telegram's retry_after
+// within botAPIRetryBudget (see there); otherwise the first error ends the
+// send. It returns the message id of the first chunk (0 when the answer did
+// not name it, also with an error after the first chunk went out). Every error
+// goes through botAPIRedact, so none contains the bot token.
+func botAPISend(ctx context.Context, token, chatID, text string, replyTo int64) (int64, error) {
+	var first int64
+	var waited time.Duration
+	for n, chunk := range splitMessage(text, botAPILimit) {
+		reply := int64(0)
+		if n == 0 {
+			reply = replyTo
 		}
-		resp.Body.Close()
-		if resp.StatusCode != http.StatusOK {
-			return fmt.Errorf("bot API sendMessage: %s", resp.Status)
+		for try := 0; ; try++ {
+			id, err := botAPISendChunk(ctx, token, chatID, chunk, reply)
+			if err == nil {
+				if n == 0 {
+					first = id
+				}
+				break
+			}
+			d, tooMany := botAPIRetryAfter(err)
+			if !tooMany || d <= 0 || try >= botAPIRetryMax || waited+d > botAPIRetryBudget {
+				return first, botAPIRedact(err, token)
+			}
+			log.Printf("bot API: 429 Too Many Requests on message %d — sending it again in %s (Telegram's retry_after)", n+1, d)
+			waited += d
+			if err := botAPISleep(ctx, d); err != nil {
+				return first, botAPIRedact(fmt.Errorf("waiting out a 429: %w", err), token)
+			}
 		}
 	}
-	return nil
+	return first, nil
+}
+
+// botAPISendChunk sends one message with the Bot API (a reply to replyTo when
+// it is not 0) and returns its message id (0 when the answer cannot be read:
+// the message was sent all the same). Its errors still contain the bot token
+// (a *url.Error names the URL): botAPISend redacts them.
+func botAPISendChunk(ctx context.Context, token, chatID, chunk string, replyTo int64) (int64, error) {
+	msg := map[string]any{
+		"chat_id":                  chatID,
+		"text":                     chunk,
+		"disable_web_page_preview": true,
+	}
+	if replyTo != 0 {
+		msg["reply_parameters"] = map[string]any{"message_id": replyTo, "allow_sending_without_reply": true}
+	}
+	body, err := json.Marshal(msg)
+	if err != nil {
+		return 0, fmt.Errorf("encode: %w", err)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, botAPIBase+"/bot"+token+"/sendMessage", bytes.NewReader(body))
+	if err != nil {
+		return 0, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+	var res struct {
+		Result struct {
+			MessageID int64 `json:"message_id"`
+		} `json:"result"`
+		Description string `json:"description"`
+		Parameters  struct {
+			RetryAfter int64 `json:"retry_after"`
+		} `json:"parameters"`
+	}
+	decodeErr := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&res)
+	if resp.StatusCode != http.StatusOK {
+		e := &botAPIError{Status: resp.Status, Code: resp.StatusCode}
+		if decodeErr == nil {
+			e.Description = res.Description
+			e.RetryAfter = time.Duration(res.Parameters.RetryAfter) * time.Second
+		}
+		if e.RetryAfter <= 0 {
+			if s, err := strconv.Atoi(resp.Header.Get("Retry-After")); err == nil && s > 0 {
+				e.RetryAfter = time.Duration(s) * time.Second
+			}
+		}
+		return 0, e
+	}
+	if decodeErr != nil {
+		return 0, nil
+	}
+	return res.Result.MessageID, nil
 }
 
 // worker processes queued CAs one at a time (replies can't be correlated
-// otherwise). With the rescan lane on, it looks at the lane whenever the live
-// queue is empty (at once, and every rescanTick while idle) and runs at most
-// one rescan at a time, in this goroutine: a live call that arrives meanwhile
-// waits for it to finish (rescan.go).
+// otherwise). Whenever the live queue is empty (at once, and every
+// min(rescanTick, recheckTick) while idle) it looks at the lanes that are on,
+// in this order: the live Perceptor re-check (recheck.go), the rescan lane
+// (rescan.go), the sAlpha re-ask lane (salpha_reask.go). It runs at most one
+// request of one lane at a time, in this goroutine, then looks at the live
+// queue again: a live call that arrives meanwhile waits for that one to
+// finish.
 func (s *scanner) worker(ctx context.Context) {
-	lane := s.rescan
-	lane.noteLive(time.Now()) // a new worker (start, reconnect) waits SCOUT_RESCAN_IDLE first
+	lane, reask := s.rescan, s.reask
+	// a new worker (start, reconnect) waits the lanes' idle time first
+	lane.noteLive(time.Now())
+	reask.noteLive(time.Now())
+	queueLen := func() int { return len(s.queue) }
 	for {
 		// live calls first, without blocking
 		select {
@@ -921,16 +1153,20 @@ func (s *scanner) worker(ctx context.Context) {
 			continue
 		default:
 		}
-		// the live Perceptor re-check (recheck.go) before the rescan lane
-		if s.recheck != nil && s.recheck.step(ctx, func() int { return len(s.queue) }) {
+		// the live Perceptor re-check (recheck.go) before the rescan lane,
+		// then the sAlpha re-ask lane
+		if s.recheck != nil && s.recheck.step(ctx, queueLen) {
 			continue
 		}
-		if lane != nil && lane.step(ctx, s.db, func() int { return len(s.queue) }) {
+		if lane != nil && lane.step(ctx, s.db, queueLen) {
 			continue
 		}
-		var tick <-chan time.Time // nil (never ready) with both lanes off
+		if reask != nil && reask.step(ctx, s.db, queueLen) {
+			continue
+		}
+		var tick <-chan time.Time // nil (never ready) with every lane off
 		var timer *time.Timer
-		if lane != nil || s.recheck != nil {
+		if lane != nil || s.recheck != nil || reask != nil {
 			timer = time.NewTimer(min(rescanTick, recheckTick))
 			tick = timer.C
 		}
@@ -961,6 +1197,7 @@ func (s *scanner) runLive(ctx context.Context, j job) bool {
 	s.process(ctx, j, !s.cfg.DryRun)
 	s.jobDone(j)
 	s.rescan.noteLive(time.Now())
+	s.reask.noteLive(time.Now())
 	select {
 	case <-ctx.Done():
 		return false
@@ -1006,11 +1243,12 @@ func (s *scanner) investigateAll(ctx context.Context, ca string) []*toolResult {
 }
 
 // shouldDeliver: every gating tool must have completed with an allowed verdict.
-// With no gating tool configured, every CA with at least one report is delivered.
+// With no gating tool configured, every CA with at least one report is
+// delivered (an sAlpha decline is no report).
 func (s *scanner) shouldDeliver(results []*toolResult) bool {
 	gated, anyReport := false, false
 	for _, r := range results {
-		if r.Status == investigationCompleted {
+		if r.Status == investigationCompleted && !reportDeclined(r) {
 			anyReport = true
 		}
 		if !r.Spec.Gate {
@@ -1074,13 +1312,8 @@ func (s *scanner) process(ctx context.Context, j job, deliver bool) []*toolResul
 	if scoreLine != "" {
 		header += "\n" + scoreLine
 	}
-	err := s.deliver(ctx, j, header, results)
-	var attached []int
-	for _, r := range results {
-		if id := invIDs[r.Spec.Code]; id != nil && r.Spec.Attach && r.Status == investigationCompleted {
-			attached = append(attached, *id)
-		}
-	}
+	msgID, err := s.deliver(ctx, j, header, results)
+	attached := deliveryAttachments(results, invIDs)
 	if err != nil {
 		rec.Error = "deliver: " + err.Error()
 		log.Printf("deliver %s failed: %v", j.CA, err)
@@ -1088,7 +1321,7 @@ func (s *scanner) process(ctx context.Context, j job, deliver bool) []*toolResul
 		rec.Delivered = true
 		log.Printf("delivered %s (%d report(s))", j.CA, len(attached))
 	}
-	s.recordDelivery(j, header, attached, err)
+	s.recordDelivery(j, header, attached, msgID, err)
 	return results
 }
 
@@ -1236,7 +1469,19 @@ func investigationRow(r *toolResult, callID *int, ca string, toolID int) *ScoutI
 	return row
 }
 
-func (s *scanner) recordDelivery(j job, header string, investigationIDs []int, sendErr error) {
+// notifyMsgIDPtr is a delivery's notify_message_id as stored: nil when id is 0
+// (unknown, stored as NULL).
+func notifyMsgIDPtr(id int64) *int64 {
+	if id == 0 {
+		return nil
+	}
+	return &id
+}
+
+// recordDelivery stores a delivery: the attached investigations, and
+// notifyMsgID, the id of its header message in the delivery chat (0 =
+// unknown, stored as NULL).
+func (s *scanner) recordDelivery(j job, header string, investigationIDs []int, notifyMsgID int64, sendErr error) {
 	if s.db == nil {
 		return
 	}
@@ -1247,6 +1492,7 @@ func (s *scanner) recordDelivery(j job, header string, investigationIDs []int, s
 		Status:           DeliveryStatusSent,
 		HeaderText:       header,
 		InvestigationIDs: investigationIDs,
+		NotifyMessageID:  notifyMsgIDPtr(notifyMsgID),
 	}
 	if sendErr != nil {
 		d.Status, d.Error = DeliveryStatusFailed, strPtr(sendErr.Error())
@@ -1513,22 +1759,44 @@ func isPeerError(err error) bool {
 	return tgerr.Is(err, "PEER_ID_INVALID", "CHAT_ID_INVALID", "CHANNEL_INVALID", "CHANNEL_PRIVATE", "CHAT_FORBIDDEN")
 }
 
-// sendNotifyText sends text to the delivery chat; if Telegram says the chat id
-// is invalid, it looks the chat up again once and retries.
-func (s *scanner) sendNotifyText(ctx context.Context, text string) error {
-	_, err := s.sender.To(s.notifyPeer).Text(ctx, text)
-	if err == nil || !isPeerError(err) {
-		return err
+// sendNotify sends text to the delivery chat, as a reply to message replyTo
+// when that is not 0; if Telegram says the chat id is invalid, it looks the
+// chat up again once and retries. It returns the id of the message sent (0
+// when Telegram's answer does not name it: the message was sent all the same).
+func (s *scanner) sendNotify(ctx context.Context, text string, replyTo int) (int, error) {
+	send := func() (tg.UpdatesClass, error) {
+		if replyTo != 0 {
+			return s.sender.To(s.notifyPeer).Reply(replyTo).Text(ctx, text)
+		}
+		return s.sender.To(s.notifyPeer).Text(ctx, text)
 	}
-	log.Printf("delivery chat rejected (%v) — looking up SCOUT_NOTIFY_PEER=%q again", err, s.cfg.NotifyPeer)
-	peer, label, rerr := s.resolveNotify(ctx)
-	if rerr != nil {
-		return fmt.Errorf("%w (re-resolve failed: %v)", err, rerr)
+	upd, err := send()
+	if err != nil && isPeerError(err) {
+		log.Printf("delivery chat rejected (%v) — looking up SCOUT_NOTIFY_PEER=%q again", err, s.cfg.NotifyPeer)
+		peer, label, rerr := s.resolveNotify(ctx)
+		if rerr != nil {
+			return 0, fmt.Errorf("%w (re-resolve failed: %v)", err, rerr)
+		}
+		s.notifyPeer = peer
+		log.Printf("reports will be delivered to %s", label)
+		upd, err = send()
 	}
-	s.notifyPeer = peer
-	log.Printf("reports will be delivered to %s", label)
-	_, err = s.sender.To(s.notifyPeer).Text(ctx, text)
-	return err
+	if err != nil {
+		return 0, err
+	}
+	return sentMessageID(upd), nil
+}
+
+// sentMessageID returns the id of the message a successful send created, or
+// 0 (logged) when Telegram's answer does not name one. That is no send error:
+// the message is in the chat, only its id is not known.
+func sentMessageID(upd tg.UpdatesClass) int {
+	id, err := unpack.MessageID(upd, nil)
+	if err != nil {
+		log.Printf("delivery: sent, but Telegram's answer names no message id (%v) — stored without it", err)
+		return 0
+	}
+	return id
 }
 
 // normalizeChatID converts Bot-API style ids (-100<channel>, -<chat>) to raw MTProto ids.
@@ -1677,6 +1945,7 @@ func main() {
 	retryDryRun := flag.Bool("retry-dry-run", false, "with -retry-no-pool: only print what would be reset")
 	rescanMissing := flag.Bool("rescan-missing", false, "with -dry-run: list and count the first calls without a Perceptor report that the rescan lane (SCOUT_RESCAN) would re-scan under the current settings, and how long it would take, then exit (DB only; nothing is scanned)")
 	backfillTiming := flag.Bool("backfill-timing", false, "fill in the timing columns of done on-chain horizons from the stored candles, and the rug time of rugged calls (one node lookup each), then exit; with -dry-run: only count (DB only, no Telegram)")
+	reaskMissing := flag.Bool("salpha-reask-missing", false, "with -dry-run: list and count the first calls whose live sAlpha reply was no report (declined, empty, timeout, failed) that the sAlpha re-ask lane (SCOUT_SALPHA_REASK) would ask about again under the current settings, by age, then exit (DB only; nothing is sent)")
 	flag.Parse()
 	if !*retryNoPool && (*retryGaveUp || *retryLaunchpad != "" || *retryDryRun) {
 		log.Fatal("-retry-gave-up, -retry-launchpad and -retry-dry-run are used with -retry-no-pool")
@@ -1690,6 +1959,10 @@ func main() {
 
 	if *rescanMissing && !*dryRun {
 		fmt.Println("-rescan-missing scans nothing itself: the rescan lane runs inside the listener with SCOUT_RESCAN=on (see README, \"Re-scanning calls without a Perceptor report\"). Add -dry-run to see what it would re-scan.")
+		return
+	}
+	if *reaskMissing && !*dryRun {
+		fmt.Println("-salpha-reask-missing sends nothing itself: the sAlpha re-ask lane runs inside the listener with SCOUT_SALPHA_REASK=on (see README, \"Asking sAlpha again\"). Add -dry-run to see what it would ask about.")
 		return
 	}
 
@@ -1737,11 +2010,15 @@ func main() {
 	}
 
 	// Modes that need only the database (no Telegram login).
-	if *exportPath != "" || *trackOnly || *trackOnce || *webOnly || *retryNoPool || *rescanMissing {
+	if *exportPath != "" || *trackOnly || *trackOnce || *webOnly || *retryNoPool || *rescanMissing || *reaskMissing {
 		if s.db == nil {
 			log.Fatal("these modes need the database (SCOUT_DB=off is set)")
 		}
 		switch {
+		case *reaskMissing: // with -dry-run (checked above)
+			if err := runReaskDryRun(ctx, s.db, os.Stdout, cfg.Reask, time.Now()); err != nil {
+				log.Fatalf("sAlpha re-ask dry run: %v", err)
+			}
 		case *rescanMissing: // with -dry-run (checked above)
 			if err := runRescanDryRun(ctx, s.db, os.Stdout, cfg.Rescan, time.Now()); err != nil {
 				log.Fatalf("rescan dry run: %v", err)
@@ -1841,9 +2118,10 @@ func main() {
 	if *testNotify {
 		if err := run(ctx, s, func(ctx context.Context) error {
 			if cfg.NotifyBotToken != "" {
-				return botAPISend(ctx, cfg.NotifyBotToken, cfg.NotifyChatID, "✅ scoutanalytics test message")
+				_, err := botAPISend(ctx, cfg.NotifyBotToken, cfg.NotifyChatID, "✅ scoutanalytics test message", 0)
+				return err
 			}
-			if err := s.sendNotifyText(ctx, "✅ scoutanalytics test message — reports will arrive here"); err != nil {
+			if _, err := s.sendNotify(ctx, "✅ scoutanalytics test message — reports will arrive here", 0); err != nil {
 				return fmt.Errorf("test message to %q failed: %w", cfg.NotifyPeer, err)
 			}
 			fmt.Println("test message sent — check the chat")
@@ -1939,6 +2217,7 @@ func main() {
 	if s.rescan != nil && s.recheck != nil {
 		s.rescan.holdBack = cfg.Recheck.horizon()
 	}
+	s.reask = s.newReaskLane(cfg.Reask) // the sAlpha re-ask lane (salpha_reask.go); nil when off
 	backoff := 5 * time.Second
 	for {
 		start := time.Now()
