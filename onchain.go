@@ -13,6 +13,7 @@ import (
 	"math/big"
 	"net"
 	"net/http"
+	"regexp"
 	"slices"
 	"sort"
 	"strconv"
@@ -419,7 +420,12 @@ func cleanTokenText(s string, max int) string {
 }
 
 // isNoSuchValue: the contract answered, but has no such function or value (a
-// revert or an empty result) — as opposed to the node being unreachable.
+// revert, an EVM execution error or an empty result), or the node answered
+// that it has no state for the block asked (a full node asked about an old
+// block) — as opposed to the node being unreachable, busy, or failing in some
+// other way, which is tried again later. A JSON-RPC error counts only when
+// isNoStateText matches it, or, if it reads as neither busy nor rate limiting,
+// with code 3 (execution reverted) or a text in noSuchValueTexts.
 func isNoSuchValue(err error) bool {
 	if err == nil {
 		return false
@@ -428,14 +434,62 @@ func isNoSuchValue(err error) bool {
 	if !errors.As(err, &re) {
 		return errors.Is(err, errEmptyResult)
 	}
-	// A node that is busy or rate limiting also answers with a JSON-RPC error.
 	msg := strings.ToLower(re.Message)
+	// The node's own "no state for this block" texts come before the busy
+	// words: geth's "required historical state unavailable (reexec=128)"
+	// contains "unavailable".
+	if isNoStateText(msg) {
+		return true
+	}
+	// A node that is busy or rate limiting also answers with a JSON-RPC error
+	// (checked before the revert texts: a revert reason can read "limit" too,
+	// see TestFillTokenSupplyGivesUp).
 	for _, transient := range []string{"rate", "limit", "too many", "timeout", "timed out", "capacity", "busy", "try again", "unavailable", "overloaded"} {
 		if strings.Contains(msg, transient) {
 			return false
 		}
 	}
-	return true
+	if re.Code == 3 {
+		return true // execution reverted (with revert data)
+	}
+	for _, s := range noSuchValueTexts {
+		if strings.Contains(msg, s) {
+			return true
+		}
+	}
+	return false
+}
+
+// noSuchValueTexts: lower-case parts of the JSON-RPC error messages that mean
+// the contract refused or failed the call, for isNoSuchValue (geth and Nitro:
+// "execution reverted…", "invalid opcode: INVALID", …).
+var noSuchValueTexts = []string{
+	"revert",
+	"invalid opcode", "invalid jump", "stack underflow", "out of gas",
+}
+
+// noStateTexts: lower-case parts of the JSON-RPC error messages in which the
+// node says it has no state for the block asked (geth and Nitro full nodes:
+// "missing trie node <hash> (path ) state 0x<root> is not available…"; geth
+// hash scheme: "required historical state unavailable (reexec=128)"; geth
+// path scheme: "historical state <root> is not available").
+var noStateTexts = []string{"missing trie node", "historical state"}
+
+// noStateRe: "state <root or block> is not available" on its own, e.g.
+// "state 0x12ab is not available" or Erigon-style "state at block 123 is not
+// available". The root or block is required, so that "the method … is not
+// available" or "state sync is not available" do not match.
+var noStateRe = regexp.MustCompile(`(?i)\bstate (0x[0-9a-f]+|at block \d+) is not available`)
+
+// isNoStateText reports whether a lower-case JSON-RPC error message says the
+// node has no state for the block asked.
+func isNoStateText(msg string) bool {
+	for _, s := range noStateTexts {
+		if strings.Contains(msg, s) {
+			return true
+		}
+	}
+	return noStateRe.MatchString(msg)
 }
 
 // readTokenText calls a string getter (name() / symbol()). ok is false when the

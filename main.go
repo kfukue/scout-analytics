@@ -270,11 +270,12 @@ func caKey(ca string) string {
 	return ca
 }
 
-// classify returns (isFlagged, matchedMarker).
+// classify returns (isFlagged, matchedMarker). The safe phrases are removed
+// first, with stripSafePhrase.
 func classify(report string, markers, safe []string) (bool, string) {
 	t := strings.ToLower(report)
 	for _, p := range safe {
-		t = strings.ReplaceAll(t, p, " ")
+		t = stripSafePhrase(t, p)
 	}
 	for _, m := range markers {
 		if strings.Contains(t, m) {

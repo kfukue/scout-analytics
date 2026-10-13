@@ -9,6 +9,8 @@ import (
 	"regexp"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/gotd/td/tg"
 )
@@ -70,10 +72,64 @@ var (
 	titleRe       = regexp.MustCompile(`(?is)<title[^>]*>(.*?)</title>`)
 )
 
+// zeroRedFlagsRe finds a count of zero red flags ("0 red flags", "zero red
+// flags", "Red flags: 0", "Red flags: none"), which means the same as "no red
+// flags". The boundaries keep "10 red flags" and "Red flags: 0x…" out.
+var zeroRedFlagsRe = regexp.MustCompile(`(?i)\b(?:0|zero)\s+red\s+flags?\b|\bred\s+flags?\s*:\s*(?:0|none|zero)\b`)
+
+// zeroRedFlagsAsNone rewrites every zero count of red flags as "no red flags",
+// so that the "red flag" in it is not read as a red flag (by levelFromLabel or
+// by the red flag markers; "no red flags" is a default safe phrase).
+func zeroRedFlagsAsNone(s string) string {
+	return zeroRedFlagsRe.ReplaceAllString(s, "no red flags")
+}
+
+// stripSafePhrase replaces each occurrence of the safe phrase p in t with a
+// space, as strings.ReplaceAll would, except where a digit at an edge of p
+// touches a letter or digit next to it in t: that number is then part of a
+// longer one, so "0 red flags" stays in "10 red flags", "0 warnings" in "20
+// warnings" and "red flags: 0" in "red flags: 0x…". Phrases with no digit at
+// an edge ("honeypot: no", "no red flag") still match anywhere, as before.
+func stripSafePhrase(t, p string) string {
+	if p == "" {
+		return t
+	}
+	first, _ := utf8.DecodeRuneInString(p)
+	last, _ := utf8.DecodeLastRuneInString(p)
+	checkStart, checkEnd := unicode.IsDigit(first), unicode.IsDigit(last)
+	if !checkStart && !checkEnd {
+		return strings.ReplaceAll(t, p, " ")
+	}
+	alnum := func(r rune) bool { return unicode.IsLetter(r) || unicode.IsDigit(r) }
+	var b strings.Builder
+	done, from := 0, 0 // t[:done] is written to b; search again from t[from:]
+	for {
+		k := strings.Index(t[from:], p)
+		if k < 0 {
+			break
+		}
+		i, j := from+k, from+k+len(p)
+		before, _ := utf8.DecodeLastRuneInString(t[:i]) // RuneError at the start
+		after, _ := utf8.DecodeRuneInString(t[j:])      // RuneError at the end
+		if (checkStart && alnum(before)) || (checkEnd && alnum(after)) {
+			from = i + len(string(first)) // not standalone: look further on
+			continue
+		}
+		b.WriteString(t[done:i])
+		b.WriteByte(' ')
+		done, from = j, j
+	}
+	if done == 0 {
+		return t
+	}
+	b.WriteString(t[done:])
+	return b.String()
+}
+
 // levelFromLabel maps a verdict phrase to a level. Order matters:
-// "no red flags" must be checked before "red flag".
+// "no red flags" (or a zero count of them) must be checked before "red flag".
 func levelFromLabel(s string) string {
-	t := strings.ToLower(s)
+	t := strings.ToLower(zeroRedFlagsAsNone(s))
 	switch {
 	case strings.Contains(t, "no red flag"):
 		return levelClean
@@ -239,6 +295,7 @@ func fetchPerceptorVerdict(ctx context.Context, id string) (verdict, error) {
 // from the Telegram message itself.
 func textVerdict(text string, markers, safe []string) verdict {
 	v := verdict{Source: "telegram_text"}
+	text = zeroRedFlagsAsNone(text) // "0 red flags" is "no red flags" for the markers too
 	lvl := levelFromLabel(text)
 	if lvl == levelClean {
 		// Explicit "no red flags" — still make sure there is no caution/warning marker elsewhere.
