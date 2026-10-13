@@ -622,7 +622,7 @@ the returns: never model inputs. Seconds are counted from `entry_at` (the post);
 | Column (`scout_call_returns`) | Meaning |
 |---|---|
 | `peak_late_after_s` | Start of the first bucket whose high is the horizon's late peak (E × (1 + `max_gain_late_pct`/100)). `0` when the peak is the entry itself (`max_gain_late_pct` = 0). When no candle reaches the stored peak, no timing is stored for the horizon (`timing_at` stays NULL, logged). |
-| `first_2x_after_s` | Start of the first bucket whose high touched 2E. NULL = never reached 2×. |
+| `first_2x_after_s` | Start of the first bucket whose high touched 2E. NULL = never reached 2×. "Reached 2×" in these columns means this stored touch; the website's Timing tab uses a stricter held rule on top of them (see **Timing tab** under "Website"). |
 | `above_2x_s` | Seconds a close was at or above 2E (see below). `0` = never reached 2×, or touched 2× but never closed at or above it. |
 | `fall_below_2x_after_s` | First time, from the first 2× on, that a close was under 2E, or the rug time if the window ended with a rug while still at 2×. NULL = never reached 2×, or censored. |
 | `above_2x_censored` | `true` = reached 2× and no close under 2E was seen by the end of the window (no rug): the hold was cut off by the horizon, not ended. This includes a first 2× in the bucket that holds the horizon's end (`above_2x_s` 0). `false` otherwise (also when 2× was never reached). |
@@ -1817,19 +1817,42 @@ dependencies; `go test` runs it when `node` is on the PATH). Only the visible ta
   and counted ("Timing not computed"). Times are counted from the post; their resolution is 5
   minutes on the first day and 1 hour after. The window, Pool family, Verdict and Quiet choices
   apply as on the other tabs.
-  - **Counts:** calls, with data, timed, timing not computed, reached 2× (touched twice the
-    late entry price), still at 2× at the end (censored), touch and drop, rugged in the window.
+  - **Counts:** calls, with data, timed, timing not computed, reached 2× (see the rule below),
+    still at 2× at the end (censored; of the calls that reached 2×), touched 2× but under 1 hour
+    (touched 2× with a known held time, including those still at 2× at the end, but did not
+    reach 2× by the rule), rugged in the window.
   - **How long it took:** five histograms in log bands (< 5m, 5–15m, 15–60m, 1–4h, 4–24h,
     1–3d, 3–7d, 7–30d; a time on a boundary goes to the band above it), each bar a share of its
     chart's n: **time to peak** (every timed call), **time to the first 2×** (the calls that
     reached 2×), **time held at 2×** on closes (every timed call), **time to fall back below
     2×** (the calls that reached 2× and fell back within the window; the censored ones are left
     out) and **time to rug** (event rug times within the window).
-  - **The 0-held rule:** a call that never reached 2× counts as **0 held** (owner decision;
-    the grey part of the "0" bar). A **touch and drop**, a call whose price touched 2× (a
-    candle high) but never closed at or above it (`first_2x_after_s` set, `above_2x_s` 0,
-    not censored), counts as reaching 2× with 0 held (option (a); the tab's default, pending
-    the owner's confirmation).
+  - **Reached 2×** (owner decision, 12 October 2026: at or above 2× for at least 1 hour in
+    total): in every window including 1h, with no exception for a call still at 2× when the
+    window ended. On the stored columns: `first_2x_after_s` set and `above_2x_s` ≥ 3600.
+    Because the time held is counted from the end of the first 2× candle, a call in the 1h
+    window holds less than 1 hour (at most 59 min 59 s, when the post is 1 s before a 5-minute
+    candle boundary and the entry delay is 0; at most 55 minutes when the post is on a
+    boundary), so no call can reach 2× by this rule in the 1h window, and the 1h window shows
+    "n/a — needs 1 hour held" instead of the reached-2× figures (owner decision, 12 October
+    2026): the Reached 2× and Still at 2× at the end counts; the Reached 2×, First 2×, Fell below 2×, Still at 2× at end and Half fell back by
+    columns of the group table; the time to the first 2× and time to fall back below 2×
+    histograms; and the "still at 2× after t" curve. The other figures stay: the touched 2×
+    but under 1 hour count, the time held histogram and the Held at 2× column (every timed
+    call), the totals, the time to peak and the rug figures. `can2xReach` in
+    `frontend/analytics-stats.js` decides it from the window length: a window is too short
+    when even a first 2× candle closing 1 s after the post (the earliest `candleTiming`
+    allows) leaves less than 1 hour to the window's end, which is only the 1h window.
+    `MIN_HELD_2X_S` and `reached2x` in `frontend/analytics-stats.js` are the only place the
+    threshold and the rule live; the stored columns and `/api/analytics` are unchanged. A call
+    that touched 2× (a candle high) without reaching it by this rule, including a touch and
+    drop (`above_2x_s` 0), counts as **not** reaching 2×, exactly like a call that never
+    touched it: it stays in every total and in the denominator of the 2× rate, and is left out
+    of the time to the first 2×, the time to fall back below 2× and the "still at 2× after t"
+    curve.
+  - **The 0-held rule:** a call that did not reach 2× (never touched it, or touched it without
+    reaching it by the rule above) counts as **0 held** (owner decision; the grey part of the
+    "0" bar).
   - **Rugs by kind of rug time** (a table): event rug times within the window, event rug
     times after it, rugs **at the call** (drained at or before the post), rugs only
     **detected** at the end of tracking (their time is that check's, an upper bound), any
@@ -1840,14 +1863,14 @@ dependencies; `go test` runs it when `node` is on the PATH). Only the visible ta
     week or month (the Period choice), the pool family, the DEX named in the post, or any
     number factor of the By factor tab in 4, 5 or 10 equal-count groups (the same choice as
     on By factor). Per group: timed calls, the share that reached 2×, and the median and mean
-    (with n) of the time to peak, to the first 2×, held at 2× (0 for calls that never reached
+    (with n) of the time to peak, to the first 2×, held at 2× (0 for calls that did not reach
     it), to fall below 2× and to rug; the share still at 2× at the end; and the Kaplan–Meier
     median of the time held ("half fell back by").
   - **Still at 2× after t:** a Kaplan–Meier curve per group (and all timed calls) over the
     calls that reached 2×, t counted from the first 2×. A call that fell back counts at the
-    time it held on closes, at most until its first close under 2× (a touch and drop falls at
-    0); a call still at 2× when the window ended is censored (it counts as at 2× up to then,
-    not as a fall).
+    time it held on closes, at most until its first close under 2× (so a call that held 1 hour
+    or more in several stretches can fall before 1 hour); a call still at 2× when the window
+    ended is censored (it counts as at 2× up to then, not as a fall).
   - **Share rugged by t:** per group, the share of the timed calls whose pool was drained
     (event rug times) within t of the post: a plain running share, as every timed call was
     followed for the whole window.
@@ -2196,7 +2219,9 @@ clients that take it; `503` before the first snapshot.
   columns hold numbers. Within a timed window, `null` means what `NULL` means in the column:
   `t2x` `null` = never reached 2×; `tfall` `null` = never reached 2×, or still at 2× when the
   window ended. `held` is `0` for a call that never reached 2× or touched it and never
-  closed at or above it.
+  closed at or above it. "Reached 2×" here is the stored touch (`first_2x_after_s` set); the
+  Timing tab applies its own held rule to these values in the browser (see **Timing tab**
+  under "Website").
   - `timed`: bit *i* set = window *i* of `horizons` has its timing; `cens_2x`: bit *i* =
     `above_2x_censored` of a timed window *i* (still at 2× at the end, no rug).
   - `rug_s` = `scout_call_tracking.rug_at` − `entry_at` in whole seconds (`0` or negative

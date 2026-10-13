@@ -2,7 +2,8 @@
 // state): mean and median, equal-count groups, the fixed return bands, the
 // outcome classes, the symmetric-log and log scales, UTC weeks and hours,
 // "$100 on every call" and "gave back more than half"; and for the Timing tab
-// the time bands, the 0-held rule, Kaplan–Meier and the share rugged by t,
+// the time bands, the "reached 2×" rule (at least MIN_HELD_2X_S at 2×) and
+// the windows too short for it (can2xReach), the 0-held rule, Kaplan–Meier and the share rugged by t,
 // the time axis and short durations. Plain JavaScript,
 // loaded by analytics.html before analytics.js (window.AnaStats), and by
 // testdata/analytics-stats.test.js under Node (module.exports).
@@ -443,10 +444,101 @@
     return out;
   }
 
-  // The time held at 2× of a timed call, by the owner's rule: a call that
-  // never reached 2× (first 2× missing) counts as 0 held; one that touched 2×
-  // but never closed at or above it has held 0 already. NaN when held is
-  // missing although 2× was reached.
+  // "Reached 2×" on the Timing tab (owner decision, 12 October 2026: at or
+  // above 2× for at least 1 hour in total): a call reached 2× when it held at
+  // or above 2× on closes (above_2x_s) for at least this many seconds in
+  // total within the window, in every window (1h included), with no
+  // exception for a call still at 2× when the window ended. A call that
+  // touched 2× (first_2x_after_s set) and held less counts as not reaching
+  // 2×, like one that never touched it. The only place the threshold is set;
+  // reached2x below is the only place the rule is.
+  //
+  // As stored by candleTiming in timing.go: times count from entry_at (the
+  // post); the window ends at due_at = entry_at + the horizon, or earlier at
+  // the rug. Held is counted from the END of the first 2× bucket (5-minute
+  // buckets on day one, hourly after; first_2x_after_s is the bucket's
+  // START), each close carried to the next bucket's end or the window's end.
+  // That bucket ends after the post, so in the 1h window a call holds less
+  // than 1 hour (at most 55 minutes when the post is on a 5-minute boundary)
+  // and none reaches 2× by this rule: can2xReach below, and the tab shows
+  // n/a (na2x) instead of the reached-2× figures there.
+  var MIN_HELD_2X_S = 3600;
+
+  // The earliest the first 2× candle can close, in seconds after the post.
+  // In candleTiming (timing.go) a candle is used only when it ends after the
+  // late entry (entry_at + SCOUT_ENTRY_DELAY, which may be set to 0), so
+  // after the post, and times are whole seconds; held is counted from that
+  // candle's end to the window's end (due_at, or earlier at the rug). So a
+  // call holds at most windowSeconds - 1 s. On day one the candles are 5
+  // minutes, so the first candle closes between 1 s and 300 s after the post
+  // (55 minutes held at most in the 1h window when the post is on a 5-minute
+  // boundary, 59 min 59 s when it is 1 s before one). The bound is the
+  // smallest gap, 1 s, not 300 s: a window is called too short only when no
+  // call at all can reach the rule. The entry delay is not used (the page
+  // does not know it, and it can be 0).
+  var FIRST_2X_CLOSE_MIN_S = 1;
+
+  // Whether any call can reach 2× by the rule above in a window of this many
+  // seconds: false when windowSeconds - FIRST_2X_CLOSE_MIN_S <
+  // MIN_HELD_2X_S (1h: 3599 s at most, so false; 1d and longer: true). An
+  // unknown window gives true (the figures are shown: nothing is proven).
+  function can2xReach(windowSeconds) {
+    if (!isNum(windowSeconds)) { return true; }
+    return windowSeconds - FIRST_2X_CLOSE_MIN_S >= MIN_HELD_2X_S;
+  }
+
+  // What the tab shows instead of a reached-2× figure where can2xReach is
+  // false: the same words everywhere (short: in a table cell, needs: under
+  // it), and why (a title).
+  function na2x() {
+    var hold = holdWords(MIN_HELD_2X_S);
+    var needs = 'needs ' + hold + ' held';
+    return {
+      short: 'n/a', needs: needs, text: 'n/a — ' + needs,
+      why: 'Time held at 2× is counted from the end of the first 2× candle, so this window is too short ' +
+        'for any call to be at or above 2× for ' + hold + ' (the "reached 2×" rule).'
+    };
+  }
+
+  // A threshold in words ("1 hour", "2 hours", "90 minutes").
+  function holdWords(s) {
+    if (s % 3600 === 0) { return s / 3600 + (s === 3600 ? ' hour' : ' hours'); }
+    return Math.round(s / 60) + ' minutes';
+  }
+
+  // Whether a timed call reached 2× by the rule above (t2x = the first 2×
+  // touch, held = seconds at or above 2× on closes). Whether the call was
+  // still at 2× when the window ended does not matter.
+  function reached2x(t2x, held) {
+    return isNum(t2x) && isNum(held) && held >= MIN_HELD_2X_S;
+  }
+
+  // The 2× timing of a timed call by the rule above: the one place that
+  // decides it. A call that did not reach 2× is treated exactly like one that
+  // never touched it (no time to 2×, 0 held, no fall, not censored, not in
+  // the "still at 2× after t" curve); it stays in every count of timed calls.
+  // touched: first 2× set; short: touched with a known held but not reached
+  // (held under MIN_HELD_2X_S, whether or not still at 2× at the window's end).
+  function timing2x(t2x, held, tfall, censored) {
+    var touched = isNum(t2x);
+    var reached = reached2x(t2x, held);
+    var rt = reached ? t2x : null;
+    var short = touched && isNum(held) && !reached;
+    return {
+      touched: touched, reached: reached, short: short,
+      t2x: reached ? t2x : NaN,
+      // touched with held missing: unknown (left out), as before the rule
+      held: touched && !isNum(held) ? NaN : heldValue(rt, held),
+      tfall: reached && isNum(tfall) ? tfall : NaN,
+      cens: reached && !!censored,
+      hold: holdItem(rt, held, tfall, censored)
+    };
+  }
+
+  // The time held at 2× of a timed call: a call that never reached 2× (first
+  // 2× missing) counts as 0 held. NaN when held is missing although 2× was
+  // reached. timing2x passes null as t2x for a call that touched 2× but did
+  // not reach it by the rule above.
   function heldValue(t2x, held) {
     if (!isNum(t2x)) { return 0; }
     return isNum(held) ? held : NaN;
@@ -553,6 +645,8 @@
   var api = {
     isNum: isNum, mean: mean, median: median, summarize: summarize,
     TIME_BANDS: TIME_BANDS, timeBand: timeBand, timeHistogram: timeHistogram, heldValue: heldValue,
+    MIN_HELD_2X_S: MIN_HELD_2X_S, holdWords: holdWords, reached2x: reached2x, timing2x: timing2x,
+    FIRST_2X_CLOSE_MIN_S: FIRST_2X_CLOSE_MIN_S, can2xReach: can2xReach, na2x: na2x,
     holdItem: holdItem, kaplanMeier: kaplanMeier, stepAt: stepAt, cumulativeShare: cumulativeShare,
     timeAxis: timeAxis, timeAxisInv: timeAxisInv, fmtDur: fmtDur,
     equalCountGroups: equalCountGroups, BANDS: BANDS, band: band, histogram: histogram,
