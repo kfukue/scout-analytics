@@ -31,6 +31,12 @@ root).
   `TESTING.md`); never the Windows Postgres service on port 5432.
 - `.env`: the tracker reads `.env` from the folder it is started in, and a
   variable already set in the shell wins over the file.
+- Small changes, small functions (owner, 13 Oct 2026): keep each change to
+  one function of the system so its PR is easy to review; if a task turns
+  out to span several (e.g. storage, API, page), say so and propose the
+  split instead of growing one large diff. Write new code as small,
+  single-purpose, testable functions; split a function that grows long
+  rather than adding to it.
 
 ## How you report (basics)
 
