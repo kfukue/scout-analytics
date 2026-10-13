@@ -464,31 +464,33 @@ func TestRecheckSecondIsRescan(t *testing.T) {
 }
 
 // The website takes a real verdict over "not enough data yet" for the same
-// call (the 12-minute re-check), and never the 2-hour one. The dataset view
+// call (the 12-minute re-check), and never the 2-hour one as the call-time
+// verdict (that one is "Perceptor today"); the Perceptor filter takes the
+// latest report with a verdict, the 2-hour one included. The dataset view
 // (a model input) and the Analytics "verdict at call" never take a re-check:
 // they keep the answer known at the call.
 func TestRecheckVerdictChoice(t *testing.T) {
 	f := newRecheckFixture(t)
 	ctx := context.Background()
 	t0 := time.Now().Add(-5 * time.Hour)
-	type want struct{ dataset, web, today, atCall string }
+	type want struct{ dataset, web, today, atCall, filter string }
 	cases := map[string]struct {
 		setup func(call int, ca string)
 		want  want
 	}{
 		"12m re-check caution": {func(call int, ca string) {
 			f.recheckRow(t, call, ca, t0.Add(12*time.Minute), 1, levelCaution)
-		}, want{levelInsufficient, levelCaution, "", levelUnknown}},
+		}, want{levelInsufficient, levelCaution, "", levelUnknown, levelCaution}},
 		"12m insufficient, 2h clean": {func(call int, ca string) {
 			f.recheckRow(t, call, ca, t0.Add(12*time.Minute), 1, levelInsufficient)
 			f.recheckRow(t, call, ca, t0.Add(2*time.Hour), 2, levelClean)
-		}, want{levelInsufficient, levelInsufficient, levelClean, levelUnknown}},
+		}, want{levelInsufficient, levelInsufficient, levelClean, levelUnknown, levelClean}},
 		"a later insufficient live scan": {func(call int, ca string) {
 			// e.g. a re-check stored with a real verdict, then an insufficient live scan of the same call
 			f.recheckRow(t, call, ca, t0.Add(12*time.Minute), 1, levelRedFlags)
 			seedInvestigation(t, f.st, f.perc, &call, ca, t0.Add(30*time.Minute), investigationCompleted, ScanKindLive, levelInsufficient)
-		}, want{levelInsufficient, levelRedFlags, "", levelUnknown}},
-		"only insufficient": {func(call int, ca string) {}, want{levelInsufficient, levelInsufficient, "", levelUnknown}},
+		}, want{levelInsufficient, levelRedFlags, "", levelUnknown, levelRedFlags}},
+		"only insufficient": {func(call int, ca string) {}, want{levelInsufficient, levelInsufficient, "", levelUnknown, levelInsufficient}},
 	}
 	ids := map[string]int{}
 	i := 0
@@ -516,12 +518,13 @@ func TestRecheckVerdictChoice(t *testing.T) {
 			t.Fatal(err)
 		}
 		r := byID[call]
-		got := want{strOrNil(v), strOrNil(r.PerceptorVerd), strOrNil(r.PerceptorTodayVerd), strOrNil(r.VerdictAtCall)}
+		got := want{strOrNil(v), strOrNil(r.PerceptorVerd), strOrNil(r.PerceptorTodayVerd), strOrNil(r.VerdictAtCall),
+			strOrNil(webLatestPerceptor(r.PerceptorVerd, r.PerceptorAt, r.PerceptorTodayVerd, r.PerceptorTodayAt))}
 		if c.want.today == "" {
 			c.want.today = "<nil>"
 		}
 		if got != c.want {
-			t.Errorf("%s: dataset, web, today, at call = %+v, want %+v", name, got, c.want)
+			t.Errorf("%s: dataset, web, today, at call, filter = %+v, want %+v", name, got, c.want)
 		}
 	}
 }

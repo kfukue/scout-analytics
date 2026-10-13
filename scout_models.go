@@ -303,6 +303,10 @@ type ScoutWebRow struct {
 	PerceptorVerd   *string // clean | caution | red_flags | insufficient | unknown
 	PerceptorURL    *string
 	PerceptorID     *int
+	// PerceptorAt: when the live report PerceptorVerd comes from completed
+	// (completed_at, else requested_at); nil without one. Not sent: only the
+	// Perceptor filter's "latest report" rule (webLatestPerceptor) reads it.
+	PerceptorAt *time.Time
 	// "Perceptor today": the token's latest completed rescan (scan_kind
 	// 'rescan', run long after the call by the rescan lane): its verdict
 	// (clean | caution | red_flags | insufficient | unknown), link and time (completed_at,
@@ -398,8 +402,13 @@ type ScoutWebRow struct {
 	RugAtKind  *string
 
 	// worked out by the website when it builds its snapshot (websnapshot.go)
-	usd     bool  // priced in USD: only then are the numbers shown
-	verdict uint8 // webBucket…: where the Perceptor filter puts the token
+	usd bool // priced in USD: only then are the numbers shown
+	// latestVerd: the verdict of the token's latest Perceptor report with a
+	// verdict (webLatestPerceptor: PerceptorVerd or PerceptorTodayVerd), the
+	// one the Perceptor filter uses; verdict is its webBucket… (where the
+	// filter and its counts put the token).
+	latestVerd *string
+	verdict    uint8
 	// salphaDeclined: the sAlpha report SAlphaID names only declines to report
 	// (set by webReportsFor from its text)
 	salphaDeclined bool
@@ -491,14 +500,20 @@ type ScoutWebCall struct {
 	// of the call itself, and without one.
 	SAlphaReaskAfterS *int64 `json:"salpha_reask_after_s"`
 	// "Perceptor today": the token's latest completed Perceptor re-scan by the
-	// rescan lane, run long after the call (SCOUT_RESCAN): its verdict (clean |
-	// caution | red_flags | unknown), report link (https only) and when it ran.
-	// All three are nil without one. perceptor_verdict, perceptor_url and
-	// perceptor_report_id above (and the Perceptor filter) come from scans
-	// made at the time of a call only, never from a re-scan.
+	// rescan lane or the 2-hour re-check, run long after the call
+	// (SCOUT_RESCAN): its verdict (clean | caution | red_flags | insufficient
+	// | unknown), report link (https only) and when it ran. All three are nil
+	// without one. perceptor_verdict, perceptor_url and perceptor_report_id
+	// above come from scans made at the time of a call only (with the
+	// 12-minute re-check), never from a re-scan.
 	PerceptorTodayVerd *string    `json:"perceptor_today_verdict"`
 	PerceptorTodayURL  *string    `json:"perceptor_today_url"`
 	PerceptorTodayAt   *time.Time `json:"perceptor_today_at"`
+	// PerceptorLatestVerd: the verdict the Perceptor filter (verdict=) and
+	// its counts use: that of the token's latest Perceptor report with a
+	// verdict, perceptor_verdict or perceptor_today_verdict (the rule is
+	// webLatestPerceptor's). nil when the token has no completed report.
+	PerceptorLatestVerd *string `json:"perceptor_latest_verdict"`
 }
 
 // ScoutWebReport is one investigation as the website's row detail shows it

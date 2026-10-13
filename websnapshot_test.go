@@ -282,10 +282,7 @@ func referencePage(rows []ScoutWebRow, f ScoutWebCallsFilter) (ids []int, total 
 		if q != "" && !has(r.TokenName) && !has(r.TokenSymbol) && !strings.Contains(strings.ToLower(r.ContractAddress), q) {
 			continue
 		}
-		verdict := "not_scanned"
-		if r.PerceptorVerd != nil && *r.PerceptorVerd != levelUnknown {
-			verdict = *r.PerceptorVerd
-		}
+		verdict := refFilterVerdict(r) // the latest report with a verdict
 		if f.Verdict != "" && !slices.Contains(strings.Split(f.Verdict, ","), verdict) {
 			continue
 		}

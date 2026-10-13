@@ -40,8 +40,9 @@
   var VERDICT_FILTER_TEXT = { clean: 'No red flags', caution: 'Caution', red_flags: 'Red flags', not_scanned: 'Not scanned' };
   // "Perceptor today": the token's latest Perceptor re-scan, run long after the
   // call (perceptor_today_*). Never the verdict at the time of the call: its own
-  // words ("today: …") and an outlined style, and the Perceptor filter and its
-  // counts never use it.
+  // words ("today: …") and an outlined style. The Perceptor filter and its
+  // counts use it when it is the token's latest report with a verdict
+  // (perceptor_latest_verdict, filterVerdict).
   var TODAY_TEXT = {
     clean: { text: 'no red flags', cls: 'pv-today pv-today-clean' },
     caution: { text: 'caution', cls: 'pv-today pv-today-caution' },
@@ -52,7 +53,7 @@
   // Perceptor's "not enough data yet" (verdict insufficient: a token too new to
   // judge). Shown with its own words, but no verdict: the Perceptor filter and
   // its counts put it under "not scanned" (verdictBucket), like a report
-  // without a readable verdict.
+  // without a readable verdict, unless another report of the token has one.
   VERDICT_TEXT.insufficient = { text: 'not enough data yet', cls: 'pv pv-insufficient' };
   TODAY_TEXT.insufficient = { text: 'not enough data yet', cls: 'pv-today pv-today-unknown' };
 
@@ -115,10 +116,28 @@
     return { text: v.text, cls: v.cls, at: at === DASH ? '' : at, url: c.perceptor_today_url };
   }
 
-  // The words of the title of a "Perceptor today" label.
-  function todayTitle(t, linked) {
+  // The words of the title of a "Perceptor today" label; used: the Perceptor
+  // filter goes by this verdict (filterUsesToday).
+  function todayTitle(t, linked, used) {
     return 'Perceptor re-scan' + (t.at ? ' on ' + t.at : '') + ', not the verdict at call time' +
+      (used ? '; the Perceptor filter uses this verdict (the latest report with one)' : '') +
       (linked ? ' (opens the re-scan report)' : '');
+  }
+
+  // The verdict the Perceptor filter and its counts use for a row: that of the
+  // token's latest Perceptor report with a verdict, the call-time one or
+  // "Perceptor today" (perceptor_latest_verdict, worked out by the server);
+  // the call-time verdict if the server did not send it.
+  function filterVerdict(c) {
+    if (!c) { return null; }
+    return Object.prototype.hasOwnProperty.call(c, 'perceptor_latest_verdict') ? c.perceptor_latest_verdict : c.perceptor_verdict;
+  }
+
+  // Whether the Perceptor filter puts the row where its "Perceptor today"
+  // does, not where its call-time verdict would.
+  function filterUsesToday(c) {
+    var b = verdictBucket(filterVerdict(c));
+    return b !== verdictBucket(c.perceptor_verdict) && b === verdictBucket(c.perceptor_today_verdict);
   }
 
   // A link that opens in a new tab, or plain text when the address is not https.
@@ -467,15 +486,19 @@
     tdDate.appendChild(linkOrText(c.post_url, fmtDate(c.message_date)));
     tr.appendChild(tdDate);
 
-    // Latest Perceptor report of the token; a dash when it was never scanned
-    // (or the report had no readable verdict).
+    // Latest call-time Perceptor report of the token; a dash when it was never
+    // scanned (or the report had no readable verdict).
     var tdPerc = el('td', 'perc');
     var pv = Object.prototype.hasOwnProperty.call(VERDICT_TEXT, c.perceptor_verdict) ? VERDICT_TEXT[c.perceptor_verdict] : null;
+    var usesToday = filterUsesToday(c);
     if (pv) {
       var pvNode = linkOrText(c.perceptor_url, pv.text, pv.cls);
       if (pvNode.tagName === 'A') { pvNode.title = 'Open the Perceptor report'; }
-      if (c.perceptor_verdict === 'insufficient') {
-        pvNode.title = 'Perceptor: not enough data yet (the token was too new to judge; counted as not scanned)' +
+      if (c.perceptor_verdict === 'insufficient' || usesToday) {
+        pvNode.title = (c.perceptor_verdict === 'insufficient'
+          ? 'Perceptor: not enough data yet (the token was too new to judge; counted as not scanned unless a later report has a verdict)'
+          : 'Verdict at call time') +
+          (usesToday ? '; the Perceptor filter uses the newer re-scan ("today")' : '') +
           (pvNode.tagName === 'A' ? '. Opens the Perceptor report' : '');
       }
       tdPerc.appendChild(pvNode);
@@ -495,7 +518,7 @@
     if (today) {
       var line = el('span', 'today-line');
       var tNode = linkOrText(today.url, 'today: ' + today.text, today.cls);
-      tNode.title = todayTitle(today, tNode.tagName === 'A');
+      tNode.title = todayTitle(today, tNode.tagName === 'A', usesToday);
       line.appendChild(tNode);
       tdPerc.appendChild(line);
     }
@@ -678,8 +701,12 @@
     var parts = [el('span', t.cls, 'today: ' + t.text)];
     if (t.at) { parts.push(t.at); }
     sec.appendChild(reportMeta(parts));
-    sec.appendChild(el('p', 'muted small', 'A Perceptor re-scan made long after the call, not the verdict at call time. ' +
-      'The Perceptor filter and its counts use the call-time verdict only.'));
+    var c = rowData[key];
+    var fb = verdictBucket(filterVerdict(c));
+    var why = filterUsesToday(c) ? 'The Perceptor filter and its counts use this re-scan\'s verdict: it is the token\'s latest Perceptor report with a verdict.'
+      : fb === 'not_scanned' ? 'The Perceptor filter counts the token as "Not scanned": none of its Perceptor reports has a verdict.'
+        : 'The Perceptor filter and its counts use the verdict at call time (' + VERDICT_FILTER_TEXT[fb] + '): it is the token\'s latest Perceptor report with a verdict.';
+    sec.appendChild(el('p', 'muted small', 'A Perceptor re-scan made long after the call, not the verdict at call time. ' + why));
     if (isHttps(t.url)) { sec.appendChild(linkOrText(t.url, 'Open the re-scan report', 'report-link')); }
     box.appendChild(sec);
   }
@@ -1375,8 +1402,10 @@
   //
   // GET api/events streams what changed in the list: "call" (a new token row),
   // "report" (a token's Perceptor verdict or sAlpha report changed, or, with
-  // tool perceptor_today, its Perceptor re-scan, "Perceptor today", which
-  // updates the row without a notice, sound or desktop alert) and
+  // tool perceptor_today, its Perceptor re-scan, "Perceptor today", or the
+  // verdict the Perceptor filter uses, which updates the row without a
+  // notice, sound or desktop alert; a row that leaves or enters the Perceptor
+  // filter chosen makes the list load again, quietly) and
   // "reload" (many changes at once, or events were missed). A new row goes on
   // top of the table only when the table shows the newest calls first, on page
   // 1, and the row matches the search and the Perceptor filter; otherwise a
@@ -1433,9 +1462,10 @@
 
   // Whether a row passes the search and the Perceptor filter of the page, the
   // way the server decides it (search: name, symbol or address contains the
-  // text, letter case ignored; verdict: the row's bucket is one of those chosen).
+  // text, letter case ignored; verdict: the bucket of the row's latest
+  // Perceptor report with a verdict, filterVerdict, is one of those chosen).
   function rowMatchesFilters(c) {
-    if (state.verdicts.length && state.verdicts.indexOf(verdictBucket(c.perceptor_verdict)) < 0) { return false; }
+    if (state.verdicts.length && state.verdicts.indexOf(verdictBucket(filterVerdict(c))) < 0) { return false; }
     if (state.days) {
       // the server counts back from its snapshot time, and so does this
       var posted = timeMs(c.message_date);
@@ -1566,7 +1596,13 @@
     // so it never pushes the call-time notices out of the corner.
     if (d.tool !== 'perceptor_today') { liveNotice('report', c, d.tool); }
     var tr = findRow(key);
-    if (!tr) { return; }
+    if (!tr) {
+      // not shown: with a Perceptor filter on, its new report (a re-scan, say)
+      // may have brought it into the filter: one quiet reload per burst
+      // (an sAlpha report never moves a row in the Perceptor filter)
+      if (d.tool !== 'salpha' && state.verdicts.length && rowMatchesFilters(c)) { scheduleQuietLoad(); }
+      return;
+    }
     if (!rowMatchesFilters(c)) { loadCalls(true); return; } // no longer in this filter
     var i = shownIndex(key);
     if (d.horizon !== state.horizon && i >= 0) {

@@ -224,6 +224,8 @@ type webCallJSON struct {
 	PerceptorTodayVerd *string `json:"perceptor_today_verdict"`
 	PerceptorTodayURL  *string `json:"perceptor_today_url"`
 	PerceptorTodayAt   *string `json:"perceptor_today_at"`
+	// the verdict the Perceptor filter uses (webLatestPerceptor)
+	PerceptorLatest *string `json:"perceptor_latest_verdict"`
 }
 
 type webCallsJSON struct {

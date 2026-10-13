@@ -142,11 +142,14 @@ type webEventOut struct {
 }
 
 // webSnapshotEvents compares two snapshots and returns the events for what
-// changed: a "call" for each new row, a "report" for each row whose Perceptor
-// verdict or report, or sAlpha report (or decline; also a report the re-ask
+// changed: a "call" for each new row, a "report" for each row whose call-time
+// Perceptor verdict or report, or sAlpha report (or decline; also a report the re-ask
 // lane got later, which is a new sAlpha id), changed, and a "report"
 // with tool perceptor_today for each row with a new or changed re-scan
-// ("Perceptor today"). Rows that went away send nothing. More than
+// ("Perceptor today"), or whose Perceptor filter bucket (the latest report
+// with a verdict) changed otherwise. Every row an event carries has its
+// perceptor_latest_verdict, so the page can tell whether it now enters or
+// leaves its Perceptor filter. Rows that went away send nothing. More than
 // webEventsMaxPerRefresh events become one "reload". Both snapshots are in
 // place already and are only read.
 func webSnapshotEvents(prev, next *webSnapshot) []webEventOut {
@@ -167,14 +170,19 @@ func webSnapshotEvents(prev, next *webSnapshot) []webEventOut {
 			changes = append(changes, change{pos: int32(j)})
 			j++
 		default: // the same row
-			pb, nb := prev.flags[i]&^webFlagUSD, next.flags[j]&^webFlagUSD
-			if pb != nb || (next.percID[j] != 0 && next.percID[j] != prev.percID[i]) {
+			// the call-time verdict (its own bucket, not the filter's) or report
+			perc := prev.callVerd[i] != next.callVerd[j] || (next.percID[j] != 0 && next.percID[j] != prev.percID[i])
+			if perc {
 				changes = append(changes, change{pos: int32(j), tool: webToolPerceptor})
 			}
 			if next.salphaID[j] != 0 && next.salphaID[j] != prev.salphaID[i] {
 				changes = append(changes, change{pos: int32(j), tool: webToolSAlpha})
 			}
-			if next.todayVerd[j] != 0 && (next.todayVerd[j] != prev.todayVerd[i] || next.todayAt[j] != prev.todayAt[i]) {
+			// a new or changed re-scan, or else the Perceptor filter's bucket
+			// moved: the row may enter or leave a filtered page, so it is
+			// sent too, quietly, as a re-scan is
+			today := next.todayVerd[j] != 0 && (next.todayVerd[j] != prev.todayVerd[i] || next.todayAt[j] != prev.todayAt[i])
+			if today || (!perc && prev.flags[i]&^webFlagUSD != next.flags[j]&^webFlagUSD) {
 				changes = append(changes, change{pos: int32(j), tool: webEventPerceptorToday})
 			}
 			i++
