@@ -492,6 +492,15 @@ func isNoStateText(msg string) bool {
 	return noStateRe.MatchString(msg)
 }
 
+// isNoStateErr: err is the node's own JSON-RPC answer that it has no state
+// for the block asked (isNoStateText), the only error that may switch the
+// price reads to event logs (o.noState). A transport error, a busy node, a
+// revert or any other node error is not.
+func isNoStateErr(err error) bool {
+	var re *rpcError
+	return errors.As(err, &re) && isNoStateText(strings.ToLower(re.Message))
+}
+
 // readTokenText calls a string getter (name() / symbol()). ok is false when the
 // node could not be asked (try again later); a token without the value gives "".
 func (c *rpcClient) readTokenText(ctx context.Context, addr, selector string, max int) (text string, ok bool) {
@@ -2763,7 +2772,12 @@ func (o *onchainSource) ethFromPool(ctx context.Context, block uint64) (float64,
 		if block == 0 {
 			return 0, fmt.Errorf("ETH/USD pool slot0: %w", err)
 		}
-		stateErr = err
+		if !isNoSuchValue(err) {
+			// A busy node, a transport error or another node error, not
+			// missing state: try again later (like chainlink).
+			return 0, fmt.Errorf("ETH/USD pool %s slot0 at block %d: %w", pool, block, err)
+		}
+		stateErr = err // no state at that block (full node), or a revert / no code: the pool's swaps
 	}
 	l, err := o.lastLogBefore(ctx, pool, []any{topicSwapV3}, block)
 	if err != nil {
@@ -2773,7 +2787,9 @@ func (o *onchainSource) ethFromPool(ctx context.Context, block uint64) (float64,
 		return 0, fmt.Errorf("ETH/USD pool %s: no historical state and no swap found before block %d", pool, block)
 	}
 	p, err := orient(priceFromSqrtX96(word(unhex(l.Data), 2), m0.Decimals, m1.Decimals))
-	if err == nil && stateErr != nil && o.noState.CompareAndSwap(false, true) {
+	// Only the node's own "no state" answer switches every later historical
+	// read to the event logs; a revert or no code says nothing about the node.
+	if err == nil && isNoStateErr(stateErr) && o.noState.CompareAndSwap(false, true) {
 		log.Printf("prices: node has no historical state (%v) — reading Chainlink/ETH prices from event logs instead", stateErr)
 	}
 	return p, err

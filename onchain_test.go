@@ -52,6 +52,8 @@ type fakeChain struct {
 	// callErr (optional): a JSON-RPC error message for an eth_call ("" = none),
 	// e.g. a busy node; to and sel are lower case.
 	callErr func(to, sel string, block uint64) string
+	// callErrCode: the JSON-RPC error code of callErr's errors (0 = -32000).
+	callErrCode int
 	// blockErr (optional): a JSON-RPC error message for eth_getBlockByNumber of
 	// block n ("" = none). Called with f.mu held.
 	blockErr func(n uint64) string
@@ -228,7 +230,11 @@ func (f *fakeChain) serve(w http.ResponseWriter, r *http.Request) {
 		f.callTags = append(f.callTags, tag)
 		if f.callErr != nil {
 			if msg := f.callErr(strings.ToLower(c.To), strings.ToLower(sel), num(tag)); msg != "" {
-				fail(msg)
+				code := f.callErrCode
+				if code == 0 {
+					code = -32000
+				}
+				json.NewEncoder(w).Encode(map[string]any{"jsonrpc": "2.0", "id": req.ID, "error": map[string]any{"code": code, "message": msg}})
 				return
 			}
 		}
@@ -1094,6 +1100,73 @@ func TestFullNodePricesFromLogs(t *testing.T) {
 	}
 	if p, ok, err := o.quoteUSD(ctx, zeroAddr, now-day); err != nil || !ok || math.Abs(p-3300) > 1e-6 {
 		t.Fatalf("native ETH quote: %v %v %v", p, ok, err)
+	}
+}
+
+// nitroNoState is the prod Robinhood Chain node's (Nitro full node) answer to
+// an eth_call at a block whose state it no longer keeps.
+const nitroNoState = "missing trie node 631b0e668228012bb16069cdc0083e6fe535a1e213a5383d856319c7afbd26c2 (path ) state 0x631b0e668228012bb16069cdc0083e6fe535a1e213a5383d856319c7afbd26c2 is not available, not found"
+
+// ETH/USD from the own WETH/USDG pool at a past block: only the node's own
+// "no state" answer to slot0() switches the price reads to event logs
+// (noState); a busy node or another node error is returned (the caller tries
+// again later) and leaves noState alone; a revert or an empty answer still
+// takes the pool's last swap, without flipping noState.
+func TestEthFromPoolHistoricalErrors(t *testing.T) {
+	const pool = "0x69bfaf19c9f377bb306a89aed9f6b07e2c1a8d9a" // SCOUT_ETH_USD_POOL's default
+	day := uint64(864000)
+	for _, c := range []struct {
+		name        string
+		msg         string // slot0() error at the past block ("" = none)
+		code        int    // its JSON-RPC code (0 = -32000)
+		empty       bool   // slot0() answers "0x" (no code there)
+		want        float64
+		wantErr     bool
+		wantNoState bool
+	}{
+		{name: "archive answers", want: 3100},
+		{name: "nitro full node, no state", msg: nitroNoState, want: 3000, wantNoState: true},
+		{name: "rate limited", msg: "rate limit exceeded", wantErr: true},
+		{name: "timed out", msg: "request timed out", wantErr: true},
+		{name: "unknown block", msg: "header not found", wantErr: true},
+		{name: "internal error", msg: "internal error", code: -32603, wantErr: true},
+		{name: "revert", msg: "execution reverted", code: 3, want: 3000},
+		{name: "no code", empty: true, want: 3000},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			f := newFakeChain(t, 20*24*time.Hour)
+			now := f.latest
+			f.addToken(tWETH, 18, "WETH")
+			f.addToken(tUSDG, 6, "USDG")
+			f.constCall(pool, selToken0, ret(wAddr(tWETH)))
+			f.constCall(pool, selToken1, ret(wAddr(tUSDG)))
+			slot0 := ret(w32(sqrtX96(3100e6/1e18)), wInt(0))
+			if c.empty {
+				slot0 = "0x"
+			}
+			f.constCall(pool, selSlot0, slot0)
+			f.swapV3(pool, now-5*day, "0xe1", sqrtX96(3000e6/1e18))
+			f.swapV3(pool, now-2*day, "0xe2", sqrtX96(3300e6/1e18))
+			f.callErrCode = c.code
+			f.callErr = func(to, sel string, block uint64) string {
+				if to == pool && sel == selSlot0 && block != f.latest {
+					return c.msg
+				}
+				return ""
+			}
+			o := testOnchain(t, f, nil)
+			p, err := o.ethFromPool(context.Background(), now-3*day)
+			if c.wantErr {
+				if err == nil {
+					t.Errorf("ethFromPool with slot0 error %q (code %d) = %v, nil; want an error", c.msg, c.code, p)
+				}
+			} else if err != nil || math.Abs(p-c.want) > 1e-6 {
+				t.Errorf("ethFromPool with slot0 error %q (code %d) = %v, %v; want %v, nil", c.msg, c.code, p, err, c.want)
+			}
+			if got := o.noState.Load(); got != c.wantNoState {
+				t.Errorf("noState after slot0 error %q (code %d) = %v, want %v", c.msg, c.code, got, c.wantNoState)
+			}
+		})
 	}
 }
 

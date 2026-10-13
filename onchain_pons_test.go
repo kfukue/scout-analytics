@@ -677,6 +677,96 @@ func TestPonsGraduationFarFromCallFullNode(t *testing.T) {
 	}
 }
 
+// Finding the close by bisection over graduated() at past blocks: only the
+// node's own "no state" answer switches to the event logs and sets noState; a
+// busy node or another node error is returned (the call is tried again later)
+// and leaves noState alone; a revert or no code before the curve existed is
+// "not graduated yet", as before.
+func TestPonsFindCurveDoneHistoricalErrors(t *testing.T) {
+	for _, c := range []struct {
+		name        string
+		msg         string // graduated() error at past blocks ("" = none)
+		code        int    // its JSON-RPC code (0 = -32000)
+		beforeCurve bool   // msg / no code only before the curve existed
+		noCode      bool   // graduated() answers "0x" before the curve existed
+		wantErr     bool
+		wantNoState bool
+	}{
+		{name: "archive answers"},
+		{name: "nitro full node, no state", msg: nitroNoState, wantNoState: true},
+		{name: "rate limited", msg: "rate limit exceeded", wantErr: true},
+		{name: "timed out", msg: "request timed out", wantErr: true},
+		{name: "unknown block", msg: "header not found", wantErr: true},
+		{name: "internal error", msg: "internal error", code: -32603, wantErr: true},
+		{name: "revert before the curve", msg: "execution reverted", code: 3, beforeCurve: true},
+		{name: "no code before the curve", noCode: true, beforeCurve: true},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			x := newPonsScanFixture(t, 3000, false)
+			f := x.f
+			born := x.eb - 1000 // the curve's first trade is at eb-500
+			if c.noCode {
+				key := tPonsCurve + "|" + selPonsGraduated
+				orig := f.calls[key]
+				f.calls[key] = func(b uint64) (string, bool) {
+					if b < born {
+						return "0x", true
+					}
+					return orig(b)
+				}
+			}
+			f.callErrCode = c.code
+			f.callErr = func(to, sel string, block uint64) string {
+				if to != tPonsCurve || sel != selPonsGraduated || block == f.latest || (c.beforeCurve && block >= born) {
+					return ""
+				}
+				return c.msg
+			}
+			o := testOnchain(t, f, nil)
+			st := &onchainState{Kind: "pons", Pool: tPonsCurve, Curve: tPonsCurve, Token: x.fp.token, TokenDec: 18,
+				Quote: zeroAddr, QuoteDec: 18, QuoteSym: "ETH", EntryBlock: x.eb, Hook: defaultPonsHook}
+			got, err := o.ponsFindCurveDone(context.Background(), st, f.latest)
+			if c.wantErr {
+				if err == nil {
+					t.Errorf("ponsFindCurveDone with graduated() error %q (code %d) = %d, nil; want an error", c.msg, c.code, got)
+				}
+			} else if err != nil || got != x.closeB {
+				t.Errorf("ponsFindCurveDone with graduated() error %q (code %d) = %d, %v; want %d, nil", c.msg, c.code, got, err, x.closeB)
+			}
+			if ns := o.noState.Load(); ns != c.wantNoState {
+				t.Errorf("noState after graduated() error %q (code %d) = %v, want %v", c.msg, c.code, ns, c.wantNoState)
+			}
+		})
+	}
+}
+
+// isRevertOrNoCode: a revert or an address without code is a contract-level
+// answer; a busy node, another node error or no state is not.
+func TestIsRevertOrNoCode(t *testing.T) {
+	rpc := func(code int, msg string) error { return &rpcError{Code: code, Message: msg} }
+	for _, c := range []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"nil", nil, false},
+		{"empty result", errEmptyResult, true},
+		{"empty result, wrapped", fmt.Errorf("graduated(): %w", errEmptyResult), true},
+		{"execution reverted", rpc(-32000, "execution reverted"), true},
+		{"code 3", rpc(3, "execution reverted: not open"), true},
+		{"nitro full node, no state", rpc(-32000, nitroNoState), false},
+		{"rate limited", rpc(-32005, "rate limit exceeded"), false},
+		{"timed out", rpc(-32000, "request timed out"), false},
+		{"unknown block", rpc(-32000, "header not found"), false},
+		{"internal error", rpc(-32603, "internal error"), false},
+		{"transport", errors.New("dial tcp: connection refused"), false},
+	} {
+		if got := isRevertOrNoCode(c.err); got != c.want {
+			t.Errorf("%s: isRevertOrNoCode(%v) = %v, want %v", c.name, c.err, got, c.want)
+		}
+	}
+}
+
 // A graduation search under a progress context says how far it got while it
 // is still widening.
 func TestPonsSearchProgress(t *testing.T) {

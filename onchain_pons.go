@@ -163,17 +163,11 @@ func curveTrade(l rpcLog, quoteDec int) (buy bool, vol float64, ok bool) {
 	return false, 0, false
 }
 
-// isRevertOrNoCode: an eth_call that reverted or hit an address without code
-// (as opposed to a node that could not answer, e.g. no historical state).
+// isRevertOrNoCode: an eth_call that reverted (JSON-RPC code 3 or a "revert"
+// text) or hit an address without code (an empty result), as opposed to a
+// node that could not answer (no historical state, busy, any other error).
 func isRevertOrNoCode(err error) bool {
-	if err == nil {
-		return false
-	}
-	if err.Error() == "empty result" {
-		return true
-	}
-	var re *rpcError
-	return errors.As(err, &re) && strings.Contains(strings.ToLower(re.Message), "revert")
+	return errors.Is(err, errEmptyResult) || isRevert(err)
 }
 
 // ponsCurveFor checks whether curve is the Pons V2 curve of token (factory()
@@ -263,8 +257,10 @@ func (o *onchainSource) ponsFindCurveDone(ctx context.Context, st *onchainState,
 			mid := lo + (top-lo)/2
 			g, err := o.ponsGraduatedAt(ctx, st.Curve, mid)
 			if err != nil {
-				if ctx.Err() != nil || nonRPC(err) != nil {
-					return 0, err // transport trouble: try again later
+				if ctx.Err() != nil || !isNoStateErr(err) {
+					// Transport trouble, a busy node or another node error:
+					// try again later (the caller's back-off).
+					return 0, err
 				}
 				// No historical state (full node): read the events instead, and
 				// do not ask the next token's curve about the past either.
