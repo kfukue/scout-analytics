@@ -1574,3 +1574,115 @@ func TestBlockNumberHeadCache(t *testing.T) {
 		t.Fatalf("node back: got %d (%v), want %d (the failure was not kept)", n, err, want)
 	}
 }
+
+// isNoSuchValue says "no such value" only for a JSON-RPC error that says the
+// contract refused or failed the call, or that the node has no state for the
+// block, and for an empty result. Any other JSON-RPC error (an unknown block,
+// an internal or upstream error, an unknown method, …) was taken for "no such
+// value" before (so a token got no supply, no symbol, or the price reads moved
+// to event logs on a passing error); it is now an error tried again later.
+func TestIsNoSuchValue(t *testing.T) {
+	rpc := func(code int, msg string) error {
+		return fmt.Errorf("totalSupply(0xabc): %w", &rpcError{Code: code, Message: msg})
+	}
+	for _, c := range []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"nil", nil, false},
+		{"empty result", errEmptyResult, true},
+		{"wrapped empty result", fmt.Errorf("decimals(0xabc): %w", errEmptyResult), true},
+		{"transport error", errors.New("dial tcp 127.0.0.1:8540: connect: connection refused"), false},
+		{"client deadline", context.DeadlineExceeded, false},
+		// the fake chain's answers (fakeChain.serve)
+		{"execution reverted", rpc(-32000, "execution reverted"), true},
+		{"full node, old block", rpc(-32000, "missing trie node 6b1f… (path ) state 0x… is not available"), true},
+		{"code 3", rpc(3, "execution reverted: Ownable: caller is not the owner"), true},
+		{"invalid opcode", rpc(-32000, "invalid opcode: INVALID"), true},
+		{"path scheme, old block", rpc(-32000, "historical state 0x1234 is not available"), true},
+		// the prod Nitro node's answer to eth_getBalance at block 1 (13 October)
+		{"nitro full node, block 1", rpc(-32000, "missing trie node 631b0e668228012bb16069cdc0083e6fe535a1e213a5383d856319c7afbd26c2 (path ) state 0x631b0e668228012bb16069cdc0083e6fe535a1e213a5383d856319c7afbd26c2 is not available, not found"), true},
+		// geth hash scheme past the reexec window: says "unavailable", which
+		// is also a busy word; the no-state texts are checked first
+		{"required historical state", rpc(-32000, "required historical state unavailable (reexec=128)"), true},
+		{"state root not available", rpc(-32000, "state 0x12ab is not available"), true},
+		{"state root not available, upper case", rpc(-32000, "State 0x12AB is not available"), true},
+		{"erigon, state at block", rpc(-32000, "state at block 123 is not available"), true},
+		// near misses of the no-state texts
+		{"state of something else", rpc(-32000, "state sync is not available"), false},
+		{"method not available", rpc(-32601, "method eth_getBalance is not available"), false},
+		{"service unavailable", rpc(-32000, "service unavailable"), false},
+		// busy or rate limiting: unchanged (false), even in a revert reason
+		{"revert reason with limit", rpc(-32000, "execution reverted: mint limit exceeded"), false},
+		{"rate limit", rpc(-32005, "rate limit exceeded"), false},
+		{"node timeout", rpc(-32000, "request timed out"), false},
+		{"busy", rpc(-32000, "server busy, try again later"), false},
+		// true before, false now
+		{"unknown block", rpc(-32000, "header not found"), false},
+		{"internal error", rpc(-32603, "internal error"), false},
+		{"odd answer", rpc(-32000, "something odd happened"), false},
+		{"unknown method", rpc(-32601, "the method eth_call does not exist/is not available"), false},
+		{"unsupported", rpc(-32000, "unsupported eth_call"), false},
+		{"upstream", rpc(-32000, "upstream connect error or disconnect/reset before headers"), false},
+		{"deadline on the node", rpc(-32000, "context deadline exceeded"), false},
+		{"execution aborted", rpc(-32000, "execution aborted (timeout = 5s)"), false},
+	} {
+		if got := isNoSuchValue(c.err); got != c.want {
+			t.Errorf("%s: isNoSuchValue(%v) = %v, want %v", c.name, c.err, got, c.want)
+		}
+	}
+}
+
+// Through the fake chain: an eth_getBalance (the state probe) or eth_call
+// answered with an unrelated JSON-RPC error is a node error, not "no state"
+// or "no such value"; the full node's "missing trie node" and a revert still
+// are.
+func TestNoSuchValueOnFakeChain(t *testing.T) {
+	oldBase := rpcRetryBase
+	rpcRetryBase = time.Millisecond
+	t.Cleanup(func() { rpcRetryBase = oldBase })
+	ctx := context.Background()
+	tok := "0x4545454545454545454545454545454545454545"
+	for _, c := range []struct {
+		name       string
+		fullNode   bool
+		balanceErr string
+		callErr    string
+		wantHas    bool
+		wantHasErr bool
+		wantNameOK bool
+	}{
+		{name: "archive", wantHas: true, wantNameOK: true},
+		{name: "full node", fullNode: true, wantNameOK: true},
+		{name: "past reexec", balanceErr: "required historical state unavailable (reexec=128)", callErr: "required historical state unavailable (reexec=128)", wantNameOK: true},
+		{name: "state root", balanceErr: "state 0x12ab is not available", callErr: "state 0x12ab is not available", wantNameOK: true},
+		{name: "node error", balanceErr: "something odd happened", callErr: "something odd happened", wantHasErr: true},
+		{name: "unknown block", balanceErr: "header not found", callErr: "header not found", wantHasErr: true},
+		{name: "busy node", balanceErr: "too many requests, try again later", callErr: "rate limit exceeded", wantHasErr: true},
+		{name: "revert", callErr: "execution reverted", wantHas: true, wantNameOK: true},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			f := newFakeChain(t, 10*24*time.Hour)
+			f.addToken(tok, 18, "TKN") // no name(): reverts on the fake chain
+			f.fullNode, f.balanceErr = c.fullNode, c.balanceErr
+			if c.callErr != "" {
+				f.callErr = func(to, sel string, _ uint64) string {
+					if sel == selName {
+						return c.callErr
+					}
+					return ""
+				}
+			}
+			o := testOnchain(t, f, nil)
+			has, err := o.hasStateAt(ctx, f.latest/2)
+			if has != c.wantHas || (err != nil) != c.wantHasErr {
+				t.Errorf("hasStateAt(%d) = %v, %v; want %v, error %v", f.latest/2, has, err, c.wantHas, c.wantHasErr)
+			}
+			name, ok := o.rpc.readTokenText(ctx, tok, selName, maxTokenNameLen)
+			if ok != c.wantNameOK || name != "" {
+				t.Errorf("readTokenText(name) = %q, %v; want \"\", %v (callErr %q)", name, ok, c.wantNameOK, c.callErr)
+			}
+		})
+	}
+}

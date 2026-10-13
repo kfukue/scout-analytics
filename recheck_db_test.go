@@ -1157,18 +1157,24 @@ func TestRecheckPendingDelivery(t *testing.T) {
 
 // The lane asks Perceptor only when the runner is free: while the runner's
 // pacing (production MinInterval) still runs it does not sleep (a live call
-// never waits behind it) and looks again when the pacing has passed; during a
-// rate-limit pause it does not ask either. Delivering a stored re-check, which
-// does not ask Perceptor, goes ahead in both.
+// never waits behind it) and looks again at the earlier of the normal look
+// (recheckTick) and the end of the pacing. During a rate-limit pause it does
+// not ask either. Delivering a stored re-check, which does not ask Perceptor,
+// goes ahead in all of them.
 func TestRecheckPacing(t *testing.T) {
 	cases := []struct {
 		name  string
 		block func(l *recheckLane) // makes Perceptor busy
 		free  func(l *recheckLane) // frees it
-		// look: the next look expected while blocked (zero: the normal look)
+		// look: the next look expected while blocked (nil: the normal look)
 		look func(l *recheckLane) time.Time
 	}{
-		{"pacing", func(l *recheckLane) { l.runner.lastSent = time.Now().Add(-time.Minute) },
+		// the pacing ends after the normal look (about 65 s left, tick 30 s):
+		// the normal look stays (before the fix it was pushed to the pacing end)
+		{"pacing past the normal look", func(l *recheckLane) { l.runner.lastSent = time.Now().Add(-time.Minute) },
+			func(l *recheckLane) { l.runner.lastSent = time.Now().Add(-3 * time.Minute) }, nil},
+		// the pacing ends before the normal look (about 15 s left): look then
+		{"pacing before the normal look", func(l *recheckLane) { l.runner.lastSent = time.Now().Add(-110 * time.Second) },
 			func(l *recheckLane) { l.runner.lastSent = time.Now().Add(-3 * time.Minute) },
 			func(l *recheckLane) time.Time { return l.runner.lastSent.Add(l.runner.spec.MinInterval) }},
 		{"rate-limit pause", func(l *recheckLane) { l.percPausedUntil = time.Now().Add(recheckRetryPause) },
@@ -1199,7 +1205,7 @@ func TestRecheckPacing(t *testing.T) {
 			}
 			if c.look != nil {
 				if want := c.look(l); l.nextLook.Sub(want).Abs() > 2*time.Second {
-					t.Errorf("next look %s, want about %s (the end of the pacing)", l.nextLook, want)
+					t.Errorf("next look %s, want about %s (the end of the pacing, before the normal look)", l.nextLook, want)
 				}
 			} else if want := time.Now().Add(recheckTick); l.nextLook.Sub(want).Abs() > 2*time.Second {
 				t.Errorf("next look %s, want about %s (the normal look)", l.nextLook, want)

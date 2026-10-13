@@ -639,7 +639,11 @@ func (l *recheckLane) step(ctx context.Context, queueLen func() int) bool {
 		switch wait := paceWait(l.runner); {
 		case wait > 0:
 			first, second = nil, nil
-			l.nextLook = now.Add(wait) // look again when the pacing has passed
+			// look again when the pacing has passed, unless an earlier look
+			// is already set (the normal tick, a retry or a due re-check)
+			if at := now.Add(wait); at.Before(l.nextLook) {
+				l.nextLook = at
+			}
 		case now.Before(l.percPausedUntil):
 			first, second = nil, nil // the normal look: a stored re-check may need delivering
 		}

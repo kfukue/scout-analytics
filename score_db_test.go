@@ -232,8 +232,14 @@ func TestScoreCallBudget(t *testing.T) {
 	if err := st.Migrate(ctx); err != nil {
 		t.Fatal(err)
 	}
-	const budget = 300 * time.Millisecond
-	const slack = 2 * time.Second // DB round trips, -race on a slow machine; far below the old 20 s pre-call limit
+	// budget: long enough for the feature-row read before the slow scorer is
+	// asked (wantAsked), even under -race on a loaded machine (300 ms flaked
+	// once). The slow handlers never answer on their own, so without the budget
+	// scoreCall would not return at all.
+	const budget = 2 * time.Second
+	// slack: time past the budget for giving up and logging under -race;
+	// budget+slack (7 s) is still far below the old 20 s pre-call limit.
+	const slack = 5 * time.Second
 	cases := []struct {
 		name        string
 		ca          string
