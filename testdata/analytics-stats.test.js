@@ -272,6 +272,135 @@ check('holdItem: fell back, rose again', S.holdItem(600, 7200, 2100, false), { t
 check('holdItem: censored', S.holdItem(600, 3000, null, true), { t: 3000, event: false });
 check('holdItem: censored, first 2x in the last bucket', S.holdItem(3300, 0, null, true), { t: 0, event: false });
 
+// "reached 2×" (owner decision, 12 October 2026: at or above 2× for at least
+// 1 hour in total): held (above_2x_s) >= MIN_HELD_2X_S, in every window
+// (1h included), whether or not the call was still at 2× when the window
+// ended; otherwise the call is treated exactly like one that never touched
+// 2×. As stored by candleTiming in timing.go: t2x = the START of the first 2×
+// bucket, held is counted from that bucket's END, so the most that can be
+// held is the window's end minus the end of the first 2× bucket. The cases
+// below use a post on a 5-minute boundary, so buckets end on multiples of
+// 300 s from the post (hourly ones after the first day on multiples of
+// 3600 s).
+check('MIN_HELD_2X_S', S.MIN_HELD_2X_S, 3600);
+check('holdWords', [S.holdWords(3600), S.holdWords(7200), S.holdWords(5400)], ['1 hour', '2 hours', '90 minutes']);
+// what every call that touched 2× (with a known held) but did not reach it gives
+var NOT_REACHED = { touched: true, reached: false, short: true, t2x: NaN, held: 0, tfall: NaN, cens: false, hold: null };
+[
+  // [name, t2x, held, tfall, censored, want]
+  ['never touched', null, 0, null, false,
+    { touched: false, reached: false, short: false, t2x: NaN, held: 0, tfall: NaN, cens: false, hold: null }],
+  ['touched, 0 held (touch and drop)', 600, 0, 900, false, NOT_REACHED],
+  ['held 3599 s', 600, 3599, 4500, false, NOT_REACHED],
+  ['held exactly 3600 s', 600, 3600, 4500, false,
+    { touched: true, reached: true, short: false, t2x: 600, held: 3600, tfall: 4500, cens: false, hold: { t: 3600, event: true } }],
+  ['held more than 3600 s', 600, 7200, 9000, false,
+    { touched: true, reached: true, short: false, t2x: 600, held: 7200, tfall: 9000, cens: false, hold: { t: 7200, event: true } }],
+  ['held 2 h in two stretches, first one 25 min', 600, 7200, 2100, false,
+    { touched: true, reached: true, short: false, t2x: 600, held: 7200, tfall: 2100, cens: false, hold: { t: 1500, event: true } }],
+  // 1d window (86400 s): first 2× in the bucket 84000-84300, at 2× from its
+  // end to the window's end (2100 s): under 1 hour, so not reached
+  ['1d, censored, first 2× 40 min before the end, held to the end', 84000, 2100, null, true, NOT_REACHED],
+  // 1d: first 2× in the last 30 min (bucket 84600-84900, held to the end 1500 s)
+  ['1d, first 2× in the last 30 min, held to the end', 84600, 1500, null, true, NOT_REACHED],
+  ['1d, first 2× in the last 30 min, fell back one candle before the end', 84600, 1200, 86100, false, NOT_REACHED],
+  ['censored, first 2× in the last bucket (0 held)', 86100, 0, null, true, NOT_REACHED],
+  // 1h window (3600 s): first 2× at 20 min, bucket 1200-1500, held to the end 2100 s
+  ['1h, first 2× at 20 min, at 2× until the hour ended', 1200, 2100, null, true, NOT_REACHED],
+  // the most a 1h call can hold: first 2× in the first candle (0-300), at 2×
+  // from its end to the end of the hour (3300 s, 55 minutes)
+  ['1h, first 2× in the first candle, at 2× until the hour ended (55 min, the most possible)', 0, 3300, null, true, NOT_REACHED],
+  ['1h, first 2× at 20 min, fell back in the last candle', 1200, 1800, 3300, false, NOT_REACHED],
+  ['1h, first 2× at 20 min, first close under 2× at the end', 1200, 2100, 3600, false, NOT_REACHED],
+  ['1h, touched at 20 min, fell back at 50 min', 1200, 1500, 3000, false, NOT_REACHED],
+  ['1h, first 2× in the last candle, censored with 0 held (a wick at the end)', 3300, 0, null, true, NOT_REACHED],
+  // rugged while still at 2×: never censored, the rug is the fall
+  ['1h, at 2× until a rug at 50 min', 1200, 1500, 3000, false, NOT_REACHED],
+  // 7d window (604800 s), hourly candles: first 2× in the hourly bucket
+  // 597600-601200, held to the end (3600 s): reached; in 601200-604800 (ends
+  // at the window's end, 0 held): not reached
+  ['7d, first 2× two hours before the end, held to the end', 597600, 3600, null, true,
+    { touched: true, reached: true, short: false, t2x: 597600, held: 3600, tfall: NaN, cens: true, hold: { t: 3600, event: false } }],
+  ['7d, first 2× in the last hourly candle, censored with 0 held', 601200, 0, null, true, NOT_REACHED],
+  ['censored with exactly 1 h at 2×', 82500, 3600, null, true,
+    { touched: true, reached: true, short: false, t2x: 82500, held: 3600, tfall: NaN, cens: true, hold: { t: 3600, event: false } }],
+  ['censored with 3599 s at 2×', 82500, 3599, null, true, NOT_REACHED],
+  ['censored with over 1 h at 2×', 3000, 80000, null, true,
+    { touched: true, reached: true, short: false, t2x: 3000, held: 80000, tfall: NaN, cens: true, hold: { t: 80000, event: false } }],
+  ['touched, held missing: unknown (not counted as short)', 600, null, null, false,
+    { touched: true, reached: false, short: false, t2x: NaN, held: NaN, tfall: NaN, cens: false, hold: null }],
+  ['touched, censored, held missing: unknown (not counted as short)', 3300, null, null, true,
+    { touched: true, reached: false, short: false, t2x: NaN, held: NaN, tfall: NaN, cens: false, hold: null }]
+].forEach(function (c) {
+  var got = S.timing2x(c[1], c[2], c[3], c[4]);
+  var keys = Object.keys(c[5]);
+  // JSON turns NaN into null on both sides: compare NaN explicitly
+  keys.forEach(function (k) {
+    var g = got[k], w = c[5][k];
+    if (typeof w === 'number' && isNaN(w)) {
+      check('timing2x ' + c[0] + ' (t2x ' + c[1] + ', held ' + c[2] + ', tfall ' + c[3] + ', cens ' + c[4] + ').' + k + ' is NaN', typeof g === 'number' && isNaN(g), true);
+    } else {
+      check('timing2x ' + c[0] + ' (t2x ' + c[1] + ', held ' + c[2] + ', tfall ' + c[3] + ', cens ' + c[4] + ').' + k, g, w);
+    }
+  });
+  check('timing2x ' + c[0] + ': reached2x agrees', S.reached2x(c[1], c[2]), c[5].reached);
+  check('timing2x ' + c[0] + ': keys', Object.keys(got).sort(), keys.slice().sort());
+});
+
+// the 1h window shows 0 reached by construction: whichever 5-minute candle
+// holds the first 2×, a call at 2× from its end until the hour ended holds
+// under 1 hour, so none reaches 2× (and none is in the time to 2×, the falls
+// or the "still at 2× after t" curve), while every one stays in the totals
+(function () {
+  var xs = [];
+  for (var t = 0; t < 3600; t += 300) { xs.push(S.timing2x(t, 3600 - (t + 300), null, true)); }
+  check('1h: calls at 2× until the hour ended, one per candle', xs.length, 12);
+  check('1h: none reached 2×', xs.filter(function (x) { return x.reached; }).length, 0);
+  check('1h: all touched 2× without reaching it', xs.filter(function (x) { return x.short; }).length, 12);
+  check('1h: all count as 0 held', xs.map(function (x) { return x.held; }), xs.map(function () { return 0; }));
+  check('1h: none counted as still at 2× at the end (only reached calls are)', xs.filter(function (x) { return x.cens; }).length, 0);
+  check('1h: none in the time to 2×', xs.map(function (x) { return x.t2x; }).filter(S.isNum).length, 0);
+  check('1h: none in the KM curve', S.kaplanMeier(xs.map(function (x) { return x.hold; })).n, 0);
+}());
+
+// the rule moves calls from "reached" to "not reached" but never out of the
+// totals: 6 timed calls (1d window), every one gives a held value (the
+// denominator of the held figures and of the 2× rate stays 6); only the 2
+// that held at least 1 h reach 2× (the one at 2× from 40 min before the end
+// until the end held under 1 hour and does not); the time to 2×, the falls
+// and the KM curve use those 2 only
+(function () {
+  var calls = [[null, 0, null, false], [600, 0, 900, false], [600, 3599, 4500, false], [600, 3600, 4500, false],
+    [600, 7200, 9000, false], [84000, 2100, null, true]];
+  var xs = calls.map(function (c) { return S.timing2x(c[0], c[1], c[2], c[3]); });
+  var helds = xs.map(function (x) { return x.held; }).filter(S.isNum);
+  check('denominator: every timed call has a held value', helds.length, calls.length);
+  check('denominator: held values', helds, [0, 0, 0, 3600, 7200, 0]);
+  var reached = xs.filter(function (x) { return x.reached; }).length;
+  check('2× rate: 2 of 6 (the denominator unchanged)', [reached, xs.length], [2, 6]);
+  check('touched without reaching 2×', xs.filter(function (x) { return x.short; }).length, 3);
+  check('time to 2× over the reached calls only', xs.map(function (x) { return x.t2x; }).filter(S.isNum), [600, 600]);
+  check('falls over the reached calls only', xs.map(function (x) { return x.tfall; }).filter(S.isNum), [4500, 9000]);
+  var km = S.kaplanMeier(xs.map(function (x) { return x.hold; }));
+  check('KM over the reached calls only', [km.n, km.events, km.censored], [2, 2, 0]);
+  near('mean held (0 for the 4 that did not reach 2×)', S.mean(helds), 10800 / 6);
+  check('every reached call held at least 1 hour (the 0 bar is only calls that did not reach 2×)',
+    xs.filter(function (x) { return x.reached && !(x.held >= S.MIN_HELD_2X_S); }).length, 0);
+}());
+
+// a touched call with held missing is unknown: not in the held figures and
+// not counted as "touched 2×, under 1 hour" (the count and the grey 0 bar
+// share the held figures' denominator)
+(function () {
+  var calls = [[600, 0, 900, false], [600, null, null, false], [3300, null, null, true], [1200, 2100, null, true]];
+  var xs = calls.map(function (c) { return S.timing2x(c[0], c[1], c[2], c[3]); });
+  var helds = xs.map(function (x) { return x.held; }).filter(S.isNum);
+  check('held missing: held figures n', helds.length, 2);
+  check('held missing: short count', xs.filter(function (x) { return x.short; }).length, 2);
+  check('held missing: zeros (grey bar) + reached = held figures n',
+    helds.filter(function (v) { return v === 0; }).length + xs.filter(function (x) { return x.reached; }).length, helds.length);
+}());
+
 // Kaplan–Meier, worked by hand: times 0 E, 300 E, 300 C, 600 C, 900 E, 1200 C
 //   t=0:   6 at risk, 1 event → S = 5/6
 //   t=300: 5 at risk, 1 event (the censored one at 300 still at risk) → S = 5/6 × 4/5 = 2/3
@@ -319,6 +448,27 @@ check('cumulativeShare: n 0', S.cumulativeShare([5], 0), [{ t: 0, s: 0, k: 0 }])
   near('mean held', S.mean(held), 1800);
   near('median held', S.median(held), 0);
 }());
+
+// windows too short for the "reached 2×" rule (owner decision, 12 October
+// 2026): the first 2× candle closes at least 1 s after the post
+// (timing.go), so a call holds at most window − 1 s; a window is too short
+// only when even that is under MIN_HELD_2X_S
+check('FIRST_2X_CLOSE_MIN_S', S.FIRST_2X_CLOSE_MIN_S, 1);
+check('can2xReach: 1h', S.can2xReach(3600), false);
+check('can2xReach: 1d, 3d, 7d, 30d', [86400, 259200, 604800, 2592000].map(S.can2xReach), [true, true, true, true]);
+check('can2xReach: around the bound (3599, 3600, 3601, 3602, 3900)',
+  [3599, 3600, 3601, 3602, 3900].map(S.can2xReach), [false, false, true, true, true]);
+check('can2xReach: tiny windows', [0, 1, 300].map(S.can2xReach), [false, false, false]);
+check('can2xReach: unknown window shows the figures', [undefined, null, NaN, '1h'].map(S.can2xReach), [true, true, true, true]);
+// it agrees with the rule itself: the longest possible hold in a window
+// reaches 2× exactly when the window is not too short
+[3599, 3600, 3601, 86400].forEach(function (w) {
+  check('can2xReach(' + w + ') = reached2x of the longest hold', S.can2xReach(w), S.reached2x(0, w - S.FIRST_2X_CLOSE_MIN_S));
+});
+check('na2x: the same words everywhere', S.na2x().text, 'n/a — needs 1 hour held');
+check('na2x: short and needs make the text', S.na2x().short + ' — ' + S.na2x().needs, S.na2x().text);
+check('na2x: why says where held is counted from',
+  S.na2x().why.indexOf('counted from the end of the first 2× candle') >= 0 && S.na2x().why.indexOf('1 hour') >= 0, true);
 
 // the time axis and durations
 near('timeAxis(0)', S.timeAxis(0), 0);

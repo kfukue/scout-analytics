@@ -983,13 +983,59 @@ func TestAnalyticsPageFiles(t *testing.T) {
 	if !strings.Contains(html, "price at the post × the token's total supply read from the chain") {
 		t.Error("analytics.html: the By factor help does not explain the market cap at the call")
 	}
-	// the Timing tab: its panel, the 0-held rule said on the page, and the
-	// vendored chart library loaded (deferred) before the page's scripts, with
-	// its licence and notice, and nothing in it that the CSP would need
-	// 'unsafe-eval' or 'unsafe-inline' for
-	for _, want := range []string{`id="panel-timing"`, `id="tab-timing"`, "Calls that never reached 2× count as 0 held"} {
+	// the Timing tab: its panel, the "reached 2×" rule (owner decision, 12
+	// October 2026: at or above 2× for at least 1 hour in total, in every
+	// window) and the 0-held rule said on the page, and the vendored chart
+	// library loaded (deferred) before the page's scripts, with its licence
+	// and notice, and nothing in it that the CSP would need 'unsafe-eval' or
+	// 'unsafe-inline' for
+	for _, want := range []string{`id="panel-timing"`, `id="tab-timing"`, "Calls that did not reach 2× count as 0 held",
+		`Reached 2× = at or above 2× for at least <span id="lg-2x-hold">1 hour</span> in total within the window</strong> (the time held at 2×, below), in every window: a call still at 2× when the window ended needs it too.`} {
 		if !strings.Contains(html, want) {
 			t.Errorf("analytics.html: missing %q", want)
+		}
+	}
+	// the rule's threshold lives in one constant and the rule in one
+	// function, and the tab decides "reached 2×" through the function that
+	// applies it
+	stats := read("analytics-stats.js")
+	for _, want := range []string{"var MIN_HELD_2X_S = 3600;", "function reached2x(t2x, held)", "held >= MIN_HELD_2X_S;"} {
+		if !strings.Contains(stats, want) {
+			t.Errorf("analytics-stats.js: missing %q (reached 2× = at least 1 hour at 2× in total)", want)
+		}
+	}
+	for _, want := range []string{"A.timing2x(", "'Reached 2× = at or above 2× on closes for at least '", "' in total within the window '",
+		"'(in every window; a call still at 2× at the window\\'s end needs it too).'"} {
+		if !strings.Contains(js, want) {
+			t.Errorf("analytics.js: missing %q", want)
+		}
+	}
+	// a window too short for any call to reach the rule (1h; owner decision,
+	// 12 October 2026) shows "n/a — needs 1 hour held" instead
+	// of the reached-2× figures: the guard is defined once, from the first
+	// candle's earliest close, and the tab checks it once per render and
+	// passes it to every part that hangs on "reached 2×"
+	for _, want := range []string{"var FIRST_2X_CLOSE_MIN_S = 1;", "function can2xReach(windowSeconds)",
+		"return windowSeconds - FIRST_2X_CLOSE_MIN_S >= MIN_HELD_2X_S;", "function na2x()", "short: 'n/a', needs: needs, text: 'n/a — ' + needs,",
+		"var needs = 'needs ' + hold + ' held';", "counted from the end of the first 2× candle"} {
+		if !strings.Contains(stats, want) {
+			t.Errorf("analytics-stats.js: missing %q (n/a where no call can reach 2× by the rule)", want)
+		}
+	}
+	for _, want := range []string{"var na = !A.can2xReach(H);", "tmCounts(all, rows.length, withData, notTimed, hz, na);",
+		"drawTmDist(all, hz, na);", "fillTmGroups(all, gr, hz, na);", "drawTmKM(all, gr, H, hz, na);",
+		"stat(dl, 'Reached 2×', x.text,", "stat(dl, 'Still at 2× at the end', x.text,",
+		"if (na && (d.key === 't2x' || d.key === 'fall'))", "naChart($('ch-tm-km'));",
+		"tr.appendChild(na ? naCell() : rateCell(a.reached, a.n, 'timed calls reached 2×'));"} {
+		if !strings.Contains(js, want) {
+			t.Errorf("analytics.js: missing %q (n/a where no call can reach 2× by the rule)", want)
+		}
+	}
+	// the earlier rule scaled to the window (a call still at 2× at the end
+	// counted with less than 1 hour) is gone from the page
+	for name, src := range map[string]string{"analytics.html": html, "analytics.js": js, "analytics-stats.js": stats} {
+		if strings.Contains(src, "the window was left after the first 2×") {
+			t.Errorf("%s: still describes the rule scaled to the window", name)
 		}
 	}
 	const echartsTag = `<script src="vendor/echarts-6.1.0.custom.min.js" defer></script>`
