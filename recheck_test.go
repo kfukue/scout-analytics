@@ -104,8 +104,9 @@ func testRecheckScanner(t *testing.T, lane bool) *scanner {
 		s.runners = append(s.runners, newToolRunner(sp))
 	}
 	if lane {
-		s.recheck = &recheckLane{cfg: recheckConfig{After: 12 * time.Minute, After2: 2 * time.Hour},
+		s.recheck = &recheckLane{cfg: recheckConfig{After: 12 * time.Minute, After2: 2 * time.Hour}, now: time.Now,
 			hold: func(ctx context.Context, invID int) error { return nil }} // no database: the marker "is written"
+		s.recheck.init()
 	}
 	return s
 }
@@ -166,8 +167,19 @@ func TestRecheckGating(t *testing.T) {
 			if c.unstored {
 				inv = nil
 			}
-			if got := s.deferToRecheck(context.Background(), job{CA: "0xA", CallID: c.callID}, res, inv); got != c.deferred {
+			const line = "Model v1 · 7d: runner 12%, collapse 64%"
+			if got := s.deferToRecheck(context.Background(), job{CA: "0xA", CallID: c.callID}, res, inv, line); got != c.deferred {
 				t.Errorf("deferToRecheck(%s %s, stored %v, marker fails %v) = %v, want %v", c.status, c.level, !c.unstored, c.holdErr, got, c.deferred)
+			}
+			// the score line computed at the call is kept only for a held call
+			if s.recheck != nil {
+				want := ""
+				if c.deferred {
+					want = line
+				}
+				if got := s.recheck.scoreLine(call); got != want {
+					t.Errorf("deferToRecheck(%s %s): kept score line %q, want %q", c.status, c.level, got, want)
+				}
 			}
 		})
 	}

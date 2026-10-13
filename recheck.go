@@ -49,6 +49,15 @@ package main
 // removes that record; the stored first re-check is then delivered on a later
 // step (recheckDeliver), without asking Perceptor again. In a dry run
 // (-dry-run) the lane is off: nothing is held, re-checked or stored.
+//
+// Model score line: process() scores every call when it comes in (scoreCall,
+// from call-time data) and a held call keeps that line in memory
+// (recheckLane.scores); the re-check delivery shows it last, exactly as a
+// delivery at the call would have. The score is never asked again for the
+// re-check (re-check results are never model inputs). The line is not stored
+// (the scores are, in scout_call_predictions, but not what decides the line:
+// which buckets passed, SCOUT_MODEL_LINE), so a re-check delivered after a
+// restart of the listener (not a reconnect) goes out without it.
 
 import (
 	"context"
@@ -239,7 +248,9 @@ func recheckDecide(c recheckConfig, now time.Time, p PerceptorRecheckRow, delive
 // calls to re-check in the database by that marker, so a call whose result
 // was not stored, or whose marker cannot be written, is not held back (it
 // stays undelivered, as before, and that is logged).
-func (s *scanner) deferToRecheck(ctx context.Context, j job, results []*toolResult, invID *int) bool {
+// scoreLine is the call's model score line computed at the call (scoreCall;
+// "" without one): a held call keeps it for its re-check delivery.
+func (s *scanner) deferToRecheck(ctx context.Context, j job, results []*toolResult, invID *int, scoreLine string) bool {
 	if s.recheck == nil || j.CallID == nil {
 		return false
 	}
@@ -280,6 +291,7 @@ func (s *scanner) deferToRecheck(ctx context.Context, j job, results []*toolResu
 			j.CA, what, *j.CallID, rescanAgeText(age))
 		return true
 	}
+	s.recheck.keepScore(*j.CallID, scoreLine)
 	log.Printf("%s: Perceptor %s — not delivering yet; re-checking %s after the call (call %d)",
 		j.CA, what, s.recheck.cfg.After, *j.CallID)
 	return true
@@ -349,7 +361,19 @@ type recheckLane struct {
 	// stored and delivered with the label. Kept up to recheckOwedMax.
 	owed   map[int]time.Time
 	missed map[int]bool // recheckKey: missed windows already logged
+	// scores: the model score line of each call held in this process (call
+	// id -> line, computed at the call), shown last in its re-check delivery.
+	// Removed once that delivery has an outcome (sent or failed) or the
+	// re-check finds red flags; given up after recheckOwedMax past the first
+	// window. Not stored: lost on a restart (see the file comment).
+	scores map[int]heldScore
 	errLog logLimiter
+}
+
+// heldScore is a held call's model score line and when it was kept.
+type heldScore struct {
+	line string
+	at   time.Time
 }
 
 // recheckOwedMax: an owed call (recheckLane.owed) older than its first
@@ -432,7 +456,34 @@ func (s *scanner) newRecheckLane(c recheckConfig) *recheckLane {
 // init sets the maps and the error log's pace.
 func (l *recheckLane) init() {
 	l.tried, l.missed, l.retryAt, l.owed = map[int]bool{}, map[int]bool{}, map[int]time.Time{}, map[int]time.Time{}
+	l.scores = map[int]heldScore{}
 	l.errLog = logLimiter{every: 10 * time.Minute}
+}
+
+// keepScore keeps call id's model score line (computed at the call) for its
+// re-check delivery; an empty line keeps nothing.
+func (l *recheckLane) keepScore(id int, line string) {
+	if line == "" {
+		return
+	}
+	now := l.now()
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.scores[id] = heldScore{line: line, at: now}
+}
+
+// scoreLine returns call id's kept model score line ("" without one).
+func (l *recheckLane) scoreLine(id int) string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.scores[id].line
+}
+
+// dropScore forgets call id's model score line.
+func (l *recheckLane) dropScore(id int) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	delete(l.scores, id)
 }
 
 // markHeld marks investigation invID held for the re-check (a stop of ctx
@@ -500,6 +551,11 @@ func (l *recheckLane) step(ctx context.Context, queueLen func() int) bool {
 		}
 		if at.Before(since) {
 			since = at
+		}
+	}
+	for id, sc := range l.scores {
+		if now.Sub(sc.at) > l.cfg.maxAge1()+recheckOwedMax {
+			delete(l.scores, id) // its delivery can no longer come
 		}
 	}
 	l.mu.Unlock()
@@ -713,6 +769,7 @@ func (l *recheckLane) recheck(ctx context.Context, p PerceptorRecheckRow, n int)
 	completed := res.Status == investigationCompleted
 	if completed && verdictUsable(res.Verdict.Level) && !cfg.DeliverLevels[res.Verdict.Level] {
 		log.Printf("%s: %s — not delivered (not in SCOUT_DELIVER_LEVELS)", what, outcome)
+		l.dropScore(p.CallID)
 		l.logScan(p, res, false, false, "")
 		return
 	}
@@ -744,11 +801,12 @@ func (l *recheckLane) deliverStored(ctx context.Context, p PerceptorRecheckRow) 
 }
 
 // deliverCall delivers p after its first re-check res (stored as invID; nil
-// when storing failed): the header as for a live call (without the model
-// score, which is not asked again) plus a line with the re-check's age, the
-// original call post, the re-check's report and the other tools' reports of
-// the call's live scan, read from the database. n is the lane key's n that
-// ran it (1 or recheckDeliverN).
+// when storing failed): the header as for a live call plus a line with the
+// re-check's age (second) and, last, the model score line computed at the
+// call (recheckLane.scores; never asked again, and left out when there is
+// none, e.g. after a restart), the original call post, the re-check's report
+// and the other tools' reports of the call's live scan, read from the
+// database. n is the lane key's n that ran it (1 or recheckDeliverN).
 //
 // The delivery is recorded in scout_deliveries (status sending) BEFORE it is
 // sent, and that row is updated to sent or failed after: any delivery row of
@@ -766,6 +824,9 @@ func (l *recheckLane) deliverCall(ctx context.Context, p PerceptorRecheckRow, re
 	j := job{CA: p.ContractAddress, SourceMsg: p.MessageID, SourceText: p.MessageText, Meta: metaOf(p.MessageText), CallID: &p.CallID}
 	results, ids := l.callResults(ctx, p.CallID, res, invID)
 	header := withRecheckLine(l.s.deliveryHeader(j, results), fmt.Sprintf("🔁 %s re-checked %s after the call", res.Spec.Name, rescanAgeText(age)))
+	if line := l.scoreLine(p.CallID); line != "" {
+		header += "\n" + line // as process() adds it at the call
+	}
 	var attached []int
 	for i, r := range results {
 		if ids[i] != nil && r.Spec.Attach && r.Status == investigationCompleted {
@@ -804,6 +865,7 @@ func (l *recheckLane) deliverCall(ctx context.Context, p PerceptorRecheckRow, re
 		log.Printf("%s: %s — stopped before the delivery was sent (not recorded; delivered later): %v", what, outcome, err)
 		return
 	}
+	l.dropScore(p.CallID) // the delivery has an outcome now: never sent again
 	status, errText := DeliveryStatusSent, (*string)(nil)
 	var at *time.Time
 	if err != nil {

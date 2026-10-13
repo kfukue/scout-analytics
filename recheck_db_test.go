@@ -207,12 +207,18 @@ func TestRecheckScheduleFromDatabase(t *testing.T) {
 	f.s.recheck = f.lane(recheckReply, verdict{Level: levelClean}, &sent)
 	late, lateInv := f.unheldCall(t, 7, ca('g'), 4*time.Hour, levelInsufficient)
 	res := []*toolResult{{Spec: f.s.runners[0].spec, Status: investigationCompleted, Verdict: verdict{Level: levelInsufficient}}}
-	if !f.s.deferToRecheck(ctx, job{CA: ca('g'), CallID: &late}, res, &lateInv) || !f.s.recheck.missed[recheckKey(late, 1)] {
+	if !f.s.deferToRecheck(ctx, job{CA: ca('g'), CallID: &late}, res, &lateInv, "Model v1 · 7d: runner 9%") || !f.s.recheck.missed[recheckKey(late, 1)] {
 		t.Errorf("late call: deferToRecheck false or not marked missed (%v)", f.s.recheck.missed)
 	}
+	if got := f.s.recheck.scoreLine(late); got != "" {
+		t.Errorf("late call: score line kept %q, want none (it is never delivered)", got)
+	}
 	fresh, freshInv := f.unheldCall(t, 8, ca('h'), 2*time.Minute, levelInsufficient)
-	if !f.s.deferToRecheck(ctx, job{CA: ca('h'), CallID: &fresh}, res, &freshInv) || f.s.recheck.missed[recheckKey(fresh, 1)] {
+	if !f.s.deferToRecheck(ctx, job{CA: ca('h'), CallID: &fresh}, res, &freshInv, "Model v1 · 7d: runner 12%") || f.s.recheck.missed[recheckKey(fresh, 1)] {
 		t.Errorf("fresh call: deferToRecheck false or marked missed (%v)", f.s.recheck.missed)
+	}
+	if got, want := f.s.recheck.scoreLine(fresh), "Model v1 · 7d: runner 12%"; got != want {
+		t.Errorf("fresh call: score line kept %q, want %q", got, want)
 	}
 	if !f.held(t, lateInv) || !f.held(t, freshInv) {
 		t.Errorf("held markers: late %v, fresh %v; want both written", f.held(t, lateInv), f.held(t, freshInv))
@@ -704,11 +710,15 @@ func TestRecheckDeliveryStopped(t *testing.T) {
 			cancel()
 			return fmt.Errorf("send original call: %w", ctx.Err())
 		}
+		l.keepScore(call, recheckScoreLine)
 		if !l.step(ctx, func() int { return 0 }) {
 			t.Fatal("step() = false, want a re-check")
 		}
 		if d := f.deliveries(t, call); len(d) != 1 || d[0].Status != DeliveryStatusFailed {
 			t.Fatalf("delivery rows %+v, want one failed", d)
+		}
+		if got := l.scoreLine(call); got != "" {
+			t.Errorf("score line after a failed send %q, want it forgotten (the delivery is never sent again)", got)
 		}
 		if l.step(context.Background(), func() int { return 0 }) || calls != 1 || len(sent) != 1 {
 			t.Errorf("after a stop in the middle of sending: deliver called %d times, sent %q; want once, one /scan", calls, sent)
@@ -904,7 +914,7 @@ func TestRecheckHeldMarker(t *testing.T) {
 				c.setup(f, res)
 			}
 			if c.deferred {
-				if got := f.s.deferToRecheck(ctx, job{CA: ca, CallID: &call}, res, &inv); got != c.held {
+				if got := f.s.deferToRecheck(ctx, job{CA: ca, CallID: &call}, res, &inv, ""); got != c.held {
 					t.Errorf("deferToRecheck = %v, want %v", got, c.held)
 				}
 			}
