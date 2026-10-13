@@ -1,6 +1,93 @@
 # Scout analytics: handoff to Claude Code
 
-## Session state (13 October 2026: main 56ad247 after PRs #31-#35; prod pulled 56ad247)
+## Session state (13 October 2026, evening: main 29b5c2e after PRs #36-#40; prod 29b5c2e)
+
+This section supersedes the earlier 13 October and the 12 October states
+below wherever they differ.
+
+**Main and prod:** main is at **29b5c2e** (PR #40). Prod: the owner
+pulled 29b5c2e on the server (`git log -1` read back by him) and
+restarted the listener (`-listen-only`), the tracker (`-track`) and
+`-web`; `SCOUT_MODEL_URL` is in the prod `.env` (count 1). The first
+scored delivery was still awaited at the time of writing (no new call
+yet); the listener may need one more restart if the `.env` line was added
+after its restart. Merged 13 Oct after 56ad247 (PR, merge commit, head):
+
+- PR #36 (9dbed27; head 4437690): this file and the PM skill for the
+  first half of 13 Oct.
+- PR #37 (e5db130; head a08d7d4, `work/2026-10-13-testdb-guard`): DB tests
+  read `SCOUT_TEST_DATABASE_URL` only through `testDatabaseURL`
+  (`testdb_test.go`) and fail before connecting unless it is database
+  `scout_test` on localhost/127.0.0.1/::1/unix socket on a TCP port other
+  than 5432 (no port = 5432 = refused). Test code and docs only. The paused
+  CI draft must map a non-5432 port when it resumes.
+- PR #38 (495f881; head 4f08fb0, `work/2026-10-13-reply-to-filter`): a bot
+  reply to a message older than our request (or sent before it) is
+  ignored (logged, `details.ignored_replies`, `details.request_msg_id`) in
+  every lane (live, 12-minute re-check, re-scan, re-ask). Messages without
+  a reply link still count (sAlpha leaves it off on ~25% of replies;
+  Perceptor set it on all 448 in the owner's 14-day sample). Read-only
+  follow-up SQL in the PR description; if Perceptor always replies to our
+  request, requiring the link for Perceptor can be proposed.
+- PR #39 (4c81819; head dee1aae, `work/2026-10-13-go-small-fixes`):
+  re-check `paceWait` only lowers `nextLook`; `isNoSuchValue` narrowed
+  (node no-state texts first, incl. the prod Nitro text `missing trie node
+  … state 0x… is not available, not found`, code -32000, read by the owner
+  13 Oct; then busy words; then code 3 / reverts; other errors retried);
+  "0 red flags" read as clean and "10 red flags" as red flags again
+  (`stripSafePhrase`); `TestScoreCallBudget` 2 s / 5 s. Owner's count of
+  stored Perceptor rows hit by the zero case: 0 (no data fix needed).
+- PR #40 (29b5c2e; head ab62022, `work/2026-10-13-perceptor-filter-latest`):
+  owner request: the call list's Perceptor filter and counts use
+  `perceptor_latest_verdict` (call-time report or the latest re-scan /
+  2-hour re-check; a real verdict beats insufficient/unknown, else the
+  later completion wins, tie → re-scan). Display only; the dataset view,
+  export, scoring and Analytics "verdict at the call" stay call-time.
+
+**Live on prod since 13 Oct (owner):**
+- sAlpha re-ask **on** (`SCOUT_SALPHA_REASK=on`; the dry run showed 406
+  first calls without a report: 169 declined, 196 empty, 37 timeouts; 6
+  candidates in the 6–24 h window; 4 `reask` rows by the evening).
+  Default max age 24 h kept; the owner may take the 79 calls under 7 days
+  later with `SCOUT_SALPHA_REASK_MAX_AGE=168h` for a day (open).
+- Scoring service **installed and running** (`scout-model.service`, user
+  `lyle`, `SCOUT_MODEL_LINE=all`, `OMP_NUM_THREADS=2`, serving
+  20261013-1909; `/health` and a sample `/score` checked by the owner).
+  The listener has `SCOUT_MODEL_URL=http://127.0.0.1:8601`. After a
+  retrain no restart is needed (LATEST is read per request); restart it
+  only when `ml/` code changes.
+
+**Latest model report (20261013-1909, first under the PR #34 gates):**
+short FAIL (pooled lift 1.02), 3day FAIL (median 1.98 of 1.98/2.06/1.98;
+every other gate passes, sim difference +32.2 [+18.2, +44.1]), **medium
+PASS** (median 2.26 of 2.34/2.26/1.61, lower end 2.04, sim difference
++41.3 [+24.5, +57.4], collapses removed 0.483), long skipped. Medium
+passed on 0702 too. Caveats: the top 10% still averages −10.4 % at 7 d
+(vs −51.7 % for all calls): ranking, not profit; only 4 counted weeks;
+seed 23 at 1.61; adversarial AUC 0.99 driven by `calls_prev_24h`.
+Diagnostics 22 s. Report copied by the owner (to be saved under
+`ml-results/models/20261013-1909/`).
+
+**`calls_prev_*` finding (investigate, 13 Oct):** `calls_prev_24h`/`_1h`
+count every stored row of the channel in the window strictly before the
+post (real calls and "hit 3X" update posts, >50 %), so no leakage, but
+they trend with calendar time (a timestamp proxy). Training/serving
+mismatch possible: rows added later by backfill raise the training count.
+`perceptor_verdict` is filled only for calls handled live (8.8 %).
+Read-only SQL Q1/Q2 for the owner (per-day storage, per-week calls_prev
+split) were sent; report-only variants are being built (below).
+
+**In progress (PM worktrees from `origin/main` 29b5c2e, uncommitted):**
+
+| Worktree | Branch | Work |
+|---|---|---|
+| web-model-scores-20261013 | `work/2026-10-13-web-model-scores` | model scores on the website (owner request; defaults: fixed 7d column, detail in the row JSON, "n.v." for failed gates, only scores within 24 h of the call); `passed` column on `scout_call_predictions` (repeat-safe); NOTIFY/SSE `score`; `model_scores` switch off for the GCP site; leakage guards |
+| ml-callsprev-variants-20261013 | `work/2026-10-13-ml-callsprev-variants` | report-only variants: `calls_prev` burst ratio; calls_prev variants across seeds |
+| tracker-nostate-paths-20261013 | `work/2026-10-13-tracker-nostate-paths` | ETH/USD pool `slot0` and Pons graduation paths flip `noState` only on a real no-state text |
+| timing-tab-polish-20261013 | `work/2026-10-13-timing-tab-polish` | Kaplan–Meier caption wording, unused `ech-tip-box` class |
+| handoff-1013b-20261013 | `work/2026-10-13-handoff-1013b` | this update |
+
+## Earlier session state (13 October 2026, first half: main 56ad247 after PRs #31-#35; history)
 
 This section supersedes the 12 October one below wherever they differ.
 
@@ -530,8 +617,8 @@ Never touch the owner's own Postgres server.
 
 ## Introduction
 
-Up to date as of 13 October 2026 (main at 56ad247; prod pulled 56ad247
-and restarted, per the owner). Start Claude
+Up to date as of 13 October 2026, evening (main and prod at 29b5c2e;
+scoring service live, sAlpha re-ask on). Start Claude
 Code in the repo root; `.claude/settings.json` makes the session the product
 manager, which delegates to the agents in `.claude/agents/` (see "Agent setup").
 
@@ -551,15 +638,15 @@ matter are in section 5. Package `main` is at the repo root: `go run .`.
 ## Deferred / open
 
 Kept current by the PM whenever an item is deferred or an owner check is
-pending (13 October 2026). Everything through PR #35 is on `main`
-(56ad247), and the owner reported it pulled and restarted on prod 13 Oct
-(listener, `-web`, tracker; retrain running). The owner checks from that
-deploy are in "Owner to-do after the 56ad247 deploy" at the top. The
-scoring-service unit `ops/scout-model.*` (PR #24) is on `main` but not
-installed on prod yet ("Then switch scores on" in the 12 Oct state).
-Resolved 13 Oct: sAlpha re-ask, bot-token redaction, re-check score-line
+pending (13 October 2026, evening). Everything through PR #40 is on
+`main` (29b5c2e) and deployed on prod (owner, 13 Oct). The scoring service
+is installed and the listener connected; sAlpha re-ask is on. Resolved
+13 Oct: sAlpha re-ask, bot-token redaction, re-check score-line
 persistence (PR #35); ML gates option (b) (PR #34); Timing real time held
-(PR #33).
+(PR #33); test-DB guard (PR #37); `reply_to_msg_id` filtering (PR #38);
+`paceWait`, `isNoSuchValue`, "0 red flags" parser, score budget test
+(PR #39); Perceptor filter on the latest report (PR #40); scoring service
+installed (owner).
 
 - **Not on `main`** (each item exists as uncommitted changes, or a local
   commit not yet pushed, in an agent worktree under `.claude/worktrees/` —
@@ -568,28 +655,34 @@ persistence (PR #35); ML gates option (b) (PR #34); Timing real time held
     (agent-afcf62469a29564cf) (paused, see Session state).
   - CI draft `.github/workflows/test.yml` (agent-aa31691b57e3bc7ff; owner
     approval) (paused, see Session state).
-  - In progress 13 Oct (table "In progress" at the top): Go small fixes
-    (`paceWait` only lowers `nextLook`, narrow `isNoSuchValue`, the
-    "0 red flags" parser, `TestScoreCallBudget` margin), the test-DB
-    safety guard (plus the `scout_models_db_test.go:18` `localhost:5432`
-    example), and `reply_to_msg_id` filtering.
-  - The old worktree `agent-ae167c3d46439a04d` is a backup of the work
-    ported as PR #35; it is kept until an `investigate` check confirms it
-    holds nothing that is not on main.
-- **Owner setting:** `SCOUT_SALPHA_REASK` stays off until the owner has
-  checked `go run . -salpha-reask-missing -dry-run`.
+  - In progress (table "In progress" at the top): model scores on the
+    website, `calls_prev` report-only variants, tracker no-state paths
+    (`slot0`, Pons), Timing tab caption and `ech-tip-box`.
+  - The old worktree `agent-ae167c3d46439a04d` was checked (nothing
+    missing from main) and removed by the owner 13 Oct.
+- **Owner setting:** `SCOUT_SALPHA_REASK=on` since 13 Oct; the 7-day
+  backlog (`SCOUT_SALPHA_REASK_MAX_AGE=168h` for a day) is the owner's
+  option.
 - **Small fixes, not started:**
   - wait-group hardening: the listener goroutines on a Telegram reconnect;
-  - Timing tab (PR #22 review notes): the Kaplan–Meier caption wording, and
-    the unused `ech-tip-box` CSS class.
+  - marker words match inside other words ("non-mintable" → red flags,
+    "precaution" → caution): word boundaries for `defaultMarkers`;
+  - the listener could refuse to score calls older than 24 h (manual
+    `-post`/`-ca` can back-score; the website hides such scores);
+  - `scout_models.data.go`: `pgxpool.ParseConfig`'s error can contain the
+    raw DB URL (password) for an unparseable `SCOUT_DATABASE_URL`
+    (startup log only; pre-existing).
 - **Owner checks:**
   - GCP publish: the merged draft publishes sAlpha report text (scrubbed)
     and Perceptor report links; confirm (b) publish, or ask for (a) labels
     only with an opt-in in `deploy/gcp/INTERFACE.md`, before the Go export
     is written (section 4 item 8; PM recommends (a): both are paid bots);
-  - ML: the first report under the PR #34 gates (the retrain on 56ad247);
+  - ML: the `calls_prev` read-only SQL Q1/Q2 (13 Oct session state);
     `GATE_MIN_POOLED_WEEKS = 2` is an implementer default the owner may
     change;
+  - after the 29b5c2e deploy: the first delivery with the model line;
+    Perceptor filter "Caution" includes tokens with only "today: caution";
+    no CSP errors;
   - disk space: ~318 GB free on C: (12 Oct; was ~100 MB before the
     owner's 10 Oct clean-up, which blocked Go builds); old agent
     scratchpads under `...\AppData\Local\Temp\claude\...` (~5.5 GB) may be
@@ -1377,9 +1470,10 @@ Later:
 - Other call sources (Call Analyser channels): paused, section 4 item 6.
 - In-flight scans cut off by a stop end as `failed` and are not requeued.
 - Poison post: a stored-only post with a permanent DB error pauses polling.
-- Resolved: `prior_calls`, `calls_prev_1h` and `calls_prev_24h` counting update
-  posts no longer matters (training uses first calls only, so they are
-  near-constant).
+- `prior_calls` and `secs_since_prev_call` (per token) are near-constant for
+  first calls and not model inputs. **Corrected 13 Oct:** `calls_prev_1h` and
+  `calls_prev_24h` count the whole channel (update posts included), are model
+  inputs and drift with time (see the 13 Oct session state).
 
 ## 5. Repo migration (done; pushed and cut over on 8 October)
 
