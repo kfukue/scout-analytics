@@ -50,8 +50,12 @@ anything non-trivial (`DEPLOY.md` and `ml/RUNBOOK.md` for deploy and training).
   single-run gate is kept as information (`gates.old`). Walk-forward weeks
   count only with at least 1000 training rows (`WF_MIN_TRAIN_ROWS`). Scores never filter deliveries; they
   are only appended as one line, whose buckets are set by `SCOUT_MODEL_LINE` on
-  the scoring service (default `passed`; prod is to run `all` once the
-  scoring service is installed, failing buckets marked "(not validated)"). The `long` bucket waits for matured data until about
+  the scoring service (default `passed`; prod runs `all` since 13 Oct, failing
+  buckets marked "(not validated)"). The scoring service
+  (`scout-model.service`, user `lyle`, `127.0.0.1:8601`) is installed on prod
+  since 13 Oct and the listener has `SCOUT_MODEL_URL`; it reads `LATEST` per
+  request (no restart after a retrain; restart only when `ml/` code changes).
+  The `long` bucket waits for matured data until about
   25 December 2026. Trained on the prod server with `ml/run_training.sh` into
   `~/scout-ml` (Python 3.11 venv; never replace the system python3). Reports
   copied to the PC go in `ml-results/` (gitignored).
@@ -459,8 +463,8 @@ Every Go start applies `scoutanalytics.sql` unless `SCOUT_DB_AUTO_MIGRATE=false`
   (merged in PR #20, deployed 12 Oct in 68a4954).
 - sAlpha: declines are never forwarded; re-ask when the first answer was
   declined, empty or timed out (merged in PR #35, 56ad247, 13 Oct). The lane
-  stays off (`SCOUT_SALPHA_REASK` unset) until the owner has checked
-  `go run . -salpha-reask-missing -dry-run`.
+  is on in prod since 13 Oct (`SCOUT_SALPHA_REASK=on`, default 24 h max age)
+  after the owner checked the dry run.
 - 13 Oct: the Perceptor re-check delivery's score line survives a listener
   restart (option (a): `score_line` in the held investigation's `details`
   JSONB; never re-scored; PR #35).
@@ -474,8 +478,8 @@ Every Go start applies `scoutanalytics.sql` unless `SCOUT_DB_AUTO_MIGRATE=false`
   labelled by channel, with the same `clean,caution` filter.
 - 12 Oct: the delivery score line may show model numbers even when buckets
   fail their gates, marked "(not validated)", because the owner is the only
-  reader of the private delivery group. Prod is to run the scoring service
-  with `SCOUT_MODEL_LINE=all`; the code default stays `passed`. Scores never filter
+  reader of the private delivery group. Prod runs the scoring service
+  with `SCOUT_MODEL_LINE=all` (since 13 Oct); the code default stays `passed`. Scores never filter
   deliveries. Supersedes "scores only after a report passes" for this group.
 - 12 Oct: Timing tab: "reached 2×" = at or above 2× for at least 1 hour in
   total, in every window; windows too short for it (1h) show
@@ -485,6 +489,14 @@ Every Go start applies `scoutanalytics.sql` unless `SCOUT_DB_AUTO_MIGRATE=false`
   2×; "reached 2×" still needs 1 hour held (PR #33).
 - 13 Oct: ML gates option (b), pooled walk-forward + seed median (PR #34;
   see "Model" under "The project").
+- 13 Oct: the call list's Perceptor filter uses each token's latest
+  Perceptor report with a verdict, re-scans included (PR #40); display only,
+  the dataset view and the Analytics "verdict at the call" stay call-time.
+- 13 Oct: model scores are to be shown on the website (in progress):
+  a fixed 7d column, per-bucket detail in the row, failed-gate buckets
+  marked "n.v."/"(not validated)", only scores made within 24 h of the call
+  (no back-scoring of historical calls: they are training data); never on
+  the public GCP site unless the owner decides otherwise.
 - 12 Oct: the PM has the `Bash` tool for git only: read-only git, `git fetch`
   and `git worktree add` to create worktrees for `implement`; never add,
   commit, push, stash, switch, reset, rebase or merge (see "Your git
