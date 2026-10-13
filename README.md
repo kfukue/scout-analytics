@@ -797,6 +797,13 @@ WHERE p.features->>'quote_asset' IS NOT NULL AND t.onchain->>'quote_sym' IS NOT 
 
 `scout_call_predictions_v` shows each score next to the real outcome.
 
+All buckets of one score are stored in one transaction (one `created_at`), each
+with `passed` (whether that bucket's model passed its gates, as the scoring
+service says; NULL = not recorded, e.g. rows stored before this column existed). The
+listener then sends `NOTIFY scout_events` with `{"kind":"score","call_id":…}`; an
+open website refreshes its snapshot on it (it does not show scores yet). Neither
+the dataset view, `-export-dataset` nor `ml/` ever read this table.
+
 ### Latest price (the return as of now)
 
 The horizon numbers stop at 30 days. So that an older call still shows where it stands
@@ -1491,8 +1498,8 @@ stored as `score_line` in the `details` of the held Perceptor investigation (the
 update that writes the held marker; only when there is a line). The delivery uses the line
 in memory, else the stored one, so a re-check delivered after a **restart** of the listener
 shows exactly the line the call got when it came in (it is never rebuilt from
-`scout_call_predictions`, which does not keep which buckets passed nor the
-`SCOUT_MODEL_LINE` mode). The stored line is display text only: the dataset view and the
+`scout_call_predictions`, which does not keep the `SCOUT_MODEL_LINE` mode, and
+has `passed` NULL for rows stored before this column existed). The stored line is display text only: the dataset view and the
 export never read it. A missing line never holds back or delays the delivery.
 
 The re-check's delivery is recorded in `scout_deliveries` with `status = 'sending'` **before**
@@ -1669,7 +1676,8 @@ storing a new real call (not an update post, not a post stored again, not a call
 `-backfill`), and
 `{"kind":"report","call_id":812,"tool":"perceptor","id":5120,"scan_kind":"live"}` after storing
 a completed Perceptor or sAlpha report (`"scan_kind":"rescan"` for a re-scan by the rescan
-lane, `"scan_kind":"reask"` for sAlpha asked again by the re-ask lane). A failed `NOTIFY` never fails the insert; it is logged (at most
+lane, `"scan_kind":"reask"` for sAlpha asked again by the re-ask lane), and
+`{"kind":"score","call_id":812}` after storing a model score (see "Scoring new calls"). A failed `NOTIFY` never fails the insert; it is logged (at most
 one line a minute) and the page then shows the row with the next regular refresh. You can
 watch them with `LISTEN scout_events;` in psql. `-web` opens **one extra database connection**
 for `LISTEN`, outside its pool (so it holds one more connection than before). If that

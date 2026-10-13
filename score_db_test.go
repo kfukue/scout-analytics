@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -37,7 +38,8 @@ func TestScoreCall(t *testing.T) {
 		json.Unmarshal(b, &req)
 		got = req.Row
 		w.Write([]byte(`{"model_version":"v3","line":` + strconv.Quote(respLine) + `,
-			"buckets":[{"bucket":"short","runner_prob":0.31,"collapse_prob":0.44,"runner_rank_pct":92.5},
+			"buckets":[{"bucket":"short","runner_prob":0.31,"collapse_prob":0.44,"runner_rank_pct":92.5,"passed":false},
+			           {"bucket":"medium","runner_prob":0.12,"collapse_prob":0.5,"runner_rank_pct":80,"passed":true},
 			           {"bucket":"long","runner_prob":0.06,"collapse_prob":null,"runner_rank_pct":null}]}`))
 	}))
 	cfg := &config{SourceChannel: "scoutrobinhood", Chains: map[string]bool{"evm": true}, StateDir: t.TempDir(),
@@ -50,10 +52,19 @@ func TestScoreCall(t *testing.T) {
 	var logs bytes.Buffer
 	log.SetOutput(&logs)
 	t.Cleanup(func() { log.SetOutput(os.Stderr) })
+	// listening from here on: the call's own notification has gone already
+	conn := listenTest(t, st)
 
 	line := s.scoreCall(ctx, j)
 	if !strings.HasPrefix(line, "Model v3") {
 		t.Fatalf("line %q", line)
+	}
+	// the stored score is announced once, for an open website
+	if got, want := nextNotification(t, conn, 5*time.Second), fmt.Sprintf(`{"kind":"score","call_id":%d}`, *j.CallID); got != want {
+		t.Fatalf("after a score: notification %q, want %q", got, want)
+	}
+	if got := nextNotification(t, conn, 300*time.Millisecond); got != "" {
+		t.Fatalf("a second notification for one score: %q", got)
 	}
 	// The pre-call time is logged with the outcome, for tuning SCOUT_MODEL_TIMEOUT.
 	if want := "score " + j.CA + ": " + respLine + " (precall "; !strings.Contains(logs.String(), want) {
@@ -63,9 +74,18 @@ func TestScoreCall(t *testing.T) {
 		t.Fatalf("row sent to the model: %v", got)
 	}
 	ps, err := st.PredictionsForCall(ctx, *j.CallID)
-	if err != nil || len(ps) != 2 || ps[0].Bucket != "short" || *ps[0].RunnerProb != 0.31 || *ps[0].RunnerRankPct != 92.5 ||
-		ps[1].CollapseProb != nil {
+	if err != nil || len(ps) != 3 || ps[0].Bucket != "short" || *ps[0].RunnerProb != 0.31 || *ps[0].RunnerRankPct != 92.5 ||
+		ps[2].Bucket != "long" || ps[2].CollapseProb != nil {
 		t.Fatalf("stored %+v %v", ps, err)
+	}
+	// passed as the service sent it: false, true, and not sent = NULL (not recorded)
+	if ps[0].Passed == nil || *ps[0].Passed || ps[1].Passed == nil || !*ps[1].Passed || ps[2].Passed != nil {
+		t.Fatalf("passed %v %v %v, want false true nil", ps[0].Passed, ps[1].Passed, ps[2].Passed)
+	}
+	// one transaction: every bucket has the same created_at
+	var times int
+	if err := st.Pool.QueryRow(ctx, `SELECT count(DISTINCT created_at) FROM scout_call_predictions WHERE call_id = $1`, *j.CallID).Scan(&times); err != nil || times != 1 {
+		t.Fatalf("created_at values of one score: %d (%v), want 1", times, err)
 	}
 
 	// No bucket passed its gates: the service sends no line, the delivery has none.

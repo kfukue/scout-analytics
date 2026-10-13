@@ -14,6 +14,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -1714,33 +1715,65 @@ type ScoutCallPrediction struct {
 	RunnerProb    *float64 `json:"runner_prob"`
 	CollapseProb  *float64 `json:"collapse_prob"`
 	RunnerRankPct *float64 `json:"runner_rank_pct"` // share of recent calls with a lower runner score
+	// Passed: the bucket's model passed its validation gates (the scoring
+	// service's "passed"); nil = not recorded
+	Passed *bool `json:"passed"`
 }
 
 // TableName returns the table name for this model.
 func (ScoutCallPrediction) TableName() string { return "scout_call_predictions" }
 
+// pgExecer is what upsertPrediction needs: the pool or a transaction.
+type pgExecer interface {
+	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
+}
+
 // UpsertPrediction stores a score (one row per call, model version and bucket).
 func (st *ScoutStore) UpsertPrediction(ctx context.Context, p ScoutCallPrediction, features []byte) error {
+	return upsertPrediction(ctx, st.Pool, p, features)
+}
+
+// StorePredictions stores every bucket of one score in one transaction: all or
+// none. Its rows share one created_at (now() is the time the transaction
+// started), which the website will show as the time of the score.
+func (st *ScoutStore) StorePredictions(ctx context.Context, ps []ScoutCallPrediction, features []byte) error {
+	tx, err := st.Pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }() // a no-op after Commit
+	for _, p := range ps {
+		if err := upsertPrediction(ctx, tx, p, features); err != nil {
+			return fmt.Errorf("bucket %s: %w", p.Bucket, err)
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit: %w", err)
+	}
+	return nil
+}
+
+func upsertPrediction(ctx context.Context, db pgExecer, p ScoutCallPrediction, features []byte) error {
 	var f *string
 	if len(features) > 0 {
 		s := string(features)
 		f = &s
 	}
 	// uuid, contract_address and created_by are the shared table's required columns.
-	_, err := st.Pool.Exec(ctx, `INSERT INTO scout_call_predictions
-		(uuid, call_id, contract_address, model_version, bucket, runner_prob, collapse_prob, runner_rank_pct, features, created_by)
-		SELECT $8::uuid, c.id, c.contract_address, $2, $3, $4, $5, $6, $7::jsonb, $9 FROM scout_calls c WHERE c.id = $1
+	_, err := db.Exec(ctx, `INSERT INTO scout_call_predictions
+		(uuid, call_id, contract_address, model_version, bucket, runner_prob, collapse_prob, runner_rank_pct, features, passed, created_by)
+		SELECT $8::uuid, c.id, c.contract_address, $2, $3, $4, $5, $6, $7::jsonb, $10, $9 FROM scout_calls c WHERE c.id = $1
 		ON CONFLICT (call_id, model_version, bucket) DO UPDATE SET
 		 runner_prob = EXCLUDED.runner_prob, collapse_prob = EXCLUDED.collapse_prob,
-		 runner_rank_pct = EXCLUDED.runner_rank_pct, features = EXCLUDED.features, created_at = now()`,
-		p.CallID, p.ModelVersion, p.Bucket, p.RunnerProb, p.CollapseProb, p.RunnerRankPct, f, uuid.NewString(), "scoutanalytics")
+		 runner_rank_pct = EXCLUDED.runner_rank_pct, features = EXCLUDED.features, passed = EXCLUDED.passed, created_at = now()`,
+		p.CallID, p.ModelVersion, p.Bucket, p.RunnerProb, p.CollapseProb, p.RunnerRankPct, f, uuid.NewString(), "scoutanalytics", p.Passed)
 	return err
 }
 
 // PredictionsForCall returns the stored scores of a call.
 func (st *ScoutStore) PredictionsForCall(ctx context.Context, callID int) ([]ScoutCallPrediction, error) {
 	rows, err := st.Pool.Query(ctx, `SELECT call_id, model_version, bucket, runner_prob::float8, collapse_prob::float8,
-		runner_rank_pct::float8 FROM scout_call_predictions WHERE call_id = $1 AND bucket IS NOT NULL ORDER BY model_version, id`, callID)
+		runner_rank_pct::float8, passed FROM scout_call_predictions WHERE call_id = $1 AND bucket IS NOT NULL ORDER BY model_version, id`, callID)
 	if err != nil {
 		return nil, err
 	}
@@ -1748,7 +1781,7 @@ func (st *ScoutStore) PredictionsForCall(ctx context.Context, callID int) ([]Sco
 	var out []ScoutCallPrediction
 	for rows.Next() {
 		var p ScoutCallPrediction
-		if err := rows.Scan(&p.CallID, &p.ModelVersion, &p.Bucket, &p.RunnerProb, &p.CollapseProb, &p.RunnerRankPct); err != nil {
+		if err := rows.Scan(&p.CallID, &p.ModelVersion, &p.Bucket, &p.RunnerProb, &p.CollapseProb, &p.RunnerRankPct, &p.Passed); err != nil {
 			return nil, err
 		}
 		out = append(out, p)

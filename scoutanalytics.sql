@@ -343,6 +343,10 @@ ALTER TABLE scout_call_predictions ADD COLUMN IF NOT EXISTS runner_prob     NUME
 ALTER TABLE scout_call_predictions ADD COLUMN IF NOT EXISTS collapse_prob   NUMERIC;  -- 0..1
 ALTER TABLE scout_call_predictions ADD COLUMN IF NOT EXISTS runner_rank_pct NUMERIC;  -- % of recent calls with a lower runner score
 ALTER TABLE scout_call_predictions ADD COLUMN IF NOT EXISTS features        JSONB;    -- the feature row that was scored
+-- whether the bucket's model passed its validation gates (the scoring service's
+-- "passed"; NULL = not recorded: rows stored before this column, or a service
+-- that did not send it). Never read by scout_call_dataset_v or ml/.
+ALTER TABLE scout_call_predictions ADD COLUMN IF NOT EXISTS passed          BOOLEAN;
 CREATE INDEX IF NOT EXISTS scout_call_predictions_call_idx ON scout_call_predictions (call_id);
 CREATE INDEX IF NOT EXISTS scout_call_predictions_ca_idx   ON scout_call_predictions (contract_address);
 -- one bucket row per call and model version (rows without a bucket are not limited)

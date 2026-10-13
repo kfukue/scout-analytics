@@ -68,6 +68,36 @@ def test_trades_24h_is_the_last_view_column_and_an_outcome():
     assert "trades_24h" not in outcome_columns()           # a count, not a percent outcome
 
 
+def dataset_view_body(sql: str) -> str:
+    """The whole CREATE VIEW scout_call_dataset_v statement (select list and
+    joins), up to its terminating semicolon; comments removed."""
+    body = sql.split("CREATE VIEW scout_call_dataset_v AS", 1)[1]
+    body = re.sub(r"--[^\n]*", "", body)
+    end = body.find(";")
+    assert end > 0, "scout_call_dataset_v has no end"
+    return body[:end]
+
+
+@pytest.mark.skipif(not SQL.exists(), reason="scoutanalytics.sql not next to ml/")
+def test_dataset_view_never_reads_model_scores():
+    """Leakage guard: the dataset (and so every training row and every row
+    the scoring service gets) never reads the model's own stored scores."""
+    body = dataset_view_body(SQL.read_text(encoding="utf-8"))
+    assert "FROM scout_calls_v cv" in body  # the whole statement, joins included
+    assert "scout_call_predictions" not in body
+
+
+def test_ml_code_never_reads_model_scores():
+    """No module of ml/ outside the tests refers to scout_call_predictions
+    (the scores are written by the listener and shown by the website only)."""
+    root = Path(__file__).resolve().parents[1]
+    tests = root / "tests"
+    hits = [str(p.relative_to(root)) for p in root.rglob("*.py")
+            if tests not in p.parents and ".venv" not in p.parts
+            and "scout_call_predictions" in p.read_text(encoding="utf-8", errors="replace")]
+    assert hits == []
+
+
 def test_unused_columns_stay_in_the_view_but_are_no_features():
     """prior_calls / secs_since_prev_call are 0 / NULL for every first call:
     still exported by the view (VIEW_COLUMNS), never model inputs."""
