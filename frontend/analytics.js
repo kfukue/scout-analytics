@@ -1441,7 +1441,7 @@
   }
   function tooltipBase(formatter, trigger) {
     return {
-      trigger: trigger || 'axis', confine: true, className: 'ech-tip-box', renderMode: 'html', formatter: formatter,
+      trigger: trigger || 'axis', confine: true, renderMode: 'html', formatter: formatter,
       axisPointer: { type: trigger === 'item' ? 'none' : 'shadow' }
     };
   }
@@ -1704,7 +1704,7 @@
     ['Held at 2×', 'Time at or above 2× on closes: median and mean over every timed call, at the time it really held (also under ' + A.holdWords(A.MIN_HELD_2X_S) + '; never touched 2× = 0)'],
     ['Fell below 2×', 'Time to fall back below 2×, from the post: median and mean over the calls that reached 2× and fell back'],
     ['Still at 2× at end', 'Of the calls that reached 2×: still at 2× when the window ended (censored)'],
-    ['Half fell back by', 'Kaplan–Meier median of the time held after the first 2× (censored calls counted)'],
+    ['Half fell back by', 'Kaplan–Meier median of "Still at 2× after t" (calls that reached 2×): the t where the curve first drops to 50% or below (those still at 2× at the end count until then, not as fallen back)'],
     ['Rugged in window', 'Event rug times within the window'],
     ['Time to rug', 'Median and mean of the event rug times within the window']
   ];
@@ -1773,7 +1773,7 @@
       'Held at 2× is the time each timed call really held: also the time held by the calls that touched 2× without reaching it (under ' +
       A.holdWords(A.MIN_HELD_2X_S) + '); the calls that never touched 2× count as 0 (so its median is often 0). ' +
       (na ? 'Reached 2×, First 2×, Fell below 2×, Still at 2× at end and Half fell back by: "' + A.na2x().text + '". ' + A.na2x().why + ' '
-        : 'Fell below 2× is counted from the post and leaves out the calls still at 2× at the end; "Half fell back by" counts them (Kaplan–Meier). ') +
+        : 'Fell below 2× is counted from the post and leaves out the calls still at 2× at the end; "Half fell back by" is the Kaplan–Meier median of "Still at 2× after t" below, where they count until the window ended. ') +
       'Grey: fewer than ' + MIN_N + ' calls.';
   }
 
@@ -1830,7 +1830,7 @@
       var x = A.na2x();
       $('key-tm-km').replaceChildren();
       naChart($('ch-tm-km'));
-      $('cap-tm-km').textContent = 'Kaplan–Meier over the timed calls that reached 2×, and when half of them had fallen back: "' + x.text + '". ' +
+      $('cap-tm-km').textContent = 'The share of the calls that reached 2× still at 2× t after first reaching it (Kaplan–Meier), and "half fell back by": "' + x.text + '". ' +
         x.why + ' ' + rule2x();
       return;
     }
@@ -1843,12 +1843,14 @@
     drawStep('ch-tm-km', 'key-tm-km', H, series, 'the first 2×',
       'Share still at 2× after the first 2×, Kaplan–Meier, ' + fmtInt(aKM.n) + ' calls that reached 2× in the ' + hz + ' window' +
       (isNum(aKM.median) ? '; half had fallen back by ' + A.fmtDur(aKM.median) : '; fewer than half fell back'));
-    $('cap-tm-km').textContent = 'Kaplan–Meier over the ' + fmtInt(aKM.n) + ' timed calls that reached 2×. ' + rule2x() + ' ' +
-      't counts from the first 2× (the start of its candle). ' +
-      'A call that fell back counts at the time it held on closes, at most until its first close under 2× (so a call whose first stretch was short can fall before ' + A.holdWords(A.MIN_HELD_2X_S) + '). ' +
-      'The ' + fmtInt(aKM.censored) + ' calls still at 2× when the window ended are censored: counted as at 2× up to then, not as a fall. ' +
-      'Across: log scale of time. Dashed: fewer than ' + MIN_N + ' calls. The ' + fmtInt(all.n - all.reached) +
-      ' timed calls that did not reach 2× are not in this curve (' + fmtInt(all.short) + ' of them touched 2× without reaching it).';
+    $('cap-tm-km').textContent = 'Of the ' + fmtInt(aKM.n) + ' timed calls that reached 2×, the share still at or above 2× t after first reaching it (Kaplan–Meier). ' +
+      rule2x() + ' The other ' + fmtInt(all.n - all.reached) + ' timed calls are not in it (' + fmtInt(all.short) +
+      ' of them touched 2× but held it under ' + A.holdWords(A.MIN_HELD_2X_S) + '). ' +
+      't is the time held at 2× on closes, but at most the time from the first 2× (the start of its candle) to the first close under 2× or the rug, ' +
+      'so a call that fell back and rose again counts only its first stretch and can fall back before ' +
+      A.holdWords(A.MIN_HELD_2X_S) + '. The ' + fmtInt(aKM.censored) + ' calls still at 2× when the window ended are censored: counted until then, not as fallen back. ' +
+      '"Half fell back by" is the Kaplan–Meier median: the t where the curve first drops to 50% or below. ' +
+      'Across: log scale of time. Dashed: fewer than ' + MIN_N + ' calls.';
   }
 
   function drawTmRug(all, gr, H, hz) {

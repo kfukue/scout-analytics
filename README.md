@@ -2128,10 +2128,11 @@ dependencies; `go test` runs it when `node` is on the PATH). Only the visible ta
     that never touched 2×), to fall below 2× and to rug; the share still at 2× at the end; and the Kaplan–Meier
     median of the time held ("half fell back by").
   - **Still at 2× after t:** a Kaplan–Meier curve per group (and all timed calls) over the
-    calls that reached 2×, t counted from the first 2×. A call that fell back counts at the
-    time it held on closes, at most until its first close under 2× (so a call that held 1 hour
-    or more in several stretches can fall before 1 hour); a call still at 2× when the window
-    ended is censored (it counts as at 2× up to then, not as a fall).
+    calls that reached 2×. t is the time held at 2× on closes, but at most the time from the
+    first 2× (the start of its candle) to the first close under 2× or the rug, so a call that
+    fell back and rose again counts only its first stretch and can fall back before 1 hour; a
+    call still at 2× when the window ended is censored (counted until then, not as a fall).
+    "Half fell back by" is the curve's median.
   - **Share rugged by t:** per group, the share of the timed calls whose pool was drained
     (event rug times) within t of the post: a plain running share, as every timed call was
     followed for the whole window.

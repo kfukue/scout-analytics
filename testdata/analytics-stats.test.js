@@ -482,7 +482,23 @@ function notReached(held) {
   var all = S.kaplanMeier([{ t: 10, event: true }, { t: 20, event: true }, { t: 20, event: true }, { t: 40, event: true }]);
   check('KM no censoring', all.points.map(function (p) { return p.s; }), [1, 0.75, 0.25, 0]);
   near('KM no censoring: median', all.median, 20);
+  // "Half fell back by" = the first t where the curve drops to 50% or below
+  // (exactly 50% counts)
+  var half = S.kaplanMeier([{ t: 10, event: true }, { t: 20, event: true }, { t: 30, event: false }, { t: 40, event: true }]);
+  near('KM median at exactly 50%', half.median, 20);
 }());
+
+// The "still at 2× after t" caption: t is the time held on closes, but at most
+// the time from the first 2× (the start of its candle) to the first close under
+// 2× or the rug. Here the first 2× candle (start 600) itself closes under 2×
+// (at 900) and the call rose again later (3600 s held in total): only that
+// first stretch counts, t = 900 − 600 = 300 s, a fall before 1 hour
+check('reached, first 2× candle closes under 2×, rose again later: t = first 2× start to that close = 300 s',
+  S.timing2x(600, 3600, 900, false).hold, { t: 300, event: true });
+check('reached, at 2× until a rug: falls at the rug',
+  S.timing2x(600, 4000, 4900, false).hold, { t: 4000, event: true });
+check('reached, still at 2× at the end: censored at its held time',
+  S.timing2x(600, 5000, null, true).hold, { t: 5000, event: false });
 
 // share rugged by t: of n calls; ties make one step; times below 0 count at 0
 check('cumulativeShare', S.cumulativeShare([3600, 300, 300, -20, null], 10),
