@@ -1225,10 +1225,7 @@ func (s *scanner) investigateAll(ctx context.Context, ca string) []*toolResult {
 		wg.Add(1)
 		go func(i int, r *toolRunner) {
 			defer wg.Done()
-			send := func(ctx context.Context, text string) error {
-				_, err := s.sender.To(r.botPeer).Text(ctx, text)
-				return err
-			}
+			send := func(ctx context.Context, text string) error { return s.sendToBot(ctx, r, text) }
 			res := r.investigateWithRetry(ctx, send, ca)
 			if res.Status == investigationCompleted {
 				res.Verdict = s.judge(ctx, r.spec, res.Replies)
@@ -1455,7 +1452,7 @@ func investigationRow(r *toolResult, callID *int, ca string, toolID int) *ScoutI
 		Ticker:          strPtr(r.Verdict.Ticker),
 		VerdictSummary:  strPtr(r.Verdict.Summary),
 		VerdictSource:   strPtr(r.Verdict.Source),
-		Details:         replyDetails(r.Replies, r.Attempts, r.RateLimitWaits),
+		Details:         replyDetails(r),
 	}
 	if id := perceptorID(r.Replies...); id != "" && r.Spec.Parser == parserPerceptor {
 		row.ExternalID = &id
@@ -1512,7 +1509,11 @@ func (s *scanner) recordDelivery(j job, header string, investigationIDs []int, n
 // entry per reply (its time, edit time, the message it replies to, its media
 // type, "" for none, and its text length) so a report with empty text, the
 // gap between sAlpha's photo and its text, and late replies can be diagnosed.
-func replyDetails(msgs []*tg.Message, attempts int, rateLimitWaits []int) []byte {
+// It also stores the request's message id (request_msg_id, left out when
+// unknown) and the bot messages left out because they cannot answer the
+// request (ignored_replies, see staleReply).
+func replyDetails(r *toolResult) []byte {
+	msgs := r.Replies
 	type media struct {
 		MessageID int    `json:"message_id"`
 		Type      string `json:"type"`
@@ -1533,13 +1534,15 @@ func replyDetails(msgs []*tg.Message, attempts int, rateLimitWaits []int) []byte
 		TextLen      int    `json:"text_len"`                  // characters of text (caption included)
 	}
 	var d struct {
-		Attempts       int      `json:"attempts,omitempty"`
-		RateLimitWaits []int    `json:"rate_limit_waits_s,omitempty"`
-		Replies        []reply  `json:"replies,omitempty"`
-		Media          []media  `json:"media,omitempty"`
-		Buttons        []button `json:"buttons,omitempty"`
+		Attempts       int            `json:"attempts,omitempty"`
+		RateLimitWaits []int          `json:"rate_limit_waits_s,omitempty"`
+		RequestMsgID   int            `json:"request_msg_id,omitempty"`
+		Replies        []reply        `json:"replies,omitempty"`
+		IgnoredReplies []ignoredReply `json:"ignored_replies,omitempty"`
+		Media          []media        `json:"media,omitempty"`
+		Buttons        []button       `json:"buttons,omitempty"`
 	}
-	d.Attempts, d.RateLimitWaits = attempts, rateLimitWaits
+	d.Attempts, d.RateLimitWaits, d.RequestMsgID, d.IgnoredReplies = r.Attempts, r.RateLimitWaits, r.RequestMsgID, r.Ignored
 	for _, m := range msgs {
 		rp := reply{MessageID: m.ID, Date: m.Date, TextLen: utf8.RuneCountInString(m.Message)}
 		if m.Media != nil {
@@ -1785,6 +1788,31 @@ func (s *scanner) sendNotify(ctx context.Context, text string, replyTo int) (int
 		return 0, err
 	}
 	return sentMessageID(upd), nil
+}
+
+// sendToBot sends text (a request) to r's bot and records the request
+// message's id on r (noteRequest), so replies to an earlier request are not
+// taken for this one (staleReply). Every lane that asks a bot uses it: live
+// calls, the Perceptor re-check, the rescan lane and the sAlpha re-ask.
+func (s *scanner) sendToBot(ctx context.Context, r *toolRunner, text string) error {
+	upd, err := s.sender.To(r.botPeer).Text(ctx, text)
+	if err != nil {
+		return err
+	}
+	r.noteRequest(requestMessageID(r.spec.Code, upd))
+	return nil
+}
+
+// requestMessageID returns the id of the request message a successful send
+// to a bot created, or 0 (logged) when Telegram's answer does not name one:
+// then that request's replies are not filtered by it.
+func requestMessageID(code string, upd tg.UpdatesClass) int {
+	id, err := unpack.MessageID(upd, nil)
+	if err != nil {
+		log.Printf("[%s] sent, but Telegram's answer names no message id (%v) — on a token's first attempt, no reply is filtered for that token (retries included); on a retry, the first attempt's id still filters", code, err)
+		return 0
+	}
+	return id
 }
 
 // sentMessageID returns the id of the message a successful send created, or
