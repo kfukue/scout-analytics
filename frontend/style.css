@@ -684,7 +684,6 @@ td.hm-n3 .ana-n, td.hm-n2 .ana-n, td.hm-n1 .ana-n, td.hm-z .ana-n, td.hm-p1 .ana
 .ech-tip-h { font-weight: 600; margin: 0 0 2px; }
 .ech-tip-row { display: flex; align-items: center; gap: 6px; }
 .ech-tip-row .sw { flex: none; }
-.ech-tip-n { color: var(--muted); }
 .sw.sw-all { --c: var(--text-2); }
 .sw.sw-never { --c: var(--muted); opacity: .6; }
 .sw.sw-acc { --c: var(--accent); }
