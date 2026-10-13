@@ -237,10 +237,13 @@ def wf_counted(w: dict) -> bool:
 
 
 def gates(test: dict, windows: list) -> dict:
-    """PASS needs all three: lift, collapse removal, and every COUNTED
-    walk-forward window beating buy-everything (no counted window = fail).
-    Counted = evaluated and trained on >= C.WF_MIN_TRAIN_ROWS rows (owner, 9 Oct
-    2026); evaluated weeks below that are reported as `windows_not_counted`."""
+    """The OLD single-run gates (the verdict until 13 Oct 2026; now information,
+    and the gate column of the --variants rows and the seed table): PASS needs
+    all three: test-part lift, collapse removal, and every COUNTED walk-forward
+    window beating buy-everything (no counted window = fail). Counted =
+    evaluated and trained on >= C.WF_MIN_TRAIN_ROWS rows (owner, 9 Oct 2026);
+    evaluated weeks below that are reported as `windows_not_counted`. The
+    verdict of the saved model is `pooled_gates`."""
     evaluated = [w for w in windows if not w.get("skipped")]
     counted = [w for w in evaluated if wf_counted(w)]
     g = {"lift_ok": bool(test["top_lift"] >= C.GATES["min_top_lift"]),
@@ -252,6 +255,106 @@ def gates(test: dict, windows: list) -> dict:
          "wf_min_train_rows": C.WF_MIN_TRAIN_ROWS}
     g["passed"] = g["lift_ok"] and g["collapse_ok"] and g["walk_forward_ok"]
     return g
+
+
+def _finite(v) -> bool:
+    """A real number that is not NaN / inf (None, strings and bools are not)."""
+    return (isinstance(v, (int, float, np.integer, np.floating)) and not isinstance(v, bool)
+            and bool(np.isfinite(v)))
+
+
+def pooled_gates(single: dict, test: dict, pooled: dict | None, seed_lifts: dict) -> dict:
+    """The bucket verdict since the owner decision of 13 Oct 2026 (config "Bucket
+    gates"; `passed` is what the scoring service reads). All four must hold:
+
+    - pooled_lift_ok: median over C.STABILITY_SEEDS of the pooled expanding
+      walk-forward top-10% lift >= C.GATES["min_top_lift"], every seed defined;
+    - pooled_lift_lower_ok: lower end of the 95% week-block bootstrap interval
+      of the saved seed's pooled lift > C.GATE_POOLED_LIFT_LOWER;
+    - sim_diff_ok: lower end of the 95% bootstrap interval of the pooled
+      simulation difference (top 10% minus all, mean capped net return)
+      > C.GATE_SIM_DIFF_LOWER;
+    - collapse_ok: collapses removed on the test part >= C.GATES["min_collapse_removed"].
+
+    `single`: the old single-run gates (`gates`), kept under "old" (information).
+    `test`: the saved model's test-part trading metrics. `pooled`: `D.pooled` of
+    the saved seed's counted walk-forward weeks with the bootstrap (None: not
+    computed). `seed_lifts`: per seed its pooled walk-forward lift, or a string
+    saying why there is none. Fewer than C.GATE_MIN_POOLED_WEEKS counted weeks,
+    a missing seed or any NaN fails the gate concerned, with a reason in
+    `reasons`: never a PASS on missing data. The pooled top-10% mean net return
+    (`abs_return_*`) is information only."""
+    p = pooled if isinstance(pooled, dict) else {}
+    reasons = []
+    if pooled is None or p.get("error"):
+        reasons.append("pooled walk-forward not computed"
+                       + (f" ({p['error']})" if p.get("error") else ""))
+    weeks = int(p.get("weeks") or 0)
+    enough = weeks >= C.GATE_MIN_POOLED_WEEKS
+    if not enough:
+        reasons.append(f"only {weeks} counted walk-forward week(s); the pooled gates need at "
+                       f"least {C.GATE_MIN_POOLED_WEEKS}")
+    seeds = list(C.STABILITY_SEEDS)
+    if not seeds:
+        reasons.append("no STABILITY_SEEDS configured")
+    lifts = {}
+    for s in seeds:
+        v = seed_lifts.get(s)
+        lift = float(v) if _finite(v) else None
+        lifts[str(s)] = lift
+        if lift is None:
+            reasons.append(f"pooled lift of seed {s}: {v if isinstance(v, str) else 'undefined'}")
+    complete = bool(seeds) and all(v is not None for v in lifts.values())
+    median = float(np.median(list(lifts.values()))) if complete else np.nan
+    min_lift = C.GATES["min_top_lift"]
+    lift_ok = enough and complete and median >= min_lift
+    if enough and complete and not lift_ok:
+        reasons.append(f"median pooled lift {median:.2f} < {min_lift:g}")
+    lo = p.get("lift_lo", np.nan)
+    lower_ok = enough and _finite(lo) and lo > C.GATE_POOLED_LIFT_LOWER
+    if enough and not _finite(lo):
+        reasons.append("pooled lift 95% interval undefined")
+    elif enough and not lower_ok:
+        reasons.append(f"pooled lift 95% lower end {lo:.2f} <= {C.GATE_POOLED_LIFT_LOWER:g}")
+    sim_lo = p.get("sim_gain_lo", np.nan)
+    sim_ok = enough and _finite(sim_lo) and sim_lo > C.GATE_SIM_DIFF_LOWER
+    if enough and not _finite(sim_lo):
+        reasons.append("pooled simulation difference 95% interval undefined")
+    elif enough and not sim_ok:
+        reasons.append(f"pooled simulation difference 95% lower end {sim_lo:+.1f} <= "
+                       f"{C.GATE_SIM_DIFF_LOWER:g}")
+    cr = test.get("collapse_removed", np.nan)
+    min_cr = C.GATES["min_collapse_removed"]
+    collapse_ok = _finite(cr) and cr >= min_cr
+    if not _finite(cr):
+        reasons.append("collapses removed undefined (no collapse model or no collapse on test)")
+    elif not collapse_ok:
+        reasons.append(f"collapses removed {cr:.3f} < {min_cr:g}")
+    top = p.get("sim_top_mean", np.nan)
+    g = {"rule": "pooled walk-forward (owner decision)", "set_on": C.GATES_SET_ON,
+         "pooled_weeks": weeks, "min_pooled_weeks": C.GATE_MIN_POOLED_WEEKS,
+         "pooled_lift_seeds": lifts, "pooled_lift_median": median, "min_pooled_lift": min_lift,
+         "pooled_lift_ok": bool(lift_ok),
+         "pooled_lift": p.get("lift", np.nan), "pooled_lift_lo": lo,
+         "pooled_lift_hi": p.get("lift_hi", np.nan),
+         "min_pooled_lift_lower": C.GATE_POOLED_LIFT_LOWER, "pooled_lift_lower_ok": bool(lower_ok),
+         "sim_diff": p.get("sim_gain", np.nan), "sim_diff_lo": sim_lo,
+         "sim_diff_hi": p.get("sim_gain_hi", np.nan),
+         "min_sim_diff_lower": C.GATE_SIM_DIFF_LOWER, "sim_diff_ok": bool(sim_ok),
+         "collapse_removed": cr, "min_collapse_removed": min_cr, "collapse_ok": bool(collapse_ok),
+         # information only, never a gate
+         "abs_return_top": top, "abs_return_all": p.get("sim_all_mean", np.nan),
+         "abs_return_positive": bool(top > 0) if _finite(top) else None,
+         "old": {**single, "top_lift": test.get("top_lift", np.nan)},
+         "reasons": reasons}
+    g["passed"] = bool(lift_ok and lower_ok and sim_ok and collapse_ok)
+    return g
+
+
+def single_run_gates(g: dict) -> dict:
+    """The old single-run gates of a bucket result: `g["old"]` for the saved
+    model (whose `gates` are `pooled_gates`), `g` itself for a variant or seed run."""
+    return g.get("old", g)
 
 
 def window_ok(n_test: int) -> bool:

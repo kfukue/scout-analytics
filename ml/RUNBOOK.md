@@ -278,32 +278,46 @@ cd "$ML/src/ml"
 time "$ML/venv/bin/python" train.py --csv "$ML/data/calls.csv" --out "$ML/models"
 ```
 
-It prints one line per bucket (`PASS`, `FAIL (see report.md)` or
-`skipped: ...`) and `wrote .../models/<version>`. A line `WARNING: the data has
+It first trains the normal model, then retrains it with the LightGBM seeds
+11 and 23 and pools the walk-forward weeks: the gates need both (owner
+decision of 13 Oct 2026, see step 7), and it prints
+`[gates] seed retrains N s, pooled walk-forward N s`. Then one line per bucket
+(`PASS`, `FAIL: <reasons> (see report.md)` or `skipped: ...`) and
+`wrote .../models/<version>`. A line `WARNING: seed <n> of the seed retrains
+failed (...)` means every trained bucket FAILS this run (a gate input is
+missing); paste it. The saved model is not affected. A line `WARNING: the data has
 no trades_24h column` means step 3b has not been done yet (the training is
 still valid, with the plain collapse labels). After the buckets it trains
 the report-only dead score and prints `[dead score] N s` (a few seconds); a
 line `WARNING: the dead score failed (...)` means only that report section is
 missing: the saved models are not affected.
 
-Then it runs the stability diagnostics (report only, never a gate; see step 7,
-item 5). They are on by default and print one line at the end, e.g.
-`[diagnostics] seeds N s, walk_forward N s, no_dead N s, adversarial N s; total N s`.
-They retrain the normal model with two more seeds, so they cost extra time: on
-synthetic data a whole run took about 3 to 4 times as long with them as without
-(28 s without, 99 s with, on a desktop PC). On the prod data the extra time is
-an estimate, not measured yet; the `[diagnostics]` line gives the real figure
-(paste it, step 8). They start only after the model, `meta.json`, `report.md`
-and `LATEST` are written, and the saved model, the gates and the verdict are
-the same with or without them, so stopping during them still leaves the normal
-result. A `WARNING` line about them (`WARNING: diagnostics part '<name>'
-failed (...)`, `WARNING: seed <n> of the seed stability failed (...)` or
+Then it runs the stability diagnostics (see step 7, item 5). They are on by
+default and print one line at the end, e.g.
+`[diagnostics] seeds N s, walk_forward N s, no_dead N s, adversarial N s; total N s`
+("seeds" is the time of the seed retrains above, done for the gates; they are
+not run twice). The seed retrains cost about two normal runs, with or without
+the diagnostics: on synthetic data a whole run took 26 s before 13 Oct 2026,
+73 s now with the diagnostics off and 102 s with them on (desktop PC). On the
+prod data the extra time is an estimate, not measured yet; the `[gates]` and
+`[diagnostics]` lines give the real figures (paste them, step 8). The
+diagnostics start only after the model, `meta.json`, `report.md` and `LATEST`
+are written, and the saved model, the gates and the verdict are the same with
+or without them, so stopping during them still leaves the normal result.
+Stopping earlier, during the seed retrains (before the bucket `PASS` / `FAIL`
+lines), leaves a version directory with model files but no `meta.json`, and
+`LATEST` still names the previous version (the scoring service keeps using
+it); delete that directory and run again. A `WARNING` line about the
+diagnostics (`WARNING: diagnostics part '<name>' failed (...)` or
 `WARNING: the stability diagnostics failed (...)`) means only that part of
-the section is missing (it says `Not computed: error: ...`, or a failed seed
-shows the error in its row); the saved models are not affected. Paste the warning.
+the section is missing (it says `Not computed: error: ...`); the saved models
+and the verdict are not affected. Paste the warning.
 
 To skip them for one run (for example when time is short), put
-`SCOUT_ML_DIAGNOSTICS=0` in front of the command:
+`SCOUT_ML_DIAGNOSTICS=0` in front of the command. That skips only the
+report-only parts (rolling walk-forward, evaluation without dead calls,
+adversarial validation, about 30 s on synthetic data): the seed retrains and
+the pooled walk-forward still run, because the verdict needs them.
 
 ```bash
 time SCOUT_ML_DIAGNOSTICS=0 "$ML/venv/bin/python" train.py --csv "$ML/data/calls.csv" --out "$ML/models"
@@ -314,7 +328,8 @@ SCOUT_ML_DIAGNOSTICS=0 REPO="$PWD" ML=~/scout-ml bash ~/scout-ml/run_training.sh
 `0`, `off`, `false` and `no` switch them off; any other value prints a
 `WARNING` and keeps the default (on). The script passes the variable through
 to `train.py` as it is; nothing else changes. The report then has no
-"Stability diagnostics" section.
+"Stability diagnostics" section; the verdict table still shows the three seed
+values and the pooled numbers.
 
 Exit code 0 even when gates fail. Random seed: fixed (`LGBM_SEED = 7` in
 `scout_ml/config.py`; the diagnostics use fixed seeds too), so a rerun on the
@@ -357,21 +372,24 @@ time "$ML/venv/bin/python" train.py --csv "$ML/data/calls.csv" --out "$ML/models
 ```
 
 It trains the normal model
-exactly as in step 5 (that is the one saved, served and gated), then five
+exactly as in step 5 (that is the one saved, served and gated), then six
 variants that each change one setting (dead rule on, i.e. collapse OR dead;
 raw `dex` instead of `dex_family`; raw `dex` + `dex_family`; runners must have
 `trades_24h >= 100`; stronger regularisation, i.e. smaller trees with more
 calls per leaf, a stronger L2 penalty and fewer inputs per tree,
-`LGBM_REGULARISATION = "strong"` in `scout_ml/config.py`). The "dead rule off" and "dead threshold 100" rows of
+`LGBM_REGULARISATION = "strong"` in `scout_ml/config.py`; no calls_prev
+inputs, i.e. without `calls_prev_1h` and `calls_prev_24h`, which adversarial
+validation found driving the train/test drift in report 20261013-0702). The "dead rule off" and "dead threshold 100" rows of
 earlier reports are gone: the rule is now off in the baseline, and the
 threshold only matters with the rule on. The variants are not saved; they only add a section
 "Variant comparison" at the end of `report.md`, one table per bucket, one row
 per variant (the `baseline` row is the saved model). It prints one
 `[variant] <name>: N s` line per variant. Time: more than the 4 to 5 times
 the step 5 train time measured with four variants (on a desktop PC,
-synthetic data of 6,000 calls: about 30 s without, about 2 min with
-`--variants`): each variant costs about one normal training run, so the fifth
-adds about one more. The stability
+synthetic data of 6,000 calls, before the gates of 13 Oct 2026: about 30 s
+without, about 2 min with `--variants`; the gates' seed retrains now add
+about 47 s to every run): each variant costs about one normal training run, so the fifth
+and sixth add about one more each. The stability
 diagnostics of step 5 also run (before the variants) unless switched off with
 `SCOUT_ML_DIAGNOSTICS=0`, and add their own time on top. Memory as in step 5.
 The model, `meta.json`, `report.md` and `LATEST` are written before the
@@ -385,6 +403,12 @@ warning to the product manager; the saved model is not affected.
 
 How to read the table: compare each row with `baseline`. "collapses removed
 (plain; gate)" and "collapse AUC, plain label" are comparable across all rows.
+The last column is the old single-run gate of each row ("single-run (old)
+gate, information"), also for `baseline`, so it can differ from the verdict at
+the top (the pooled gates would need every variant retrained with every seed).
+The column before it is each variant's own pooled walk-forward lift and
+simulation difference with their intervals (seed 7 only): compare those with
+the baseline's for a fairer picture than the test part alone.
 The `runners must be tradeable` row measures lift on its own stricter runner
 label (look at its "runner rate (test)"); its money simulation still uses every
 call. Every row is judged on the same test part, so a variant that is better
@@ -409,27 +433,40 @@ cat "$ML/models/$(cat "$ML/models/LATEST")/report.md"
 
 From the top:
 
-1. **Verdict**: one line per bucket. A bucket PASSes only if all three hold
-   on the test part (`short`, `3day`: the latest ~15% of calls; `medium`,
-   `long`: the calls of the last 14 days with an outcome):
-   - top-10% lift >= 2: calls in the top 10% by runner score are at least
-     twice as often runners as calls overall (the report adds an approximate
-     95% interval and the runner counts; with ~70 calls in the top 10% the
-     interval is wide, so read a lift near 2 with care);
-   - collapses removed >= 40%: skipping the 30% with the highest collapse
-     score avoids at least 40% of the collapses. Always counted on the plain
-     collapse label, also when the model was trained on collapse OR dead; the
-     "bad outcomes removed incl. dead" row under it is information only, not
-     a gate;
-   - beats buy-all in every week: in every counted walk-forward week, the
-     top 10% earned more on average than buying every call. A week counts
-     only when its training part has at least 1000 rows (`WF_MIN_TRAIN_ROWS`,
-     owner decision of 9 Oct 2026); weeks below are still in the walk-forward
-     table, marked "not counted (train < 1000)", and the verdict cell says
-     how many (e.g. "yes (8/8 weeks; 3 not counted)"). The early weeks of
-     the data (e.g. `medium` from 18 Aug 2026, 530 train rows) are such weeks.
-     The variant table's walk-forward columns and the dead-score proposal use
-     the counted weeks only, too.
+1. **Verdict**: one line per bucket, by the gates the owner decided on
+   13 Oct 2026 (pooled walk-forward, "option (b)"). "Pooled" means the test
+   calls of all counted walk-forward weeks put together, each week still
+   ranked by its own model. A week counts only when its training part has at
+   least 1000 rows (`WF_MIN_TRAIN_ROWS`, owner decision of 9 Oct 2026); weeks
+   below are still in the walk-forward table, marked "not counted (train <
+   1000)" (e.g. the early `medium` weeks from 18 Aug 2026, 530 train rows).
+   A bucket PASSes only if all of these hold:
+   - runner lift: the median of the pooled top-10% lift over the three
+     LightGBM seeds 7, 11 and 23 is at least 2 (the cell shows the median and
+     the three values, e.g. "yes: 2.18 (2.18 / 2.26 / 1.94)"), and the lower
+     end of the 95% interval of the seed-7 pooled lift (whole weeks drawn
+     again 2000 times) is above 1.0 (the next column);
+   - beats buy-all: the pooled money simulation, top 10% minus all calls
+     (mean net return, each call capped at +1,000 %), has the lower end of
+     its 95% interval above 0 (e.g. "yes: +43.1 [+36.7, +51.6]");
+   - collapses removed >= 40% on the test part (`short`, `3day`: the latest
+     ~15% of calls; `medium`, `long`: the calls of the last 14 days with an
+     outcome): skipping the 30% with the highest collapse score avoids at
+     least 40% of the collapses. Always counted on the plain collapse label,
+     also when the model was trained on collapse OR dead; the "bad outcomes
+     removed incl. dead" row under it is information only, not a gate.
+   Information only, never a gate: "absolute return" (the pooled top-10%
+   mean net return; "(<= 0)" means even the top 10% lost money on average)
+   and the two old gates, marked "old gate, information only": the top-10%
+   lift on the test part (>= 2) and "beats buy-all in every counted week"
+   (with how many weeks were not counted). They show how the old verdict
+   would have been. Under the table, each FAILing bucket has a line with its
+   reasons. A missing value never passes: fewer than 2 counted weeks, a seed
+   retrain that failed, or an "n/a" value makes the bucket FAIL with that
+   reason. On report 20261013-0702 this gives: `3day` FAIL (median 1.98 from
+   1.98 / 2.02 / 1.85), `medium` PASS, `short` FAIL. The variant table's
+   walk-forward columns and the dead-score proposal use the counted weeks
+   only, too.
 2. **Data and exclusions**: one line per reason a row was left out (update
    post, repeat call, no pool, not in USD, extreme outcome), then per bucket
    how many calls are not labelled yet. Not labelled yet means the horizon is
@@ -437,8 +474,10 @@ From the top:
    that bucket, never counted as losses.
 3. Per bucket: the split (rows dropped by the embargo), class balance, for
    `medium` and `long` the purged k-fold inside train (rounds, calibration),
-   test metrics (LightGBM vs the logistic baseline), the gate table, the
-   money simulation, the walk-forward table, calibration and top features.
+   test metrics (LightGBM vs the logistic baseline), the gate table (the
+   gates, then the information rows and a "Why FAIL:" line), the money
+   simulation on the test part, the walk-forward table, calibration and top
+   features.
    Each label's "Platt calibration:" line names the calibration it uses
    (**recent window** or **all held-out rows**), chosen on held-out rows only
    (comparison Brier values given, or the reason no comparison was made);
@@ -461,19 +500,23 @@ From the top:
    error: ...` (and the run printed `WARNING: the dead score failed`), paste
    that line; the saved models are not affected. Never act on this score:
    it is not served.
-5. **Stability diagnostics (report only; not saved, not served, never a
-   gate)**: helps tell whether the numbers above are real or noise. Nothing
-   in it changes the saved model, the gates or the verdict, and nothing in it
-   passes or fails. It is missing when the run had `SCOUT_ML_DIAGNOSTICS=0`
+5. **Stability diagnostics (not saved, not served)**: helps tell whether the
+   numbers above are real or noise. Since 13 Oct 2026 two of its numbers are
+   the inputs of the gates (computed in every run, also without this
+   section): each seed's pooled walk-forward lift, and the pooled expanding
+   walk-forward with its intervals. Everything else in it passes or fails
+   nothing, and the section never changes the saved model, the gates or the
+   verdict. It is missing when the run had `SCOUT_ML_DIAGNOSTICS=0`
    (step 5). Its parts:
    - **Seed stability**: the normal model trained again with the LightGBM
      seeds 11 and 23 next to the saved model's seed 7 (same rows, splits and
      weeks; only the seed changes). Per bucket and seed: test top-10% lift
      with its interval, collapses removed, runner ROC AUC, the money
      simulation top 10% vs all, the counted walk-forward weeks beating
-     buy-all and the pooled walk-forward lift; then min / median / max over
-     the seeds. A lift or a PASS/FAIL that moves between seeds is noise, not
-     a real result.
+     buy-all, the pooled walk-forward lift (marked "gate input": its median
+     is the runner-lift gate) and the old single-run gate of each run
+     (information); then min / median / max over the seeds. A lift or a
+     PASS/FAIL that moves between seeds is noise, not a real result.
    - **Pooled walk-forward (expanding and rolling)**: the test rows of all
      counted walk-forward weeks of a bucket put together, each week still
      ranked by its own model, so one lift over many more calls than a single
@@ -482,7 +525,8 @@ From the top:
      with few weeks it is rough, with one week n/a. Also pooled collapses
      removed, the pooled money simulation (with an interval on the
      difference to buying all) and the weeks beating buy-all. "Expanding" is
-     the gate's walk-forward (every call before the week); "rolling" trains
+     the gates' walk-forward (every call before the week; its lift and
+     simulation-difference intervals are the ones in the verdict); "rolling" trains
      each week's model on the last 4 weeks of calls only. Both are pooled
      over the same weeks (the ones the gate counts), minus any week the
      rolling model could not train (marked in the per-week table), and the
@@ -502,8 +546,9 @@ From the top:
      same per counted walk-forward week, for the newest 6 weeks.
 
    A part that failed says `Not computed: error: ...` (and the run printed a
-   `WARNING`); paste that line. The product manager reads these numbers next
-   to the gates; they never decide anything on their own.
+   `WARNING`); paste that line. Apart from the two gate inputs, the product
+   manager reads these numbers next to the gates; they never decide anything
+   on their own.
 6. With `--variants` only: **Variant comparison** (step 5b).
 
 What to expect from the October 2026 data (calls from late July 2026):
@@ -530,26 +575,27 @@ with the "positive rate (usable)" column of each bucket's Class balance table
   dead calls, so use the "collapse rate (plain)" column of the bucket's "Dead
   after the call" table instead (it also shows the rate with dead calls, and
   the "bad outcomes removed incl. dead" figure, which is not a gate);
-- top-10% lift >= 2 is impossible when the runner rate is above 50% (the lift
-  is at most 1 / rate).
+- a pooled top-10% lift >= 2 is impossible when the runner rate is above 50%
+  (the lift is at most 1 / rate).
 
 A bucket above either ceiling FAILs whatever the model does; say so when you
 paste the report. The `long` collapse label (<= -90% at 30 days, or rugged)
 is the most likely to be above 75%.
 
-A FAIL on the first run is a normal outcome, not an error. "Beats buy-all in
-every week" is strict with only 8 to 10 weeks, the earliest of which train
-on one or two weeks of calls.
+A FAIL is a normal outcome, not an error. The pooled gates replaced the old
+"beats buy-all in every week" and test-part lift because those swung with
+the seed and with single weeks (report 20261013-0702: `3day` and `medium`
+passed with seed 7 and failed with seeds 11 and 23).
 
 ## 8. Paste back to the product manager
 
 - The whole `report.md` (it has only counts and metrics, no calls or
   addresses), or at least: Verdict, Data and exclusions, and per bucket the
-  Split line, the gate table, the money simulation line and the walk-forward
-  table.
+  Split line, the gate table (with its "Why FAIL:" line), the money
+  simulation line and the walk-forward table.
 - The output of the step 3 queries, if you ran them.
-- The train time (`real` from `time`) and the `[diagnostics] ...` line
-  (step 5), if the diagnostics ran.
+- The train time (`real` from `time`), the `[gates] ...` line and the
+  `[diagnostics] ...` line (step 5), if the diagnostics ran.
 
 Never paste the CSV, rows of it, or anything from `.env`.
 

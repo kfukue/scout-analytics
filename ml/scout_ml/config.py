@@ -245,16 +245,31 @@ def categorical_inputs(dex_inputs: str) -> list:
     return raw + (DERIVED_CATEGORICAL if dex_inputs != "raw" else [])
 
 
-# The categorical model inputs of new models (rebuilt by `overrides`).
-CATEGORICAL = categorical_inputs(DEX_INPUTS)
-FEATURES = NUMERIC_RAW + DERIVED + CATEGORICAL
-NUMERIC_FEATURES = NUMERIC_RAW + DERIVED
+# Inputs left out of new models (a VARIANT_KNOB; "no calls_prev inputs" sets
+# it). Empty: every input above (the saved model). Only numeric inputs
+# (NUMERIC_RAW + DERIVED) can be left out; it can only remove inputs, never add one.
+EXCLUDED_INPUTS = ()
 # Signed, bounded or already-small columns are standardised as is by the
 # logistic baseline; every other numeric feature is non-negative and skewed.
 NO_LOG = set(["liq_pct", "tax_buy_pct", "tax_sell_pct", "proof_elite", "proof_good",
               "hour_utc", "weekday_utc"]
              + [f"pre_price_chg_{w}_pct" for w in _WINDOWS]
              + [f"pre_buy_vol_share_{w}" for w in _WINDOWS])
+
+
+def numeric_inputs(excluded=()) -> list:
+    """The numeric model inputs without `excluded` (raises on a name that is not one)."""
+    allowed, excluded = NUMERIC_RAW + DERIVED, set(excluded)
+    bad = sorted(excluded - set(allowed))
+    if bad:
+        raise ValueError(f"EXCLUDED_INPUTS must name numeric inputs only, not {bad}")
+    return [c for c in allowed if c not in excluded]
+
+
+# The model inputs of new models (rebuilt by `overrides`).
+CATEGORICAL = categorical_inputs(DEX_INPUTS)
+NUMERIC_FEATURES = numeric_inputs(EXCLUDED_INPUTS)
+FEATURES = NUMERIC_FEATURES + CATEGORICAL
 LOG1P_FEATURES = [c for c in NUMERIC_FEATURES if c not in NO_LOG]
 # Category levels are learned from the training rows of each split only (main
 # split, every walk-forward window, every inner k-fold), after lower-casing
@@ -295,8 +310,39 @@ MIN_WINDOW_TEST_ROWS = 50              # walk-forward weeks smaller than this ar
 TOP_FRAC = 0.10                        # "buy the top 10% by runner score"
 SKIP_FRAC = 0.30                       # "skip the 30% with highest collapse score"
 GATES = {"min_top_lift": 2.0, "min_collapse_removed": 0.40}
-# Owner decision of 9 Oct 2026: a walk-forward week counts toward the "beats
-# buy-all in every week" gate only when its training part has at least this
+# --- Bucket gates (owner decision of 13 Oct 2026, "option (b)") ----------------
+# A bucket PASSes (meta.json metrics.<bucket>.gates.passed, which the scoring
+# service reads) only when all four hold (validate.pooled_gates):
+# 1. runner lift: the MEDIAN over STABILITY_SEEDS of the pooled expanding
+#    walk-forward top-10% lift >= GATES["min_top_lift"] (2), every seed's pooled
+#    lift defined; AND the lower end of the 95% week-block bootstrap interval
+#    (POOLED_CI, POOLED_BOOTSTRAP_REPS, POOLED_BOOTSTRAP_SEED) of the saved
+#    seed's (LGBM_SEED) pooled lift > GATE_POOLED_LIFT_LOWER;
+# 2. beats buy-all: the lower end of the 95% bootstrap interval of the pooled
+#    simulation difference (mean net return of the per-week top 10% minus that
+#    of all calls, each capped at SIM_MAX_RET_PCT; saved seed) > GATE_SIM_DIFF_LOWER;
+# 3. collapses removed >= GATES["min_collapse_removed"] on the test part (saved
+#    model; unchanged).
+# Pooled = the test rows of the counted walk-forward weeks (WF_MIN_TRAIN_ROWS),
+# each week ranked by its own model. Fewer than GATE_MIN_POOLED_WEEKS counted
+# weeks, a seed whose run failed / was skipped, or any undefined (NaN) input:
+# the bucket FAILS, with the reason in gates["reasons"]; never a PASS on missing
+# data. The pooled top-10% mean net return (> 0 or not) is shown as information
+# only, never a gate. The old single-run gates (test-part lift >= 2, beats
+# buy-all in every counted week) are still computed and shown as information
+# (gates["old"]); the --variants rows and the seed table use them.
+# The seed retrains and the pooled walk-forward run in every training, also
+# with the stability diagnostics switched off (DIAGNOSTICS_ENV=0): only the
+# report-only parts (rolling walk-forward, evaluation without dead calls,
+# adversarial validation) are switchable. STABILITY_SEEDS and POOLED_* below
+# therefore decide the verdict.
+GATE_POOLED_LIFT_LOWER = 1.0
+GATE_SIM_DIFF_LOWER = 0.0
+GATE_MIN_POOLED_WEEKS = 2              # the week-block bootstrap needs at least 2 weeks
+GATES_SET_ON = "13 Oct 2026"
+# Owner decision of 9 Oct 2026: a walk-forward week counts (toward the pooled
+# walk-forward gates since 13 Oct 2026, and the old "beats buy-all in every
+# week" count, now information) only when its training part has at least this
 # many rows. Weeks below are still computed and shown, marked "not counted
 # (train < WF_MIN_TRAIN_ROWS)". The same weeks are left out of the walk-forward
 # summaries (variant table, dead-score proposal). The early weeks of an
@@ -367,7 +413,7 @@ LIFT_CI_Z = 1.96
 # the gates of the saved model (that is always the baseline). "baseline" reuses
 # the results of the saved model. Knobs: VARIANT_KNOBS.
 VARIANT_KNOBS = ("DEAD_IS_COLLAPSE", "DEAD_TRADES_24H", "DEX_INPUTS", "RUNNER_NEEDS_TRADES",
-                 "LGBM_REGULARISATION", "LGBM_SEED")
+                 "LGBM_REGULARISATION", "LGBM_SEED", "EXCLUDED_INPUTS")
 # "dead threshold 100" was dropped: DEAD_TRADES_24H only changes the labels
 # while the dead rule is on, so with the rule off it would equal the baseline.
 VARIANTS = {
@@ -377,30 +423,39 @@ VARIANTS = {
     "raw dex + dex_family": {"DEX_INPUTS": "both"},
     "runners must be tradeable": {"RUNNER_NEEDS_TRADES": True},
     "stronger regularisation": {"LGBM_REGULARISATION": "strong"},
+    # report 20261013-0702: adversarial validation found calls_prev_24h driving the
+    # train/test drift (AUC 0.99; gain share 0.42-0.87)
+    "no calls_prev inputs": {"EXCLUDED_INPUTS": ("calls_prev_1h", "calls_prev_24h")},
 }
 # Variants that only differ from the baseline through trades_24h: not applicable
 # when the export has no trades_24h column.
 TRADES_VARIANTS = ("dead rule on (collapse OR dead)", "runners must be tradeable")
 
-# --- Stability diagnostics (report only) ----------------------------------------
+# --- Stability diagnostics ---------------------------------------------------------
 # Extra sections at the end of report.md (before the variant comparison) to
 # tell whether the results are real or noise: seed stability, pooled and
 # rolling walk-forward, the evaluation without dead calls, and adversarial
-# validation. Report only: never saved, never served, never a gate; the saved
-# model, its meta.json fields, the gates and the verdict are the same with them
-# on or off (meta.json only gets an extra "diagnostics" entry).
+# validation. Since 13 Oct 2026 the seed retrains (STABILITY_SEEDS) and the
+# pooled EXPANDING walk-forward with its bootstrap are gate inputs (see "Bucket
+# gates" above): they run in every training, before meta.json is written,
+# whatever the switch says. The rest (rolling walk-forward, evaluation without
+# dead calls, adversarial validation) is report only: never saved, never
+# served, never a gate; the saved model, its meta.json fields, the gates and
+# the verdict are the same with the switch on or off (meta.json only gets an
+# extra "diagnostics" entry).
 # On by default for train.py; the environment variable DIAGNOSTICS_ENV set to
-# 0 / off / false / no switches them off for one run (1 / on / true / yes
-# switches them on when DIAGNOSTICS is False).
+# 0 / off / false / no switches the section off for one run (1 / on / true / yes
+# switches it on when DIAGNOSTICS is False).
 DIAGNOSTICS = True
 DIAGNOSTICS_ENV = "SCOUT_ML_DIAGNOSTICS"
-# Seed stability: the baseline retrained with each of these LightGBM seeds
-# (LGBM_SEED); a seed equal to LGBM_SEED reuses the saved model's results.
+# Seed stability (a gate input): the baseline retrained with each of these
+# LightGBM seeds (LGBM_SEED); a seed equal to LGBM_SEED reuses the saved model's
+# results. The runner-lift gate takes the median over exactly these seeds.
 STABILITY_SEEDS = (7, 11, 23)
-# Pooled walk-forward: the test rows of all counted weeks of a bucket pooled,
-# each week ranked by its own model (top 10% / top 30% per week, as the gate
-# does); 95% interval by a week-block bootstrap (weeks resampled with
-# replacement) with this many repetitions and this seed.
+# Pooled walk-forward (the expanding one is a gate input): the test rows of all
+# counted weeks of a bucket pooled, each week ranked by its own model (top 10% /
+# top 30% per week); 95% interval by a week-block bootstrap (weeks resampled
+# with replacement) with this many repetitions and this seed.
 POOLED_BOOTSTRAP_REPS = 2000
 POOLED_BOOTSTRAP_SEED = 7
 POOLED_CI = (0.025, 0.975)
@@ -449,8 +504,9 @@ def variant_settings(name: str) -> dict:
 
 @contextmanager
 def overrides(**knobs):
-    """Temporarily set VARIANT_KNOBS (and rebuild CATEGORICAL / FEATURES from
-    DEX_INPUTS); everything is restored on exit, also after an error."""
+    """Temporarily set VARIANT_KNOBS (and rebuild CATEGORICAL, NUMERIC_FEATURES,
+    LOG1P_FEATURES and FEATURES from DEX_INPUTS / EXCLUDED_INPUTS); everything is
+    restored on exit, also after an error."""
     g = globals()
     bad = sorted(set(knobs) - set(VARIANT_KNOBS))
     if bad:
@@ -458,11 +514,15 @@ def overrides(**knobs):
     if "LGBM_REGULARISATION" in knobs and knobs["LGBM_REGULARISATION"] not in LGBM_REG_SETS:
         raise ValueError(f"LGBM_REGULARISATION must be one of {sorted(LGBM_REG_SETS)}, "
                          f"not {knobs['LGBM_REGULARISATION']!r}")
-    saved = {k: g[k] for k in (*VARIANT_KNOBS, "CATEGORICAL", "FEATURES")}
+    numeric_inputs(knobs.get("EXCLUDED_INPUTS", ()))       # raises before anything is changed
+    saved = {k: g[k] for k in (*VARIANT_KNOBS, "CATEGORICAL", "FEATURES", "NUMERIC_FEATURES",
+                               "LOG1P_FEATURES")}
     try:
         g.update(knobs)
         g["CATEGORICAL"] = categorical_inputs(g["DEX_INPUTS"])
-        g["FEATURES"] = NUMERIC_RAW + DERIVED + g["CATEGORICAL"]
+        g["NUMERIC_FEATURES"] = numeric_inputs(g["EXCLUDED_INPUTS"])
+        g["LOG1P_FEATURES"] = [c for c in g["NUMERIC_FEATURES"] if c not in NO_LOG]
+        g["FEATURES"] = g["NUMERIC_FEATURES"] + g["CATEGORICAL"]
         yield
     finally:
         g.update(saved)

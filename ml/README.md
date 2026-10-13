@@ -109,13 +109,14 @@ How it validates (no random splits):
   so this drops nothing; the report counts embargo and token drops apart;
 - walk-forward: train up to week N, test on week N+1, for every week (the
   main model's round count; category levels from each window's training rows).
-  A week counts toward the "beats buy-all in every week" gate, and toward the
-  walk-forward summaries (variant table, dead-score proposal), only when its
-  training part has at least `WF_MIN_TRAIN_ROWS` (1000) rows (owner decision,
-  9 Oct 2026). Weeks below are still computed and shown, marked "not counted
-  (train < 1000)": the early weeks of an expanding walk-forward from the data
-  start (e.g. `medium`, week of 18 Aug 2026, 530 train rows) would otherwise
-  fail the gate in every report.
+  A week counts toward the pooled walk-forward gates (see "Gates" below; and
+  the old "beats buy-all in every week" count, now information), and toward
+  the walk-forward summaries (variant table, dead-score proposal), only when
+  its training part has at least `WF_MIN_TRAIN_ROWS` (1000) rows (owner
+  decision, 9 Oct 2026). Weeks below are still computed and shown, marked "not
+  counted (train < 1000)": the early weeks of an expanding walk-forward from
+  the data start (e.g. `medium`, week of 18 Aug 2026, 530 train rows) are such
+  weeks.
 
 Calls without a pool (`no_pool`, `gave_up`, or no late entry price) and rows
 whose prices are not in USD are excluded; the report says how many. The tracker
@@ -146,6 +147,57 @@ kept. In the money simulation each call's net return counts at most
 `SIM_MAX_RET_PCT` (+1,000 %), so one huge winner cannot decide "beats
 buy-everything" alone; labels are not affected. Both caps are in
 `scout_ml/config.py`.
+
+### Gates (owner decision of 13 Oct 2026)
+
+A bucket PASSes, i.e. `meta.json` has `metrics.<bucket>.gates.passed = true`
+(what the scoring service reads), only when all of these hold
+(`validate.pooled_gates`, settings in the "Bucket gates" block of
+`scout_ml/config.py`). The owner chose these pooled walk-forward gates
+("option (b)") on 13 Oct 2026, after report 20261013-0702 showed `3day` and
+`medium` passing the old gates with seed 7 but failing with seeds 11 and 23.
+"Pooled" = the test rows of all counted walk-forward weeks of the bucket
+together, each week ranked by its own model (the expanding walk-forward;
+counted = training part of at least 1000 rows).
+
+1. **Runner lift**: the median over the LightGBM seeds `STABILITY_SEEDS`
+   (7, 11, 23; the baseline retrained with each, nothing saved) of the pooled
+   top-10% lift >= `GATES["min_top_lift"]` (2), and the lower end of the 95%
+   week-block bootstrap interval of the saved seed's (`LGBM_SEED` = 7) pooled
+   lift > `GATE_POOLED_LIFT_LOWER` (1.0). Pooled lift = runner rate in the
+   per-week top 10% / runner rate of all pooled calls.
+2. **Beats buy-all**: the lower end of the 95% bootstrap interval of the
+   pooled simulation difference (mean net return of the per-week top 10% minus
+   that of all calls, each call capped at `SIM_MAX_RET_PCT`; saved seed)
+   > `GATE_SIM_DIFF_LOWER` (0).
+3. **Collapses removed** >= 40% on the test part (saved model; unchanged).
+
+Bootstrap: `POOLED_BOOTSTRAP_REPS` (2000) resamples of whole weeks with
+replacement, seed `POOLED_BOOTSTRAP_SEED` (7), interval `POOLED_CI` (2.5% /
+97.5%). A missing or undefined input never passes: fewer than
+`GATE_MIN_POOLED_WEEKS` (2) counted weeks (the bootstrap needs two), a seed
+retrain that failed or skipped the bucket, or any NaN fails the gate
+concerned, and `gates.reasons` (and the report) says why. The **absolute
+return** (pooled top-10% mean net return > 0) is shown as information only,
+never a gate. The old single-run gates (top-10% lift >= 2 on the test part;
+beats buy-all in every counted walk-forward week) are still computed and shown
+as "old gate, information only" (`gates.old` in `meta.json`), so the change is
+traceable. On the numbers of report 20261013-0702: `3day` FAIL (median pooled
+lift 1.98 from 1.98 / 2.02 / 1.85; its simulation difference +28.6 [14.7, 51.0]
+passes), `medium` PASS (2.18 from 2.18 / 2.26 / 1.94, lower end 1.74,
+simulation difference +43.1 [36.7, 51.6]), `short` FAIL.
+
+The seed retrains and the pooled walk-forward run in every training, before
+`meta.json` is written, also with `SCOUT_ML_DIAGNOSTICS=0`: that switch now
+only skips the report-only diagnostics (see "Stability diagnostics"). So
+`STABILITY_SEEDS` and `POOLED_BOOTSTRAP_*` decide the verdict; change them
+only with the owner. The saved model itself (training, features, seed 7,
+calibration, scores) is the same as before the decision; only `passed` and
+the report changed. `meta.json` keeps its structure; the new gate values are
+in `metrics.<bucket>.gates` (`pooled_lift_seeds`, `pooled_lift_median`,
+`pooled_lift`, `pooled_lift_lo` / `_hi`, `sim_diff`, `sim_diff_lo` / `_hi`,
+`collapse_removed`, one `*_ok` per gate, `abs_return_*`, `reasons`, `old`)
+and the settings in `thresholds.gate_rules`.
 
 ### Dead after the call
 
@@ -347,6 +399,7 @@ baseline:
 | raw dex + dex_family | `DEX_INPUTS = "both"` |
 | runners must be tradeable | `RUNNER_NEEDS_TRADES = True`: runner also needs `trades_24h >= RUNNER_MIN_TRADES_24H` (100); NULL keeps the label |
 | stronger regularisation | `LGBM_REGULARISATION = "strong"`: `num_leaves` 15 -> 7, `min_child_samples` (min_data_in_leaf) 20 -> 50, `reg_lambda` (lambda_l2) 1 -> 10, `colsample_bytree` (feature_fraction) 0.8 -> 0.6 (`LGBM_REG_SETS`); rounds still from early stopping / the purged k-fold |
+| no calls_prev inputs | `EXCLUDED_INPUTS = ("calls_prev_1h", "calls_prev_24h")`: the model and the logistic baseline without those two inputs (adversarial validation in report 20261013-0702 found `calls_prev_24h` driving the train/test drift: AUC 0.99, gain share 0.42-0.87). `EXCLUDED_INPUTS` can only remove numeric inputs; an outcome, a categorical or an unknown name raises |
 
 Variants are report only: they are never saved or served, and the saved model,
 its `meta.json` (features, levels, rules) and its gates are always the
@@ -365,8 +418,13 @@ runner rate on test, runner lift top 10% with its 95% interval, runner ROC AUC
 (LightGBM / logistic), collapse ROC AUC on the plain label (comparable across
 variants) and on the label each variant trained on, collapses removed (plain,
 the gate), counted weeks beating buy-all, walk-forward mean lift and mean
-collapses removed (counted weeks only, as the gate), simulation top 10% vs all
-calls, and the gate result. Lift and runner
+collapses removed (counted weeks only), simulation top 10% vs all calls, the
+variant's own pooled walk-forward lift and simulation difference with their
+95% bootstrap intervals (its seed-7 run only; information), and its
+"single-run (old) gate, information" result. The variants are not judged by
+the pooled gates of the verdict (that would need each variant retrained with
+every seed, three times the cost); the baseline row shows the old single-run
+gate too, so the column compares like with like. Lift and runner
 AUC of the tradeable variant use its own (stricter) runner label; compare its
 runner rate. The logistic baseline uses numeric inputs only, so it is the same
 in the DEX variants. All variants are compared on the same test part: picking
@@ -380,27 +438,35 @@ other variants still run and `train.py` still exits 0: the baseline is saved
 before any variant starts. If every variant fails, a `WARNING: all N variants
 failed` line says so.
 
-Runtime: about 4 to 5 times a normal run (on synthetic data of the fixture's
-size, 6,000 calls over 170 days: about 30 s without, including about 2 s for
-the dead score, and about 2 min with `--variants`).
+Runtime: each variant costs about one training of the normal model (on
+synthetic data of the fixture's size, 6,000 calls over 170 days: about 25 s,
+the dead score about 2 s of it; a whole run with `--variants` took about
+2 min before the gates of 13 Oct 2026, whose seed retrains add about 47 s to
+every run, see "Stability diagnostics").
 
-### Stability diagnostics (report only)
+### Stability diagnostics
 
 Every `train.py` run also writes a section "Stability diagnostics" near the
 end of `report.md` (before the variant comparison; `meta.json`:
-`"diagnostics"`), to tell whether a result is real or noise. It is **report
-only: not saved, not served, never a gate**. The saved model, its `meta.json`
-fields, the gates, the verdict and everything above the section are the same
-with it on or off (`tests/test_diagnostics.py` checks this). Settings: the
-"Stability diagnostics" block of `scout_ml/config.py`.
+`"diagnostics"`), to tell whether a result is real or noise. Nothing in it is
+saved or served. Since 13 Oct 2026 two of its inputs are the gates' inputs
+(see "Gates"): the seeds' pooled walk-forward lifts and the pooled expanding
+walk-forward with its bootstrap. They are computed in every training, before
+`meta.json`, whether the section is on or off, and the section reuses them
+(nothing is retrained twice). The rest is report only and never a gate. The
+saved model, its `meta.json` fields, the gates, the verdict and everything
+above the section are the same with it on or off (`tests/test_diagnostics.py`
+checks this). Settings: the "Stability diagnostics" block of
+`scout_ml/config.py`.
 
 - **Seed stability**: the baseline retrained with each LightGBM seed in
   `STABILITY_SEEDS` (7, 11, 23; 7 is the saved model's `LGBM_SEED`, its
   numbers are reused). Per bucket and seed: test top-10% lift with its
   interval, collapses removed, runner ROC AUC, simulation top 10% vs all,
-  counted walk-forward weeks beating buy-all, pooled walk-forward lift; then
-  min / median / max over the seeds. A lift or a PASS/FAIL that moves between
-  seeds is noise.
+  counted walk-forward weeks beating buy-all, pooled walk-forward lift (its
+  median over the seeds is the runner-lift gate) and the run's old single-run
+  gate (information); then min / median / max over the seeds. A lift or a
+  PASS/FAIL that moves between seeds is noise.
 - **Pooled walk-forward (expanding and rolling)**: the test rows of all
   counted walk-forward weeks of a bucket pooled. Each week is ranked by its
   own model (top 10% / top 30% per week, as the gate does; the week models'
@@ -409,7 +475,8 @@ with it on or off (`tests/test_diagnostics.py` checks this). Settings: the
   (`POOLED_BOOTSTRAP_REPS` = 2000 resamples of the weeks with replacement, seed
   `POOLED_BOOTSTRAP_SEED` = 7; n/a with one week, rough with few). Also pooled
   collapses removed, pooled simulation top 10% vs all (with an interval on the
-  difference) and weeks beating buy-all. Next to the gate's expanding
+  difference) and weeks beating buy-all. The expanding row is the gates'
+  input (its lift and simulation-difference lower ends). Next to the expanding
   walk-forward, a rolling one trains each week's model on the last
   `WF_ROLLING_WEEKS` (4) weeks of calls before the week only (minus the
   embargo; same rounds and test weeks), with a per-week table of both. Both
@@ -433,20 +500,25 @@ with it on or off (`tests/test_diagnostics.py` checks this). Settings: the
   `ADV_WEEK_FOLDS` = 3).
 
 Switch: on by default (`DIAGNOSTICS = True`); `SCOUT_ML_DIAGNOSTICS=0` (or
-`off`, `false`, `no`) in the environment switches it off for one run, e.g.
+`off`, `false`, `no`) in the environment switches the section off for one run
+(the seed retrains and the pooled walk-forward still run for the gates; only
+the rolling walk-forward, the evaluation without dead calls and adversarial
+validation are skipped), e.g.
 `SCOUT_ML_DIAGNOSTICS=0 python train.py --csv calls.csv --out models/`
 (`run_training.sh` passes the environment through; it needs no change). A part
 that raises is shown as "Not computed: error: ..." with a `WARNING` and the
 others still run; the saved model is written before the section starts.
 
 Runtime: on synthetic data of the fixture's size (6,000 calls over 170 days,
-every bucket trained) a run took 28 s without and 99 s with the section: seed
-stability 45 s (two retrains of the baseline), rolling walk-forward 10 s,
-adversarial validation 18 s, evaluation without dead calls under 1 s. The seed
-retrains cost about two normal runs, so on the prod data (about 6 s per
-variant in report 20261012-2209, `long` still skipped) expect roughly 20 to
-30 s more per run. `--variants` adds one more variant row ("stronger
-regularisation"), about one more normal run.
+every bucket trained, one desktop PC, 13 Oct 2026): 26 s before the gate
+decision with the section off, 73 s now with it off (the seed retrains for the
+gates: 47 s, two retrains of the baseline; pooled walk-forward under 1 s) and
+102 s with it on, about as before (rolling walk-forward 11 s, adversarial
+validation 18 s, evaluation without dead calls under 1 s). So a run with the
+section off now costs about two normal runs more; on the prod data (about 6 s
+per variant in report 20261012-2209, `long` still skipped) expect roughly 20
+to 30 s more per run then. `--variants` adds two more variant rows ("stronger
+regularisation", "no calls_prev inputs"), about one normal run each.
 
 The `model.py`, `validate.py`, `features.py` (`MIN_CATEGORY_COUNT`) and
 `labels.py` (`MAX_OUTCOME_PCT`) settings are read from `config` when a function
@@ -457,15 +529,18 @@ seeds) takes effect.
 
 `models/<version>/report.md`, top to bottom:
 
-1. **Verdict** - PASS/FAIL per bucket. PASS needs all of: top-10% lift >= 2;
-   skipping the 30% highest collapse scores removes >= 40% of collapses; the
-   top-10% simulation beats buy-everything in every counted walk-forward week
-   (a week counts when its training part has at least 1000 rows; see
-   "Validation"; the verdict cell says how many weeks were not counted). Each
-   top-10% lift (test and every walk-forward week) comes with an approximate
-   95% interval (Wilson interval of the runner rate in the top 10%, divided by
-   the base rate) and the runner counts in the top 10% and overall; the gate
-   uses the point value.
+1. **Verdict** - PASS/FAIL per bucket by the gates of 13 Oct 2026 (see
+   "Gates"): the median pooled walk-forward lift over the seeds (with each
+   seed's value), the lower end of the saved seed's pooled-lift interval, the
+   pooled simulation difference with its interval, collapses removed on the
+   test part; then, as information only, the absolute return (pooled top-10%
+   mean net return) and the two old gates ("old gate, information only":
+   test-part lift >= 2, beats buy-all in every counted week, with the weeks
+   not counted). Each FAILing bucket gets a line with its reasons. Each
+   top-10% lift of the test part and of every walk-forward week also comes
+   with an approximate 95% interval (Wilson interval of the runner rate in the
+   top 10%, divided by the base rate) and the runner counts in the top 10% and
+   overall.
 2. **Data and exclusions**, **Feature coverage** - how much data there was and
    which columns are mostly empty (coverage is measured on the calls left
    after the exclusions).
@@ -483,9 +558,11 @@ seeds) takes effect.
    calibration side by side.
 4. **Dead after the call: separate score** (report only; see "Dead after the
    call: separate score" above).
-5. **Stability diagnostics** (report only; see "Stability diagnostics"
-   above): seed stability, pooled and rolling walk-forward, evaluation
-   without dead calls, adversarial validation.
+5. **Stability diagnostics** (not saved or served; the seeds' pooled lifts
+   and the pooled expanding walk-forward are the gates' inputs, the rest is
+   report only; see "Stability diagnostics" above): seed stability, pooled
+   and rolling walk-forward, evaluation without dead calls, adversarial
+   validation.
 6. With `--variants` only: **Variant comparison**, one table per bucket (see
    "Variant comparison" above).
 
@@ -522,8 +599,9 @@ Outcome columns in the row are ignored. `buckets` has every bucket with a
 trained runner model (a skipped bucket, e.g. `long` before its data has
 matured, is left out), whether or not it passed its gates, so all scores can be
 stored and checked live; `passed` is true only when `meta.json` records
-`metrics.<bucket>.gates.passed = true` (a missing entry, e.g. an older
-`meta.json` without gate info, counts as not passed). Without a collapse model
+`metrics.<bucket>.gates.passed = true` (the gates of 13 Oct 2026 for a model
+trained since; a missing entry, e.g. an older `meta.json` without gate info,
+counts as not passed). Without a collapse model
 `collapse_prob` is null.
 
 `SCOUT_MODEL_LINE` chooses which buckets `line` names, by horizon (`1d`, `3d`,
@@ -590,10 +668,10 @@ roll back, write an older version name into `models/LATEST`. Compare the new
     scout_ml/validate.py  time splits, embargo, purged k-fold, token grouping, walk-forward, metrics
     scout_ml/model.py     LightGBM + calibration, logistic baseline, serving bundle
     scout_ml/report.py    report.md
-    scout_ml/diagnostics.py  report-only stability diagnostics (pooled walk-forward, bootstrap, adversarial)
+    scout_ml/diagnostics.py  pooled walk-forward + bootstrap (gate inputs), seed spreads, adversarial
     train.py  serve.py  make_synthetic.py  tests/
 
-    python -m pytest tests -q        # 206 passed, about 2.5 to 3 minutes
+    python -m pytest tests -q        # 236 passed, about 4 minutes
 
 `build_features` raises if an outcome or bookkeeping column (anything starting
 with `ret_`, `max_gain_`, `max_dd_`, `trades_`, `peak_late_after_`, `peak_after_`,

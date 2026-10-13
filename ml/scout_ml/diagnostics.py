@@ -1,8 +1,14 @@
-"""Stability diagnostics (report only): pooled walk-forward with a week-block
-bootstrap, spreads over seeds, and adversarial validation (train vs test).
+"""Pooled walk-forward with a week-block bootstrap, spreads over seeds, and
+adversarial validation (train vs test).
 
 Pure functions on arrays; train.py collects the arrays and renders nothing.
-Nothing here is saved, served or used by a gate."""
+Since the owner decision of 13 Oct 2026, `week_sums` and `pooled` compute the
+bucket gate inputs (train.gate_inputs, judged by validate.pooled_gates): the
+pooled walk-forward lift (also per seed), its bootstrap interval and the pooled
+simulation difference. The rest stays report only (seed spreads via `spread`,
+`adversarial`, and the rolling and no-dead walk-forward tables train.py builds
+with `pooled`): it only goes into report.md and the "diagnostics" part of
+meta.json, and is never served or used by a gate."""
 import lightgbm as lgb
 import numpy as np
 import pandas as pd

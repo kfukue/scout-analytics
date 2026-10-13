@@ -44,7 +44,10 @@ def test_end_to_end_training_artifacts(trained):
         assert (vdir / f"{b}_runner.joblib").exists() and f"{b}_runner" in meta["models"]
         assert len(meta["runner_reference"][b]) == 101
         m = meta["metrics"][b]
-        assert {"lift_ok", "collapse_ok", "walk_forward_ok", "passed"} <= set(m["gates"])
+        assert {"pooled_lift_ok", "pooled_lift_lower_ok", "sim_diff_ok", "collapse_ok", "passed",
+                "reasons", "old"} <= set(m["gates"])
+        assert {"lift_ok", "collapse_ok", "walk_forward_ok", "passed"} <= set(m["gates"]["old"])
+        assert set(m["gates"]["pooled_lift_seeds"]) == {"7", "11", "23"}   # the shipped seeds
         assert len(m["walk_forward"]) >= 5
         for model in ("lightgbm", "logistic"):
             assert {"base_rate", "roc_auc", "pr_auc", "brier"} <= set(m["labels"]["runner"][model])
@@ -793,16 +796,18 @@ def test_walk_forward_weeks_below_the_minimum_are_shown_but_not_counted(trained)
         counted = [w for w in weeks if w["counted"]]
         not_counted = [w for w in weeks if not w.get("skipped") and not w["enough_train"]]
         small += len(not_counted)
-        g = m["gates"]
+        g = m["gates"]["old"]                  # the old single-run gate (information)
+        assert m["gates"]["pooled_weeks"] == len(counted)   # the pooled gates use the same weeks
         assert g["windows_evaluated"] == len(counted)
         assert g["windows_not_counted"] == len(not_counted)
         assert g["windows_beating"] == sum(w["sim_beats_all"] for w in counted)
         assert g["walk_forward_ok"] == (bool(counted) and all(w["sim_beats_all"] for w in counted))
-        assert g == V.gates(m["trading"], weeks)
+        assert {k: v for k, v in g.items() if k != "top_lift"} == V.gates(m["trading"], weeks)
     assert small > 0                           # the synthetic data has early weeks below 1000
     assert "| not counted (train < 1000) |" in report and "| counted |" in report
-    assert ("a week counts toward \"beats buy-all in every week\" only when its training part "
-            "has at least 1000 rows (WF_MIN_TRAIN_ROWS, set on 9 Oct 2026)") in report
+    assert ("a week counts toward the pooled walk-forward gates (and the old \"beats buy-all in "
+            "every week\" count, information only) only when its training part has at least 1000 "
+            "rows (WF_MIN_TRAIN_ROWS, set on 9 Oct 2026)") in report
     assert " not counted)" in report           # verdict / gate cell: weeks not counted
 
 

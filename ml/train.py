@@ -276,9 +276,12 @@ def _train_bucket(b, df, L, out_dir, with_dead=False, keep=None):
     `out_dir` None: nothing is saved (a --variants run). `with_dead` (the data
     has trades_24h): the "Dead after the call" table and the information
     figures on collapse OR dead, whether or not the dead rule is on.
-    `keep` (a dict, stability diagnostics only): filled with the bucket's rows,
-    labels, masks, feature matrix, test scores and walk-forward scores; the
-    results are the same with or without it (nothing of it reaches meta.json)."""
+    `keep` (a dict; every caller passes it, since the pooled gates need the
+    walk-forward arrays): filled with the bucket's rows, labels, masks, feature
+    matrix, test scores and walk-forward scores, the input of gate_inputs and of
+    the stability diagnostics. The results are the same with or without it; the
+    arrays never reach meta.json (only the gate values apply_gates computes
+    from them do)."""
     cfg = C.BUCKETS[b]
     use = L[f"usable_{b}"].to_numpy()
     res = {"usable": int(use.sum())}
@@ -354,11 +357,16 @@ def _train_bucket(b, df, L, out_dir, with_dead=False, keep=None):
     return res, reference.tolist(), levels
 
 
-def variant_summary(r: dict) -> dict:
-    """The comparison numbers of one bucket of one variant (see report.variant_table)."""
+def variant_summary(r: dict, pooled: dict | None = None) -> dict:
+    """The comparison numbers of one bucket of one variant (see report.variant_table).
+    The gate columns are the old single-run gates (information; computing the
+    pooled gates of a variant would need its seed retrains too). `pooled`: the
+    variant's own pooled walk-forward (its LGBM_SEED run only, with the bootstrap;
+    information, not its verdict)."""
     if r.get("skipped"):
         return {"skipped": r["skipped"]}
-    t, g, labs = r["trading"], r["gates"], r["labels"]
+    t, g, labs = r["trading"], V.single_run_gates(r["gates"]), r["labels"]
+    p = pooled if isinstance(pooled, dict) else {}
 
     def auc(lab, model):
         m = labs.get(lab) or {}
@@ -382,13 +390,25 @@ def variant_summary(r: dict) -> dict:
         "wf_mean_collapse_removed": float(np.nanmean([w["collapse_removed"] for w in weeks]))
         if weeks and not all(np.isnan(w["collapse_removed"]) for w in weeks) else np.nan,
         "windows_beating": g["windows_beating"], "windows_evaluated": g["windows_evaluated"],
-        "passed": g["passed"]}
+        "passed": g["passed"],
+        **{f"wf_pooled_{k}": p.get(k, np.nan)
+           for k in ("lift", "lift_lo", "lift_hi", "sim_gain", "sim_gain_lo", "sim_gain_hi")}}
 
 
-def run_variants(df: pd.DataFrame, baseline: dict, has_trades: bool) -> dict:
+def _variant_bucket(b, df, L, has_trades) -> dict:
+    """One bucket of one variant: its summary with its own pooled walk-forward."""
+    keep = {}
+    r = _train_bucket(b, df, L, None, has_trades, keep=keep)[0]
+    pooled = D.pooled(_wf_weeks(keep)) if keep.get("wf") is not None else None
+    return variant_summary(r, pooled)
+
+
+def run_variants(df: pd.DataFrame, baseline: dict, has_trades: bool,
+                 baseline_pooled: dict | None = None) -> dict:
     """Train every C.VARIANTS entry (one knob changed from the configured
     values) on the same rows and splits; report only, nothing is saved.
-    `baseline`: the bucket results of the saved model, reused for "baseline".
+    `baseline`: the bucket results of the saved model, reused for "baseline"
+    (`baseline_pooled`: its pooled walk-forward per bucket, from the gate inputs).
     `df`: sorted rows as prepared by `train`. `has_trades`: the data has the
     trades_24h column (else the C.TRADES_VARIANTS equal the baseline: n/a).
     A variant that raises is recorded as {"error": "error: <short message>"} and the
@@ -399,7 +419,8 @@ def run_variants(df: pd.DataFrame, baseline: dict, has_trades: bool) -> dict:
         entry = {"changes": dict(knobs)}
         out[name] = entry
         if not knobs:
-            entry["buckets"] = {b: variant_summary(r) for b, r in baseline.items()}
+            entry["buckets"] = {b: variant_summary(r, (baseline_pooled or {}).get(b))
+                                for b, r in baseline.items()}
             continue
         if not has_trades and name in C.TRADES_VARIANTS:
             entry["not_applicable"] = (f"the data has no {C.DEAD_COLUMN} column, so this "
@@ -411,9 +432,7 @@ def run_variants(df: pd.DataFrame, baseline: dict, has_trades: bool) -> dict:
             with C.overrides(**knobs):
                 policy = dead_policy(df)
                 L = build_labels(df, policy)
-                entry["buckets"] = {
-                    b: variant_summary(_train_bucket(b, df, L, None, has_trades)[0])
-                    for b in C.BUCKETS}
+                entry["buckets"] = {b: _variant_bucket(b, df, L, has_trades) for b in C.BUCKETS}
         except Exception as exc:  # not BaseException: Ctrl-C still stops the run
             failed += 1
             entry.pop("buckets", None)
@@ -682,17 +701,22 @@ def train(df: pd.DataFrame, out_root, version: str | None = None, variants: bool
         "coverage": {c: float(blank[c][eligible].notna().mean()) if eligible.any() else 0.0
                      for c in raw_cols}}}
     reference, cat_levels = {}, {}  # per trained bucket: learned from its training rows
-    keeps = {}   # diagnostics only: arrays of each trained bucket (never in meta.json)
+    keeps = {}   # arrays of each trained bucket: gate inputs and diagnostics (never in meta.json)
     for b in C.BUCKETS:
-        keep = {} if diag else None
+        keep = {}
         res["buckets"][b], ref, levels = _train_bucket(b, df, L, out_dir, has_trades, keep=keep)
-        if keep and keep.get("wf") is not None:
+        if keep.get("wf") is not None:
             keeps[b] = keep
         if ref is not None:
             reference[b], cat_levels[b] = ref, levels
-        status = res["buckets"][b]
+    # The bucket gates (owner decision of 13 Oct 2026): seed retrains and the pooled
+    # walk-forward, in every training (also with the diagnostics off), before meta.json.
+    gate_in = gate_inputs(df, L, res["buckets"], keeps, has_trades)
+    apply_gates(res["buckets"], gate_in)
+    for b, status in res["buckets"].items():
         print(f"[{b}] " + (f"skipped: {status['skipped']}" if status.get("skipped") else
-                           "PASS" if status["gates"]["passed"] else "FAIL (see report.md)"))
+                           "PASS" if status["gates"]["passed"] else
+                           "FAIL: " + "; ".join(status["gates"]["reasons"]) + " (see report.md)"))
 
     models = sorted(p.stem for p in out_dir.glob("*.joblib") if p.stem.split("_")[0] in reference)
     for p in out_dir.glob("*.joblib"):  # a collapse model without its runner model is unusable
@@ -700,7 +724,8 @@ def train(df: pd.DataFrame, out_root, version: str | None = None, variants: bool
             p.unlink()
     meta = {"version": version, "trained_at": datetime.now(timezone.utc).isoformat(),
             "features": list(C.FEATURES), "categorical": C.CATEGORICAL,
-            "category_levels": cat_levels, "thresholds": {"buckets": C.BUCKETS, "gates": C.GATES},
+            "category_levels": cat_levels,
+            "thresholds": {"buckets": C.BUCKETS, "gates": C.GATES, "gate_rules": gate_rules()},
             "dead": {"policy": res["data"]["dead_policy"], "column": C.DEAD_COLUMN,
                      "max_trades_24h": C.DEAD_TRADES_24H},
             "dex_family_rules": dex_family_rules(),  # serving maps dex -> family with these
@@ -724,7 +749,7 @@ def train(df: pd.DataFrame, out_root, version: str | None = None, variants: bool
               "models are not affected", flush=True)
         _write_version(out_dir, meta, res)
     if diag:   # report only, after the saved model is complete; never fails the run
-        res["diagnostics"] = run_diagnostics(df, L, res["buckets"], keeps, has_trades)
+        res["diagnostics"] = run_diagnostics(df, L, res["buckets"], keeps, has_trades, gate_in)
         try:
             meta["diagnostics"] = _json_safe(res["diagnostics"])
             _write_version(out_dir, meta, res)
@@ -733,9 +758,9 @@ def train(df: pd.DataFrame, out_root, version: str | None = None, variants: bool
             print(f"WARNING: the stability diagnostics failed ({meta['diagnostics']['error']}); "
                   "the saved models are not affected", flush=True)
             _write_version(out_dir, meta, res)
-        keeps.clear()
+    keeps.clear()
     if variants:
-        res["variants"] = run_variants(df, res["buckets"], has_trades)
+        res["variants"] = run_variants(df, res["buckets"], has_trades, gate_in["pooled"])
         meta["variants"] = _json_safe(res["variants"])
         _write_version(out_dir, meta, res)
     return out_dir
@@ -766,10 +791,11 @@ SEED_METRICS = ("top_lift", "collapse_removed", "runner_auc", "sim_top_mean", "s
 
 
 def _run_summary(r: dict, keep: dict | None) -> dict:
-    """The seed-stability numbers of one bucket of one training run."""
+    """The seed-stability numbers of one bucket of one training run (its gate
+    fields are the old single-run gates; `wf_pooled_lift` feeds the bucket gate)."""
     if r.get("skipped"):
         return {"skipped": r["skipped"]}
-    t, g, lab = r["trading"], r["gates"], r["labels"]["runner"]
+    t, g, lab = r["trading"], V.single_run_gates(r["gates"]), r["labels"]["runner"]
     pool = D.pooled(_wf_weeks(keep), reps=0) if keep and keep.get("wf") is not None else {}
     return {"top_lift": t["top_lift"], "top_lift_lo": t["top_lift_lo"],
             "top_lift_hi": t["top_lift_hi"], "collapse_removed": t["collapse_removed"],
@@ -779,12 +805,14 @@ def _run_summary(r: dict, keep: dict | None) -> dict:
             "wf_pooled_lift": pool.get("lift", np.nan)}
 
 
-def seed_stability(df, L, buckets: dict, keeps: dict, has_trades: bool) -> dict:
+def seed_runs(df, L, buckets: dict, keeps: dict, has_trades: bool) -> dict:
     """The baseline retrained with each C.STABILITY_SEEDS LightGBM seed (a seed
-    equal to C.LGBM_SEED reuses the saved model's results); per bucket the
-    numbers of every run and their spread (min / median / max)."""
+    equal to C.LGBM_SEED reuses the saved model's results; nothing is saved):
+    {seed: {"buckets": {bucket: _run_summary}, ...} or {"error": ...}}. A gate
+    input (the median pooled lift) and the seed-stability table. `buckets`:
+    the saved model's results with their single-run gates."""
     runs = {}
-    for seed in C.STABILITY_SEEDS:
+    for seed in dict.fromkeys(C.STABILITY_SEEDS):
         if seed == C.LGBM_SEED:
             runs[seed] = {"saved_model": True, "buckets": {
                 b: _run_summary(r, keeps.get(b)) for b, r in buckets.items()}}
@@ -800,9 +828,87 @@ def seed_stability(df, L, buckets: dict, keeps: dict, has_trades: bool) -> dict:
             runs[seed] = {"buckets": out}
         except Exception as exc:  # one seed failing never stops the others
             runs[seed] = {"error": variant_error(exc)}
-            print(f"WARNING: seed {seed} of the seed stability failed ({runs[seed]['error']})",
-                  flush=True)
+            print(f"WARNING: seed {seed} of the seed retrains failed ({runs[seed]['error']}); "
+                  "every trained bucket FAILS its runner-lift gate", flush=True)
         runs[seed]["seconds"] = round(time.time() - t0, 1)
+    return runs
+
+
+def _seed_lifts(runs: dict, b: str) -> dict:
+    """Per seed of C.STABILITY_SEEDS: the pooled walk-forward lift of bucket `b`,
+    or a string saying why there is none (for V.pooled_gates)."""
+    out = {}
+    for seed in C.STABILITY_SEEDS:
+        run = runs.get(seed)
+        s = ((run or {}).get("buckets") or {}).get(b)
+        if run is None:
+            out[seed] = "not run"
+        elif run.get("error"):
+            out[seed] = f"retrain failed ({run['error']})"
+        elif s is None:
+            out[seed] = "bucket not trained"
+        elif s.get("skipped"):
+            out[seed] = f"bucket skipped ({s['skipped']})"
+        else:
+            out[seed] = s.get("wf_pooled_lift")
+    return out
+
+
+def gate_inputs(df, L, buckets: dict, keeps: dict, has_trades: bool) -> dict:
+    """What the bucket gates need (owner decision of 13 Oct 2026), computed in
+    every training, also with the stability diagnostics off: the seed retrains
+    (`seed_runs`) and, per trained bucket, the pooled expanding walk-forward of
+    the saved seed with the week-block bootstrap. A part that raises is
+    recorded as an error (the buckets concerned then FAIL); never fails the run."""
+    t0 = time.time()
+    try:
+        runs = seed_runs(df, L, buckets, keeps, has_trades)
+    except Exception as exc:  # not BaseException: Ctrl-C still stops the run
+        err = variant_error(exc)
+        runs = {s: {"error": err} for s in C.STABILITY_SEEDS}
+        print(f"WARNING: the seed retrains failed ({err}); every trained bucket FAILS", flush=True)
+    t1 = time.time()
+    pooled = {}
+    for b, k in keeps.items():
+        try:
+            pooled[b] = D.pooled(_wf_weeks(k))
+        except Exception as exc:
+            pooled[b] = {"error": variant_error(exc)}
+            print(f"WARNING: the pooled walk-forward of {b} failed ({pooled[b]['error']}); "
+                  f"{b} FAILS", flush=True)
+    seconds = {"seeds": round(t1 - t0, 1), "pooled": round(time.time() - t1, 1)}
+    print(f"[gates] seed retrains {seconds['seeds']:.0f} s, pooled walk-forward "
+          f"{seconds['pooled']:.0f} s", flush=True)
+    return {"runs": runs, "pooled": pooled, "seconds": seconds}
+
+
+def apply_gates(buckets: dict, gate_in: dict) -> None:
+    """Replace each trained bucket's single-run gates by the verdict of
+    V.pooled_gates (the single-run gates kept under "old")."""
+    for b, r in buckets.items():
+        if r.get("skipped"):
+            continue
+        r["gates"] = V.pooled_gates(r["gates"], r["trading"], gate_in["pooled"].get(b),
+                                    _seed_lifts(gate_in["runs"], b))
+
+
+def gate_rules() -> dict:
+    """The gate settings written to meta.json (thresholds.gate_rules)."""
+    return {"set_on": C.GATES_SET_ON, "seeds": list(C.STABILITY_SEEDS), "saved_seed": C.LGBM_SEED,
+            "min_pooled_lift_median": C.GATES["min_top_lift"],
+            "min_pooled_lift_lower": C.GATE_POOLED_LIFT_LOWER,
+            "min_sim_diff_lower": C.GATE_SIM_DIFF_LOWER,
+            "min_collapse_removed": C.GATES["min_collapse_removed"],
+            "min_pooled_weeks": C.GATE_MIN_POOLED_WEEKS,
+            "bootstrap_reps": C.POOLED_BOOTSTRAP_REPS, "bootstrap_seed": C.POOLED_BOOTSTRAP_SEED,
+            "ci": list(C.POOLED_CI), "wf_min_train_rows": C.WF_MIN_TRAIN_ROWS,
+            "sim_max_ret_pct": C.SIM_MAX_RET_PCT}
+
+
+def seed_stability(runs: dict, buckets: dict) -> dict:
+    """The seed-stability table from the seed retrains of the gate inputs
+    (`seed_runs`): per bucket the numbers of every run and their spread
+    (min / median / max)."""
     spread = {}
     for b in buckets:
         ok = [v["buckets"][b] for v in runs.values()
@@ -819,10 +925,10 @@ def _wf_week_row(w: dict) -> dict:
     return {k: w[k] for k in keys if k in w}
 
 
-def walk_forward_diagnostics(buckets: dict, keeps: dict) -> dict:
-    """Per trained bucket: the pooled expanding walk-forward (the gate's weeks)
-    and a rolling walk-forward (C.WF_ROLLING_WEEKS weeks of training calls),
-    both pooled with the week-block bootstrap over the same weeks: the weeks the
+def walk_forward_diagnostics(buckets: dict, keeps: dict, pooled: dict) -> dict:
+    """Per trained bucket: the pooled expanding walk-forward (the gate's weeks;
+    `pooled`: the gate inputs' pooled numbers per bucket, reused) and a rolling
+    walk-forward (C.WF_ROLLING_WEEKS weeks of training calls), both pooled with the week-block bootstrap over the same weeks: the weeks the
     expanding walk-forward counts, minus any week the rolling model could not
     train (marked in the per-week table) (a paired comparison; a rolling window is
     small by design, so the C.WF_MIN_TRAIN_ROWS rule is not applied to its own
@@ -838,10 +944,10 @@ def walk_forward_diagnostics(buckets: dict, keeps: dict) -> dict:
             w["counted"] = w["week"] in same and not w.get("skipped")
         by_week = {w["week"]: w for w in weeks_roll}
         counted_roll = [w for w in weeks_roll if w["counted"]]
-        out[b] = {"expanding": D.pooled(_wf_weeks(k)),
+        out[b] = {"expanding": pooled[b],
                   "rolling": D.pooled(_wf_weeks({**k, "wf": roll})),
                   "rolling_weeks": C.WF_ROLLING_WEEKS,
-                  "expanding_gate": {x: buckets[b]["gates"][x]
+                  "expanding_gate": {x: V.single_run_gates(buckets[b]["gates"])[x]
                                      for x in ("windows_evaluated", "windows_beating")},
                   "rolling_gate": {"windows_evaluated": len(counted_roll),
                                    "windows_beating": sum(bool(w["sim_beats_all"])
@@ -905,17 +1011,19 @@ def adversarial_validation(keeps: dict) -> dict:
     return out
 
 
-def run_diagnostics(df, L, buckets: dict, keeps: dict, has_trades: bool) -> dict:
-    """All report-only stability diagnostics; each part that raises is recorded
-    as {"error": ...} with a WARNING and the others still run."""
+def run_diagnostics(df, L, buckets: dict, keeps: dict, has_trades: bool, gate_in: dict) -> dict:
+    """The stability diagnostics section; each part that raises is recorded
+    as {"error": ...} with a WARNING and the others still run. `gate_in` (the
+    gate inputs of this training, `gate_inputs`): its seed retrains and pooled
+    expanding walk-forward are reused, not computed again."""
     out = {"settings": {"seeds": list(C.STABILITY_SEEDS), "saved_seed": C.LGBM_SEED,
                         "rolling_weeks": C.WF_ROLLING_WEEKS, "reps": C.POOLED_BOOTSTRAP_REPS,
                         "bootstrap_seed": C.POOLED_BOOTSTRAP_SEED,
                         "eval_exclude_dead": C.EVAL_EXCLUDE_DEAD, "adv_folds": C.ADV_FOLDS,
                         "adv_per_week": C.ADV_PER_WEEK},
            "seconds": {}}
-    parts = (("seeds", lambda: seed_stability(df, L, buckets, keeps, has_trades)),
-             ("walk_forward", lambda: walk_forward_diagnostics(buckets, keeps)),
+    parts = (("seeds", lambda: seed_stability(gate_in["runs"], buckets)),
+             ("walk_forward", lambda: walk_forward_diagnostics(buckets, keeps, gate_in["pooled"])),
              ("no_dead", lambda: no_dead_evaluation(buckets, keeps, has_trades)),
              ("adversarial", lambda: adversarial_validation(keeps)))
     for name, fn in parts:
@@ -927,6 +1035,8 @@ def run_diagnostics(df, L, buckets: dict, keeps: dict, has_trades: bool) -> dict
             print(f"WARNING: diagnostics part {name!r} failed ({out[name]['error']}); the saved "
                   "models are not affected", flush=True)
         out["seconds"][name] = round(time.time() - t0, 1)
+    # the seed retrains ran with the gate inputs: their time is shown here
+    out["seconds"]["seeds"] += gate_in["seconds"]["seeds"]
     total = sum(out["seconds"].values())
     print("[diagnostics] " + ", ".join(f"{k} {v:.0f} s" for k, v in out["seconds"].items())
           + f"; total {total:.0f} s", flush=True)
