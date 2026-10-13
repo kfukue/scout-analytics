@@ -151,8 +151,8 @@ def test_outcome_columns_cover_every_label_and_simulation_column():
 
 
 def test_cap_comes_from_config(monkeypatch):
-    from scout_ml import labels
-    monkeypatch.setattr(labels, "MAX_OUTCOME_PCT", 50.0)
+    from scout_ml import config as C
+    monkeypatch.setattr(C, "MAX_OUTCOME_PCT", 50.0)      # read at call time
     assert build_labels(pd.DataFrame([row(ret_late_7d=60)]))["extreme"][0]
 
 

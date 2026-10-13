@@ -333,10 +333,26 @@ CALIB_CHOICE_FIT_FRAC = 0.5
 N_REF_QUANTILES = 101
 
 # --- LightGBM: deliberately small/regularised for ~10k rows ----------------
+# model.lgbm_params() builds the settings of every fit at call time:
+# LGBM_PARAMS, then LGBM_REG_SETS[LGBM_REGULARISATION], then
+# random_state = LGBM_SEED (all three are VARIANT_KNOBS).
 LGBM_PARAMS = dict(objective="binary", n_estimators=600, learning_rate=0.05,
                    num_leaves=15, min_child_samples=20, subsample=0.8,
                    subsample_freq=1, colsample_bytree=0.8, reg_lambda=1.0,
-                   random_state=7, n_jobs=2, verbose=-1)
+                   n_jobs=2, verbose=-1)
+LGBM_SEED = 7                          # the saved model's seed (bagging and feature sampling)
+# "default" changes nothing. "strong" (a --variants row, report only) is a
+# clearly more regularised tree: fewer leaves (15 -> 7), at least 50 rows per
+# leaf (min_child_samples = LightGBM's min_data_in_leaf, 20 -> 50), L2 penalty
+# 1 -> 10 (reg_lambda = lambda_l2) and 60% of the features per tree
+# (colsample_bytree = feature_fraction, 0.8 -> 0.6). Rounds still come from
+# early stopping / the purged k-fold as for the baseline.
+LGBM_REGULARISATION = "default"
+LGBM_REG_SETS = {
+    "default": {},
+    "strong": {"num_leaves": 7, "min_child_samples": 50, "reg_lambda": 10.0,
+               "colsample_bytree": 0.6},
+}
 EARLY_STOPPING_ROUNDS = 50
 FALLBACK_ROUNDS = 150  # used when the validation part / k-fold cannot drive early stopping
 
@@ -350,7 +366,8 @@ LIFT_CI_Z = 1.96
 # above. They are trained and reported only: never saved, never served, never
 # the gates of the saved model (that is always the baseline). "baseline" reuses
 # the results of the saved model. Knobs: VARIANT_KNOBS.
-VARIANT_KNOBS = ("DEAD_IS_COLLAPSE", "DEAD_TRADES_24H", "DEX_INPUTS", "RUNNER_NEEDS_TRADES")
+VARIANT_KNOBS = ("DEAD_IS_COLLAPSE", "DEAD_TRADES_24H", "DEX_INPUTS", "RUNNER_NEEDS_TRADES",
+                 "LGBM_REGULARISATION", "LGBM_SEED")
 # "dead threshold 100" was dropped: DEAD_TRADES_24H only changes the labels
 # while the dead rule is on, so with the rule off it would equal the baseline.
 VARIANTS = {
@@ -359,10 +376,64 @@ VARIANTS = {
     "raw dex instead of dex_family": {"DEX_INPUTS": "raw"},
     "raw dex + dex_family": {"DEX_INPUTS": "both"},
     "runners must be tradeable": {"RUNNER_NEEDS_TRADES": True},
+    "stronger regularisation": {"LGBM_REGULARISATION": "strong"},
 }
 # Variants that only differ from the baseline through trades_24h: not applicable
 # when the export has no trades_24h column.
 TRADES_VARIANTS = ("dead rule on (collapse OR dead)", "runners must be tradeable")
+
+# --- Stability diagnostics (report only) ----------------------------------------
+# Extra sections at the end of report.md (before the variant comparison) to
+# tell whether the results are real or noise: seed stability, pooled and
+# rolling walk-forward, the evaluation without dead calls, and adversarial
+# validation. Report only: never saved, never served, never a gate; the saved
+# model, its meta.json fields, the gates and the verdict are the same with them
+# on or off (meta.json only gets an extra "diagnostics" entry).
+# On by default for train.py; the environment variable DIAGNOSTICS_ENV set to
+# 0 / off / false / no switches them off for one run (1 / on / true / yes
+# switches them on when DIAGNOSTICS is False).
+DIAGNOSTICS = True
+DIAGNOSTICS_ENV = "SCOUT_ML_DIAGNOSTICS"
+# Seed stability: the baseline retrained with each of these LightGBM seeds
+# (LGBM_SEED); a seed equal to LGBM_SEED reuses the saved model's results.
+STABILITY_SEEDS = (7, 11, 23)
+# Pooled walk-forward: the test rows of all counted weeks of a bucket pooled,
+# each week ranked by its own model (top 10% / top 30% per week, as the gate
+# does); 95% interval by a week-block bootstrap (weeks resampled with
+# replacement) with this many repetitions and this seed.
+POOLED_BOOTSTRAP_REPS = 2000
+POOLED_BOOTSTRAP_SEED = 7
+POOLED_CI = (0.025, 0.975)
+# Rolling walk-forward next to the expanding one: each week's model is trained
+# on the calls of the last WF_ROLLING_WEEKS weeks before the week (minus the
+# embargo) only. Same rounds, test weeks and metrics; pooled over the weeks the
+# expanding walk-forward counts (paired; the rolling window's own size is not
+# held to WF_MIN_TRAIN_ROWS, it is small by design).
+WF_ROLLING_WEEKS = 4
+# Evaluation without dead calls (trades_24h < DEAD_TRADES_24H): the SAME
+# trained models (test part and walk-forward weeks), metrics recomputed on the
+# rows that are not dead (NULL trades_24h is kept). Evaluation only: training
+# rows, labels, gates and the verdict are unchanged.
+EVAL_EXCLUDE_DEAD = True
+# Adversarial validation: a classifier told to separate the train part (0)
+# from the test part (1) on the model's own inputs (build_features, so the
+# leakage guard holds). ROC AUC out of fold (ADV_FOLDS-fold stratified, shuffled
+# with ADV_PARAMS' seed: a drift probe, not a forecast); 0.5 = no drift. Top
+# drifting features by gain. ADV_PER_WEEK: also per counted walk-forward week
+# (that week's training rows vs its test rows), for the newest ADV_MAX_WEEKS
+# counted weeks only and with ADV_WEEK_FOLDS folds (to keep the run short).
+ADV_PARAMS = dict(objective="binary", n_estimators=100, learning_rate=0.1, num_leaves=15,
+                  min_child_samples=20, subsample=0.8, subsample_freq=1,
+                  colsample_bytree=0.8, random_state=7, n_jobs=2, verbose=-1)
+ADV_FOLDS = 5
+# Calendar inputs left out of the probe: when in the day / week a call was
+# posted does not drift, but a test part or week that covers only part of a
+# week differs in weekday_utc by construction (the probe would just find that).
+ADV_EXCLUDE = ("hour_utc", "weekday_utc")
+ADV_TOP_FEATURES = 8
+ADV_PER_WEEK = True
+ADV_MAX_WEEKS = 6
+ADV_WEEK_FOLDS = 3
 
 
 def is_forbidden(col: str) -> bool:
@@ -384,6 +455,9 @@ def overrides(**knobs):
     bad = sorted(set(knobs) - set(VARIANT_KNOBS))
     if bad:
         raise ValueError(f"not a variant knob: {bad}")
+    if "LGBM_REGULARISATION" in knobs and knobs["LGBM_REGULARISATION"] not in LGBM_REG_SETS:
+        raise ValueError(f"LGBM_REGULARISATION must be one of {sorted(LGBM_REG_SETS)}, "
+                         f"not {knobs['LGBM_REGULARISATION']!r}")
     saved = {k: g[k] for k in (*VARIANT_KNOBS, "CATEGORICAL", "FEATURES")}
     try:
         g.update(knobs)

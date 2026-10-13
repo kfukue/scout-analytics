@@ -5,7 +5,8 @@ import numpy as np
 import pandas as pd
 
 from . import config as C
-from .config import BUCKETS, LABELS, MAX_OUTCOME_PCT, NO_POOL_STATUSES, REPEAT_STATUS, UPDATE_KIND
+# structural constants; the cap C.MAX_OUTCOME_PCT is read at call time
+from .config import BUCKETS, LABELS, NO_POOL_STATUSES, REPEAT_STATUS, UPDATE_KIND
 from .features import num, text
 
 _OPS = {">=": operator.ge, ">": operator.gt, "<=": operator.le, "<": operator.lt}
@@ -35,11 +36,11 @@ def outcome_columns() -> list:
 
 
 def extreme_outcome(df: pd.DataFrame) -> pd.Series:
-    """True where any label-relevant raw outcome is above MAX_OUTCOME_PCT
+    """True where any label-relevant raw outcome is above C.MAX_OUTCOME_PCT
     (+inf included; NaN = not known yet = not extreme)."""
     hit = pd.Series(False, index=df.index)
     for col in outcome_columns():
-        hit |= num(df, col) > MAX_OUTCOME_PCT  # NaN compares False
+        hit |= num(df, col) > C.MAX_OUTCOME_PCT  # NaN compares False
     return hit
 
 

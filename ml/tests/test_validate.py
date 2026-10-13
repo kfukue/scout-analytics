@@ -164,12 +164,12 @@ def test_one_huge_winner_cannot_decide_the_simulation(monkeypatch):
     y = np.zeros(n)
     y[[0, 2, 3]] = 1
     capped = V.trading_metrics(y, score, y, None, ret)
-    assert V.SIM_MAX_RET_PCT == 1000.0
+    assert C.SIM_MAX_RET_PCT == 1000.0
     assert capped["sim_n_top"] == 2
     assert capped["sim_top_mean"] == pytest.approx((-90 + 1000) / 2), capped
     assert capped["sim_all_mean"] == pytest.approx((-90 + 1000 + 18 * 600) / n), capped
     assert capped["sim_beats_all"] is False, capped
-    monkeypatch.setattr(V, "SIM_MAX_RET_PCT", np.inf)
+    monkeypatch.setattr(C, "SIM_MAX_RET_PCT", np.inf)        # read at call time
     uncapped = V.trading_metrics(y, score, y, None, ret)
     assert uncapped["sim_beats_all"] is True, uncapped    # what the cap prevents
     # the cap never touches losses: -100% stays -100%
@@ -187,7 +187,7 @@ def test_forward_split_test_strictly_after_train_plus_embargo(calls, horizon):
     gap = pd.Timedelta(days=horizon)
     # time-based boundary: a midnight UTC date, test_days before the newest call
     assert s["t_test"] == s["t_test"].floor("D")
-    assert s["t_test"] == (dates.max() - pd.Timedelta(days=V.FORWARD_TEST_DAYS)).floor("D")
+    assert s["t_test"] == (dates.max() - pd.Timedelta(days=C.FORWARD_TEST_DAYS)).floor("D")
     assert s["t_train_end"] == s["t_test"] - gap
     assert dates[tr].max() < s["t_test"] - gap                   # every train outcome window ends
     assert dates[tr].max() + gap < dates[te].min()               # before the first test call

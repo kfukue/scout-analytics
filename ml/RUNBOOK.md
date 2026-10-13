@@ -48,7 +48,9 @@ below remains the reference; use it when the script stops or to run a single
 step.
 
 Time: about 10 minutes the first time (mostly `pip install`), then about
-2 minutes per run. Memory: the export and training each need under 0.5 GB
+2 minutes per run, plus the stability diagnostics, which are on by default
+(step 5: on synthetic data they made the training about 3 to 4 times as long;
+not measured on prod yet). Memory: the export and training each need under 0.5 GB
 (training took about 20 s on a desktop PC and peaked at about 200 MB on synthetic data of the
 same size, and about 300 MB at 30,000 rows). `go run` compiles first, which
 takes about 1 GB and 1 to 2 minutes. Disk: about 400 MB for the venv, about
@@ -104,7 +106,7 @@ python3 -m venv "$ML/venv"
 If the server only has Python 3.10, stop here and tell the product manager
 (not tested on 3.10).
 
-Check the install with the test suite (synthetic data only, about 2 minutes;
+Check the install with the test suite (synthetic data only, about 3 minutes;
 `-p no:cacheprovider` keeps it from writing a cache into the worktree):
 
 ```bash
@@ -112,7 +114,7 @@ cd "$ML/src/ml"
 "$ML/venv/bin/python" -m pytest tests -q -p no:cacheprovider
 ```
 
-Expected: `148 passed` (one deprecation warning from fastapi is fine).
+Expected: `206 passed` (one deprecation warning from fastapi is fine).
 
 ## 3. Read-only checks before the export (optional, psql or pgAdmin)
 
@@ -282,9 +284,41 @@ no trades_24h column` means step 3b has not been done yet (the training is
 still valid, with the plain collapse labels). After the buckets it trains
 the report-only dead score and prints `[dead score] N s` (a few seconds); a
 line `WARNING: the dead score failed (...)` means only that report section is
-missing: the saved models are not affected. Exit code 0 even when gates
-fail. Random seed: fixed (`random_state=7` in `scout_ml/config.py`), so a
-rerun on the same CSV gives the same numbers.
+missing: the saved models are not affected.
+
+Then it runs the stability diagnostics (report only, never a gate; see step 7,
+item 5). They are on by default and print one line at the end, e.g.
+`[diagnostics] seeds N s, walk_forward N s, no_dead N s, adversarial N s; total N s`.
+They retrain the normal model with two more seeds, so they cost extra time: on
+synthetic data a whole run took about 3 to 4 times as long with them as without
+(28 s without, 99 s with, on a desktop PC). On the prod data the extra time is
+an estimate, not measured yet; the `[diagnostics]` line gives the real figure
+(paste it, step 8). They start only after the model, `meta.json`, `report.md`
+and `LATEST` are written, and the saved model, the gates and the verdict are
+the same with or without them, so stopping during them still leaves the normal
+result. A `WARNING` line about them (`WARNING: diagnostics part '<name>'
+failed (...)`, `WARNING: seed <n> of the seed stability failed (...)` or
+`WARNING: the stability diagnostics failed (...)`) means only that part of
+the section is missing (it says `Not computed: error: ...`, or a failed seed
+shows the error in its row); the saved models are not affected. Paste the warning.
+
+To skip them for one run (for example when time is short), put
+`SCOUT_ML_DIAGNOSTICS=0` in front of the command:
+
+```bash
+time SCOUT_ML_DIAGNOSTICS=0 "$ML/venv/bin/python" train.py --csv "$ML/data/calls.csv" --out "$ML/models"
+# or with the script (run from the deployed checkout, as in "Quick way"):
+SCOUT_ML_DIAGNOSTICS=0 REPO="$PWD" ML=~/scout-ml bash ~/scout-ml/run_training.sh --skip-install
+```
+
+`0`, `off`, `false` and `no` switch them off; any other value prints a
+`WARNING` and keeps the default (on). The script passes the variable through
+to `train.py` as it is; nothing else changes. The report then has no
+"Stability diagnostics" section.
+
+Exit code 0 even when gates fail. Random seed: fixed (`LGBM_SEED = 7` in
+`scout_ml/config.py`; the diagnostics use fixed seeds too), so a rerun on the
+same CSV gives the same numbers.
 
 If `train.py` stops with a Python error instead, paste the last 20 lines of
 the error to the product manager (not the CSV), and still do step 6.
@@ -323,19 +357,26 @@ time "$ML/venv/bin/python" train.py --csv "$ML/data/calls.csv" --out "$ML/models
 ```
 
 It trains the normal model
-exactly as in step 5 (that is the one saved, served and gated), then four
+exactly as in step 5 (that is the one saved, served and gated), then five
 variants that each change one setting (dead rule on, i.e. collapse OR dead;
 raw `dex` instead of `dex_family`; raw `dex` + `dex_family`; runners must have
-`trades_24h >= 100`). The "dead rule off" and "dead threshold 100" rows of
+`trades_24h >= 100`; stronger regularisation, i.e. smaller trees with more
+calls per leaf, a stronger L2 penalty and fewer inputs per tree,
+`LGBM_REGULARISATION = "strong"` in `scout_ml/config.py`). The "dead rule off" and "dead threshold 100" rows of
 earlier reports are gone: the rule is now off in the baseline, and the
 threshold only matters with the rule on. The variants are not saved; they only add a section
 "Variant comparison" at the end of `report.md`, one table per bucket, one row
 per variant (the `baseline` row is the saved model). It prints one
-`[variant] <name>: N s` line per variant. Time: about 4 to 5 times the train
-time of step 5 (on a desktop PC, synthetic data of 6,000 calls: about 30 s
-without, about 2 min with `--variants`); memory as in step 5. The model, `meta.json`,
-`report.md` and `LATEST` are written before the variants start, so stopping
-during the variants still leaves the normal result. A variant that crashes
+`[variant] <name>: N s` line per variant. Time: more than the 4 to 5 times
+the step 5 train time measured with four variants (on a desktop PC,
+synthetic data of 6,000 calls: about 30 s without, about 2 min with
+`--variants`): each variant costs about one normal training run, so the fifth
+adds about one more. The stability
+diagnostics of step 5 also run (before the variants) unless switched off with
+`SCOUT_ML_DIAGNOSTICS=0`, and add their own time on top. Memory as in step 5.
+The model, `meta.json`, `report.md` and `LATEST` are written before the
+diagnostics and the variants start, so stopping
+during either still leaves the normal result. A variant that crashes
 does not fail the run: it prints `WARNING: variant '<name>' failed (error:
 ...)`, its row in the table and its `meta.json` entry say `error: <message>`,
 the other variants go on, and the run still ends with exit code 0 (if every
@@ -420,7 +461,50 @@ From the top:
    error: ...` (and the run printed `WARNING: the dead score failed`), paste
    that line; the saved models are not affected. Never act on this score:
    it is not served.
-5. With `--variants` only: **Variant comparison** (step 5b).
+5. **Stability diagnostics (report only; not saved, not served, never a
+   gate)**: helps tell whether the numbers above are real or noise. Nothing
+   in it changes the saved model, the gates or the verdict, and nothing in it
+   passes or fails. It is missing when the run had `SCOUT_ML_DIAGNOSTICS=0`
+   (step 5). Its parts:
+   - **Seed stability**: the normal model trained again with the LightGBM
+     seeds 11 and 23 next to the saved model's seed 7 (same rows, splits and
+     weeks; only the seed changes). Per bucket and seed: test top-10% lift
+     with its interval, collapses removed, runner ROC AUC, the money
+     simulation top 10% vs all, the counted walk-forward weeks beating
+     buy-all and the pooled walk-forward lift; then min / median / max over
+     the seeds. A lift or a PASS/FAIL that moves between seeds is noise, not
+     a real result.
+   - **Pooled walk-forward (expanding and rolling)**: the test rows of all
+     counted walk-forward weeks of a bucket put together, each week still
+     ranked by its own model, so one lift over many more calls than a single
+     week. Its 95% interval comes from a week-block bootstrap (whole weeks
+     drawn again 2000 times), so it includes the swings from week to week;
+     with few weeks it is rough, with one week n/a. Also pooled collapses
+     removed, the pooled money simulation (with an interval on the
+     difference to buying all) and the weeks beating buy-all. "Expanding" is
+     the gate's walk-forward (every call before the week); "rolling" trains
+     each week's model on the last 4 weeks of calls only. Both are pooled
+     over the same weeks (the ones the gate counts), minus any week the
+     rolling model could not train (marked in the per-week table), and the
+     per-week table shows them side by side; the rolling window is small by design, so the
+     1000-row rule does not apply to its training size.
+   - **Evaluation without dead calls**: the same trained models measured
+     again on the calls that are not dead (`trades_24h < 50`; calls with an
+     unknown `trades_24h` stay in), with the top 10% / 30% taken again among
+     them. Nothing is retrained and the gates do not change; it shows how
+     much of the result comes from the dead calls. "n/a" when the data has no
+     `trades_24h` column (step 3b).
+   - **Adversarial validation**: a separate model tries to tell the train
+     part from the test part on the model's own inputs (without hour and
+     weekday). Its ROC AUC: about 0.5 = the two parts look alike, above 0.7 =
+     clear drift (the test calls differ from the calls the model learned
+     on). The "top drifting features" are the inputs that changed most. The
+     same per counted walk-forward week, for the newest 6 weeks.
+
+   A part that failed says `Not computed: error: ...` (and the run printed a
+   `WARNING`); paste that line. The product manager reads these numbers next
+   to the gates; they never decide anything on their own.
+6. With `--variants` only: **Variant comparison** (step 5b).
 
 What to expect from the October 2026 data (calls from late July 2026):
 
@@ -464,7 +548,8 @@ on one or two weeks of calls.
   Split line, the gate table, the money simulation line and the walk-forward
   table.
 - The output of the step 3 queries, if you ran them.
-- The train time (`real` from `time`).
+- The train time (`real` from `time`) and the `[diagnostics] ...` line
+  (step 5), if the diagnostics ran.
 
 Never paste the CSV, rows of it, or anything from `.env`.
 

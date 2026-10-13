@@ -8,7 +8,7 @@ import numpy as np
 import pandas as pd
 
 from . import config as C
-from .config import MIN_CATEGORY_COUNT, NUMERIC_RAW, PRE_VOL, is_forbidden
+from .config import NUMERIC_RAW, PRE_VOL, is_forbidden   # structural; C.MIN_CATEGORY_COUNT is read at call time
 
 
 def num(df: pd.DataFrame, col: str) -> pd.Series:
@@ -75,7 +75,7 @@ def learn_cat_levels(df: pd.DataFrame) -> dict:
     out = {}
     for c in C.CATEGORICAL:
         counts = category(df, c).value_counts()
-        out[c] = sorted(counts[counts >= MIN_CATEGORY_COUNT].index.tolist())
+        out[c] = sorted(counts[counts >= C.MIN_CATEGORY_COUNT].index.tolist())
     return out
 
 

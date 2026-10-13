@@ -7,9 +7,9 @@ import numpy as np
 import pandas as pd
 from sklearn.metrics import average_precision_score, brier_score_loss, roc_auc_score
 
-from . import config as C   # read at call time: WF_MIN_TRAIN_ROWS
-from .config import (FORWARD_TEST_DAYS, GATES, KFOLD_K, LIFT_CI_Z, MIN_WINDOW_TEST_ROWS,
-                     SIM_MAX_RET_PCT, SKIP_FRAC, TOP_FRAC, TRAIN_FRAC, VAL_FRAC)
+# Every setting is read from C at call time (also the defaults of keyword
+# arguments), never bound at import, so a knob set after import takes effect.
+from . import config as C
 
 
 def _token_key(tokens: pd.Series) -> pd.Series:
@@ -29,8 +29,8 @@ def time_split(dates: pd.Series, tokens: pd.Series, horizon_days: float) -> dict
     tokens = _token_key(tokens)
     ordered = dates.sort_values()
     n = len(ordered)
-    t1 = ordered.iloc[min(int(n * TRAIN_FRAC), n - 1)]
-    t2 = ordered.iloc[min(int(n * (TRAIN_FRAC + VAL_FRAC)), n - 1)]
+    t1 = ordered.iloc[min(int(n * C.TRAIN_FRAC), n - 1)]
+    t2 = ordered.iloc[min(int(n * (C.TRAIN_FRAC + C.VAL_FRAC)), n - 1)]
     first = dates.groupby(tokens.to_numpy()).transform("min")
     gap = pd.Timedelta(days=horizon_days)
     parts = {"train": ((first < t1) & (dates < t1 - gap)).to_numpy(),
@@ -54,15 +54,17 @@ def dropped_counts(dates: pd.Series, tokens: pd.Series, parts: dict, zones: dict
 
 
 def forward_split(dates: pd.Series, tokens: pd.Series, horizon_days: float,
-                  test_days: float = FORWARD_TEST_DAYS) -> dict:
+                  test_days: float | None = None) -> dict:
     """Masks `train`/`test` for long horizons; no validation part.
 
     * the test part starts at a date: midnight UTC `test_days` days before the
-      newest call (time-based, not a row quantile), and runs to the end;
+      newest call (time-based, not a row quantile), and runs to the end
+      (`test_days` None: C.FORWARD_TEST_DAYS);
     * train = calls posted before that date minus the horizon (embargo), so
       no train outcome window reaches into the test period;
     * token grouping as in `time_split`.
     Rounds and calibration come from `purged_kfold` on the train rows only."""
+    test_days = C.FORWARD_TEST_DAYS if test_days is None else test_days
     dates = pd.to_datetime(dates, utc=True)
     first = dates.groupby(_token_key(tokens).to_numpy()).transform("min")
     t_test = (dates.max() - pd.Timedelta(days=test_days)).floor("D")
@@ -74,7 +76,7 @@ def forward_split(dates: pd.Series, tokens: pd.Series, horizon_days: float,
             **dropped_counts(dates, tokens, parts, zones)}
 
 
-def purged_kfold(dates: pd.Series, tokens: pd.Series, horizon_days: float, k: int = KFOLD_K):
+def purged_kfold(dates: pd.Series, tokens: pd.Series, horizon_days: float, k: int | None = None):
     """Time-ordered k-fold for rounds and calibration INSIDE a train part.
 
     Yields {"fold", "fit", "held", "lo", "hi"} (masks aligned to `dates`).
@@ -84,7 +86,8 @@ def purged_kfold(dates: pd.Series, tokens: pd.Series, horizon_days: float, k: in
     within one horizon before the fold's first or after its last call are
     dropped from the fit part (both sides); calls of a
     held-out token are dropped from the fit part too. Never used for the final
-    test, which is forward only (`forward_split`)."""
+    test, which is forward only (`forward_split`). `k` None: C.KFOLD_K."""
+    k = C.KFOLD_K if k is None else k
     dates = pd.to_datetime(dates, utc=True).reset_index(drop=True)
     tok = _token_key(tokens).reset_index(drop=True)
     gap = pd.Timedelta(days=horizon_days)
@@ -104,17 +107,24 @@ def purged_kfold(dates: pd.Series, tokens: pd.Series, horizon_days: float, k: in
                "start": start, "end": end}
 
 
-def walk_forward_windows(dates: pd.Series, tokens: pd.Series, horizon_days: float):
+def walk_forward_windows(dates: pd.Series, tokens: pd.Series, horizon_days: float,
+                         train_weeks: float | None = None):
     """Expanding weekly windows: train on everything before week N+1 (minus the
-    embargo), test on week N+1. Same token-grouping rule as `time_split`."""
+    embargo), test on week N+1. Same token-grouping rule as `time_split`.
+    `train_weeks` (rolling walk-forward, report only): train only on calls
+    posted in the `train_weeks` weeks before the embargo cut, i.e. in
+    [week start - horizon - train_weeks * 7 days, week start - horizon); the
+    test weeks are the same as for the expanding windows."""
     dates = pd.to_datetime(dates, utc=True)
     first = dates.groupby(_token_key(tokens).to_numpy()).transform("min")
     gap, week = pd.Timedelta(days=horizon_days), pd.Timedelta(days=7)
     start, k = dates.min().floor("D"), 1
     while start + k * week <= dates.max():
         lo, hi = start + k * week, start + (k + 1) * week
-        yield {"week": k + 1, "start": lo,
-               "train": ((first < lo) & (dates < lo - gap)).to_numpy(),
+        train = (first < lo) & (dates < lo - gap)
+        if train_weeks is not None:
+            train &= dates >= lo - gap - train_weeks * week
+        yield {"week": k + 1, "start": lo, "train": train.to_numpy(),
                "test": ((first >= lo) & (dates >= lo) & (dates < hi)).to_numpy()}
         k += 1
 
@@ -149,8 +159,10 @@ def top_mask(score, frac: float) -> np.ndarray:
     return mask
 
 
-def wilson(k: int, n: int, z: float = LIFT_CI_Z) -> tuple:
-    """Wilson score interval for a proportion k/n ((nan, nan) when n == 0)."""
+def wilson(k: int, n: int, z: float | None = None) -> tuple:
+    """Wilson score interval for a proportion k/n ((nan, nan) when n == 0;
+    `z` None: C.LIFT_CI_Z)."""
+    z = C.LIFT_CI_Z if z is None else z
     if n <= 0:
         return np.nan, np.nan
     p = k / n
@@ -186,8 +198,8 @@ def trading_metrics(y_runner, runner_score, y_collapse, collapse_score, net_ret)
            "top_n": 0, "all_pos": 0, "all_n": 0, "collapse_removed": np.nan,
            "sim_top_mean": np.nan, "sim_all_mean": np.nan, "sim_n_top": 0, "sim_beats_all": False}
     if runner_score is not None and len(runner_score):
-        y, top = np.asarray(y_runner, dtype=float), top_mask(runner_score, TOP_FRAC)
-        ret = np.minimum(np.asarray(net_ret, dtype=float), SIM_MAX_RET_PCT)
+        y, top = np.asarray(y_runner, dtype=float), top_mask(runner_score, C.TOP_FRAC)
+        ret = np.minimum(np.asarray(net_ret, dtype=float), C.SIM_MAX_RET_PCT)
         counts = dict(top_pos=int(y[top].sum()), top_n=int(top.sum()),
                       all_pos=int(y.sum()), all_n=int(len(y)))
         out.update(counts)
@@ -209,7 +221,7 @@ def collapse_removed(y_collapse, collapse_score) -> float:
     y = np.asarray(y_collapse, dtype=float)
     if y.sum() <= 0:
         return np.nan
-    return float(y[top_mask(collapse_score, SKIP_FRAC)].sum() / y.sum())
+    return float(y[top_mask(collapse_score, C.SKIP_FRAC)].sum() / y.sum())
 
 
 def wf_enough_train(w: dict) -> bool:
@@ -231,8 +243,8 @@ def gates(test: dict, windows: list) -> dict:
     2026); evaluated weeks below that are reported as `windows_not_counted`."""
     evaluated = [w for w in windows if not w.get("skipped")]
     counted = [w for w in evaluated if wf_counted(w)]
-    g = {"lift_ok": bool(test["top_lift"] >= GATES["min_top_lift"]),
-         "collapse_ok": bool(test["collapse_removed"] >= GATES["min_collapse_removed"]),
+    g = {"lift_ok": bool(test["top_lift"] >= C.GATES["min_top_lift"]),
+         "collapse_ok": bool(test["collapse_removed"] >= C.GATES["min_collapse_removed"]),
          "walk_forward_ok": bool(counted) and all(w["sim_beats_all"] for w in counted),
          "windows_evaluated": len(counted),
          "windows_beating": sum(bool(w["sim_beats_all"]) for w in counted),
@@ -243,4 +255,4 @@ def gates(test: dict, windows: list) -> dict:
 
 
 def window_ok(n_test: int) -> bool:
-    return n_test >= MIN_WINDOW_TEST_ROWS
+    return n_test >= C.MIN_WINDOW_TEST_ROWS
