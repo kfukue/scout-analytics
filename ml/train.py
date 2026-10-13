@@ -7,6 +7,7 @@
 import argparse
 import json
 import math
+import os
 import sys
 import time
 from datetime import datetime, timezone
@@ -17,6 +18,7 @@ import numpy as np
 import pandas as pd
 
 from scout_ml import config as C
+from scout_ml import diagnostics as D
 from scout_ml.features import build_features, category, dex_family_rules, learn_cat_levels, num
 from scout_ml.labels import build_labels, dead_policy
 from scout_ml.model import (apply_calibrator, best_rounds, choose_platt, fit_baseline, fit_lgbm,
@@ -203,12 +205,16 @@ def collapse_check(y_runner, runner_score, y_plain, y_with_dead, collapse_score,
 
 
 def _walk_forward(rows, Y, y_plain, y_with_dead, net_ret, dates, tokens, horizon_days, rounds,
-                  with_dead):
+                  with_dead, train_weeks=None, collect=None):
     """Refit per week with the main model's round count; ranking metrics only.
     Category levels are learned from each window's training rows. Collapses
-    removed are measured on the plain label `y_plain` (see collapse_check)."""
+    removed are measured on the plain label `y_plain` (see collapse_check).
+    `train_weeks`: rolling windows (see V.walk_forward_windows; report-only
+    diagnostics), None = expanding (the gate). `collect` (a list, diagnostics
+    only): each evaluated week's test rows (positions in `rows`) and scores are
+    appended to it; the returned rows are the same with or without it."""
     out = []
-    for w in V.walk_forward_windows(dates, tokens, horizon_days):
+    for w in V.walk_forward_windows(dates, tokens, horizon_days, train_weeks=train_weeks):
         tr, te = w["train"], w["test"]
         row = {"week": w["week"], "start": w["start"].strftime("%Y-%m-%d"),
                "n_train": int(tr.sum()), "n_test": int(te.sum())}
@@ -229,6 +235,10 @@ def _walk_forward(rows, Y, y_plain, y_with_dead, net_ret, dates, tokens, horizon
             row["runner_auc"] = V.model_metrics(Y["runner"][te], scores["runner"])["roc_auc"]
         row["counted"] = V.wf_counted(row)
         out.append(row)
+        if collect is not None and "runner" in scores:
+            collect.append({"week": row["week"], "start": row["start"], "n_train": row["n_train"],
+                            "counted": row["counted"], "train": tr, "idx": np.flatnonzero(te),
+                            "s_runner": scores["runner"], "s_collapse": scores.get("collapse")})
     return out
 
 
@@ -261,11 +271,14 @@ def _dead_stats(L, b, use, te):
     return out
 
 
-def _train_bucket(b, df, L, out_dir, with_dead=False):
+def _train_bucket(b, df, L, out_dir, with_dead=False, keep=None):
     """Returns (results, runner reference quantiles or None, category levels or None).
     `out_dir` None: nothing is saved (a --variants run). `with_dead` (the data
     has trades_24h): the "Dead after the call" table and the information
-    figures on collapse OR dead, whether or not the dead rule is on."""
+    figures on collapse OR dead, whether or not the dead rule is on.
+    `keep` (a dict, stability diagnostics only): filled with the bucket's rows,
+    labels, masks, feature matrix, test scores and walk-forward scores; the
+    results are the same with or without it (nothing of it reaches meta.json)."""
     cfg = C.BUCKETS[b]
     use = L[f"usable_{b}"].to_numpy()
     res = {"usable": int(use.sum())}
@@ -328,9 +341,15 @@ def _train_bucket(b, df, L, out_dir, with_dead=False):
         res["collapse_auc_plain"] = {
             "lightgbm": V.model_metrics(y_plain[te], scores["collapse"])["roc_auc"],
             "logistic": V.model_metrics(y_plain[te], logistic["collapse"])["roc_auc"]}
+    wf_rows = None if keep is None else []
     res["walk_forward"] = _walk_forward(rows, Y, y_plain, y_with_dead, net_ret, dates, tokens, h,
-                                        rounds, with_dead)
+                                        rounds, with_dead, collect=wf_rows)
     res["gates"] = V.gates(res["trading"], res["walk_forward"])
+    if keep is not None:
+        keep.update(rows=rows, dates=dates, tokens=tokens, h=h, Y=Y, y_plain=y_plain,
+                    y_with_dead=y_with_dead, net_ret=net_ret, rounds=dict(rounds),
+                    with_dead=with_dead, tr=tr, te=te, X=X, scores=dict(scores),
+                    dead=L["dead"][use].to_numpy().astype(bool), wf=wf_rows)
     reference = np.quantile(scores["runner"], np.linspace(0, 1, C.N_REF_QUANTILES))
     return res, reference.tolist(), levels
 
@@ -594,9 +613,32 @@ def run_dead_score(df: pd.DataFrame, L: pd.DataFrame) -> dict:
     return out
 
 
-def train(df: pd.DataFrame, out_root, version: str | None = None, variants: bool = False) -> Path:
+def diagnostics_on(flag: bool | None = None) -> bool:
+    """Whether to run the stability diagnostics: `flag` when given; else the
+    environment variable C.DIAGNOSTICS_ENV (0/off/false/no: off, 1/on/true/yes:
+    on), else C.DIAGNOSTICS. Any other value of the variable: the default and a
+    WARNING."""
+    if flag is not None:
+        return bool(flag)
+    raw = os.environ.get(C.DIAGNOSTICS_ENV, "")
+    val = raw.strip().lower()
+    if val in ("0", "off", "false", "no"):
+        return False
+    if val in ("1", "on", "true", "yes"):
+        return True
+    if val:
+        print(f"WARNING: {C.DIAGNOSTICS_ENV}={raw!r} is not one of 0/off/false/no or "
+              f"1/on/true/yes; using the default ({'on' if C.DIAGNOSTICS else 'off'})", flush=True)
+    return bool(C.DIAGNOSTICS)
+
+
+def train(df: pd.DataFrame, out_root, version: str | None = None, variants: bool = False,
+          diagnostics: bool | None = None) -> Path:
     """Run the whole pipeline on raw view rows; returns the version directory.
-    `variants`: also train C.VARIANTS for the report (never saved or served)."""
+    `variants`: also train C.VARIANTS for the report (never saved or served).
+    `diagnostics`: the report-only stability diagnostics (None: `diagnostics_on`,
+    i.e. C.DIAGNOSTICS unless C.DIAGNOSTICS_ENV says otherwise)."""
+    diag = diagnostics_on(diagnostics)
     version = version or datetime.now(timezone.utc).strftime("%Y%m%d-%H%M")
     out_dir = Path(out_root) / version
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -640,8 +682,12 @@ def train(df: pd.DataFrame, out_root, version: str | None = None, variants: bool
         "coverage": {c: float(blank[c][eligible].notna().mean()) if eligible.any() else 0.0
                      for c in raw_cols}}}
     reference, cat_levels = {}, {}  # per trained bucket: learned from its training rows
+    keeps = {}   # diagnostics only: arrays of each trained bucket (never in meta.json)
     for b in C.BUCKETS:
-        res["buckets"][b], ref, levels = _train_bucket(b, df, L, out_dir, has_trades)
+        keep = {} if diag else None
+        res["buckets"][b], ref, levels = _train_bucket(b, df, L, out_dir, has_trades, keep=keep)
+        if keep and keep.get("wf") is not None:
+            keeps[b] = keep
         if ref is not None:
             reference[b], cat_levels[b] = ref, levels
         status = res["buckets"][b]
@@ -677,11 +723,214 @@ def train(df: pd.DataFrame, out_root, version: str | None = None, variants: bool
         print(f"WARNING: the dead score failed ({meta['dead_score']['error']}); the saved "
               "models are not affected", flush=True)
         _write_version(out_dir, meta, res)
+    if diag:   # report only, after the saved model is complete; never fails the run
+        res["diagnostics"] = run_diagnostics(df, L, res["buckets"], keeps, has_trades)
+        try:
+            meta["diagnostics"] = _json_safe(res["diagnostics"])
+            _write_version(out_dir, meta, res)
+        except Exception as exc:
+            res["diagnostics"] = meta["diagnostics"] = {"error": variant_error(exc)}
+            print(f"WARNING: the stability diagnostics failed ({meta['diagnostics']['error']}); "
+                  "the saved models are not affected", flush=True)
+            _write_version(out_dir, meta, res)
+        keeps.clear()
     if variants:
         res["variants"] = run_variants(df, res["buckets"], has_trades)
         meta["variants"] = _json_safe(res["variants"])
         _write_version(out_dir, meta, res)
     return out_dir
+
+
+# --- Stability diagnostics (report only; see config "Stability diagnostics") ---
+
+def _wf_weeks(keep: dict, exclude_dead: bool = False) -> list:
+    """Per counted walk-forward week of `keep["wf"]`: D.week_sums of its test
+    rows (`exclude_dead`: without dead calls, then only weeks that still have
+    C.MIN_WINDOW_TEST_ROWS rows), each week ranked by its own model."""
+    out = []
+    for w in keep["wf"]:
+        if not w["counted"]:
+            continue
+        idx, mask = w["idx"], None
+        if exclude_dead:
+            mask = ~keep["dead"][idx]
+            if not V.window_ok(int(mask.sum())):
+                continue
+        out.append(D.week_sums(keep["Y"]["runner"][idx], w["s_runner"], keep["y_plain"][idx],
+                               w["s_collapse"], keep["net_ret"][idx], mask))
+    return out
+
+
+SEED_METRICS = ("top_lift", "collapse_removed", "runner_auc", "sim_top_mean", "sim_all_mean",
+                "windows_beating", "wf_pooled_lift")
+
+
+def _run_summary(r: dict, keep: dict | None) -> dict:
+    """The seed-stability numbers of one bucket of one training run."""
+    if r.get("skipped"):
+        return {"skipped": r["skipped"]}
+    t, g, lab = r["trading"], r["gates"], r["labels"]["runner"]
+    pool = D.pooled(_wf_weeks(keep), reps=0) if keep and keep.get("wf") is not None else {}
+    return {"top_lift": t["top_lift"], "top_lift_lo": t["top_lift_lo"],
+            "top_lift_hi": t["top_lift_hi"], "collapse_removed": t["collapse_removed"],
+            "runner_auc": lab["lightgbm"]["roc_auc"], "sim_top_mean": t["sim_top_mean"],
+            "sim_all_mean": t["sim_all_mean"], "windows_beating": g["windows_beating"],
+            "windows_evaluated": g["windows_evaluated"], "passed": g["passed"],
+            "wf_pooled_lift": pool.get("lift", np.nan)}
+
+
+def seed_stability(df, L, buckets: dict, keeps: dict, has_trades: bool) -> dict:
+    """The baseline retrained with each C.STABILITY_SEEDS LightGBM seed (a seed
+    equal to C.LGBM_SEED reuses the saved model's results); per bucket the
+    numbers of every run and their spread (min / median / max)."""
+    runs = {}
+    for seed in C.STABILITY_SEEDS:
+        if seed == C.LGBM_SEED:
+            runs[seed] = {"saved_model": True, "buckets": {
+                b: _run_summary(r, keeps.get(b)) for b, r in buckets.items()}}
+            continue
+        t0 = time.time()
+        try:
+            out = {}
+            with C.overrides(LGBM_SEED=seed):
+                for b in C.BUCKETS:
+                    keep = {}
+                    r = _train_bucket(b, df, L, None, has_trades, keep=keep)[0]
+                    out[b] = _run_summary(r, keep)
+            runs[seed] = {"buckets": out}
+        except Exception as exc:  # one seed failing never stops the others
+            runs[seed] = {"error": variant_error(exc)}
+            print(f"WARNING: seed {seed} of the seed stability failed ({runs[seed]['error']})",
+                  flush=True)
+        runs[seed]["seconds"] = round(time.time() - t0, 1)
+    spread = {}
+    for b in buckets:
+        ok = [v["buckets"][b] for v in runs.values()
+              if not v.get("error") and not v["buckets"].get(b, {"skipped": 1}).get("skipped")]
+        if ok:
+            spread[b] = {m: D.spread([s[m] for s in ok]) for m in SEED_METRICS}
+    return {"seeds": list(C.STABILITY_SEEDS), "saved_seed": C.LGBM_SEED,
+            "runs": {str(k): v for k, v in runs.items()}, "spread": spread}
+
+
+def _wf_week_row(w: dict) -> dict:
+    keys = ("n_train", "n_test", "top_lift", "collapse_removed", "sim_top_mean", "sim_all_mean",
+            "sim_beats_all", "runner_auc", "counted", "skipped")
+    return {k: w[k] for k in keys if k in w}
+
+
+def walk_forward_diagnostics(buckets: dict, keeps: dict) -> dict:
+    """Per trained bucket: the pooled expanding walk-forward (the gate's weeks)
+    and a rolling walk-forward (C.WF_ROLLING_WEEKS weeks of training calls),
+    both pooled with the week-block bootstrap over the same weeks: the weeks the
+    expanding walk-forward counts, minus any week the rolling model could not
+    train (marked in the per-week table) (a paired comparison; a rolling window is
+    small by design, so the C.WF_MIN_TRAIN_ROWS rule is not applied to its own
+    training size, which the table shows), and the two side by side per week."""
+    out = {}
+    for b, k in keeps.items():
+        roll = []
+        weeks_roll = _walk_forward(k["rows"], k["Y"], k["y_plain"], k["y_with_dead"], k["net_ret"],
+                                   k["dates"], k["tokens"], k["h"], k["rounds"], k["with_dead"],
+                                   train_weeks=C.WF_ROLLING_WEEKS, collect=roll)
+        same = {w["week"] for w in buckets[b]["walk_forward"] if V.wf_counted(w)}
+        for w in roll + weeks_roll:
+            w["counted"] = w["week"] in same and not w.get("skipped")
+        by_week = {w["week"]: w for w in weeks_roll}
+        counted_roll = [w for w in weeks_roll if w["counted"]]
+        out[b] = {"expanding": D.pooled(_wf_weeks(k)),
+                  "rolling": D.pooled(_wf_weeks({**k, "wf": roll})),
+                  "rolling_weeks": C.WF_ROLLING_WEEKS,
+                  "expanding_gate": {x: buckets[b]["gates"][x]
+                                     for x in ("windows_evaluated", "windows_beating")},
+                  "rolling_gate": {"windows_evaluated": len(counted_roll),
+                                   "windows_beating": sum(bool(w["sim_beats_all"])
+                                                          for w in counted_roll)},
+                  "weeks": [{"week": w["week"], "start": w["start"],
+                             "expanding": _wf_week_row(w),
+                             "rolling": _wf_week_row(by_week.get(w["week"], {}))}
+                            for w in buckets[b]["walk_forward"]]}
+    return out
+
+
+def no_dead_evaluation(buckets: dict, keeps: dict, has_trades: bool) -> dict:
+    """The same trained models evaluated without dead calls (C.EVAL_EXCLUDE_DEAD):
+    test part and counted walk-forward weeks, top shares re-taken among the
+    calls that are not dead. Evaluation only (labels, training, gates unchanged)."""
+    if not C.EVAL_EXCLUDE_DEAD:
+        return {"off": "EVAL_EXCLUDE_DEAD = False"}
+    if not has_trades:
+        return {"not_applicable": f"the data has no {C.DEAD_COLUMN} column"}
+    out = {}
+    for b, k in keeps.items():
+        te = k["te"]
+        dead_te = k["dead"][te]
+        y_r, s_r, s_c = k["Y"]["runner"][te], k["scores"]["runner"], k["scores"].get("collapse")
+        rows = {}
+        for name, m, exclude in (("all calls", np.ones(len(y_r), bool), False),
+                                 ("dead calls excluded", ~dead_te, True)):
+            t = V.trading_metrics(y_r[m], s_r[m], k["y_plain"][te][m],
+                                  None if s_c is None else s_c[m], k["net_ret"][te][m])
+            pool = D.pooled(_wf_weeks(k, exclude_dead=exclude))
+            rows[name] = {**t, "n_test": int(m.sum()),
+                          "runner_auc": V.model_metrics(y_r[m], s_r[m])["roc_auc"],
+                          "wf_weeks": pool["weeks"],
+                          "wf_weeks_beating": pool.get("weeks_beating", 0),
+                          "wf_pooled": {x: pool.get(x, np.nan) for x in
+                                        ("lift", "lift_lo", "lift_hi", "collapse_removed",
+                                         "sim_top_mean", "sim_all_mean")}}
+        out[b] = {"dead_test": int(dead_te.sum()), "rows": rows}
+    return out
+
+
+def adversarial_validation(keeps: dict) -> dict:
+    """Per trained bucket: train part vs test part (the bucket's own feature
+    matrix, levels from its train part), and with C.ADV_PER_WEEK per counted
+    walk-forward week (that week's training rows vs its test rows; the newest
+    C.ADV_MAX_WEEKS counted weeks, C.ADV_WEEK_FOLDS folds)."""
+    out = {}
+    for b, k in keeps.items():
+        m = k["tr"] | k["te"]
+        res = {"split": D.adversarial(k["X"][m], k["te"][m]), "weeks": []}
+        if C.ADV_PER_WEEK:
+            counted = [w for w in k["wf"] if w["counted"]]
+            for w in counted[len(counted) - max(C.ADV_MAX_WEEKS, 0):]:
+                te_w = np.zeros(len(k["rows"]), bool)
+                te_w[w["idx"]] = True
+                mm = w["train"] | te_w
+                Xw = build_features(k["rows"], learn_cat_levels(k["rows"][w["train"]]))
+                res["weeks"].append({"week": w["week"], "start": w["start"],
+                                     **D.adversarial(Xw[mm], te_w[mm], C.ADV_WEEK_FOLDS)})
+        out[b] = res
+    return out
+
+
+def run_diagnostics(df, L, buckets: dict, keeps: dict, has_trades: bool) -> dict:
+    """All report-only stability diagnostics; each part that raises is recorded
+    as {"error": ...} with a WARNING and the others still run."""
+    out = {"settings": {"seeds": list(C.STABILITY_SEEDS), "saved_seed": C.LGBM_SEED,
+                        "rolling_weeks": C.WF_ROLLING_WEEKS, "reps": C.POOLED_BOOTSTRAP_REPS,
+                        "bootstrap_seed": C.POOLED_BOOTSTRAP_SEED,
+                        "eval_exclude_dead": C.EVAL_EXCLUDE_DEAD, "adv_folds": C.ADV_FOLDS,
+                        "adv_per_week": C.ADV_PER_WEEK},
+           "seconds": {}}
+    parts = (("seeds", lambda: seed_stability(df, L, buckets, keeps, has_trades)),
+             ("walk_forward", lambda: walk_forward_diagnostics(buckets, keeps)),
+             ("no_dead", lambda: no_dead_evaluation(buckets, keeps, has_trades)),
+             ("adversarial", lambda: adversarial_validation(keeps)))
+    for name, fn in parts:
+        t0 = time.time()
+        try:
+            out[name] = fn()
+        except Exception as exc:  # not BaseException: Ctrl-C still stops the run
+            out[name] = {"error": variant_error(exc)}
+            print(f"WARNING: diagnostics part {name!r} failed ({out[name]['error']}); the saved "
+                  "models are not affected", flush=True)
+        out["seconds"][name] = round(time.time() - t0, 1)
+    total = sum(out["seconds"].values())
+    print("[diagnostics] " + ", ".join(f"{k} {v:.0f} s" for k, v in out["seconds"].items())
+          + f"; total {total:.0f} s", flush=True)
+    return out
 
 
 def _write_version(out_dir: Path, meta: dict, res: dict) -> None:

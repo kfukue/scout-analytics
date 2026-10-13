@@ -299,6 +299,8 @@ def render(res: dict) -> str:
             out.append(table(["feature", "gain share"], m["importance"]))
     if "dead_score" in res:
         out.append(dead_score_section(res["dead_score"]))
+    if res.get("diagnostics"):
+        out.append(diagnostics_section(res["diagnostics"], res["buckets"]))
     if res.get("variants"):
         out.append(variants_section(res["variants"], res["buckets"]))
     return "\n".join(out)
@@ -442,6 +444,255 @@ def proposal_text(p: dict) -> str:
                      f"{lift:g}); weeks meeting it {q['weeks_meeting']}/{q['weeks_judged']}; "
                      f"would {'pass' if q['would_pass'] else 'not pass'} the proposal")
     return "\n".join(lines) + "\n"
+
+
+DIAGNOSTICS_TITLE = "## Stability diagnostics (report only; not saved, not served, never a gate)\n"
+
+
+def _ci(v, lo, hi, digits=2) -> str:
+    return f"{fmt(v, digits)} [{fmt(lo, digits)}, {fmt(hi, digits)}]"
+
+
+def _part_error(part) -> str:
+    """'' or the line for a diagnostics part that failed / does not apply."""
+    if not isinstance(part, dict):
+        return "n/a\n"
+    if part.get("error"):
+        return f"**Not computed: {part['error']}.** Nothing else in this report is affected.\n"
+    if part.get("not_applicable"):
+        return f"n/a: {part['not_applicable']}.\n"
+    if part.get("off"):
+        return f"Switched off ({part['off']}).\n"
+    return ""
+
+
+def diagnostics_section(dg: dict, buckets: dict) -> str:
+    """The report-only stability diagnostics (see train.run_diagnostics)."""
+    out = [DIAGNOSTICS_TITLE]
+    if dg.get("error"):
+        return "\n".join(out + [f"**Not computed: {dg['error']}.** The saved models, their "
+                                "gates and everything above are not affected.\n"])
+    st = dg["settings"]
+    secs = dg.get("seconds") or {}
+    out.append(
+        "These sections help tell whether the results above are real or noise. They are report "
+        "only: nothing here is saved or served, the gates and the verdict above are unchanged, and "
+        "no number here passes or fails anything. Switch them off for a run with "
+        f"{C.DIAGNOSTICS_ENV}=0 (config DIAGNOSTICS). Time: "
+        + "; ".join(f"{k} {v:.0f} s" for k, v in secs.items())
+        + f" (total {sum(secs.values()):.0f} s).\n")
+    out.append(seed_section(dg.get("seeds"), buckets))
+    out.append(pooled_section(dg.get("walk_forward"), st, buckets))
+    out.append(no_dead_section(dg.get("no_dead"), buckets))
+    out.append(adversarial_section(dg.get("adversarial"), st, buckets))
+    return "\n".join(out)
+
+
+def seed_section(sd, buckets) -> str:
+    out = ["### Seed stability\n"]
+    err = _part_error(sd)
+    if err:
+        return "\n".join(out + [err])
+    seeds = ", ".join(str(s) for s in sd["seeds"])
+    out.append(
+        f"The baseline retrained with LightGBM seeds {seeds} (LGBM_SEED; STABILITY_SEEDS); seed "
+        f"{sd['saved_seed']} is the saved model (its numbers are reused, not retrained). Only the "
+        "seed changes (bagging and feature sampling, and so the rounds from early stopping / the "
+        "purged k-fold): same rows, splits, labels and walk-forward weeks. If the lift or the "
+        "pass/fail moves a lot between seeds, a single run's number is mostly noise. Counted "
+        "weeks beating = walk-forward weeks beating buy-all (counted weeks only, as the gate); "
+        "pooled WF lift = see \"Pooled walk-forward\" below.\n")
+    head = ["run", "top-10% lift [95%]", "collapses removed", "runner AUC",
+            "sim top 10% vs all (%)", "counted weeks beating buy-all", "pooled WF lift",
+            "gates (information)"]
+    for b in buckets:
+        out.append(f"#### Bucket `{b}`\n")
+        if buckets[b].get("skipped"):
+            out.append(f"n/a: {buckets[b]['skipped']}\n")
+            continue
+        rows = []
+        for seed, run in sd["runs"].items():
+            name = f"seed {seed}" + (" (saved model)" if run.get("saved_model") else "")
+            if run.get("error"):
+                rows.append([name, run["error"]] + [""] * 6)
+                continue
+            s = (run.get("buckets") or {}).get(b)
+            if s is None or s.get("skipped"):
+                rows.append([name, f"n/a: {(s or {}).get('skipped', 'not trained')}"] + [""] * 6)
+                continue
+            rows.append([name, _ci(s["top_lift"], s["top_lift_lo"], s["top_lift_hi"]),
+                         s["collapse_removed"], s["runner_auc"],
+                         f"{fmt(s['sim_top_mean'], 1)} vs {fmt(s['sim_all_mean'], 1)}",
+                         f"{s['windows_beating']}/{s['windows_evaluated']}",
+                         fmt(s["wf_pooled_lift"], 2), "PASS" if s["passed"] else "FAIL"])
+        sp = (sd.get("spread") or {}).get(b)
+        if sp:
+            for q in ("min", "median", "max"):
+                rows.append([f"**{q}**", fmt(sp["top_lift"][q], 2), sp["collapse_removed"][q],
+                             sp["runner_auc"][q],
+                             f"{fmt(sp['sim_top_mean'][q], 1)} vs {fmt(sp['sim_all_mean'][q], 1)}",
+                             fmt(sp["windows_beating"][q], 1), fmt(sp["wf_pooled_lift"][q], 2), ""])
+        out.append(table(head, rows))
+        if sp:
+            out.append("min / median / max are over the seeds per column (the sim row takes the "
+                       "min / median / max of each mean separately).\n")
+    return "\n".join(out)
+
+
+def _pooled_cells(p) -> list:
+    if not p or not p.get("weeks"):
+        return ["0", "0", "n/a (no counted week)", "", "", "", ""]
+    return [p["weeks"], p["rows"],
+            _ci(p.get("lift"), p.get("lift_lo"), p.get("lift_hi")),
+            f"{p.get('top_pos', 0)}/{p.get('top_n', 0)} of {p.get('all_pos', 0)}/{p.get('all_n', 0)}",
+            _ci(p.get("collapse_removed"), p.get("collapse_removed_lo"),
+                p.get("collapse_removed_hi"), 3),
+            f"{fmt(p.get('sim_top_mean'), 1)} vs {fmt(p.get('sim_all_mean'), 1)}; difference "
+            + _ci(p.get("sim_gain"), p.get("sim_gain_lo"), p.get("sim_gain_hi"), 1),
+            f"{p.get('weeks_beating', 0)}/{p['weeks']}"]
+
+
+POOLED_HEAD = ["walk-forward", "counted weeks", "test rows", "pooled top-10% lift [95% week bootstrap]",
+               "runners top/n of all/n", "pooled collapses removed [95%]",
+               "pooled sim top 10% vs all (%); difference [95%]", "weeks beating buy-all"]
+
+
+def _week_cell(x, k, d=3) -> str:
+    """One walk-forward week's value `k` in the per-week table."""
+    return "skipped" if x.get("skipped") else fmt(x.get(k), d)
+
+
+def _week_mark(x) -> str:
+    """Whether a walk-forward week is in the pooled weeks ("-": no such week / skipped)."""
+    if not x or x.get("skipped"):
+        return "-"
+    return "yes" if x.get("counted") else "no"
+
+
+def pooled_section(wd, st, buckets) -> str:
+    out = ["### Pooled walk-forward (expanding and rolling)\n"]
+    err = _part_error(wd)
+    if err:
+        return "\n".join(out + [err])
+    out.append(
+        "Pooled = the test rows of all counted walk-forward weeks of a bucket together (counted: "
+        f"training part of at least {C.WF_MIN_TRAIN_ROWS} rows, as the gate). Each week is ranked "
+        "by its own model (the top 10% by runner score and the top 30% by collapse score are taken "
+        "per week, as the gate does: the week models' scores are not on one scale); pooled lift = "
+        "runner rate in the per-week tops / runner rate of all pooled rows. 95% interval: "
+        f"week-block bootstrap ({st['reps']} resamples of the weeks with replacement, seed "
+        f"{st['bootstrap_seed']}); with few weeks it is rough, with one week n/a. Expanding = the "
+        f"gate's walk-forward (all calls before the week); rolling = trained only on the calls of "
+        f"the last {st['rolling_weeks']} weeks before the week (minus the embargo; "
+        "WF_ROLLING_WEEKS), same rounds and test weeks. Both are pooled over the same weeks, "
+        "the ones the expanding walk-forward counts, minus any week the rolling model could not "
+        "train (marked in the per-week table) (a paired comparison; the rolling window's "
+        f"own training size, shown in the table, is not held to the {C.WF_MIN_TRAIN_ROWS}-row "
+        "rule). If rolling is clearly better, old weeks hurt (drift); if clearly worse, the model "
+        "needs the longer history (the rolling model uses the expanding model's round count, so "
+        "part of a gap can come from that).\n")
+    for b in buckets:
+        out.append(f"#### Bucket `{b}`\n")
+        if buckets[b].get("skipped") or b not in wd:
+            out.append(f"n/a: {buckets[b].get('skipped', 'not trained')}\n")
+            continue
+        w = wd[b]
+        out.append(table(POOLED_HEAD, [["expanding (the gate's)"] + _pooled_cells(w["expanding"]),
+                                       [f"rolling ({w['rolling_weeks']} weeks)"]
+                                       + _pooled_cells(w["rolling"])]))
+        rows = []
+        for r in w["weeks"]:
+            e, ro = r["expanding"], r["rolling"]
+            rows.append([r["week"], r["start"], f"{e.get('n_train', '')} / {ro.get('n_train', '')}",
+                         e.get("n_test", ""),
+                         f"{_week_cell(e, 'top_lift', 2)} / {_week_cell(ro, 'top_lift', 2)}",
+                         f"{_week_cell(e, 'collapse_removed')} / {_week_cell(ro, 'collapse_removed')}",
+                         f"{_week_cell(e, 'sim_beats_all')} / {_week_cell(ro, 'sim_beats_all')}",
+                         f"{_week_mark(e)} / {_week_mark(ro)}"])
+        out.append(table(["week", "from", "train n (expanding / rolling)", "test n",
+                          "top lift (expanding / rolling)",
+                          "collapses removed (expanding / rolling)",
+                          "beats all (expanding / rolling)", "in the pooled weeks (expanding / rolling)"],
+                         rows))
+    return "\n".join(out)
+
+
+def no_dead_section(nd, buckets) -> str:
+    out = [f"### Evaluation without dead calls ({DEAD_COLUMN} < {C.DEAD_TRADES_24H})\n"]
+    err = _part_error(nd)
+    if err:
+        return "\n".join(out + [err])
+    out.append(
+        "The same trained models (saved model on the test part, the gate's walk-forward week "
+        "models), evaluated on the calls that were not dead after the call (EVAL_EXCLUDE_DEAD; "
+        f"NULL {DEAD_COLUMN} is kept). The top 10% / 30% are re-taken among those calls. "
+        "Evaluation only: training rows, labels, gates and the verdict are unchanged. Walk-forward: "
+        "counted weeks that still have at least "
+        f"{C.MIN_WINDOW_TEST_ROWS} test rows without the dead calls; pooled as in \"Pooled "
+        "walk-forward\".\n")
+    head = ["test rows", "calls", "top-10% lift [95%]", "runners top/n of all/n",
+            "collapses removed", "runner AUC", "sim top 10% vs all (%)",
+            "walk-forward weeks beating buy-all", "pooled WF lift [95%]",
+            "pooled WF collapses removed"]
+    for b in buckets:
+        out.append(f"#### Bucket `{b}`\n")
+        if buckets[b].get("skipped") or b not in nd:
+            out.append(f"n/a: {buckets[b].get('skipped', 'not trained')}\n")
+            continue
+        rows = []
+        for name, r in nd[b]["rows"].items():
+            p = r["wf_pooled"]
+            rows.append([name, r["n_test"], _ci(r["top_lift"], r["top_lift_lo"], r["top_lift_hi"]),
+                         lift_counts(r), r["collapse_removed"], r["runner_auc"],
+                         f"{fmt(r['sim_top_mean'], 1)} vs {fmt(r['sim_all_mean'], 1)}",
+                         f"{r['wf_weeks_beating']}/{r['wf_weeks']}",
+                         _ci(p["lift"], p["lift_lo"], p["lift_hi"]), p["collapse_removed"]])
+        out.append(f"Dead calls in the test part: {nd[b]['dead_test']}.\n")
+        out.append(table(head, rows))
+    return "\n".join(out)
+
+
+def adversarial_section(ad, st, buckets) -> str:
+    out = ["### Adversarial validation (can the test part be told from the train part?)\n"]
+    err = _part_error(ad)
+    if err:
+        return "\n".join(out + [err])
+    out.append(
+        "A LightGBM classifier is trained to tell test rows from train rows on the model's own "
+        f"inputs (the same features, without the calendar inputs {', '.join(C.ADV_EXCLUDE)}: "
+        "a test part covering only part of a week differs there by construction; outcomes and "
+        f"{DEAD_COLUMN} are never inputs). ROC AUC out of "
+        f"fold ({st['adv_folds']}-fold, stratified, shuffled with a fixed seed): about 0.5 = the "
+        "test calls look like the training calls; well above 0.5 (e.g. > 0.7) = the inputs "
+        "drifted, and the features listed (gain share) are the ones that changed most. A category "
+        "level that appears only in the test period shows up as drift too (it is missing for the "
+        "model). Information only.\n")
+    rows = []
+    for b in buckets:
+        if buckets[b].get("skipped") or b not in ad:
+            rows.append([b, "", "", f"n/a: {buckets[b].get('skipped', 'not trained')}", ""])
+            continue
+        s = ad[b]["split"]
+        rows.append([b, s["n_train"], s["n_test"],
+                     f"skipped: {s['skipped']}" if s.get("skipped") else s["auc"],
+                     ", ".join(f"{f} {g:.2f}" for f, g in s["top"])])
+    out.append(table(["bucket", "train n", "test n", "AUC (train vs test)",
+                      "top drifting features (gain share)"], rows))
+    if st.get("adv_per_week"):
+        out.append(f"Per counted walk-forward week (the newest {C.ADV_MAX_WEEKS}; that week's "
+                   "training rows vs its test rows, the expanding windows of the gate; "
+                   f"{C.ADV_WEEK_FOLDS}-fold):\n")
+        for b in buckets:
+            weeks = (ad.get(b) or {}).get("weeks") if not buckets[b].get("skipped") else None
+            if not weeks:
+                continue
+            out.append(f"#### Bucket `{b}`\n")
+            out.append(table(["week", "from", "train n", "test n", "AUC", "top 3 features"],
+                             [[w["week"], w["start"], w["n_train"], w["n_test"],
+                               f"skipped: {w['skipped']}" if w.get("skipped") else w["auc"],
+                               ", ".join(f"{f} {g:.2f}" for f, g in w["top"][:3])]
+                              for w in weeks]))
+    return "\n".join(out)
 
 
 VARIANT_NOTE = (

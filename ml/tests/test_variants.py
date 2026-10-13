@@ -58,7 +58,7 @@ def test_each_variant_changes_exactly_one_knob():
     assert C.VARIANTS["baseline"] == {}
     assert list(C.VARIANTS) == ["baseline", "dead rule on (collapse OR dead)",
                                 "raw dex instead of dex_family", "raw dex + dex_family",
-                                "runners must be tradeable"]
+                                "runners must be tradeable", "stronger regularisation"]
     for name, knobs in C.VARIANTS.items():
         if name == "baseline":
             continue
@@ -71,6 +71,14 @@ def test_each_variant_changes_exactly_one_knob():
     assert C.VARIANTS["dead rule on (collapse OR dead)"] == {"DEAD_IS_COLLAPSE": True}
     assert not any("DEAD_TRADES_24H" in k for k in C.VARIANTS.values())   # needs the rule on
     assert set(C.TRADES_VARIANTS) == {"dead rule on (collapse OR dead)", "runners must be tradeable"}
+    # the regularisation variant: one knob, a named set of stronger LightGBM settings
+    assert C.VARIANTS["stronger regularisation"] == {"LGBM_REGULARISATION": "strong"}
+    assert C.LGBM_REGULARISATION == "default" and C.LGBM_REG_SETS["default"] == {}
+    strong, base_p = C.LGBM_REG_SETS["strong"], C.LGBM_PARAMS
+    assert strong["num_leaves"] < base_p["num_leaves"]
+    assert strong["min_child_samples"] > base_p["min_child_samples"]
+    assert strong["reg_lambda"] > base_p["reg_lambda"]
+    assert strong["colsample_bytree"] < base_p["colsample_bytree"]
 
 
 def test_overrides_rebuild_features_never_leak_and_restore():
@@ -156,7 +164,8 @@ def test_variant_table_contents(plain_and_variants):
         assert base[b]["windows_beating"] == m["gates"]["windows_beating"]
         assert base[b]["passed"] == m["gates"]["passed"]
         assert base[b]["runner_auc_lightgbm"] == m["labels"]["runner"]["lightgbm"]["roc_auc"]
-        for name in DEX_VARIANTS:   # logistic uses numeric inputs only: unchanged by DEX inputs
+        # logistic uses numeric inputs only and no LightGBM setting: unchanged by these variants
+        for name in DEX_VARIANTS + ("stronger regularisation",):
             s = v[name]["buckets"][b]
             assert s["runner_auc_logistic"] == base[b]["runner_auc_logistic"], (name, b)
             assert s["collapse_auc_plain_logistic"] == base[b]["collapse_auc_plain_logistic"]

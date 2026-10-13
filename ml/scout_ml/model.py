@@ -14,8 +14,12 @@ from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import FunctionTransformer, StandardScaler
 
 from . import config as C
-from .config import (ALL_CATEGORICAL, BUCKETS, EARLY_STOPPING_ROUNDS, FALLBACK_ROUNDS,
-                     LGBM_PARAMS, LOG1P_FEATURES, MIN_CLASS_ROWS, NUMERIC_FEATURES)
+from .config import ALL_CATEGORICAL, BUCKETS
+# Everything tunable (LightGBM settings, rounds, class minimums, feature lists)
+# is read from C at call time, never bound at import, so a knob set with
+# C.overrides (or monkeypatch) after this module was imported takes effect.
+# ALL_CATEGORICAL and BUCKETS are structural (serving must know every
+# categorical and every bucket a saved model can have).
 from .features import build_features
 
 
@@ -27,12 +31,23 @@ def fit_baseline(X, y):
     """Logistic regression on numeric features: the 'is the GBM worth it' check."""
     def impute():
         return SimpleImputer(strategy="median", keep_empty_features=True)
-    plain = [c for c in NUMERIC_FEATURES if c not in LOG1P_FEATURES]
+    plain = [c for c in C.NUMERIC_FEATURES if c not in C.LOG1P_FEATURES]
     prep = ColumnTransformer([
         ("log", make_pipeline(impute(), FunctionTransformer(_log1p_clipped), StandardScaler()),
-         LOG1P_FEATURES),
+         C.LOG1P_FEATURES),
         ("plain", make_pipeline(impute(), StandardScaler()), plain)])
-    return make_pipeline(prep, LogisticRegression(C=0.5, max_iter=2000)).fit(X[NUMERIC_FEATURES], y)
+    return make_pipeline(prep, LogisticRegression(C=0.5, max_iter=2000)).fit(X[C.NUMERIC_FEATURES], y)
+
+
+def lgbm_params() -> dict:
+    """The LightGBM settings of a new fit, read now: C.LGBM_PARAMS, then the
+    C.LGBM_REG_SETS entry named by C.LGBM_REGULARISATION ("default" changes
+    nothing), then random_state = C.LGBM_SEED."""
+    if C.LGBM_REGULARISATION not in C.LGBM_REG_SETS:
+        raise ValueError(f"LGBM_REGULARISATION must be one of {sorted(C.LGBM_REG_SETS)}, "
+                         f"not {C.LGBM_REGULARISATION!r}")
+    return {**C.LGBM_PARAMS, **C.LGBM_REG_SETS[C.LGBM_REGULARISATION],
+            "random_state": C.LGBM_SEED}
 
 
 def fit_lgbm(X_train, y_train, X_val=None, y_val=None, n_estimators=None):
@@ -46,13 +61,13 @@ def fit_lgbm(X_train, y_train, X_val=None, y_val=None, n_estimators=None):
     """
     y_val = None if y_val is None else np.asarray(y_val, dtype=int)
     usable_val = n_estimators is None and y_val is not None and usable_holdout(y_val)
-    params = dict(LGBM_PARAMS)
+    params = lgbm_params()
     fit_kw = {}
     if usable_val:
         fit_kw = dict(eval_set=[(X_val, y_val)], eval_metric="binary_logloss",
-                      callbacks=[lgb.early_stopping(EARLY_STOPPING_ROUNDS, verbose=False)])
+                      callbacks=[lgb.early_stopping(C.EARLY_STOPPING_ROUNDS, verbose=False)])
     else:
-        params["n_estimators"] = n_estimators or FALLBACK_ROUNDS
+        params["n_estimators"] = n_estimators or C.FALLBACK_ROUNDS
     model = lgb.LGBMClassifier(**params)
     with warnings.catch_warnings():  # lightgbm >= 4.7 deprecates eval_set; keep 4.0 compatibility
         warnings.filterwarnings("ignore", message=".*eval_set.*")
@@ -63,14 +78,14 @@ def fit_lgbm(X_train, y_train, X_val=None, y_val=None, n_estimators=None):
         calibrator = fit_platt(model.predict(X_val, raw_score=True), y_val)
     elif n_estimators is None:
         note = ("validation part too small for early stopping/calibration: "
-                f"fixed {FALLBACK_ROUNDS} rounds, probabilities uncalibrated")
+                f"fixed {C.FALLBACK_ROUNDS} rounds, probabilities uncalibrated")
     return {"model": model, "calibrator": calibrator, "note": note}
 
 
 def usable_holdout(y) -> bool:
     """Enough of each class in a held-out part to drive early stopping/calibration."""
     y = np.asarray(y, dtype=int)
-    return min(y.sum(), len(y) - y.sum()) >= MIN_CLASS_ROWS // 3
+    return min(y.sum(), len(y) - y.sum()) >= C.MIN_CLASS_ROWS // 3
 
 
 def fit_platt(raw, y):

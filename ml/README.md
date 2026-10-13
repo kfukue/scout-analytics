@@ -346,6 +346,7 @@ baseline:
 | raw dex instead of dex_family | `DEX_INPUTS = "raw"` |
 | raw dex + dex_family | `DEX_INPUTS = "both"` |
 | runners must be tradeable | `RUNNER_NEEDS_TRADES = True`: runner also needs `trades_24h >= RUNNER_MIN_TRADES_24H` (100); NULL keeps the label |
+| stronger regularisation | `LGBM_REGULARISATION = "strong"`: `num_leaves` 15 -> 7, `min_child_samples` (min_data_in_leaf) 20 -> 50, `reg_lambda` (lambda_l2) 1 -> 10, `colsample_bytree` (feature_fraction) 0.8 -> 0.6 (`LGBM_REG_SETS`); rounds still from early stopping / the purged k-fold |
 
 Variants are report only: they are never saved or served, and the saved model,
 its `meta.json` (features, levels, rules) and its gates are always the
@@ -383,6 +384,75 @@ Runtime: about 4 to 5 times a normal run (on synthetic data of the fixture's
 size, 6,000 calls over 170 days: about 30 s without, including about 2 s for
 the dead score, and about 2 min with `--variants`).
 
+### Stability diagnostics (report only)
+
+Every `train.py` run also writes a section "Stability diagnostics" near the
+end of `report.md` (before the variant comparison; `meta.json`:
+`"diagnostics"`), to tell whether a result is real or noise. It is **report
+only: not saved, not served, never a gate**. The saved model, its `meta.json`
+fields, the gates, the verdict and everything above the section are the same
+with it on or off (`tests/test_diagnostics.py` checks this). Settings: the
+"Stability diagnostics" block of `scout_ml/config.py`.
+
+- **Seed stability**: the baseline retrained with each LightGBM seed in
+  `STABILITY_SEEDS` (7, 11, 23; 7 is the saved model's `LGBM_SEED`, its
+  numbers are reused). Per bucket and seed: test top-10% lift with its
+  interval, collapses removed, runner ROC AUC, simulation top 10% vs all,
+  counted walk-forward weeks beating buy-all, pooled walk-forward lift; then
+  min / median / max over the seeds. A lift or a PASS/FAIL that moves between
+  seeds is noise.
+- **Pooled walk-forward (expanding and rolling)**: the test rows of all
+  counted walk-forward weeks of a bucket pooled. Each week is ranked by its
+  own model (top 10% / top 30% per week, as the gate does; the week models'
+  scores are not on one scale), so pooled lift = runner rate in the per-week
+  tops / runner rate of all pooled rows. 95% interval by a week-block bootstrap
+  (`POOLED_BOOTSTRAP_REPS` = 2000 resamples of the weeks with replacement, seed
+  `POOLED_BOOTSTRAP_SEED` = 7; n/a with one week, rough with few). Also pooled
+  collapses removed, pooled simulation top 10% vs all (with an interval on the
+  difference) and weeks beating buy-all. Next to the gate's expanding
+  walk-forward, a rolling one trains each week's model on the last
+  `WF_ROLLING_WEEKS` (4) weeks of calls before the week only (minus the
+  embargo; same rounds and test weeks), with a per-week table of both. Both
+  are pooled over the same weeks, the ones the expanding walk-forward counts,
+  minus any week the rolling model could not train (marked in the per-week
+  table) (a paired comparison; the rolling window's own training size, shown in the
+  table, is not held to the `WF_MIN_TRAIN_ROWS` rule, it is small by design).
+- **Evaluation without dead calls** (`EVAL_EXCLUDE_DEAD`, on): the same
+  trained models (saved model on the test part, the gate's week models),
+  metrics recomputed on the calls that are not dead (`trades_24h < 50`; NULL
+  is kept), top shares re-taken among them. Training rows, labels and gates
+  are unchanged. n/a without a `trades_24h` column.
+- **Adversarial validation**: a LightGBM classifier (`ADV_PARAMS`) told to
+  separate the train part from the test part on the model's own inputs
+  (`build_features`, so the leakage guard holds; without the calendar inputs
+  `ADV_EXCLUDE` = `hour_utc`, `weekday_utc`, which differ by construction when a
+  part covers only part of a week). Out-of-fold ROC AUC (`ADV_FOLDS` = 5,
+  stratified, shuffled with a fixed seed; about 0.5 = no drift, above 0.7 =
+  clear drift) and the top drifting features by gain; also per counted
+  walk-forward week (`ADV_PER_WEEK`; the newest `ADV_MAX_WEEKS` = 6 weeks,
+  `ADV_WEEK_FOLDS` = 3).
+
+Switch: on by default (`DIAGNOSTICS = True`); `SCOUT_ML_DIAGNOSTICS=0` (or
+`off`, `false`, `no`) in the environment switches it off for one run, e.g.
+`SCOUT_ML_DIAGNOSTICS=0 python train.py --csv calls.csv --out models/`
+(`run_training.sh` passes the environment through; it needs no change). A part
+that raises is shown as "Not computed: error: ..." with a `WARNING` and the
+others still run; the saved model is written before the section starts.
+
+Runtime: on synthetic data of the fixture's size (6,000 calls over 170 days,
+every bucket trained) a run took 28 s without and 99 s with the section: seed
+stability 45 s (two retrains of the baseline), rolling walk-forward 10 s,
+adversarial validation 18 s, evaluation without dead calls under 1 s. The seed
+retrains cost about two normal runs, so on the prod data (about 6 s per
+variant in report 20261012-2209, `long` still skipped) expect roughly 20 to
+30 s more per run. `--variants` adds one more variant row ("stronger
+regularisation"), about one more normal run.
+
+The `model.py`, `validate.py`, `features.py` (`MIN_CATEGORY_COUNT`) and
+`labels.py` (`MAX_OUTCOME_PCT`) settings are read from `config` when a function
+runs, not bound at import, so every knob (`C.overrides`, the variants, the
+seeds) takes effect.
+
 ## Read the report
 
 `models/<version>/report.md`, top to bottom:
@@ -413,7 +483,10 @@ the dead score, and about 2 min with `--variants`).
    calibration side by side.
 4. **Dead after the call: separate score** (report only; see "Dead after the
    call: separate score" above).
-5. With `--variants` only: **Variant comparison**, one table per bucket (see
+5. **Stability diagnostics** (report only; see "Stability diagnostics"
+   above): seed stability, pooled and rolling walk-forward, evaluation
+   without dead calls, adversarial validation.
+6. With `--variants` only: **Variant comparison**, one table per bucket (see
    "Variant comparison" above).
 
 If LightGBM is not clearly better than the logistic baseline, the data does
@@ -517,9 +590,10 @@ roll back, write an older version name into `models/LATEST`. Compare the new
     scout_ml/validate.py  time splits, embargo, purged k-fold, token grouping, walk-forward, metrics
     scout_ml/model.py     LightGBM + calibration, logistic baseline, serving bundle
     scout_ml/report.py    report.md
+    scout_ml/diagnostics.py  report-only stability diagnostics (pooled walk-forward, bootstrap, adversarial)
     train.py  serve.py  make_synthetic.py  tests/
 
-    python -m pytest tests -q        # 187 passed, about 2.5 minutes
+    python -m pytest tests -q        # 206 passed, about 2.5 to 3 minutes
 
 `build_features` raises if an outcome or bookkeeping column (anything starting
 with `ret_`, `max_gain_`, `max_dd_`, `trades_`, `peak_late_after_`, `peak_after_`,
