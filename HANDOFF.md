@@ -1,6 +1,124 @@
 # Scout analytics: handoff to Claude Code
 
-## Session state (12 October 2026, end of session: main 228b3e0 after PRs #26-#30; prod at 68a4954 unless the owner deployed since)
+## Session state (13 October 2026: main 56ad247 after PRs #31-#35; prod pulled 56ad247)
+
+This section supersedes the 12 October one below wherever they differ.
+
+**Main and prod:** main is at **56ad247** (PR #35). The owner reported
+13 Oct that he pulled main on the server and restarted the listener
+(`-listen-only`), `-web` and the tracker (`-track`), and is retraining.
+The prod commit hash was not read back, so 56ad247 there is the owner's
+report, not a checked `git log`. His PC's main checkout was still at
+de4b642 at that point (block A `git pull` pending), so the PM's 13 Oct
+worktrees branch from `origin/main`. Merged 13 Oct (PR, merge commit,
+branch head):
+
+- PR #31 (ff83467; head b30e1f7): this file for the 12 Oct session.
+- PR #32 (de4b642; heads 8623d8a, 8676bec): the PM commits, pushes and
+  opens PRs with `gh`; the owner reviews and merges ("Create a merge
+  commit"). Supersedes "agents never commit or push" below.
+- PR #33 (815ceb3; head 46274da, `work/2026-10-13-timing-real-held`):
+  Timing tab shows the **real time held at 2×** (stored `above_2x_s`) for
+  calls that touched 2× but held under 1 h; they used to count as 0 held.
+  Held histogram in three colours (grey 0 held, amber touched but under
+  1 h, blue reached 2× after 1 h or more). "Reached 2×" (1 h or more held)
+  and the 1h window's "n/a — needs 1 hour held" are unchanged. Frontend,
+  README and tests only.
+- PR #34 (382b1b6; head ccf5ded, `work/2026-10-13-ml-pooled-gates`): ML
+  gates **option (b)**. Runner lift = median over seeds 7/11/23 of the
+  pooled expanding walk-forward top-10% lift, which must be at least 2,
+  plus a bootstrap lower end above 1.0 for the saved seed. The pooled sim
+  difference (top 10% minus all) must have a lower end above 0.
+  "Collapses removed ≥ 40%" is unchanged. The absolute return is
+  information only. Missing inputs fail with a reason. The old gate is
+  kept under `gates.old` (information only). `meta.json`
+  `gates.passed` (read by `serve.py`) follows the new gates. Seed
+  retrains and pooled WF now run in every training
+  (`SCOUT_ML_DIAGNOSTICS=0` only drops rolling WF, no-dead and
+  adversarial). There is a new report-only variant, "no calls_prev
+  inputs" (`calls_prev_1h/24h` drove the train/test drift: adversarial
+  AUC 0.99). `GATE_MIN_POOLED_WEEKS = 2` is an implementer default, not
+  an owner decision. `ml/` only.
+- PR #35 (56ad247; head 46f2bfe, `work/2026-10-12-salpha-reask`): sAlpha
+  re-ask moved onto main and finished:
+  - Declines are no longer forwarded (header `no report (declined: …)`).
+  - Re-ask lane `salpha_reask.go`, off unless `SCOUT_SALPHA_REASK`: 6–24 h
+    after the call, at most 60 a day, `scan_kind='reask'`, sent as a reply
+    to the original delivery (`notify_message_id`), plus
+    `-salpha-reask-missing [-dry-run]`.
+  - `/api/call` version 3.
+  - `notify_message_id` is also stored for Perceptor re-check deliveries.
+  - `FirstSentDelivery` treats `sending` as not sent.
+  - Bot API 429 retry on the live path (honours `retry_after`; at most 3
+    retries / 60 s; otherwise `failed` and logged).
+  - **Bot-token redaction** (`botAPIRedact` on every Bot API error).
+  - **Re-check score line persisted** across listener restarts (owner
+    option (a): `score_line` in the held Perceptor investigation's
+    `details` JSONB; never re-scored).
+  - Schema: `scout_deliveries.notify_message_id` plus a partial index for
+    `reask` rows (repeat-safe; no new table; `onchainStateVersion`
+    unchanged).
+  - Leakage: re-ask rows, re-check results and `score_line` are never
+    read by the dataset view, the export, scoring or `ml/`.
+
+**Owner decisions taken 13 Oct (each recorded in its PR description):**
+Timing shows the real time held (supersedes 12 Oct "0 held"); ML gates
+option (b); re-check score line persisted, option (a). `SCOUT_SALPHA_REASK`
+stays off until the owner has checked `go run . -salpha-reask-missing
+-dry-run`.
+
+**Latest model report (20261013-0702, trained on prod 13 Oct on code with
+PR #29, the first report with its diagnostics; 4,759 rows, data to
+13 Oct):**
+- Old single-run gates: short FAIL (lift 1.09), 3day PASS (lift 2.12
+  [1.30, 3.27], WF 6/6), medium PASS (lift 2.05 [1.20, 3.36], WF 4/4).
+  Long skipped (2,982 rows over 47 days).
+- Seed stability (short): seeds 7/11/23 lift 1.09/1.47/0.99, all FAIL.
+- Under the PR #34 gates (re-scored in the PR, not a retrain): 3day FAIL
+  (pooled-WF median 1.98 of 1.98/2.02/1.85); medium PASS (median 2.18,
+  lower end 1.74, sim difference +43.1 [36.7, 51.6]); short FAIL.
+- Diagnostics time on prod: 29 s (seeds 16, walk_forward 4, no_dead 0,
+  adversarial 9).
+- The retrain the owner started on 56ad247 is the first under the new
+  gates: send its `report.md`.
+
+**Owner to-do after the 56ad247 deploy:**
+
+1. PC: block A, `git pull` in the main checkout, then remove the merged
+   worktrees `.claude\worktrees\timing-real-held-20261013`,
+   `ml-pooled-gates-20261013` and `salpha-reask-20261012`. Then
+   `git branch -d` their branches (`work/2026-10-13-timing-real-held`,
+   `work/2026-10-13-ml-pooled-gates`, `work/2026-10-12-salpha-reask`).
+2. Website: Analytics → Timing at 1280/390 px, light and dark: the
+   three-colour held histogram and its key in 1d; amber and grey only in
+   1h; the "Held at 2×" medians; key swatches grey for groups under 20
+   calls; the sA badge/detail; no CSP errors.
+3. Listener: the start line applied the schema (no errors); a sAlpha
+   decline now shows `no report (declined: …)` and is not forwarded.
+4. `go run . -salpha-reask-missing -dry-run` and send the count before
+   deciding to switch `SCOUT_SALPHA_REASK` on.
+5. Send the new model's `report.md` (to `ml-results/models/<version>/`
+   on the PC) and the `[diagnostics]` time line.
+6. Tracker: check the `latest prices on:` line after the restart.
+7. Still open from 12 Oct: scoring service not installed yet ("Then
+   switch scores on" below), so no scoring-service restart is needed for
+   PR #34.
+
+**In progress (13 Oct, PM worktrees from `origin/main` 56ad247,
+uncommitted):**
+
+| Worktree | Branch | Work |
+|---|---|---|
+| go-small-fixes-20261013 | `work/2026-10-13-go-small-fixes` | `paceWait` only lowers `nextLook`; narrow `isNoSuchValue`; "0 red flags" parser; `TestScoreCallBudget` margin |
+| testdb-guard-20261013 | `work/2026-10-13-testdb-guard` | DB tests refuse any `SCOUT_TEST_DATABASE_URL` that is not `scout_test` on localhost; the `localhost:5432` example comment |
+| reply-to-filter-20261013 | `work/2026-10-13-reply-to-filter` | only accept bot replies that reply to our own request (all lanes) |
+| handoff-resume-20261013 | `work/2026-10-13-handoff-resume` | this file and the PM skill's decision list |
+
+Also: an `investigate` check of whether the old worktree
+`agent-ae167c3d46439a04d` (18 uncommitted entries, ported as PR #35) holds
+anything not on main. Keep it until that check says it is safe.
+
+## Previous session state (12 October 2026, end of session: main 228b3e0 after PRs #26-#30; history, superseded by 13 October above where they differ)
 
 **Main and prod:** main is at **228b3e0** on GitHub (PR #30, merged
 12 Oct 23:20 PDT). Prod ran **68a4954** at the last confirmation (deployed
@@ -412,8 +530,8 @@ Never touch the owner's own Postgres server.
 
 ## Introduction
 
-Up to date as of 12 October 2026, end of session (main at 228b3e0; prod at
-68a4954 at the last confirmation, 228b3e0 deploy pending). Start Claude
+Up to date as of 13 October 2026 (main at 56ad247; prod pulled 56ad247
+and restarted, per the owner). Start Claude
 Code in the repo root; `.claude/settings.json` makes the session the product
 manager, which delegates to the agents in `.claude/agents/` (see "Agent setup").
 
@@ -433,22 +551,15 @@ matter are in section 5. Package `main` is at the repo root: `go run .`.
 ## Deferred / open
 
 Kept current by the PM whenever an item is deferred or an owner check is
-pending (12 October 2026). Items marked "on branch" are not on `main` yet.
-The Perceptor re-check (PR #20), the GCP site draft (PR #18), ML score
-gating (PR #19), the score live fixes (PR #21) and the Timing tab (PR #22)
-are on `main` (68a4954) and deployed on prod (owner, 12 Oct); the owner
-checks still open from that deploy are at the top. `SCOUT_MODEL_LINE`
-(PR #23, `ml/` only) is on `main` (c31d859); it takes effect once the
-scoring service runs from a checkout that has it. The scoring-service unit
-and runbook `ops/scout-model.*` (PR #24, 77dce3d) are on `main`
-but not installed on prod yet ("Then switch scores on" at the top).
-Merged 12 Oct, on `main` (228b3e0) but not deployed yet: the agent setup
-(PR #26; in use since the Claude Code restart), the Timing tab "reached 2×"
-rule (PR #27; needs `-web` restarted), the re-check score line and the
-rune-safe Bot API split (PR #28; needs the listener restarted), the ML
-stability diagnostics (PR #29; take effect at the next retrain) and the PM
-git commands (PR #30; take effect after a Claude Code restart). Owner
-to-do at the top ("Owner to-do: deploy 228b3e0").
+pending (13 October 2026). Everything through PR #35 is on `main`
+(56ad247), and the owner reported it pulled and restarted on prod 13 Oct
+(listener, `-web`, tracker; retrain running). The owner checks from that
+deploy are in "Owner to-do after the 56ad247 deploy" at the top. The
+scoring-service unit `ops/scout-model.*` (PR #24) is on `main` but not
+installed on prod yet ("Then switch scores on" in the 12 Oct state).
+Resolved 13 Oct: sAlpha re-ask, bot-token redaction, re-check score-line
+persistence (PR #35); ML gates option (b) (PR #34); Timing real time held
+(PR #33).
 
 - **Not on `main`** (each item exists as uncommitted changes, or a local
   commit not yet pushed, in an agent worktree under `.claude/worktrees/` —
@@ -457,42 +568,18 @@ to-do at the top ("Owner to-do: deploy 228b3e0").
     (agent-afcf62469a29564cf) (paused, see Session state).
   - CI draft `.github/workflows/test.yml` (agent-aa31691b57e3bc7ff; owner
     approval) (paused, see Session state).
-  - sAlpha re-ask (re-ask when the first answer was declined, empty or timed
-    out; section 3 "Decisions 9 October"): update onto main first (the
-    worktree is 45 commits behind 228b3e0). Still to do on that branch: store
-    `notify_message_id` for re-check deliveries; treat the `sending` status
-    as not sent in `FirstSentDelivery`; Bot API 429 pause on the live path;
-    then review. `notify_message_id`, `FirstSentDelivery` and `botAPIRedact`
-    exist only on the re-ask branch (worktree `agent-ae167c3d46439a04d`); the
-    `sending` delivery status is on `main` since PR #20, so the
-    `FirstSentDelivery` item can be done once re-ask is updated onto main.
-- **Should-fix, deferred:** in `recheck.go` (on `main` since PR #20), the
-  `paceWait` branch should only lower `nextLook`:
-  `if at := now.Add(wait); at.Before(l.nextLook) { l.nextLook = at }`.
-- **Should-fix, owner to decide (12 Oct):** bot-token redaction: on `main`
-  a network-level Bot API send error (`*url.Error` from
-  `http.DefaultClient.Do`) contains the full URL including the bot token
-  and can reach the listener logs (pre-existing); `botAPIRedact` exists
-  only on the sAlpha re-ask branch; proposed: pull it forward as its own
-  small fix.
-- **Owner decision pending (12 Oct):** persist the Perceptor re-check score
-  line (PR #28 keeps it in memory; lost after a full listener restart):
-  (a) a `score_line` key in the held Perceptor investigation's `details`
-  JSONB written in `MarkHeldForRecheck`, or (b) a column (schema change).
-  Shipped without it for now.
-- **Small fixes:**
-  - narrow `isNoSuchValue` (`onchain.go`);
-  - the "0 red flags" parser bug: a Perceptor report with zero red flags is
-    parsed wrongly;
-  - `reply_to_msg_id` filtering: only accept bot replies that reply to our
-    own request;
+  - In progress 13 Oct (table "In progress" at the top): Go small fixes
+    (`paceWait` only lowers `nextLook`, narrow `isNoSuchValue`, the
+    "0 red flags" parser, `TestScoreCallBudget` margin), the test-DB
+    safety guard (plus the `scout_models_db_test.go:18` `localhost:5432`
+    example), and `reply_to_msg_id` filtering.
+  - The old worktree `agent-ae167c3d46439a04d` is a backup of the work
+    ported as PR #35; it is kept until an `investigate` check confirms it
+    holds nothing that is not on main.
+- **Owner setting:** `SCOUT_SALPHA_REASK` stays off until the owner has
+  checked `go run . -salpha-reask-missing -dry-run`.
+- **Small fixes, not started:**
   - wait-group hardening: the listener goroutines on a Telegram reconnect;
-  - test-DB safety guard: make DB tests refuse any `SCOUT_TEST_DATABASE_URL`
-    that is not database `scout_test` on localhost/127.0.0.1 (touches many
-    `*_db_test.go` files; do it after the sAlpha re-ask branch merges; the
-    Perceptor re-check is merged).
-  - `scout_models_db_test.go:18`: the example DSN in the comment still uses
-    `localhost:5432`; change it to a throwaway port as in README/TESTING.md;
   - Timing tab (PR #22 review notes): the Kaplan–Meier caption wording, and
     the unused `ech-tip-box` CSS class.
 - **Owner checks:**
@@ -500,13 +587,9 @@ to-do at the top ("Owner to-do: deploy 228b3e0").
     and Perceptor report links; confirm (b) publish, or ask for (a) labels
     only with an opt-in in `deploy/gcp/INTERFACE.md`, before the Go export
     is written (section 4 item 8; PM recommends (a): both are paid bots);
-  - ML gates: (a) keep current + stability checks, or (b) stricter
-    pooled-WF/bootstrap-CI gates (Session state, "ML research"); settle it
-    with the first report that has the PR #29 diagnostics;
-  - Timing tab: the "0 held" reading for calls that touched 2× but held
-    under 1 h (PR #27) stays as built unless the owner objects;
-  - after the 228b3e0 deploy: Timing 1h shows "n/a — needs 1 hour held",
-    1d shows numbers, legend at 1280/390 px light/dark, no CSP errors;
+  - ML: the first report under the PR #34 gates (the retrain on 56ad247);
+    `GATE_MIN_POOLED_WEEKS = 2` is an implementer default the owner may
+    change;
   - disk space: ~318 GB free on C: (12 Oct; was ~100 MB before the
     owner's 10 Oct clean-up, which blocked Go builds); old agent
     scratchpads under `...\AppData\Local\Temp\claude\...` (~5.5 GB) may be
@@ -524,7 +607,8 @@ to-do at the top ("Owner to-do: deploy 228b3e0").
     settings"); the owner decides.
 - **Later:** Timing tab frontend (`/api/analytics` format 4): merged (PR
   #22) and deployed 12 Oct; the owner still records the real gzipped size
-  (top); the "reached 2×" rule (PR #27) is merged, not deployed; ML timing
+  (top); the "reached 2×" rule (PR #27) and the real time held (PR #33)
+  are deployed (owner restart 13 Oct); ML timing
   outcome columns: the
   leakage guard (`FORBIDDEN_PREFIXES`/`FORBIDDEN_COLUMNS`) for the timing and
   rug columns (`peak_late_after_s`, `first_2x_after_s`, `above_2x_s`,

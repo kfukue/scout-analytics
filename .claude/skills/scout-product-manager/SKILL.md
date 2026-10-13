@@ -40,11 +40,15 @@ anything non-trivial (`DEPLOY.md` and `ml/RUNBOOK.md` for deploy and training).
   report; shown on the website as the "Perceptor today" label. `SCOUT_RESCAN=on`
   in prod since 8 October 2026.
 - **Model** (`ml/`): LightGBM plus a logistic baseline, buckets `short`, `3day`,
-  `medium`, `long`; first calls only. A bucket passes only if top-10% lift >= 2,
-  skipping the 30% highest collapse scores removes >= 40% of (plain) collapses,
-  and the top-10% simulation beats buy-everything in every counted
-  walk-forward week (weeks with at least 1000 training rows,
-  `WF_MIN_TRAIN_ROWS`; on main since PR #15, f072467, 10 Oct). Scores never filter deliveries; they
+  `medium`, `long`; first calls only. Gates since PR #34 (382b1b6,
+  13 Oct; owner option (b)): a bucket passes only if the median over seeds
+  7/11/23 of the pooled expanding walk-forward top-10% lift is >= 2 and the
+  saved seed's week-block bootstrap lower end is > 1.0; the pooled
+  simulation difference (top 10% minus buy-all) has a 95% lower end > 0;
+  and skipping the 30% highest collapse scores removes >= 40% of (plain)
+  collapses on the test part. Missing inputs fail with a reason; the old
+  single-run gate is kept as information (`gates.old`). Walk-forward weeks
+  count only with at least 1000 training rows (`WF_MIN_TRAIN_ROWS`). Scores never filter deliveries; they
   are only appended as one line, whose buckets are set by `SCOUT_MODEL_LINE` on
   the scoring service (default `passed`; prod is to run `all` once the
   scoring service is installed, failing buckets marked "(not validated)"). The `long` bucket waits for matured data until about
@@ -201,6 +205,12 @@ back.
   resolved files, commit the merge and push. `implement` never runs
   `git merge`, `git rebase` or `git commit`. A merge needs no force push;
   never `--force`.
+- If the main checkout's local `main` is behind `origin/main` (the owner has
+  not run block A's `git pull` yet; check with `git log -1 --oneline main`
+  and `origin/main` after `git fetch`), use `origin/main` instead of `main`
+  as the start point of `git worktree add -b`. The new branch then tracks
+  `origin/main`; the first `git push -u origin <branch>` replaces that
+  (13 Oct 2026).
 - Prune merged worktrees (the owner removes them, block A). Check leftovers
   with `git worktree list` and `git branch --list "work/*"` and list them to
   the owner rather than deleting unmerged work.
@@ -432,7 +442,7 @@ From the repo root on the server:
 
 Every Go start applies `scoutanalytics.sql` unless `SCOUT_DB_AUTO_MIGRATE=false`.
 
-## Owner decisions in force (8-12 October 2026)
+## Owner decisions in force (8-13 October 2026)
 
 - The `long` model waits for data (about 25 December) rather than loosening the
   threshold.
@@ -447,9 +457,13 @@ Every Go start applies `scoutanalytics.sql` unless `SCOUT_DB_AUTO_MIGRATE=false`
 - Perceptor reports that say "not enough data yet" get an `insufficient` level
   and an automatic re-check about 12 minutes later instead of being dropped
   (merged in PR #20, deployed 12 Oct in 68a4954).
-- sAlpha: re-ask when the first answer was declined, empty or timed out (on
-  the unmerged worktree `agent-ae167c3d46439a04d`; it must be updated onto
-  main before review).
+- sAlpha: declines are never forwarded; re-ask when the first answer was
+  declined, empty or timed out (merged in PR #35, 56ad247, 13 Oct). The lane
+  stays off (`SCOUT_SALPHA_REASK` unset) until the owner has checked
+  `go run . -salpha-reask-missing -dry-run`.
+- 13 Oct: the Perceptor re-check delivery's score line survives a listener
+  restart (option (a): `score_line` in the held investigation's `details`
+  JSONB; never re-scored; PR #35).
 - Public read-only site on GCP Cloud Run at `scout-analytics.lylelabs.io`
   (draft in `deploy/gcp/`, merged in PR #18; no Go export and no GCP resources
   yet). Nothing is created in the cloud without the owner's approval.
@@ -465,8 +479,12 @@ Every Go start applies `scoutanalytics.sql` unless `SCOUT_DB_AUTO_MIGRATE=false`
   deliveries. Supersedes "scores only after a report passes" for this group.
 - 12 Oct: Timing tab: "reached 2×" = at or above 2× for at least 1 hour in
   total, in every window; windows too short for it (1h) show
-  "n/a — needs 1 hour held"; touch-and-drop calls count as 0 held (merged
-  12 Oct).
+  "n/a — needs 1 hour held" (merged 12 Oct, PR #27).
+- 13 Oct (supersedes "touch-and-drop calls count as 0 held"): time-held
+  figures use the real time held (`above_2x_s`) for every call that touched
+  2×; "reached 2×" still needs 1 hour held (PR #33).
+- 13 Oct: ML gates option (b), pooled walk-forward + seed median (PR #34;
+  see "Model" under "The project").
 - 12 Oct: the PM has the `Bash` tool for git only: read-only git, `git fetch`
   and `git worktree add` to create worktrees for `implement`; never add,
   commit, push, stash, switch, reset, rebase or merge (see "Your git
