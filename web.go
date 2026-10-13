@@ -69,6 +69,11 @@ type webConfig struct {
 	// SCOUT_WEB_REFRESH: how often the list is read again from the database
 	// (0 = the default)
 	Refresh time.Duration
+	// ModelScores: send the model's scores (each row's model in
+	// /api/calls, sort=model). Always on for this website
+	// (loadWebConfig); a public copy (deploy/gcp) runs with it off: no row
+	// carries a score and sort=model is refused.
+	ModelScores bool
 }
 
 // parseWebRefresh reads SCOUT_WEB_REFRESH: a duration, at least minWebRefresh.
@@ -98,6 +103,7 @@ func loadWebConfig() webConfig {
 		GMGNTemplate: env("SCOUT_GMGN_URL", defaultGMGNTemplate),
 		Dir:          env("SCOUT_WEB_DIR", ""),
 		Refresh:      refresh,
+		ModelScores:  true,
 	}
 }
 
@@ -267,18 +273,21 @@ func writeJSONError(w http.ResponseWriter, status int, msg string) {
 // webCallsResponse is the body of GET /api/calls. Calls holds one row per
 // token (its first call); Total counts those rows.
 type webCallsResponse struct {
-	Total      int            `json:"total"`
-	Page       int            `json:"page"`
-	Per        int            `json:"per"`
-	Horizon    string         `json:"horizon"`
-	Sort       string         `json:"sort"`
-	Dir        string         `json:"dir"`
-	USDOnly    bool           `json:"usd_only"`
-	Verdict    string         `json:"verdict"`     // the Perceptor filter as a list, e.g. "clean,caution"; "" = all
-	Verdicts   []string       `json:"verdicts"`    // the same list as an array; [] = all
-	Days       int            `json:"days"`        // the age filter: calls from the last Days days (of SnapshotAt); 0 = all
-	SnapshotAt time.Time      `json:"snapshot_at"` // when the list was last read from the database
-	Calls      []ScoutWebCall `json:"calls"`
+	Total      int       `json:"total"`
+	Page       int       `json:"page"`
+	Per        int       `json:"per"`
+	Horizon    string    `json:"horizon"`
+	Sort       string    `json:"sort"`
+	Dir        string    `json:"dir"`
+	USDOnly    bool      `json:"usd_only"`
+	Verdict    string    `json:"verdict"`     // the Perceptor filter as a list, e.g. "clean,caution"; "" = all
+	Verdicts   []string  `json:"verdicts"`    // the same list as an array; [] = all
+	Days       int       `json:"days"`        // the age filter: calls from the last Days days (of SnapshotAt); 0 = all
+	SnapshotAt time.Time `json:"snapshot_at"` // when the list was last read from the database
+	// ModelScores: whether this website sends model scores
+	// (webConfig.ModelScores); when false every row's model is null
+	ModelScores bool           `json:"model_scores"`
+	Calls       []ScoutWebCall `json:"calls"`
 }
 
 var webCallsParams = map[string]bool{"q": true, "sort": true, "dir": true, "horizon": true, "usd_only": true, "verdict": true, "days": true, "page": true, "per": true}
@@ -340,7 +349,7 @@ func parseWebCallsQuery(v url.Values) (webCallsQuery, error) {
 		return f, err
 	}
 	usdOnly := "0"
-	if f.Sort != "date" { // every other sort: only USD-priced calls have the value
+	if f.Sort != "date" && f.Sort != webSortModel { // every other sort: only USD-priced calls have the value
 		usdOnly = "1"
 	}
 	if err := oneOf("usd_only", &usdOnly, "1", "0"); err != nil {
@@ -1114,6 +1123,9 @@ func (s *webServer) handleCalls(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	f, err := parseWebCallsQuery(vals)
+	if err == nil && f.Sort == webSortModel && !s.cfg.ModelScores {
+		err = errors.New("sort: model scores are not shown on this website")
+	}
 	if err != nil {
 		writeJSONError(w, http.StatusBadRequest, err.Error())
 		return
@@ -1139,7 +1151,7 @@ func (s *webServer) handleCalls(w http.ResponseWriter, r *http.Request) {
 		// everything but the rows, which are already encoded in the snapshot
 		head, err = json.Marshal(webCallsResponse{Total: total, Page: f.Page, Per: f.Per, Horizon: f.Horizon,
 			Sort: f.Sort, Dir: f.Dir, USDOnly: f.USDOnly, Verdict: f.Verdict, Verdicts: webVerdictSlice(f.Verdict),
-			Days: f.Days, SnapshotAt: snap.loadedAt, Calls: []ScoutWebCall{}})
+			Days: f.Days, SnapshotAt: snap.loadedAt, ModelScores: s.cfg.ModelScores, Calls: []ScoutWebCall{}})
 		if err == nil && !bytes.HasSuffix(head, []byte(webNoCallsJSON)) {
 			err = errors.New("unexpected encoding of the answer")
 		}

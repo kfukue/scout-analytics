@@ -30,8 +30,9 @@ import (
 //   - Every refresh (whatever started it) compares the new snapshot with the one
 //     before and publishes the differences as Server-Sent Events on
 //     GET /api/events: "call" (a new token row), "report" (a token's Perceptor
-//     verdict or sAlpha report changed) and "reload" (too many changes at once,
-//     or events were missed). Without LISTEN the page still gets them, only as
+//     verdict or sAlpha report changed), "score" (a row's model score arrived
+//     or changed) and "reload" (too many changes at once, or events were
+//     missed). Without LISTEN the page still gets them, only as
 //     late as the next regular refresh.
 //
 // Requests are still answered from the snapshot only: the events carry rows
@@ -151,7 +152,9 @@ type webEventOut struct {
 // ("Perceptor today"), or whose Perceptor filter bucket (the latest report
 // with a verdict) changed otherwise. Every row an event carries has its
 // perceptor_latest_verdict, so the page can tell whether it now enters or
-// leaves its Perceptor filter. Rows that went away send nothing. More than
+// leaves its Perceptor filter. A "score" goes for each row whose model score
+// arrived or changed (webSnapshot.modelAt). Rows that went away
+// send nothing. More than
 // webEventsMaxPerRefresh events become one "reload". Both snapshots are in
 // place already and are only read.
 func webSnapshotEvents(prev, next *webSnapshot) []webEventOut {
@@ -160,7 +163,8 @@ func webSnapshotEvents(prev, next *webSnapshot) []webEventOut {
 	}
 	type change struct {
 		pos  int32
-		tool string // "" = a new row
+		kind string // scoutEventCall (a new row), scoutEventReport or scoutEventScore
+		tool string // report: the tool
 	}
 	var changes []change
 	i, j := 0, 0
@@ -169,23 +173,28 @@ func webSnapshotEvents(prev, next *webSnapshot) []webEventOut {
 		case i < prev.n && prev.ids[i] < next.ids[j]:
 			i++ // a row that went away
 		case i >= prev.n || prev.ids[i] > next.ids[j]:
-			changes = append(changes, change{pos: int32(j)})
+			changes = append(changes, change{pos: int32(j), kind: scoutEventCall})
 			j++
 		default: // the same row
 			// the call-time verdict (its own bucket, not the filter's) or report
 			perc := prev.callVerd[i] != next.callVerd[j] || (next.percID[j] != 0 && next.percID[j] != prev.percID[i])
 			if perc {
-				changes = append(changes, change{pos: int32(j), tool: webToolPerceptor})
+				changes = append(changes, change{pos: int32(j), kind: scoutEventReport, tool: webToolPerceptor})
 			}
 			if next.salphaID[j] != 0 && next.salphaID[j] != prev.salphaID[i] {
-				changes = append(changes, change{pos: int32(j), tool: webToolSAlpha})
+				changes = append(changes, change{pos: int32(j), kind: scoutEventReport, tool: webToolSAlpha})
 			}
 			// a new or changed re-scan, or else the Perceptor filter's bucket
 			// moved: the row may enter or leave a filtered page, so it is
 			// sent too, quietly, as a re-scan is
 			today := next.todayVerd[j] != 0 && (next.todayVerd[j] != prev.todayVerd[i] || next.todayAt[j] != prev.todayAt[i])
 			if today || (!perc && prev.flags[i]&^webFlagUSD != next.flags[j]&^webFlagUSD) {
-				changes = append(changes, change{pos: int32(j), tool: webEventPerceptorToday})
+				changes = append(changes, change{pos: int32(j), kind: scoutEventReport, tool: webEventPerceptorToday})
+			}
+			// the model's score arrived or changed (its time: a re-score keeps
+			// the row id, not the time); sent quietly by the page
+			if next.modelAt[j] != prev.modelAt[i] {
+				changes = append(changes, change{pos: int32(j), kind: scoutEventScore})
 			}
 			i++
 			j++
@@ -195,25 +204,27 @@ func webSnapshotEvents(prev, next *webSnapshot) []webEventOut {
 		return nil
 	}
 	if len(changes) > webEventsMaxPerRefresh {
-		calls := 0
+		calls, scores := 0, 0
 		for _, c := range changes {
-			if c.tool == "" {
+			switch c.kind {
+			case scoutEventCall:
 				calls++
+			case scoutEventScore:
+				scores++
 			}
 		}
-		data := fmt.Appendf(nil, `{"calls":%d,"reports":%d}`, calls, len(changes)-calls)
+		data := fmt.Appendf(nil, `{"calls":%d,"reports":%d,"scores":%d}`, calls, len(changes)-calls-scores, scores)
 		return []webEventOut{{kind: "reload", data: data}}
 	}
 	h, _ := webHorizonIndex(webEventHorizon) // a constant of ScoutWebHorizons (TestWebSnapshotEvents checks the rows)
 	out := make([]webEventOut, 0, len(changes))
 	for _, c := range changes {
 		id := int(next.ids[c.pos])
-		b := make([]byte, 0, 1200)
+		b := make([]byte, 0, 1800)
 		b = append(b, `{"call_id":`...)
 		b = strconv.AppendInt(b, int64(id), 10)
-		kind := scoutEventCall
-		if c.tool != "" {
-			kind = scoutEventReport
+		kind := c.kind
+		if kind == scoutEventReport {
 			b = append(b, `,"tool":"`...)
 			b = append(b, c.tool...)
 			b = append(b, '"')

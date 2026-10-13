@@ -2078,7 +2078,40 @@ func (st *ScoutStore) SelectWebRows(ctx context.Context) ([]ScoutWebRow, int, er
 	if err := rows.Err(); err != nil {
 		return nil, 0, err
 	}
+	rows.Close()
+	preds, err := selectWebPredictions(ctx, tx)
+	if err != nil {
+		return nil, 0, fmt.Errorf("model scores: %w", err)
+	}
+	attachWebModel(out, preds)
 	return out, updatePosts, nil
+}
+
+// webPredictionsSQL reads the bucket model's scores for the website, in call
+// id order, oldest first (ties by id). The features column is never read, and
+// the first experiment's rows (bucket NULL) are left out.
+const webPredictionsSQL = `SELECT call_id, model_version, bucket, runner_prob::float8, collapse_prob::float8,
+	runner_rank_pct::float8, passed, created_at
+	FROM scout_call_predictions
+	WHERE bucket IS NOT NULL AND call_id IS NOT NULL
+	ORDER BY call_id, created_at, id`
+
+// selectWebPredictions runs webPredictionsSQL in SelectWebRows' transaction.
+func selectWebPredictions(ctx context.Context, tx pgx.Tx) ([]ScoutWebPrediction, error) {
+	rows, err := tx.Query(ctx, webPredictionsSQL)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []ScoutWebPrediction
+	for rows.Next() {
+		var p ScoutWebPrediction
+		if err := rows.Scan(&p.CallID, &p.Version, &p.Bucket, &p.Runner, &p.Collapse, &p.Rank, &p.Passed, &p.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
 }
 
 // SelectWebTrades24h returns, for each of the given calls, the number of swaps

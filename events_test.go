@@ -302,7 +302,7 @@ func TestWebSnapshotEvents(t *testing.T) {
 			rows = addRow(newID+2*k)(rows, nil)
 		}
 		evs := webSnapshotEvents(snapWithReports(t, cloneWebRows(base), baseReports), snapWithReports(t, rows, baseReports))
-		want := fmt.Sprintf(`{"calls":%d,"reports":0}`, webEventsMaxPerRefresh+1)
+		want := fmt.Sprintf(`{"calls":%d,"reports":0,"scores":0}`, webEventsMaxPerRefresh+1)
 		if len(evs) != 1 || string(evs[0].data) != want {
 			t.Fatalf("got %v, want one reload with %s", evs, want)
 		}
@@ -313,7 +313,7 @@ func TestWebSnapshotEvents(t *testing.T) {
 			rows = setToday(k, "caution", todayAt)(rows, nil)
 		}
 		evs := webSnapshotEvents(snapWithReports(t, cloneWebRows(base), baseReports), snapWithReports(t, rows, baseReports))
-		want := fmt.Sprintf(`{"calls":0,"reports":%d}`, webEventsMaxPerRefresh+1)
+		want := fmt.Sprintf(`{"calls":0,"reports":%d,"scores":0}`, webEventsMaxPerRefresh+1)
 		if len(evs) != 1 || evs[0].kind != "reload" || string(evs[0].data) != want {
 			t.Fatalf("got %v after %d re-scans, want one reload with %s", evs, webEventsMaxPerRefresh+1, want)
 		}

@@ -801,7 +801,8 @@ All buckets of one score are stored in one transaction (one `created_at`), each
 with `passed` (whether that bucket's model passed its gates, as the scoring
 service says; NULL = not recorded, e.g. rows stored before this column existed). The
 listener then sends `NOTIFY scout_events` with `{"kind":"score","call_id":…}`; an
-open website refreshes its snapshot on it (it does not show scores yet). Neither
+open website refreshes its snapshot on it (the API includes the scores; the page does
+not show them yet). Neither
 the dataset view, `-export-dataset` nor `ml/` ever read this table.
 
 ### Latest price (the return as of now)
@@ -2283,10 +2284,10 @@ returned and cannot be found by its own name or symbol:
 | Parameter | Values | Default | |
 |---|---|---|---|
 | `q` | text, up to 100 characters | *(none)* | part of the token name, symbol or contract address; case-insensitive (letters of any script, by the Unicode lower-case rule); `%` and `_` are ordinary characters |
-| `sort` | `date`, `return`, `peak`, `latest`, `call_mc`, `latest_mc`, `return_1h`, `return_1d`, `return_3d`, `return_7d`, `return_30d` | `date` | empty values always come last (in both directions); ties by call id, in the direction asked for. `return` / `peak` = by `return_pct` / `peak_pct` of the `horizon` asked for. `return_1h` … `return_30d` = by that window's return (`return_1h_pct` …), whatever the `horizon`. `latest` = by `latest_return_pct`, `call_mc` = by `call_mcap_usd`, `latest_mc` = by `latest_mcap_usd` (these are the same for every `horizon`) |
+| `sort` | `date`, `return`, `peak`, `latest`, `call_mc`, `latest_mc`, `model`, `return_1h`, `return_1d`, `return_3d`, `return_7d`, `return_30d` | `date` | empty values always come last (in both directions); ties by call id, in the direction asked for. `return` / `peak` = by `return_pct` / `peak_pct` of the `horizon` asked for. `return_1h` … `return_30d` = by that window's return (`return_1h_pct` …), whatever the `horizon`. `latest` = by `latest_return_pct`, `call_mc` = by `call_mcap_usd`, `latest_mc` = by `latest_mcap_usd`, `model` = by the `medium` (7d) bucket's `runner_prob` of `model` (these are the same for every `horizon`; `model` is a 400 on a website that does not send scores) |
 | `dir` | `desc`, `asc` | `desc` | |
 | `horizon` | `1h`, `1d`, `3d`, `7d`, `30d` | `1d` | which window `return_pct` / `peak_pct` / `drawdown_pct` (and `sort=return` / `peak`) are for; the page sets it with its Peak / worst drop selector |
-| `usd_only` | `1`, `0` | `1` for every `sort` but `date`, else `0` | `1` = only tokens whose first call has `price_unit = usd` |
+| `usd_only` | `1`, `0` | `1` for every `sort` but `date` and `model`, else `0` | `1` = only tokens whose first call has `price_unit = usd` |
 | `verdict` | `clean`, `caution`, `red_flags`, `not_scanned`, or several separated by commas (`verdict=clean,caution`) | *(none = all)* | the token's **latest** Perceptor verdict, `perceptor_latest_verdict` (see below); with several, a token with any of them. The parameter may also be repeated (`verdict=clean&verdict=caution`); all values add up, repeats and empty items are ignored, so `verdict=` = all, and so do all four. `clean` = no red flags found; `not_scanned` = no completed Perceptor report with a verdict (none, or only ones whose verdict is `unknown` or `insufficient`, "not enough data yet"). The order does not matter: `caution,clean` is the same question, with the same `ETag`, as `clean,caution` |
 | `days` | 1 – 3650 (whole days) | *(none = all)* | only tokens whose first call was posted within the last `days` × 24 hours, counted back from the snapshot time (`snapshot_at`), not the time of the request; `days=0` is a 400 (leave it out for all) |
 | `page` | 1 … | `1` | |
@@ -2296,7 +2297,7 @@ Any other value or parameter, or any parameter but `verdict` given twice → HTT
 
 ```json
 {"total": 3105, "page": 1, "per": 50, "horizon": "1d", "sort": "date", "dir": "desc", "usd_only": false, "verdict": "", "verdicts": [],
- "days": 0, "snapshot_at": "2026-10-02T14:30:00.123Z",
+ "days": 0, "snapshot_at": "2026-10-02T14:30:00.123Z", "model_scores": true,
  "calls": [{"call_id": 812, "message_id": 10002, "message_date": "2026-10-01T14:30:00Z",
    "post_url": "https://t.me/scoutrobinhood/10002",
    "contract_address": "0x…", "token_name": "Malfoid", "token_symbol": "MALFOID",
@@ -2311,7 +2312,10 @@ Any other value or parameter, or any parameter but `verdict` given twice → HTT
    "latest_age_seconds": 5184070, "call_mcap_usd": 45200, "latest_mcap_usd": 61110.4,
    "has_salpha_report": true, "perceptor_report_id": 5120, "salpha_report_id": 5121,
    "salpha_reask_after_s": null, "perceptor_today_verdict": null, "perceptor_today_url": null, "perceptor_today_at": null,
-   "perceptor_latest_verdict": "clean"}]}
+   "perceptor_latest_verdict": "clean",
+   "model": {"version": "20261013-1909", "scored_at": "2026-10-01T14:32:05Z", "after_s": 125,
+     "buckets": [{"bucket": "short", "horizon": "1d", "runner_prob": 0.3123, "collapse_prob": 0.44, "runner_rank_pct": 92.5, "passed": false},
+                 {"bucket": "medium", "horizon": "7d", "runner_prob": 0.12, "collapse_prob": 0.64, "runner_rank_pct": 71.0, "passed": true}]}}]}
 ```
 `call_count` = how many real calls of that token exist in total (1 or more; update posts are
 not counted); `last_call_date` = the date of the most recent one (equal to `message_date` when there is only one). Everything else
@@ -2326,6 +2330,18 @@ five as its 1h … 30d columns; `return_pct` is kept for older clients. `entry_p
 `price_unit` is `usd`. `peak_pct` is also `null` when `rugged` is `true` (the returns and
 `drawdown_pct` stay as stored). `gmgn_url` is `null` for anything that is not a plain `0x…`
 address.
+
+`model` is the model's score of the first call (`scout_call_predictions`, for any
+`price_unit`), `null` without one: only a score stored at most 24 hours after the call counts
+(`after_s` = seconds after the call); with several model versions, the earliest such score's
+version and its buckets. `buckets` lists the buckets that score has, in the order `short`
+(`1d`), `3day` (`3d`), `medium` (`7d`), `long` (`30d`), each with `runner_prob` (0 … 1;
+`null` when missing; for `long`: the chance of being up after 30 days), `collapse_prob`
+(0 … 1; `null` when missing; for `long`: down 90 % or more after 30 days, or rugged), `runner_rank_pct`
+(share of recent calls with a lower runner score) and `passed` (`true`, `false` or `null` =
+not recorded). Any change of it changes the `ETag`. `model_scores` says whether this
+website sends scores; when `false` (a public copy) every `model` is `null` and `sort=model`
+is a 400.
 
 `latest_return_pct` and `latest_price_usd` are the return (from the same entry) and the price
 as of the tracker's most recent reading, `latest_at` when it was read
@@ -2559,7 +2575,10 @@ data: {"call_id":812,"tool":"perceptor","horizon":"1d","row":{…}}
   is the row exactly as `GET /api/calls?horizon=1d` returns it (so `return_pct`, `peak_pct`
   and `drawdown_pct` are those of `horizon`, always `1d`). Rows that leave the list send
   nothing.
-- `reload` = ask for the list again instead: `{"calls":25,"reports":3}` when one read found
+- `score` = a listed token whose model score arrived or changed (a re-score has another
+  `scored_at`): `{"call_id":812,"horizon":"1d","row":{…}}`, the row with its `model`. The page
+  does not use it yet.
+- `reload` = ask for the list again instead: `{"calls":25,"reports":3,"scores":0}` when one read found
   more than 20 changes, `{"missed":true}` when events after the browser's `Last-Event-ID`
   can no longer be sent (see below).
 - **Ids** are `<process>-<n>`. A browser that reconnects sends the last one it got as

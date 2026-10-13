@@ -35,10 +35,11 @@ func syntheticWebRows(n int, seed int64) []ScoutWebRow {
 	verdicts := []string{levelClean, levelClean, levelCaution, levelRedFlags, levelUnknown}
 	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 	rows := make([]ScoutWebRow, n)
-	lrng := rand.New(rand.NewSource(seed + 1000)) // the latest price has its own source, so the rest stays as it was
-	mrng := rand.New(rand.NewSource(seed + 2000)) // so do the market caps
-	srng := rand.New(rand.NewSource(seed + 3000)) // and the sAlpha reports
-	trng := rand.New(rand.NewSource(seed + 4000)) // and the timing after the call
+	lrng := rand.New(rand.NewSource(seed + 1000))  // the latest price has its own source, so the rest stays as it was
+	mrng := rand.New(rand.NewSource(seed + 2000))  // so do the market caps
+	srng := rand.New(rand.NewSource(seed + 3000))  // and the sAlpha reports
+	trng := rand.New(rand.NewSource(seed + 4000))  // and the timing after the call
+	mdrng := rand.New(rand.NewSource(seed + 5000)) // and the model scores
 	// a market cap from the post: mostly one of few values (many ties), now and
 	// then missing, zero, negative or a number JSON cannot carry
 	mcap := func() *float64 {
@@ -162,8 +163,55 @@ func syntheticWebRows(n int, seed int64) []ScoutWebRow {
 			r.SAlphaID = &id
 		}
 		syntheticTiming(r, trng)
+		syntheticModel(r, mdrng)
 	}
 	return rows
+}
+
+// syntheticModel gives about a fifth of the rows a model score (its own
+// random source, so the other fields stay as they were): mostly all four
+// buckets, now and then one missing (the medium one too), few different
+// runner values (many ties), a number missing or one JSON cannot carry, and
+// passed recorded as true, false or not at all.
+func syntheticModel(r *ScoutWebRow, rng *rand.Rand) {
+	if rng.Intn(5) != 0 {
+		return
+	}
+	m := &ScoutWebModel{Version: "20261013-1909", ScoredAt: r.MessageDate.Add(time.Duration(5+rng.Intn(600)) * time.Second)}
+	if rng.Intn(4) == 0 {
+		m.Version = "20261020-0800"
+	}
+	num := func(v float64) *float64 {
+		switch rng.Intn(40) {
+		case 0:
+			return nil
+		case 1:
+			v = math.NaN()
+		case 2:
+			v = math.Inf(1)
+		}
+		return &v
+	}
+	for b := range m.Buckets {
+		if rng.Intn(10) == 0 {
+			continue // the score has no such bucket
+		}
+		v := &m.Buckets[b]
+		v.Has = true
+		v.Runner = num(float64(rng.Intn(20)) / 20)
+		if b != len(m.Buckets)-1 || rng.Intn(2) == 0 { // long: often no collapse model
+			v.Collapse = num(float64(rng.Intn(100)) / 100)
+		}
+		v.Rank = num(float64(rng.Intn(1000)) / 10)
+		switch rng.Intn(3) {
+		case 0:
+			v.Passed = new(bool)
+		case 1:
+			yes := true
+			v.Passed = &yes
+		}
+	}
+	r.Model = m
 }
 
 // syntheticTiming fills the timing after the call of a synthetic row (its own
@@ -300,6 +348,13 @@ func referencePage(rows []ScoutWebRow, f ScoutWebCallsFilter) (ids []int, total 
 			}
 			return *r.LatestReturn, true
 		}
+		if f.Sort == "model" {
+			// the medium bucket's runner probability, any price unit
+			if m := r.Model; m != nil && m.Buckets[2].Has && finite(m.Buckets[2].Runner) != nil {
+				return *m.Buckets[2].Runner, true
+			}
+			return 0, false
+		}
 		if f.Sort == "call_mc" || f.Sort == "latest_mc" {
 			call, latest := refMcaps(r)
 			if f.Sort == "latest_mc" {
@@ -358,7 +413,7 @@ func referencePage(rows []ScoutWebRow, f ScoutWebCallsFilter) (ids []int, total 
 
 func cloneWebRows(rows []ScoutWebRow) []ScoutWebRow { return append([]ScoutWebRow(nil), rows...) }
 
-var testWebConfig = webConfig{GMGNTemplate: defaultGMGNTemplate}
+var testWebConfig = webConfig{GMGNTemplate: defaultGMGNTemplate, ModelScores: true}
 
 // mustWebSnapshot builds a snapshot from rows (which it changes in place).
 func mustWebSnapshot(tb testing.TB, rows []ScoutWebRow, updatePosts int, prev *webSnapshot) *webSnapshot {
@@ -404,7 +459,7 @@ func TestWebSnapshotPageMatchesReference(t *testing.T) {
 		raw := syntheticWebRows(n, int64(n)+1)
 		snap := mustWebSnapshot(t, cloneWebRows(raw), 3, nil)
 		checked := 0
-		for _, sortBy := range []string{"date", "return", "peak", "latest", "call_mc", "latest_mc", "return_1h", "return_1d", "return_3d", "return_7d", "return_30d"} {
+		for _, sortBy := range []string{"date", "return", "peak", "latest", "call_mc", "latest_mc", "model", "return_1h", "return_1d", "return_3d", "return_7d", "return_30d"} {
 			for _, dir := range []string{"desc", "asc"} {
 				for _, hz := range ScoutWebHorizons {
 					for _, usdOnly := range []bool{false, true} {
@@ -426,7 +481,7 @@ func TestWebSnapshotPageMatchesReference(t *testing.T) {
 				}
 			}
 		}
-		if checked != 11*2*5*2*8*7*6 {
+		if checked != 12*2*5*2*8*7*6 {
 			t.Fatalf("checked %d combinations", checked)
 		}
 		// the market caps sent are the ones worked out the obvious way
@@ -692,7 +747,7 @@ func TestWebSnapshotVersion(t *testing.T) {
 		t.Fatalf("built alone: %q, want %q", c.version, a.version)
 	}
 	// the link template is part of every row
-	if c, err := newWebSnapshot(cloneWebRows(raw), 5, a, webConfig{GMGNTemplate: "https://example.test/{ca}"}); err != nil || c.version == a.version {
+	if c, err := newWebSnapshot(cloneWebRows(raw), 5, a, webConfig{GMGNTemplate: "https://example.test/{ca}", ModelScores: true}); err != nil || c.version == a.version {
 		t.Fatalf("another SCOUT_GMGN_URL: version %q (%v)", c.version, err)
 	}
 	// rows must come in call id order
@@ -1024,6 +1079,8 @@ var benchWebQueries = []struct{ name, query string }{
 	{"sort_latest", "sort=latest"},
 	{"sort_call_mc", "sort=call_mc"},
 	{"sort_latest_mc", "sort=latest_mc"},
+	{"sort_model", "sort=model"},
+	{"sort_model_asc", "sort=model&dir=asc"},
 	{"sort_return_1h", "sort=return_1h"},
 	{"sort_return_7d", "sort=return_7d"},
 	{"sort_return_30d_asc", "sort=return_30d&dir=asc&horizon=7d"},
@@ -1042,6 +1099,7 @@ var benchWebDaysQueries = []struct{ name, query string }{
 	{"default", ""},
 	{"date_asc", "dir=asc"},
 	{"sort_latest", "sort=latest"},
+	{"sort_model", "sort=model"},
 	{"verdicts", "verdict=clean,caution"},
 	{"q_verdict_peak", "q=pe&verdict=clean&sort=peak"},
 	{"last_page", "page=120"},
@@ -1755,7 +1813,7 @@ func TestWebSnapshotAgeFilterMatchesReference(t *testing.T) {
 			if got := snap.countSince(since); got != len(sub) {
 				t.Fatalf("n=%d countSince(%d) = %d, want %d", n, since, got, len(sub))
 			}
-			for _, sortBy := range []string{"date", "return", "latest", "call_mc", "return_7d"} {
+			for _, sortBy := range []string{"date", "return", "latest", "call_mc", "model", "return_7d"} {
 				for _, dir := range []string{"desc", "asc"} {
 					for _, usdOnly := range []bool{false, true} {
 						for _, verdict := range []string{"", "clean", "caution,not_scanned"} {

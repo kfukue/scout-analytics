@@ -118,8 +118,9 @@ func webVerdictSet(list string) (uint8, error) {
 }
 
 // Sort keys: 0 = date, then return and peak of each window, then the return
-// as of the latest price, the market cap at the call and the estimated market
-// cap at the latest price.
+// as of the latest price, the market cap at the call, the estimated market
+// cap at the latest price and the model's runner probability of the medium
+// (7d) bucket.
 const (
 	webSortKeyDate     = 0
 	webSortKeyReturn   = 1
@@ -127,14 +128,135 @@ const (
 	webSortKeyLatest   = 1 + 2*len(ScoutWebHorizons)
 	webSortKeyCallMC   = 2 + 2*len(ScoutWebHorizons)
 	webSortKeyLatestMC = 3 + 2*len(ScoutWebHorizons)
-	webSortKeys        = 4 + 2*len(ScoutWebHorizons)
+	webSortKeyModel    = 4 + 2*len(ScoutWebHorizons)
+	webSortKeys        = 5 + 2*len(ScoutWebHorizons)
 )
+
+// webSortModel is the sort parameter's name for the model column.
+const webSortModel = "model"
 
 // webSortNames are the values of the sort parameter of /api/calls. return and
 // peak are for the window asked for (horizon); return_1h … return_30d are the
 // return of one window each, whatever the horizon.
-var webSortNames = []string{"date", "return", "peak", "latest", "call_mc", "latest_mc",
+var webSortNames = []string{"date", "return", "peak", "latest", "call_mc", "latest_mc", webSortModel,
 	"return_1h", "return_1d", "return_3d", "return_7d", "return_30d"}
+
+// webModelMaxDelay: the website shows a model score only when it was stored at
+// most this long after the call. A call scored much later (back-scored, e.g.
+// to test a model on old calls) was scored with data the call did not have
+// yet, and old calls are the model's training data: such a score is not shown.
+const webModelMaxDelay = 24 * time.Hour
+
+// webModelColumn: the bucket of ScoutWebModelBuckets the list's model column
+// shows and sort=model orders by: medium, 7 days (TestAttachWebModel checks).
+const webModelColumn = 2
+
+// attachWebModel sets the Model of each row from the stored scores: preds in
+// call id order and, per call, oldest first (webPredictionsSQL); rows in call
+// id order (SelectWebRows). Only a row's own call counts (a score of a repeat
+// call names another call id and is ignored), and only scores stored within
+// webModelMaxDelay of the call (each bucket row checked on its own: a re-score
+// moves created_at). Of those, the earliest one's model version is used, with
+// that version's buckets; a bucket name not in ScoutWebModelBuckets is
+// ignored, and numbers that are not finite are dropped. ScoredAt is the time
+// of that earliest score, in UTC. A row without a qualifying score gets nil.
+func attachWebModel(rows []ScoutWebRow, preds []ScoutWebPrediction) {
+	k := 0
+	for i := range rows {
+		r := &rows[i]
+		r.Model = nil
+		for k < len(preds) && preds[k].CallID < r.CallID {
+			k++
+		}
+		var m *ScoutWebModel
+		for ; k < len(preds) && preds[k].CallID == r.CallID; k++ {
+			p := &preds[k]
+			if p.CreatedAt.Sub(r.MessageDate) > webModelMaxDelay {
+				continue // back-scored
+			}
+			if m == nil {
+				m = &ScoutWebModel{Version: p.Version, ScoredAt: p.CreatedAt.UTC()}
+			}
+			if p.Version != m.Version {
+				continue
+			}
+			b := slices.Index(ScoutWebModelBuckets[:], p.Bucket)
+			if b < 0 {
+				continue
+			}
+			m.Buckets[b] = ScoutWebModelBucket{Has: true, Runner: finite(p.Runner), Collapse: finite(p.Collapse),
+				Rank: finite(p.Rank), Passed: p.Passed}
+		}
+		if m != nil && slices.ContainsFunc(m.Buckets[:], func(b ScoutWebModelBucket) bool { return b.Has }) {
+			r.Model = m
+		}
+	}
+}
+
+// webModelClean reports whether a score is as the website sends it: its time
+// in UTC and every number finite (or missing).
+func webModelClean(m *ScoutWebModel) bool {
+	if m.ScoredAt.Location() != time.UTC {
+		return false
+	}
+	for _, v := range m.Buckets {
+		for _, p := range [3]*float64{v.Runner, v.Collapse, v.Rank} {
+			if p != finite(p) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// webShownModel returns the score a prepared row shows: nil when the website
+// does not show scores (show false: a public copy, webConfig.ModelScores),
+// else m with its time in UTC and only finite numbers. A score that is not
+// already so (webModelClean) is copied first: it may be shared with other rows
+// (copies of a row list), which are not ours to change. attachWebModel's
+// scores are already clean, so the database path never copies.
+func webShownModel(m *ScoutWebModel, show bool) *ScoutWebModel {
+	if !show {
+		return nil
+	}
+	if m == nil || webModelClean(m) {
+		return m
+	}
+	c := *m
+	c.ScoredAt = c.ScoredAt.UTC()
+	for b := range c.Buckets {
+		v := &c.Buckets[b]
+		v.Runner, v.Collapse, v.Rank = finite(v.Runner), finite(v.Collapse), finite(v.Rank)
+	}
+	return &c
+}
+
+// webModelRunner returns the runner probability of the model column's bucket
+// of a prepared row (nil without one): the value sort=model orders by.
+func webModelRunner(r *ScoutWebRow) *float64 {
+	if r.Model == nil || !r.Model.Buckets[webModelColumn].Has {
+		return nil
+	}
+	return r.Model.Buckets[webModelColumn].Runner
+}
+
+// webCallModel is the "model" object of a row as sent (nil without a score).
+func webCallModel(r *ScoutWebRow) *ScoutWebCallModel {
+	m := r.Model
+	if m == nil {
+		return nil
+	}
+	out := &ScoutWebCallModel{Version: m.Version, ScoredAt: m.ScoredAt,
+		AfterS: max(0, int64(m.ScoredAt.Sub(r.MessageDate)/time.Second)), Buckets: []ScoutWebCallModelBucket{}}
+	for b, v := range m.Buckets {
+		if !v.Has {
+			continue
+		}
+		out.Buckets = append(out.Buckets, ScoutWebCallModelBucket{Bucket: ScoutWebModelBuckets[b], Horizon: ScoutWebModelHorizons[b],
+			RunnerProb: v.Runner, CollapseProb: v.Collapse, RunnerRankPct: v.Rank, Passed: v.Passed})
+	}
+	return out
+}
 
 // webReturnSorts: sort=return_<window> → the index of the window.
 var webReturnSorts = func() map[string]int {
@@ -242,6 +364,11 @@ type webSnapshot struct {
 	// ran (Unix nanoseconds, 0 = none). Only webSnapshotEvents reads them.
 	todayVerd []uint8
 	todayAt   []int64
+	// modelAt[i]: when row i's model score was stored (ScoutWebModel.ScoredAt,
+	// Unix nanoseconds; 0 = none). Only webSnapshotEvents reads it: a new or
+	// changed time is a "score" event (a re-score keeps the row's id, not its
+	// time).
+	modelAt []int64
 	// analytics: the body of GET /api/analytics, encoded (and compressed)
 	// once when the snapshot is built (webanalytics.go)
 	analytics *webAnalytics
@@ -530,6 +657,7 @@ func (c webConfig) webCall(r *ScoutWebRow) ScoutWebCall {
 		SAlphaReaskAfterS:  reaskAfter,
 		PerceptorTodayVerd: r.PerceptorTodayVerd, PerceptorTodayURL: r.PerceptorTodayURL, PerceptorTodayAt: r.PerceptorTodayAt,
 		PerceptorLatestVerd: r.latestVerd,
+		Model:               webCallModel(r),
 	}
 }
 
@@ -548,6 +676,7 @@ func newWebSnapshot(rows []ScoutWebRow, updatePosts int, prev *webSnapshot, cfg 
 	s := &webSnapshot{n: n}
 	sum := &s.summary
 	sum.UpdatePosts = updatePosts
+	scored := 0 // rows with a model score shown (for the size of the row block)
 	for i := range rows {
 		r := &rows[i]
 		r.MessageDate, r.LastCallDate = r.MessageDate.UTC(), r.LastCallDate.UTC()
@@ -657,6 +786,10 @@ func newWebSnapshot(rows []ScoutWebRow, updatePosts int, prev *webSnapshot, cfg 
 		// or "Perceptor today")
 		r.latestVerd = webLatestPerceptor(r.PerceptorVerd, r.PerceptorAt, r.PerceptorTodayVerd, r.PerceptorTodayAt)
 		r.verdict = webBucketOf(r.latestVerd)
+		r.Model = webShownModel(r.Model, cfg.ModelScores)
+		if r.Model != nil {
+			scored++
+		}
 	}
 	sum.RepeatCalls = sum.TotalCalls - sum.Imported
 	counts := sha256.Sum256([]byte(fmt.Sprint(sum.Imported, sum.Tracked, sum.Pending, sum.Tracking, sum.Done, sum.NoPool,
@@ -683,7 +816,12 @@ func newWebSnapshot(rows []ScoutWebRow, updatePosts int, prev *webSnapshot, cfg 
 	s.salphaID = make([]int32, n)
 	s.todayVerd = make([]uint8, n)
 	s.todayAt = make([]int64, n)
-	s.rowJSON = make([]byte, 0, n*1070) // about 990 bytes a row (1,034 in BenchmarkWebSnapshot's rows)
+	s.modelAt = make([]int64, n)
+	// about 1,050 bytes a row, and about 1,530 for a row with a model score (in
+	// BenchmarkWebSnapshot's rows: 1,145 on average, a fifth scored); a little
+	// more than that, so that append does not grow the block again, and
+	// trimBlock gives back what is not used
+	s.rowJSON = make([]byte, 0, n*1100+scored*550)
 	s.search = make([]byte, 0, n*72)
 	var one bytes.Buffer // one encoded row
 	enc := json.NewEncoder(&one)
@@ -714,6 +852,9 @@ func newWebSnapshot(rows []ScoutWebRow, updatePosts int, prev *webSnapshot, cfg 
 		s.todayVerd[i] = webTodayVerdict(r.PerceptorTodayVerd)
 		if r.PerceptorTodayAt != nil {
 			s.todayAt[i] = r.PerceptorTodayAt.UnixNano()
+		}
+		if r.Model != nil {
+			s.modelAt[i] = r.Model.ScoredAt.UnixNano()
 		}
 
 		one.Reset()
@@ -918,6 +1059,33 @@ func hashWebRows(rows []ScoutWebRow, updatePosts int, gmgn string) string {
 		buf = append(buf, r.Timed, r.Censored2x)
 		optInt(r.RugAfterS)
 		opt(r.RugAtKind)
+		// the model's score as sent: version, time and every bucket (passed
+		// has three states: not recorded, false, true)
+		if m := r.Model; m == nil {
+			buf = append(buf, 0)
+		} else {
+			buf = append(buf, 1)
+			str(m.Version)
+			num(m.ScoredAt.UnixNano())
+			for _, v := range m.Buckets {
+				if !v.Has {
+					buf = append(buf, 0)
+					continue
+				}
+				buf = append(buf, 1)
+				optFlt(v.Runner)
+				optFlt(v.Collapse)
+				optFlt(v.Rank)
+				switch {
+				case v.Passed == nil:
+					buf = append(buf, 0)
+				case *v.Passed:
+					buf = append(buf, 2)
+				default:
+					buf = append(buf, 1)
+				}
+			}
+		}
 		h.Write(buf)
 	}
 	return hex.EncodeToString(h.Sum(nil)[:12])
@@ -998,6 +1166,10 @@ func (s *webSnapshot) buildOrders(rows []ScoutWebRow) {
 		func(i int32) float64 { return *rows[i].callMcap })
 	byValue(webSortKeyLatestMC, func(i int) bool { return rows[i].latestMcap != nil },
 		func(i int32) float64 { return *rows[i].latestMcap })
+	// the model column: the medium bucket's runner probability (any price
+	// unit: a score does not depend on the USD price)
+	byValue(webSortKeyModel, func(i int) bool { return webModelRunner(&rows[i]) != nil },
+		func(i int32) float64 { return *webModelRunner(&rows[i]) })
 }
 
 // webBitsPool: the "matches the search text" marks of one request.
@@ -1074,6 +1246,8 @@ func (s *webSnapshot) page(f ScoutWebCallsFilter, since int64, dst []int32) ([]i
 		key = webSortKeyCallMC // also not tied to the window
 	case "latest_mc":
 		key = webSortKeyLatestMC
+	case webSortModel:
+		key = webSortKeyModel // the medium bucket, whatever the horizon
 	default:
 		w, ok := webReturnSorts[f.Sort] // return_1h … return_30d: one window, whatever the horizon
 		if !ok {
