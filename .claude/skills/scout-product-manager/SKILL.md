@@ -497,6 +497,13 @@ Every Go start applies `scoutanalytics.sql` unless `SCOUT_DB_AUTO_MIGRATE=false`
   marked "n.v."/"(not validated)", only scores made within 24 h of the call
   (no back-scoring of historical calls: they are training data); never on
   the public GCP site unless the owner decides otherwise.
+- 13 Oct (owner): PRs must stay small, one function per PR, so they are easy
+  to review and follow. Split a feature that spans several functions (e.g.
+  storage / API / page) into a chain of PRs, each based on the previous
+  branch (`gh pr create --base <previous branch>`; GitHub retargets it to
+  `main` when the previous one merges), and say the merge order. Tell
+  `implement` to write small, single-purpose functions (also in
+  `scout-rules`). A docs-only PR may cover a whole session.
 - 12 Oct: the PM has the `Bash` tool for git only: read-only git, `git fetch`
   and `git worktree add` to create worktrees for `implement`; never add,
   commit, push, stash, switch, reset, rebase or merge (see "Your git
