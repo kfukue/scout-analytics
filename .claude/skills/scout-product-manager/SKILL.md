@@ -279,20 +279,25 @@ commands. Never write "run the usual commands" or a summary.
 - Commit trailers and the PR attribution line are the ones the session's
   system instructions specify; copy them exactly. In PowerShell, two trailer
   lines go in one `-m` joined by a backtick-n inside double quotes.
-- Always give the PR link (owner instruction, 12 Oct 2026): every hand-off
-  of something to merge to main ends with the clickable link, as a plain URL
-  on its own line (not in backticks or a code block):
-  https://github.com/kfukue/scout-analytics/compare/main...<branch>?expand=1
-  and, once the PR exists, its
-  https://github.com/kfukue/scout-analytics/pull/<N> URL. Before the push
-  GitHub shows "There isn't anything to compare" / "Choose different
-  branches" for the compare URL, so give the link together with the push
-  step (right after `git push` in the template), not as a separate earlier
-  message.
-- `gh` is not installed on the owner's PC: give the compare URL, the exact PR
-  title and the exact description to paste. If he installs it later
-  (`winget install --id GitHub.cli`, then `gh auth login`), a `gh pr create`
-  line may be given in addition, not instead.
+- Always give the PR link (owner instruction, 12 Oct 2026): once you have
+  created the PR, send its https://github.com/kfukue/scout-analytics/pull/<N>
+  URL as a plain URL on its own line (not in backticks or a code block).
+  Never send a compare URL before the push: GitHub then shows "There isn't
+  anything to compare" / "Choose different branches".
+- PRs (owner decision, 12 Oct 2026; `gh` installed and logged in as
+  `kfukue`): the owner commits and pushes; after he reports the push, verify
+  it (`git fetch`, `git log -1 --oneline origin/<branch>`), then YOU create
+  the PR with `gh`, base `main`, with the title and description from the
+  hand-off (description ends with the PR attribution line), and give him the
+  `https://github.com/kfukue/scout-analytics/pull/<N>` URL that `gh` prints.
+  He reviews and merges it manually on GitHub with "Create a merge commit".
+  You never merge, approve, close or edit-merge a PR (`gh pr merge`,
+  `gh pr review --approve`, `gh pr close` are forbidden); read-only `gh`
+  (`gh pr view`, `gh pr list`, `gh pr checks`) is fine. If `gh` is not on
+  the Bash PATH, call it as `"/c/Program Files/GitHub CLI/gh.exe"`. Write the
+  description to a file in the session scratchpad and pass `--body-file`
+  (no shell quoting of long text). If `gh` fails, fall back to giving the
+  compare URL with the exact title and description to paste.
 - Several branches ready: one full block per branch, in merge order, and say
   whether the order matters. If two branches touch the same files, the second
   one gets the merge step above (in "Worktree lifecycle"): after the first
@@ -351,9 +356,8 @@ git log -1 --oneline
 git push -u origin <branch>
 ```
 
-   Then open the PR page (works only after the push above; before it GitHub
-   shows "There isn't anything to compare"):
-   https://github.com/kfukue/scout-analytics/compare/main...<branch>?expand=1
+   Then tell the PM "pushed"; the PM creates the PR with `gh` and sends the
+   PR link (step 2).
 
    Second branch on the same files (see "Worktree lifecycle"), after the
    previous branch's step 3: merge `main` into it, in the second worktree
@@ -404,17 +408,19 @@ git push
 # a merge needs no force push; never --force
 ```
 
-2. Pull request, in the browser: on that compare page
-   (https://github.com/kfukue/scout-analytics/compare/main...<branch>?expand=1)
-   paste the title `<exact title>` and this description, create the PR, and
-   merge it with "Create a merge commit" (so `git branch -d` works
-   afterwards):
+2. Pull request: after verifying the push, the PM runs (Bash; the
+   description, ending with the PR attribution line, is in a scratchpad file):
 
-```text
-<exact description>
-
-<PR attribution line>
+```bash
+"/c/Program Files/GitHub CLI/gh.exe" pr create --repo kfukue/scout-analytics --base main --head <branch> --title "<exact title>" --body-file "<scratchpad>/pr-body.md"
 ```
+
+   and sends the owner the printed https://github.com/kfukue/scout-analytics/pull/<N>
+   URL. The owner reviews it on GitHub and merges it with "Create a merge
+   commit" (so `git branch -d` works afterwards). The PM never merges.
+   Fallback if `gh` fails: the compare URL
+   https://github.com/kfukue/scout-analytics/compare/main...<branch>?expand=1
+   with the exact title and description to paste.
 
 3. After the merge, from the main checkout on the PC (PowerShell):
 
@@ -453,10 +459,8 @@ git log -1 --oneline
 # check: <what to look for, e.g. the tracker's "latest prices on:" line, or the website loading>
 ```
 
-End the hand-off message with the PR link on its own line, as a plain
-clickable URL: the compare URL
-https://github.com/kfukue/scout-analytics/compare/main...<branch>?expand=1
-or, once the PR exists, https://github.com/kfukue/scout-analytics/pull/<N>.
+After creating the PR, send the owner its link on its own line, as a plain
+clickable URL: https://github.com/kfukue/scout-analytics/pull/<N>.
 
 ## Testing
 
@@ -518,12 +522,13 @@ Every Go start applies `scoutanalytics.sql` unless `SCOUT_DB_AUTO_MIGRATE=false`
   input; the dead rule is off by default (commit eff4868).
 - Perceptor reports that say "not enough data yet" get an `insufficient` level
   and an automatic re-check about 12 minutes later instead of being dropped
-  (on a branch, pending merge).
-- sAlpha: re-ask when the first answer was declined, empty or timed out (in
-  progress, not yet merged).
+  (merged in PR #20, deployed 12 Oct in 68a4954).
+- sAlpha: re-ask when the first answer was declined, empty or timed out (on
+  the unmerged worktree `agent-ae167c3d46439a04d`; it must be updated onto
+  main before review).
 - Public read-only site on GCP Cloud Run at `scout-analytics.lylelabs.io`
-  (draft in `deploy/gcp/` on a branch, not on main). Nothing is created in the
-  cloud without the owner's approval.
+  (draft in `deploy/gcp/`, merged in PR #18; no Go export and no GCP resources
+  yet). Nothing is created in the cloud without the owner's approval.
 - Multi-source calls: paused. The plan, for when they resume: aggregate several
   call channels (scout first; Robinhood Chain, maybe Base later). Perceptor and
   sAlpha reports for all sources, one scan per token reused across sources,
@@ -547,11 +552,11 @@ Every Go start applies `scoutanalytics.sql` unless `SCOUT_DB_AUTO_MIGRATE=false`
   other file goes to `implement`. Supersedes "the PM never edits files". The
   owner maintains `.claude/agents/` and `.claude/settings.json` himself.
 - 12 Oct: whenever something needs merging to main, always give the owner
-  the PR link: the compare URL
-  `https://github.com/kfukue/scout-analytics/compare/main...<branch>?expand=1`
-  together with the push step, and the
-  `https://github.com/kfukue/scout-analytics/pull/<N>` URL once the PR
-  exists (see "Commit hand-off: exact commands").
+  the PR link (`https://github.com/kfukue/scout-analytics/pull/<N>`; see
+  "Commit hand-off: exact commands").
+- 12 Oct: `gh` is installed. The owner commits and pushes; the PM creates the
+  PR with `gh pr create` after verifying the push; the owner reviews and
+  merges it manually on GitHub. The PM never merges, approves or closes PRs.
 
 ## Working on the owner's PC from a cloud session
 
