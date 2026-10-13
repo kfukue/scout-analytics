@@ -886,13 +886,89 @@ def variant_table(variants: dict, bucket: str) -> str:
                   "information)", "single-run (old) gate, information"], rows)
 
 
+def _variant_time(v: dict) -> str:
+    text = f"{v['seconds']:.0f} s"
+    extra = (v.get("across_seeds") or {}).get("seconds")
+    if extra is not None:
+        text += f" (of which other seeds and adversarial validation {extra:.0f} s)"
+    return text
+
+
 def variants_section(variants: dict, buckets: dict) -> str:
     out = ["## Variant comparison (report only; not saved, not served)\n", VARIANT_NOTE + "\n",
            variant_read() + "\n"]
-    times = [f"{n}: {v['seconds']:.0f} s" for n, v in variants.items() if v.get("seconds") is not None]
+    times = [f"{n}: {_variant_time(v)}" for n, v in variants.items()
+             if v.get("seconds") is not None]
     if times:
         out.append("Training time per variant: " + "; ".join(times) + ".\n")
     for b in buckets:
         out.append(f"### Bucket `{b}`\n")
         out.append(variant_table(variants, b))
+    out.append(across_seeds_section(variants, buckets))
+    return "\n".join(out)
+
+
+ACROSS_SEEDS_TITLE = "### calls_prev variants across seeds (report only)\n"
+
+
+def _across_lifts(lifts: dict, seeds) -> str:
+    """'2.10 / 1.95 / 2.31' over the seeds, a missing seed as n/a."""
+    return " / ".join(fmt(lifts.get(str(s)), 2) for s in seeds)
+
+
+def _adv_cells(adv) -> list:
+    if not isinstance(adv, dict):
+        return ["n/a", ""]
+    if adv.get("error"):
+        return [adv["error"], ""]
+    if adv.get("skipped"):
+        return [f"skipped: {adv['skipped']}", ""]
+    return [fmt(adv.get("auc")), ", ".join(f"{f} {g:.2f}" for f, g in (adv.get("top") or [])[:3])]
+
+
+def _across_cells(v: dict, b: str, seeds) -> list:
+    """The cells of variant `v` in bucket `b` after its name, or the reason it has none."""
+    acr = v.get("across_seeds") or {}
+    if v.get("error") or acr.get("error"):
+        return [v.get("error") or acr["error"]] + [""] * 6
+    a = (acr.get("buckets") or {}).get(b)
+    if a is None or a.get("skipped"):
+        return [f"n/a: {(a or {}).get('skipped', 'not trained')}"] + [""] * 6
+    return [a.get("weeks") or 0, _across_lifts(a["lifts"], acr.get("seeds") or seeds),
+            fmt(a.get("median"), 2), _ci(a.get("lift"), a.get("lift_lo"), a.get("lift_hi")),
+            _signed_ci(a.get("sim_gain"), a.get("sim_gain_lo"), a.get("sim_gain_hi")),
+            *_adv_cells(a.get("adversarial"))]
+
+
+def across_seeds_section(variants: dict, buckets: dict) -> str:
+    """The C.SEED_VARIANTS (and the baseline) with their pooled walk-forward lift
+    per STABILITY_SEEDS seed, its median, the LGBM_SEED run's pooled numbers and
+    the adversarial AUC of their inputs; '' when no variant has them."""
+    names = [n for n, v in variants.items() if v.get("across_seeds") is not None
+             or (n in C.SEED_VARIANTS and v.get("error"))]
+    if not any(n != "baseline" for n in names):
+        return ""
+    seeds = next((s for s in ((variants[n].get("across_seeds") or {}).get("seeds") for n in names)
+                  if s), list(C.STABILITY_SEEDS))
+    out = [ACROSS_SEEDS_TITLE,
+           "The baseline (the saved model) and the variants about calls_prev_1h / calls_prev_24h "
+           "(SEED_VARIANTS), each trained with every seed of STABILITY_SEEDS "
+           f"({', '.join(str(s) for s in seeds)}). The baseline's numbers are the gates' own (its "
+           "seed retrains and pooled walk-forward; nothing retrained). Pooled walk-forward lift "
+           "per seed and their median are taken as the runner-lift gate takes them (median "
+           "n/a unless every seed has a lift); the lift and simulation-difference intervals "
+           f"are the seed {C.LGBM_SEED} run's 95% week-block bootstrap, as in the gates. "
+           "Adversarial AUC: can a classifier tell the bucket's test part from its train part "
+           "on that variant's own inputs (as in \"Adversarial validation\"; 0.5 = no drift; "
+           "calendar inputs left out)? A lower AUC than the baseline's shows the drift the "
+           "removed inputs carried. Report only: never saved, never served, never a gate; "
+           "to adopt a variant change config.py and train again.\n"]
+    rows = [[b, n, *_across_cells(variants[n], b, seeds)] for b in buckets for n in names]
+    out.append(table(["bucket", "variant", "counted weeks",
+                      f"pooled WF lift, seed {' / '.join(str(s) for s in seeds)}",
+                      "median (as the gate)",
+                      f"pooled WF lift [95%] (seed {C.LGBM_SEED})",
+                      f"pooled sim difference (%) [95%] (seed {C.LGBM_SEED})",
+                      "adversarial AUC (train vs test)", "top drifting inputs (gain share)"],
+                     rows))
     return "\n".join(out)

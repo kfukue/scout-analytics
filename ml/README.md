@@ -421,7 +421,8 @@ variants) and on the label each variant trained on, collapses removed (plain,
 the gate), counted weeks beating buy-all, walk-forward mean lift and mean
 collapses removed (counted weeks only), simulation top 10% vs all calls, the
 variant's own pooled walk-forward lift and simulation difference with their
-95% bootstrap intervals (its seed-7 run only; information), and its
+95% bootstrap intervals (its seed-7 run only; information; the calls_prev
+variants also over every seed, see below), and its
 "single-run (old) gate, information" result. The variants are not judged by
 the pooled gates of the verdict (that would need each variant retrained with
 every seed, three times the cost); the baseline row shows the old single-run
@@ -433,6 +434,17 @@ the best by these numbers alone risks fitting the test period, so prefer a
 variant that also wins in the walk-forward weeks. To adopt a variant, change
 the setting in `config.py` and train again (it then becomes the baseline).
 
+After the per-bucket tables, a table **"calls_prev variants across seeds"**
+(`meta.json`: `"variants"` -> `<name>` -> `"across_seeds"`) shows the baseline
+and the `SEED_VARIANTS`, per bucket: the pooled walk-forward lift of each seed
+of `STABILITY_SEEDS` and their median (as the runner-lift gate takes it), the
+seed-7 pooled lift and simulation difference with their 95% intervals, and
+the adversarial AUC (train vs test) on each one's own inputs with its top
+three drifting inputs. The variants are retrained with seeds 11 and 23; the
+baseline row reuses the gates' and diagnostics' numbers. Report only, never a
+gate; an error there keeps the variant's other numbers. Empty `SEED_VARIANTS`
+to skip it.
+
 A variant that raises an error is recorded as `error: <message>` (in its
 table row and in `meta.json` `"variants"`), a `WARNING` line is printed, the
 other variants still run and `train.py` still exits 0: the baseline is saved
@@ -443,7 +455,12 @@ Runtime: each variant costs about one training of the normal model (on
 synthetic data of the fixture's size, 6,000 calls over 170 days: about 25 s,
 the dead score about 2 s of it; a whole run with `--variants` took about
 2 min before the gates of 13 Oct 2026, whose seed retrains add about 47 s to
-every run, see "Stability diagnostics").
+every run, see "Stability diagnostics"). The across-seeds table adds two
+retrains plus one adversarial probe per bucket for each `SEED_VARIANTS` entry
+(the baseline row reuses the diagnostics' probe): about 93 s for the two
+entries on that synthetic data (13 Oct 2026, the sum of their `[variant]`
+lines' "of which" times); on the prod data an estimated 40 to 50 s, not
+measured. Runs without `--variants` are unchanged.
 
 ### Stability diagnostics
 
@@ -520,7 +537,8 @@ section off now costs about two normal runs more; on the prod data (about 6 s
 per variant in report 20261012-2209, `long` still skipped) expect roughly 20
 to 30 s more per run then. `--variants` adds three more variant rows ("stronger
 regularisation", "no calls_prev inputs", "calls_prev as a burst ratio"),
-about one normal run each.
+about one normal run each, and the across-seeds table (two more runs per
+calls_prev variant; see "Variant comparison").
 
 The `model.py`, `validate.py`, `features.py` (`MIN_CATEGORY_COUNT`) and
 `labels.py` (`MAX_OUTCOME_PCT`) settings are read from `config` when a function
@@ -565,8 +583,8 @@ seeds) takes effect.
    report only; see "Stability diagnostics" above): seed stability, pooled
    and rolling walk-forward, evaluation without dead calls, adversarial
    validation.
-6. With `--variants` only: **Variant comparison**, one table per bucket (see
-   "Variant comparison" above).
+6. With `--variants` only: **Variant comparison**, one table per bucket, then
+   "calls_prev variants across seeds" (see "Variant comparison" above).
 
 If LightGBM is not clearly better than the logistic baseline, the data does
 not yet support the more complex model. A bucket is skipped (with the reason

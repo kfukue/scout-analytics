@@ -263,6 +263,23 @@ def _finite(v) -> bool:
             and bool(np.isfinite(v)))
 
 
+def seed_lift_median(seed_lifts: dict, seeds) -> dict:
+    """Per seed of `seeds` its pooled walk-forward lift under "lifts" (keyed by
+    str(seed); None when it is missing or not finite, the reason under "why": the
+    string given for it, else "undefined") and their "median": NaN unless every
+    seed's lift is defined. The runner-lift gate (`pooled_gates`) and the
+    across-seeds table of train.py both take the median this way."""
+    lifts, why = {}, {}
+    for s in seeds:
+        v = seed_lifts.get(s)
+        lifts[str(s)] = float(v) if _finite(v) else None
+        if lifts[str(s)] is None:
+            why[str(s)] = v if isinstance(v, str) else "undefined"
+    complete = bool(lifts) and all(v is not None for v in lifts.values())
+    return {"lifts": lifts, "why": why,
+            "median": float(np.median(list(lifts.values()))) if complete else np.nan}
+
+
 def pooled_gates(single: dict, test: dict, pooled: dict | None, seed_lifts: dict) -> dict:
     """The bucket verdict since the owner decision of 13 Oct 2026 (config "Bucket
     gates"; `passed` is what the scoring service reads). All four must hold:
@@ -297,15 +314,12 @@ def pooled_gates(single: dict, test: dict, pooled: dict | None, seed_lifts: dict
     seeds = list(C.STABILITY_SEEDS)
     if not seeds:
         reasons.append("no STABILITY_SEEDS configured")
-    lifts = {}
+    sl = seed_lift_median(seed_lifts, seeds)
+    lifts, median = sl["lifts"], sl["median"]
     for s in seeds:
-        v = seed_lifts.get(s)
-        lift = float(v) if _finite(v) else None
-        lifts[str(s)] = lift
-        if lift is None:
-            reasons.append(f"pooled lift of seed {s}: {v if isinstance(v, str) else 'undefined'}")
+        if lifts[str(s)] is None:
+            reasons.append(f"pooled lift of seed {s}: {sl['why'][str(s)]}")
     complete = bool(seeds) and all(v is not None for v in lifts.values())
-    median = float(np.median(list(lifts.values()))) if complete else np.nan
     min_lift = C.GATES["min_top_lift"]
     lift_ok = enough and complete and median >= min_lift
     if enough and complete and not lift_ok:

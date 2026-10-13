@@ -9,6 +9,7 @@ import pytest
 import make_synthetic
 import train as train_mod
 from scout_ml import config as C
+from scout_ml import validate as V
 from scout_ml.features import assert_no_leakage
 from scout_ml.labels import build_labels
 from scout_ml.model import Bundle
@@ -211,7 +212,38 @@ def test_variant_table_contents(plain_and_variants):
         assert burst["sim_all_mean"] == base[b]["sim_all_mean"]
         assert burst["runner_auc_logistic"] not in (base[b]["runner_auc_logistic"],
                                                     ncp["runner_auc_logistic"])
+        # "calls_prev variants across seeds": the baseline and the SEED_VARIANTS only
+        seeds = [str(s) for s in C.STABILITY_SEEDS]
+        for name in C.VARIANTS:
+            has = name == "baseline" or name in C.SEED_VARIANTS
+            assert ("across_seeds" in v[name]) == has, name
+            if not has:
+                continue
+            a = v[name]["across_seeds"]["buckets"][b]
+            assert list(a["lifts"]) == seeds
+            # the saved seed's lift is the variant's own pooled walk-forward lift
+            own = v[name]["buckets"][b]["wf_pooled_lift"]
+            assert a["lifts"][str(C.LGBM_SEED)] == (None if own is None else pytest.approx(own))
+            for k in ("lift", "lift_lo", "lift_hi", "sim_gain", "sim_gain_lo", "sim_gain_hi"):
+                assert a[k] == v[name]["buckets"][b][f"wf_pooled_{k}"], (name, b, k)
+            adv = a["adversarial"]
+            assert "auc" in adv and len(adv["top"]) <= 3 and "error" not in adv
+            assert not {f for f, _ in adv["top"]} & set(C.ADV_EXCLUDE)
+        # baseline row = the gates' own numbers (nothing retrained)
+        ab = v["baseline"]["across_seeds"]["buckets"][b]
+        assert ab["lifts"] == m["gates"]["pooled_lift_seeds"]
+        assert ab["median"] == m["gates"]["pooled_lift_median"]
+        assert ab["sim_gain_lo"] == m["gates"]["sim_diff_lo"]
+        # each variant's adversarial probe sees only its own inputs
+        for name, gone in (("no calls_prev inputs", {"calls_prev_1h", "calls_prev_24h",
+                                                     C.CALLS_PREV_BURST}),
+                           ("calls_prev as a burst ratio", {"calls_prev_1h", "calls_prev_24h"}),
+                           ("baseline", {C.CALLS_PREV_BURST})):
+            top = {f for f, _ in v[name]["across_seeds"]["buckets"][b]["adversarial"]["top"]}
+            assert not top & gone, (name, b, top)
     assert all(v[n].get("seconds") is not None for n in C.VARIANTS if n != "baseline")
+    for n in C.SEED_VARIANTS:
+        assert v[n]["across_seeds"]["seconds"] <= v[n]["seconds"]
     report = (var / "report.md").read_text(encoding="utf-8")
     assert "## Variant comparison (report only; not saved, not served)" in report
     assert "risks fitting the test period" in report and "walk-forward weeks" in report
@@ -221,6 +253,12 @@ def test_variant_table_contents(plain_and_variants):
     assert "pooled WF lift [95%]; sim difference [95%] (seed 7 only; information)" in report
     assert "| no calls_prev inputs | EXCLUDED_INPUTS = ('calls_prev_1h', 'calls_prev_24h') |" in report
     assert "| calls_prev as a burst ratio | CALLS_PREV_INPUTS = burst |" in report
+    across = report[report.index("### calls_prev variants across seeds (report only)"):]
+    assert "| median (as the gate) |" in across and "| adversarial AUC (train vs test) |" in across
+    for b in meta["metrics"]:
+        for name in ("baseline",) + C.SEED_VARIANTS:
+            assert f"| {b} | {name} |" in across
+    assert "| stronger regularisation |" not in across
     plain_report = (plain_and_variants[0] / "report.md").read_text(encoding="utf-8")
     assert "Variant comparison" not in plain_report
 
@@ -367,7 +405,7 @@ def test_no_calls_prev_variant_drops_exactly_those_inputs_and_keeps_the_guard(sy
         assert list(C.FEATURES) == before[0]
 
 
-# --- "calls_prev as a burst ratio" (report only) ---
+# --- "calls_prev as a burst ratio" and "calls_prev variants across seeds" (report only) ---
 
 BURST_VARIANT = "calls_prev as a burst ratio"
 
@@ -402,3 +440,100 @@ def test_burst_variant_replaces_exactly_the_raw_counts(synthetic_df):
             with C.overrides(CALLS_PREV_INPUTS=bad):
                 pass
         assert list(C.FEATURES) == before[0]
+
+
+def test_seed_median_is_taken_as_the_gate_takes_it(monkeypatch):
+    assert set(C.SEED_VARIANTS) == {"no calls_prev inputs", BURST_VARIANT}
+    assert all(n in C.VARIANTS for n in C.SEED_VARIANTS)
+    monkeypatch.setattr(C, "STABILITY_SEEDS", (7, 11, 23))
+    s = train_mod.seed_median({7: 2.0, 11: 1.0, 23: 3.5})
+    assert s["lifts"] == {"7": 2.0, "11": 1.0, "23": 3.5} and s["median"] == 2.0 and not s["why"]
+    s = train_mod.seed_median({7: 2.0, 11: "retrain failed (error: X)", 23: float("nan")})
+    assert s["lifts"] == {"7": 2.0, "11": None, "23": None} and np.isnan(s["median"])
+    assert s["why"] == {"11": "retrain failed (error: X)", "23": "undefined"}
+    assert np.isnan(train_mod.seed_median({7: 2.0})["median"])        # a seed not run: n/a
+
+
+@pytest.mark.parametrize("seed_lifts", [
+    {7: 2.0, 11: 1.0, 23: 3.5},
+    {7: 2.0, 11: "retrain failed (error: X)", 23: 3.5},
+    {7: 2.0, 11: 1.0, 23: float("nan")},
+    {7: 2.0, 11: 1.0},
+])
+def test_seed_median_and_the_gate_share_one_median(monkeypatch, seed_lifts):
+    """The across-seeds table and the runner-lift gate take the same lifts and
+    median from the same input (one helper, V.seed_lift_median)."""
+    monkeypatch.setattr(C, "STABILITY_SEEDS", (7, 11, 23))
+    s = train_mod.seed_median(seed_lifts)
+    g = V.pooled_gates({}, {"collapse_removed": 0.5}, None, seed_lifts)
+    assert s["lifts"] == g["pooled_lift_seeds"]
+    assert (np.isnan(s["median"]) and np.isnan(g["pooled_lift_median"])
+            or s["median"] == g["pooled_lift_median"])
+    for k, why in s["why"].items():
+        assert f"pooled lift of seed {k}: {why}" in g["reasons"]
+    assert not any(r.startswith("pooled lift of seed") and r.split()[4].rstrip(":") not in s["why"]
+                   for r in g["reasons"])
+
+
+def test_calls_prev_variants_are_retrained_with_every_seed(small_df, tmp_path, monkeypatch):
+    """With two seeds: the variant is retrained once more (seed 11), the baseline not
+    at all (its row is the gates' seed retrains), and the baseline's adversarial
+    AUC is the diagnostics' own when they ran."""
+    monkeypatch.setattr(C, "BUCKETS", {"short": C.BUCKETS["short"]})
+    monkeypatch.setattr(C, "STABILITY_SEEDS", (7, 11))
+    monkeypatch.setattr(C, "VARIANTS", {k: C.VARIANTS[k] for k in ("baseline", BURST_VARIANT)})
+    calls = []
+    real = train_mod._train_bucket
+    monkeypatch.setattr(train_mod, "_train_bucket", lambda *a, **k: calls.append(
+        (C.LGBM_SEED, C.CALLS_PREV_INPUTS)) or real(*a, **k))
+    out = train_mod.train(small_df, tmp_path, "v1", variants=True, diagnostics=True)
+    # saved model + gate seed 11, then the variant's own run + its seed 11: nothing else
+    assert calls == [(7, "counts"), (11, "counts"), (7, "burst"), (11, "burst")]
+    meta = json.loads((out / "meta.json").read_text())
+    assert meta["features"] == list(C.FEATURES) and C.CALLS_PREV_BURST not in meta["features"]
+    g = meta["metrics"]["short"]["gates"]
+    base = meta["variants"]["baseline"]["across_seeds"]["buckets"]["short"]
+    assert base["lifts"] == g["pooled_lift_seeds"] and set(base["lifts"]) == {"7", "11"}
+    assert base["adversarial"]["auc"] == meta["diagnostics"]["adversarial"]["short"]["split"]["auc"]
+    var = meta["variants"][BURST_VARIANT]["across_seeds"]
+    a = var["buckets"]["short"]
+    assert var["seeds"] == [7, 11] and set(a["lifts"]) == {"7", "11"}
+    assert all(isinstance(x, float) for x in a["lifts"].values())
+    assert a["median"] == pytest.approx(float(np.median(list(a["lifts"].values()))))
+    assert 0.0 <= a["adversarial"]["auc"] <= 1.0
+    report = (out / "report.md").read_text(encoding="utf-8")
+    assert "| pooled WF lift, seed 7 / 11 |" in report
+    assert (f"| short | {BURST_VARIANT} | {a['weeks']} | "
+            f"{a['lifts']['7']:.2f} / {a['lifts']['11']:.2f} | {a['median']:.2f} |") in report
+    assert "other seeds and adversarial validation" in report
+
+
+def test_a_failing_across_seeds_part_keeps_the_variant_rows(small_df, tmp_path, monkeypatch,
+                                                            capsys):
+    monkeypatch.setattr(C, "BUCKETS", {"short": C.BUCKETS["short"]})
+    monkeypatch.setattr(C, "VARIANTS", {k: C.VARIANTS[k] for k in
+                                        ("baseline", "no calls_prev inputs", BURST_VARIANT)})
+    real = train_mod.variant_across_seeds
+
+    def across(*a, **k):
+        if C.CALLS_PREV_INPUTS == "burst":
+            raise RuntimeError("boom | x")
+        return real(*a, **k)
+
+    def no_probe(keep):
+        raise ValueError("probe down")
+
+    monkeypatch.setattr(train_mod, "variant_across_seeds", across)
+    monkeypatch.setattr(train_mod, "adversarial_split", no_probe)
+    out = train_mod.train(small_df, tmp_path, "v1", variants=True)
+    assert "across-seeds part of variant 'calls_prev as a burst ratio' failed" in capsys.readouterr().out
+    v = json.loads((out / "meta.json").read_text())["variants"]
+    assert "top_lift" in v[BURST_VARIANT]["buckets"]["short"] and "error" not in v[BURST_VARIANT]
+    assert v[BURST_VARIANT]["across_seeds"] == {"error": "error: RuntimeError: boom / x"}
+    for name in ("baseline", "no calls_prev inputs"):          # the probe failing loses no row
+        a = v[name]["across_seeds"]["buckets"]["short"]
+        assert a["adversarial"] == {"error": "error: ValueError: probe down"}
+        assert "lifts" in a and "sim_gain_lo" in a
+    report = (out / "report.md").read_text(encoding="utf-8")
+    assert f"| short | {BURST_VARIANT} | error: RuntimeError: boom / x |" in report
+    assert "error: ValueError: probe down" in report
