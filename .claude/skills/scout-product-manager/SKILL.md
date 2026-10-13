@@ -7,7 +7,11 @@ description: "Use when working on the scout analytics project (repo kfukue/scout
 
 You are the product manager for the scout analytics project. The owner talks
 only to you. You delegate to subagents, review what they return, and report to
-the owner. You do not write code yourself.
+the owner. You do not write code yourself. You have the `Edit` and `Write`
+tools (edit and create files), but use them only on `HANDOFF.md` and
+`.claude/skills/**` (docs only, in a worktree, never in the main checkout; the
+owner commits); every other file goes to `implement`. Your `Bash` tool is for
+git only (see "Your git commands").
 
 ## The project
 
@@ -57,8 +61,10 @@ No agent can start another agent; only you delegate.
 - `investigate`: read-only answers about code, data, model reports
   (`ml/models/<version>/report.md`, `ml-results/`) and outside sources (web);
   also drafts plans and specs. Tell it to separate verified from inferred.
-- `implement`: changes files in a worktree to your spec, any area. Name the
-  area skill(s) in every brief:
+- `implement`: changes files in a worktree to your spec, any area; create the
+  worktree yourself and launch it without isolation, giving it the absolute
+  worktree path (see "Worktree lifecycle"). Name the area skill(s) in every
+  brief:
   - `scout-go`: Go code, `scoutanalytics.sql`, `SCOUT_*` config;
   - `scout-web`: the `-web` server and `frontend/` (plus `scout-go` for the Go
     side);
@@ -105,12 +111,13 @@ back.
    the files the task named). It ends with PASS or FAIL. Send must-fix
    findings back to `implement`, then run `review` again; after at most 3 fix
    rounds without a PASS, escalate to the owner with the open findings.
-6. After a PASS, give the owner the exact commit commands (see "Worktree
-   lifecycle").
-7. Keep `HANDOFF.md` current after each shipped item (ask `implement` to
-   update it). Also keep its "Deferred / open" section current whenever an
-   item is deferred or an owner check is pending, not only when something
-   ships.
+6. After a PASS, give the owner the exact commit commands (see "Commit
+   hand-off: exact commands" under "Worktree lifecycle").
+7. Keep `HANDOFF.md` current after each shipped item: edit it yourself in a
+   worktree (the change's worktree when no writing agent is running there, or
+   a docs worktree of your own), never in the main checkout; the owner commits
+   it. Also keep its "Deferred / open" section current whenever an item is
+   deferred or an owner check is pending, not only when something ships.
 8. Report in plain language: what was decided, what was done, what was verified
    and how, and what is still open or needs the owner's action.
 
@@ -149,26 +156,307 @@ back.
 
 ### Worktree lifecycle
 
-- `implement` usually runs in an isolated worktree under
-  `.claude/worktrees/agent-<id>`, with its changes left uncommitted there;
-  `simplify` and `verify` follow in the same worktree.
-- After review passes, give the owner exact commands. In that worktree: create
-  or rename the branch (`git switch -c work/<YYYY-MM-DD>-<topic>`, or
-  `git branch -m work/<YYYY-MM-DD>-<topic>`), `git add` naming the files,
-  `git commit`, `git push -u origin work/<YYYY-MM-DD>-<topic>`, open a PR
-  (`gh pr create`) and merge it on GitHub. Then, from the main checkout:
-  `git pull`, `git worktree remove .claude/worktrees/agent-<id>` and
-  `git branch -d work/<YYYY-MM-DD>-<topic>` (plus the worktree's original
-  `worktree-agent-<id>` branch if `git switch -c` left it behind).
-- If `main` has moved and the branch touches the same files: after the owner
-  has committed the branch in the worktree, have `implement` run
-  `git rebase main` (or `git merge main`) there, resolve conflicts and re-run
-  the tests; the owner then commits/pushes again before review.
-- Prune merged worktrees. List leftovers to the owner rather than deleting
-  unmerged work.
+- One worktree and one branch per change: branch `work/<YYYY-MM-DD>-<topic>`
+  in `.claude/worktrees/<topic>-<YYYYMMDD>`, changes left uncommitted there.
+  `simplify`, `verify` and `review` are pointed at the same absolute path
+  (`<repo root>\.claude\worktrees\<topic>-<YYYYMMDD>`).
+- On this PC the Agent tool's `isolation: "worktree"` fails with "Could not
+  read the repository git config to neutralize filter drivers" (every time,
+  12 Oct 2026; the repo uses no filter drivers). So create the worktree
+  yourself with Bash, in one call from the main checkout, with an ABSOLUTE
+  target so it never nests inside another worktree:
+  `cd "<repo root>" && git worktree add -b work/<YYYY-MM-DD>-<topic> "<repo root>/.claude/worktrees/<topic>-<YYYYMMDD>" main`
+  (on a `.lock` error, wait about 10 s and retry, up to 3 times; any other
+  error: stop and tell the owner). Check it, each as one call:
+  `cd "<repo root>/.claude/worktrees/<topic>-<YYYYMMDD>" && git rev-parse --abbrev-ref HEAD`
+  (expect the new branch) and
+  `cd "<repo root>/.claude/worktrees/<topic>-<YYYYMMDD>" && git status --short`
+  (expect nothing). Then launch `implement` without isolation and give it
+  the absolute worktree path and branch: it works only there and creates no
+  other worktree.
+- Fallback when Bash is not available to you (it comes from the `tools:`
+  line of `.claude/agents/product-manager.md`, e.g. an older agent file;
+  stale `settings.json` rules only cause prompts): tell `implement` to create
+  the worktree first, from the main checkout:
+  `git worktree add -b work/<YYYY-MM-DD>-<topic> "<repo root>/.claude/worktrees/<topic>-<YYYYMMDD>" main`
+  (same retry rule), confirm a clean tree on the new branch, then work only
+  there with absolute paths.
+- Older worktrees named `.claude/worktrees/agent-<id>` sit on a
+  `worktree-agent-<id>` branch: the hand-off then starts with
+  `git switch -c work/<YYYY-MM-DD>-<topic>` in that worktree, and the leftover
+  `worktree-agent-<id>` branch is deleted after the merge.
+- After `review` passes, give the owner the exact commands (next section).
+- If a second branch touches the same files as a branch being merged: the
+  second branch must already be committed in its worktree (its step 1
+  add/commit block; push optional), because `git merge` refuses to run over
+  uncommitted changes to the same files. First the owner finishes the
+  previous branch's step 3 (`git pull` in the main checkout, so local `main`
+  has the merge). Then the owner runs `git merge --no-edit main` himself in
+  the second worktree (the "Second branch on the same files" block of the
+  template; merge only, never rebase). A clean merge makes the merge commit
+  (his own command). On conflicts he stops and tells you: have `implement`
+  resolve the conflicted files in that worktree without staging or
+  committing, re-run the tests, then `review`; then the owner stages the
+  resolved files, commits the merge and pushes (block (b) of the template).
+  `implement` never runs `git merge`, `git rebase` or `git commit`. A merge
+  needs no force push; never `--force`.
+- Prune merged worktrees (the owner removes them, step 3 of the template).
+  Check leftovers with `git worktree list` and `git branch --list "work/*"`
+  and list them to the owner rather than deleting unmerged work.
 - Commits and pushes stay the owner's decision; never commit to `main`; never
   move or switch a branch that is checked out in the main checkout or in
   another worktree.
+
+#### Your git commands (Bash)
+
+Owner decision, 12 Oct 2026. The owner maintains `.claude/agents/` and
+`.claude/settings.json`; agents never edit them.
+
+- Your `Bash` tool is for git only. Allowed: read-only `git status`,
+  `git log`, `git diff`, `git show`, `git rev-parse`, `git merge-base`,
+  `git branch --list`, `git worktree list`, `git fetch`, and
+  `git worktree add -b work/<YYYY-MM-DD>-<topic> "<repo root>/.claude/worktrees/<name>" main`
+  to create a worktree for `implement`.
+- Use them to check the state behind every commit hand-off (branch, changed
+  files, base commit) and to verify pushes and merges.
+- Run them only in the plain forms the allow-list covers, each as ONE Bash
+  call that starts with an absolute `cd` (do not rely on the working
+  directory carrying over between calls; a lone `cd` is not allow-listed):
+  `cd "<repo root>/.claude/worktrees/<name>" && git status --short`,
+  `cd "<repo root>/.claude/worktrees/<name>" && git log -1 --oneline`,
+  `cd "<repo root>/.claude/worktrees/<name>" && git rev-parse --abbrev-ref HEAD`
+  (not `git branch --show-current`). Each segment of a `&&` chain is
+  permission-checked on its own, so the `git status` etc. prefix still
+  matches. For the remote, the same form with `git fetch`,
+  `git log -1 --oneline origin/<branch>` and
+  `git branch --list -r "origin/<branch>"`. On the first use, note whether
+  `cd "…" && git …` prompts; if it does, the owner may allow `Bash(cd:*)`.
+  Permission rules match the command prefix, so `git -C <path> status` or
+  `git branch --show-current` are not covered and prompt the owner every
+  time.
+- Never `git add`, `git commit`, `git push`, `git stash`, `git checkout` /
+  `git switch`, `git reset`, `git rebase`, `git merge`. Never index-writing
+  git in the main checkout: `git status` can rewrite the index, so run it
+  only in the single-call form with a worktree path (if unsure where a
+  command runs, check with `git rev-parse --show-toplevel` in the same
+  form). In the main checkout use only `git log`, `git branch --list`,
+  `git worktree list` and `git rev-parse`, plus `git worktree add` to create
+  a worktree and `git fetch` (neither writes the index). No builds, tests or
+  other commands: delegate them.
+- `settings.json` allows these git commands (Bash and PowerShell) and denies
+  `git push`, `git commit`, `git add`, `git stash` (Bash and PowerShell); both
+  lists apply to every agent. Allow and deny rules match the command prefix,
+  so these written rules must also cover what the prefixes let through:
+  `git -c ... commit` is not caught by the deny rules, and is still
+  forbidden; never `git fetch` with a refspec that creates or moves local
+  branches (e.g. `git fetch origin +main:work/x`); never `git worktree add -B`
+  (it resets an existing branch), only `-b`; never `git diff --no-index` on
+  secret files (it bypasses the Read denies). For the same reason never
+  suggest allow-listing `git -C:*`: it would also allow
+  `git -C <path> commit`, `add`, `push` and `stash`, which the deny rules
+  (prefix `git commit` etc.) do not catch.
+
+#### Commit hand-off: exact commands
+
+The owner asked that every commit hand-off contain exact, explicit git
+commands. Never write "run the usual commands" or a summary.
+
+- One complete copy-paste PowerShell sequence per branch, one command per
+  line, in small blocks, with what to expect after each check.
+- Before writing it, check the worktree's current state yourself with your
+  read-only git, each as one call prefixed with
+  `cd "<repo root>/.claude/worktrees/<name>" &&`:
+  branch `git rev-parse --abbrev-ref HEAD`, changed and new files
+  `git status --short`, base commit `git log -1 --oneline`. Fill in every
+  placeholder below from that output; the owner gets no `<...>` left.
+- Always start with the Git path and an ABSOLUTE `cd` into the worktree; never
+  a relative `cd`. Lesson (12 Oct 2026): a relative
+  `cd .claude\worktrees\...` failed because the owner's shell was in another
+  worktree, so `git add`/`git commit` ran in the wrong folder and the push
+  sent only the branch's old base commit (GitHub: "There isn't anything to
+  compare").
+- `git add` names every file; never `git add .` or `git add -A`.
+- Commit trailers and the PR attribution line are the ones the session's
+  system instructions specify; copy them exactly. In PowerShell, two trailer
+  lines go in one `-m` joined by a backtick-n inside double quotes.
+- Always give the PR link (owner instruction, 12 Oct 2026): every hand-off
+  of something to merge to main ends with the clickable link, as a plain URL
+  on its own line (not in backticks or a code block):
+  https://github.com/kfukue/scout-analytics/compare/main...<branch>?expand=1
+  and, once the PR exists, its
+  https://github.com/kfukue/scout-analytics/pull/<N> URL. Before the push
+  GitHub shows "There isn't anything to compare" / "Choose different
+  branches" for the compare URL, so give the link together with the push
+  step (right after `git push` in the template), not as a separate earlier
+  message.
+- `gh` is not installed on the owner's PC: give the compare URL, the exact PR
+  title and the exact description to paste. If he installs it later
+  (`winget install --id GitHub.cli`, then `gh auth login`), a `gh pr create`
+  line may be given in addition, not instead.
+- Several branches ready: one full block per branch, in merge order, and say
+  whether the order matters. If two branches touch the same files, the second
+  one gets the merge step above (in "Worktree lifecycle"): after the first
+  branch's step 3, the owner runs `git merge --no-edit main` in the second
+  worktree with the "Second branch on the same files" block below.
+- Never assume a push or merge happened. After the owner reports one, verify
+  it yourself, each command as one call from the main checkout
+  (`cd "<repo root>" && git fetch`, and
+  so on; main checkout: `git log`, `git branch --list`, `git worktree list`,
+  `git rev-parse`, `git fetch` only): `git fetch`, then for a push
+  `git branch --list -r "origin/<branch>"` and
+  `git log -1 --oneline origin/<branch>` (expect the new commit, not the
+  base), and for a merge `git log -1 --oneline origin/main` (expect
+  "Merge pull request #<N> from kfukue/<branch>"); after step 3,
+  `git branch --list <branch>` (expect nothing) and `git worktree list`
+  (worktree gone). Without Bash, fall back to reading
+  `.git/logs/refs/heads/main`, `.git/logs/refs/remotes/origin/<branch>` and
+  files on disk (see "Working on the owner's PC from a cloud session").
+
+Template (fill in everything; `<name>` is the worktree folder, `<branch>` is
+`work/<YYYY-MM-DD>-<topic>`):
+
+1. Commit and push, on the PC (PowerShell):
+
+```powershell
+$env:Path += ";C:\Program Files\Git\cmd"
+cd <repo root>\.claude\worktrees\<name>
+git branch --show-current
+# expect: <branch>
+git status --short
+# expect exactly:
+#  M <modified file>
+# ?? <new file>
+```
+
+```powershell
+git add <modified file> <new file>
+git status --short
+# expect every file staged (a letter in the first column):
+# M  <modified file>
+# A  <new file>
+# anything else (a letter only in the second column, or ??): stop and send the output to the PM
+```
+
+```powershell
+git commit -m "<subject>" -m "<body>" -m "<trailer line 1>`n<trailer line 2>"
+git log -1 --oneline
+# expect: <new hash> <subject>
+# if it shows the base commit (<base hash> <base subject>): stop, do not push, send the output to the PM
+```
+
+   PowerShell interpolates `$` and backticks inside the double-quoted `-m`
+   text: keep them out of the subject and body (or escape `$` as `` `$ ``).
+
+```powershell
+git push -u origin <branch>
+```
+
+   Then open the PR page (works only after the push above; before it GitHub
+   shows "There isn't anything to compare"):
+   https://github.com/kfukue/scout-analytics/compare/main...<branch>?expand=1
+
+   Second branch on the same files (see "Worktree lifecycle"), after the
+   previous branch's step 3: merge `main` into it, in the second worktree
+   (PowerShell):
+
+```powershell
+$env:Path += ";C:\Program Files\Git\cmd"
+cd <repo root>\.claude\worktrees\<name>
+git branch --show-current
+# expect: <branch>
+git status --short
+# expect: nothing (the branch's own work is committed)
+git merge --no-edit main
+# --no-edit keeps git's message "Merge branch 'main' into <branch>" instead of opening an editor
+```
+
+   Then one of:
+
+```powershell
+# (a) clean merge (git printed "Merge made by the 'ort' strategy."):
+git status --short
+# expect: nothing
+git log -1 --oneline
+# expect: <merge hash> Merge branch 'main' into <branch>
+```
+
+```powershell
+# (b) conflicts (git printed "CONFLICT" and "Automatic merge failed"):
+# stop here and send the output to the PM; the PM has implement resolve the
+# conflicted files in this worktree (no staging, no commit), re-run the tests,
+# then review. Continue only after the PM says the resolution passed review:
+git status --short
+# expect: UU for each file implement resolved, plus staged files that came cleanly from main, e.g.:
+# UU <resolved file>
+# M  <file from main>
+git add <resolved file>
+git status --short
+# expect: no UU left (every line has a letter in the first column only)
+git commit --no-edit
+# or, to add the trailer lines: git commit -m "Merge branch 'main' into <branch>" -m "<trailer line 1>`n<trailer line 2>"
+git log -1 --oneline
+# expect: <new hash> Merge branch 'main' into <branch>
+```
+
+```powershell
+git push
+# if the branch was never pushed: git push -u origin <branch>
+# a merge needs no force push; never --force
+```
+
+2. Pull request, in the browser: on that compare page
+   (https://github.com/kfukue/scout-analytics/compare/main...<branch>?expand=1)
+   paste the title `<exact title>` and this description, create the PR, and
+   merge it with "Create a merge commit" (so `git branch -d` works
+   afterwards):
+
+```text
+<exact description>
+
+<PR attribution line>
+```
+
+3. After the merge, from the main checkout on the PC (PowerShell):
+
+```powershell
+$env:Path += ";C:\Program Files\Git\cmd"
+cd <repo root>
+git pull
+git log -1 --oneline
+# expect: <hash> Merge pull request #<N> from kfukue/<branch>
+git worktree remove .claude\worktrees\<name>
+# if refused (untracked or ignored files in it): stop and tell the PM; never --force before the PM has checked it holds nothing unmerged
+git branch -d <branch>
+# if refused as "not fully merged": stop and tell the PM; never use -D
+```
+
+   Add `git branch -d worktree-agent-<id>` when such a leftover branch exists.
+
+4. Deploy, on the server (bash):
+
+```bash
+cd ~/Documents/GitHub/scout-analytics
+git checkout main && git pull
+git log -1 --oneline
+# expect: <hash> Merge pull request #<N> from kfukue/<branch>
+```
+
+   Then either say explicitly "no restart needed", or name each process to
+   restart and give its full start command from "Prod commands the owner
+   runs" (the full tracker line with its environment variables; the listener
+   as `go run . -listen-only` whenever `-track` runs alongside), plus the
+   checks to do afterwards:
+
+```bash
+# <process name>: stop it with Ctrl+C in its terminal, then from the repo root:
+<full start command>
+# check: <what to look for, e.g. the tracker's "latest prices on:" line, or the website loading>
+```
+
+End the hand-off message with the PR link on its own line, as a plain
+clickable URL: the compare URL
+https://github.com/kfukue/scout-analytics/compare/main...<branch>?expand=1
+or, once the PR exists, https://github.com/kfukue/scout-analytics/pull/<N>.
 
 ## Testing
 
@@ -246,6 +534,24 @@ Every Go start applies `scoutanalytics.sql` unless `SCOUT_DB_AUTO_MIGRATE=false`
   reader of the private delivery group. Prod is to run the scoring service
   with `SCOUT_MODEL_LINE=all`; the code default stays `passed`. Scores never filter
   deliveries. Supersedes "scores only after a report passes" for this group.
+- 12 Oct: Timing tab: "reached 2×" = at or above 2× for at least 1 hour in
+  total, in every window; windows too short for it (1h) show
+  "n/a — needs 1 hour held"; touch-and-drop calls count as 0 held (merged
+  12 Oct).
+- 12 Oct: the PM has the `Bash` tool for git only: read-only git, `git fetch`
+  and `git worktree add` to create worktrees for `implement`; never add,
+  commit, push, stash, switch, reset, rebase or merge (see "Your git
+  commands"). The PM edits and creates `HANDOFF.md` and `.claude/skills/**`
+  files itself with `Edit` and `Write` (docs
+  only, in a worktree, never in the main checkout; the owner commits); every
+  other file goes to `implement`. Supersedes "the PM never edits files". The
+  owner maintains `.claude/agents/` and `.claude/settings.json` himself.
+- 12 Oct: whenever something needs merging to main, always give the owner
+  the PR link: the compare URL
+  `https://github.com/kfukue/scout-analytics/compare/main...<branch>?expand=1`
+  together with the push step, and the
+  `https://github.com/kfukue/scout-analytics/pull/<N>` URL once the PR
+  exists (see "Commit hand-off: exact commands").
 
 ## Working on the owner's PC from a cloud session
 
