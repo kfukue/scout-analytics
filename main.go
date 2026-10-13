@@ -848,16 +848,39 @@ func (s *scanner) runnerFor(code string) *toolRunner {
 	return nil
 }
 
-func botAPISend(ctx context.Context, token, chatID, text string) error {
-	const limit = 4000
-	for len(text) > 0 {
-		chunk := text
-		if len(chunk) > limit {
-			chunk = chunk[:limit]
-			text = text[limit:]
-		} else {
-			text = ""
+// botAPILimit is the most bytes botAPISend puts in one message (Telegram
+// allows 4096 characters).
+const botAPILimit = 4000
+
+// splitMessage cuts text into chunks of at most limit bytes (limit > 0) that
+// join back to text exactly: each cut is right after the last newline within
+// the limit, or, without one, at the last rune boundary within it, so a
+// multi-byte rune (an emoji) is never cut. Only bytes that are not valid
+// UTF-8 can force a cut at exactly limit. No chunk is empty; "" gives none.
+func splitMessage(text string, limit int) []string {
+	var chunks []string
+	for len(text) > limit {
+		cut := strings.LastIndexByte(text[:limit], '\n') + 1
+		if cut <= 1 { // no newline, or only at the start (a chunk of just "\n")
+			cut = limit
+			for k := 0; k < utf8.UTFMax && cut > 0 && !utf8.RuneStart(text[cut]); k++ {
+				cut--
+			}
+			if cut == 0 || !utf8.RuneStart(text[cut]) {
+				cut = limit // not valid UTF-8 here: a byte cut is the only way forward
+			}
 		}
+		chunks = append(chunks, text[:cut])
+		text = text[cut:]
+	}
+	if text != "" {
+		chunks = append(chunks, text)
+	}
+	return chunks
+}
+
+func botAPISend(ctx context.Context, token, chatID, text string) error {
+	for _, chunk := range splitMessage(text, botAPILimit) {
 		body, _ := json.Marshal(map[string]any{
 			"chat_id":                  chatID,
 			"text":                     chunk,
@@ -1036,8 +1059,9 @@ func (s *scanner) process(ctx context.Context, j job, deliver bool) []*toolResul
 
 	rec.Deliver = s.shouldDeliver(results)
 	if !rec.Deliver {
-		// "not enough data yet" / unreadable: held back for the re-check (recheck.go)
-		if s.deferToRecheck(ctx, j, results, invIDs[recheckTool]) {
+		// "not enough data yet" / unreadable: held back for the re-check
+		// (recheck.go), which delivers it with this score line
+		if s.deferToRecheck(ctx, j, results, invIDs[recheckTool], scoreLine) {
 			return results
 		}
 		log.Printf("%s: gate verdict not in SCOUT_DELIVER_LEVELS — not delivering", j.CA)

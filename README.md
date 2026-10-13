@@ -1233,7 +1233,8 @@ Perceptor again:
 - **`SCOUT_PERCEPTOR_RECHECK_AFTER` (12m) after the call**: the delivery decision.
   `clean`/`caution` → delivered then, with a second header line `🔁 Perceptor re-checked 13m
   after the call` (the original call post and the call's sAlpha report are included as
-  usual; there is no model score line, the call was scored when it came in); `red_flags` →
+  usual, and the header ends with the model score line computed when the call came in,
+  exactly as a delivery at the call would show it; see the score line note below); `red_flags` →
   not delivered; still `insufficient`, `unknown` or no report → delivered then, headed
   `⏳ $TICKER Perceptor: not enough data yet` (or `❔ Perceptor: no readable verdict` /
   `no report (timeout)`). Stored as a live investigation (`scan_kind = 'live'`, `details`
@@ -1277,6 +1278,16 @@ waits behind a sleep or retry of the re-check (a live call that comes right afte
 request still waits Perceptor's normal 2m5s pacing, as after any request). Delivering a stored re-check does not ask Perceptor and is not held back by
 either. A Telegram `FLOOD_WAIT` stores nothing and pauses all re-checks for the time asked.
 A stop or reconnect during a re-check stores nothing (it runs again).
+
+The model score line of a re-check delivery (see "Scoring new calls") is the one the call
+got when it came in, from call-time data: the re-check never asks the scoring service again
+and its result is never a model input. No score at the call (scoring off, the service down
+or too slow, `SCOUT_MODEL_LINE=passed` with no bucket passed) means no line on the re-check
+delivery either. The line is kept in the listener's memory only (the scores themselves are
+in `scout_call_predictions`, but not which buckets passed nor the `SCOUT_MODEL_LINE` mode,
+so the line cannot be rebuilt from them): a reconnect keeps it, but a re-check delivered
+after a **restart** of the listener goes out without the score line. A missing line never
+holds back or delays the delivery.
 
 The re-check's delivery is recorded in `scout_deliveries` with `status = 'sending'` **before**
 it is sent, then updated to `sent` or `failed`. Any delivery row of a call (`sending`
