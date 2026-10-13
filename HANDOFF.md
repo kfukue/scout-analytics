@@ -1,17 +1,66 @@
 # Scout analytics: handoff to Claude Code
 
-## Session state (12 October 2026, after the owner merged items #1-#7 (PRs #18-#24) and the 12 Oct handoff (PR #25), and deployed 68a4954)
+## Session state (12 October 2026, end of session: main 228b3e0 after PRs #26-#30; prod at 68a4954 unless the owner deployed since)
 
-**12 October: agent setup redone by function** (5 agents + 5 skills; see
-"Agent setup"), committed on branch `work/2026-10-12-agent-setup` (worktree
-`.claude/worktrees/agent-setup-20261012`), rebased onto 41a27b0; takes
-effect only after the merge and a Claude Code restart.
+**Main and prod:** main is at **228b3e0** on GitHub (PR #30, merged
+12 Oct 23:20 PDT). Prod ran **68a4954** at the last confirmation (deployed
+by the owner 12 Oct); a deploy of 228b3e0 since then is not confirmed.
+The 228b3e0 deploy is the owner's next step ("Owner to-do: deploy 228b3e0"
+below). Merged 12 Oct after 41a27b0 (PR, merge commit, branch head):
 
-**Main and prod:** main is at **41a27b0** on GitHub (PR #25, the 12 Oct
-handoff, merged 12 Oct; PR #24, the scoring-service unit, merged just
-before it). Prod still runs **68a4954** (deployed 12 Oct); the Go
-processes need nothing from #23-#25, only the checkout the scoring service
-runs `serve.py` from. Merged since dc0a42d (session item → PR, merge
+- PR #26 (57fdced; head 67236c6, `work/2026-10-12-agent-setup`): agent
+  setup redone by function (5 agents + `scout-*` skills; see "Agent
+  setup"). Claude Code was restarted on it 12 Oct.
+- PR #27 (de62901; head 8368747, `work/2026-10-12-timing-touch-drop`):
+  Timing tab "reached 2×" rule: a call reached 2× only if it was at or
+  above 2× for at least 1 h in total, in every window; windows too short
+  for that (1h) show "n/a — needs 1 hour held" (`can2xReach`);
+  touch-and-drop calls count as 0 held. Frontend, README and tests only;
+  no API or schema change, no re-track. Not deployed yet.
+- PR #28 (1328ff1; head 61ed270, `work/2026-10-12-recheck-score-line`):
+  Perceptor re-check deliveries carry the first-pass score line, kept in
+  memory by the re-check lane (never recomputed from re-check data; lost
+  after a full listener restart; persisting it is an open owner decision,
+  below). `splitMessage` makes `botAPISend` UTF-8 safe (no cut runes).
+  Tested locally: full DB suite 857 pass / 0 skip. Not deployed yet.
+- PR #29 (27404b6; head 12bfa9d, `work/2026-10-12-ml-stability`): ML
+  report-only stability diagnostics: seeds (7, 11, 23), pooled
+  walk-forward with a week-block bootstrap CI plus a rolling 4-week
+  walk-forward, `EVAL_EXCLUDE_DEAD` evaluation, adversarial validation, a
+  "stronger regularisation" variant, late-bound config reads.
+  `SCOUT_ML_DIAGNOSTICS=0` turns them off for one run. The saved model,
+  gates and scores are unchanged. Tested locally: pytest 207 passed. Prod
+  runtime not measured yet (the `[diagnostics] …` line of the next
+  retrain gives it).
+- PR #30 (228b3e0; head c0b1332, `work/2026-10-12-pm-git-commands`): the
+  PM gets Bash for read-only git plus `git worktree add`, and Edit/Write
+  for `HANDOFF.md` and `.claude/skills/**` only; `.claude/settings.json`
+  allows those git commands and denies `git commit`/`add`/`push`/`stash`;
+  the PM skill has the exact commit hand-off template (absolute `cd`,
+  checks, PR link always) and the merge-only flow for a second branch on
+  the same files (the owner runs the merge). Takes effect after a Claude
+  Code restart.
+
+**Owner to-do: deploy 228b3e0** (no tracker restart, no schema change,
+`onchainStateVersion` unchanged), on the server:
+
+1. `cd ~/Documents/GitHub/scout-analytics && git checkout main && git pull`;
+   `git log -1 --oneline` shows `228b3e0 Merge pull request #30 …`.
+2. Restart `-web` (`go run . -web`) for #27 and the listener
+   (`go run . -listen-only`) for #28. The tracker keeps running.
+3. Checks: Analytics → Timing: the 1h window shows "n/a — needs 1 hour
+   held", 1d shows numbers; the legend at 1280/390 px, light and dark; no
+   CSP errors in DevTools.
+4. Then retrain: `REPO="$PWD" ML=~/scout-ml bash ~/scout-ml/run_training.sh
+   --skip-install` (no script refresh needed) and send the
+   `[diagnostics] seeds N s, walk_forward N s, no_dead N s, adversarial N s;
+   total N s` line plus `report.md` (to `ml-results/models/<version>/` on
+   the PC).
+
+The 12 Oct deploy checks still open from 68a4954 and the "Then switch
+scores on" steps below stay as they are.
+
+Merged earlier, after dc0a42d up to 41a27b0 (session item → PR, merge
 commit, branch head):
 
 - PR #15 (f072467, 10 Oct): ML walk-forward minimum, weeks with fewer than
@@ -48,7 +97,8 @@ commit, branch head):
   `.claude/skills/scout-product-manager/SKILL.md` and this file now state the
   `SCOUT_MODEL_LINE` rule. Done.
 
-**Prod runs main 68a4954 (deployed by the owner 12 Oct):** listener
+**Prod runs main 68a4954 (deployed by the owner 12 Oct; last confirmed
+state, see the 228b3e0 to-do above):** listener
 `-listen-only`, tracker `-track` and `-web` restarted by the owner on
 68a4954, so #2, #3 and #4 are live. The listener start applied
 `scoutanalytics.sql`, including the relabel of the 54 Perceptor rows from
@@ -62,10 +112,12 @@ to 2× / still ≥ 2× at end): 1h 5247/1365/434/229; 1d 5196/1863/850/81; 3d
 5058/1924/1002/66; 7d 4884/1905/1051/50; 30d 2982/1247/1021/28. C: has
 ~318 GB free (12 Oct); Go builds and throwaway Postgres work again.
 
-**Owner rules:** agents never push (`git push` is denied in
-`.claude/settings.json`) and agents' `git commit` isn't allowed either: the
+**Owner rules:** agents never commit or push (`.claude/settings.json`
+denies `git commit`, `git add`, `git push` and `git stash`, PR #30): the
 PM gives exact commit/push commands and the owner runs them; never commit to
-main. `review` runs on `fable`, `investigate` on `opus` (the owner asked
+main. The PM's Bash is for read-only git and `git worktree add` only; it
+edits `HANDOFF.md` and `.claude/skills/**` itself (in a worktree), every
+other file goes to `implement`. `review` runs on `fable`, `investigate` on `opus` (the owner asked
 for `fable` for one ML-planning research task). Up to 10 writing agents.
 The testing setup is PAUSED: the `verify` agent, the testdb scripts and CI
 (re-confirmed by the owner 12 Oct); `implement` runs DB tests
@@ -137,10 +189,9 @@ updated in PR #25.
 
 | # | Worktree | Branch to create/use | State | Files | Notes |
 |---|---|---|---|---|---|
-| — | agent-ae167c3d46439a04d | `worktree-agent-ae167c3d46439a04d` (work branch not named yet) | sAlpha re-ask; uncommitted, at d5d96ac (29 commits behind 68a4954) | — | See "Still to do". |
-| — | agent-afcf62469a29564cf, agent-aa31691b57e3bc7ff | `work/2026-10-09-testdb-scripts`, `work/2026-10-09-ci-tests` (to create) | testdb scripts, CI; paused, untracked | — | See "Owner rules" above. |
-| — | agent-setup-20261012 (at 41a27b0) | `work/2026-10-12-agent-setup` | owner's subagent-setup change; rebased onto 41a27b0, committed on `work/2026-10-12-agent-setup`; re-review, then owner pushes/merges and restarts Claude Code | `.claude/agents/*` (7 deleted, 5 new, `product-manager.md`), new `.claude/skills/scout-*/`, the PM skill, HANDOFF.md, README.md, TESTING.md | Replaces the 7 role agents (coder, ml-coder, react-coder, infra, tester, reviewer, researcher) with 5 function agents (`investigate` on opus, `implement`, `simplify`, `verify` (paused), `review` on fable) plus skills `scout-rules`, `scout-go`, `scout-web`, `scout-ml`, `scout-infra`; React dropped. The `SCOUT_MODEL_LINE` rule from `ml-coder.md` (PR #25) is in `scout-ml`. |
-| — | timing-touchdrop-20261012 (at c31d859) | `work/2026-10-12-timing-touch-drop` | built, in review; owner to choose how the 1h window is handled | `frontend/analytics*`, `testdata/analytics-stats.test.js`, `webanalytics_test.go`, README.md | New "reached 2×" rule (owner decision 12 Oct, section 3 "Decisions 12 October"); no data change, no re-track. |
+| — | agent-ae167c3d46439a04d | `worktree-agent-ae167c3d46439a04d` (work branch not named yet) | sAlpha re-ask; uncommitted (18 entries in `git status --short`), at d5d96ac (45 commits behind main 228b3e0) | — | See "Still to do". |
+| — | agent-afcf62469a29564cf, agent-aa31691b57e3bc7ff | `work/2026-10-09-testdb-scripts`, `work/2026-10-09-ci-tests` (to create) | testdb scripts, CI; paused, uncommitted (at dc0a42d, 33 commits behind 228b3e0) | — | See "Owner rules" above. |
+| — | handoff-session-20261012 (at 228b3e0) | `work/2026-10-12-handoff-session` | this file's 12 Oct end-of-session update; uncommitted, for the owner to commit | `HANDOFF.md` | Docs only. |
 
 **GCP site (#5): merged as PR #18 (4245939)**, a draft only (`deploy/gcp/`,
 `deploy/gcp/INTERFACE.md`); no Go export and no GCP resources yet, so
@@ -151,21 +202,33 @@ default (section 4 item 8) was verdict labels only. Owner to confirm (b)
 publish, or ask for (a) labels only (text/links behind an opt-in in
 `deploy/gcp/INTERFACE.md`) before the Go export is written.
 
-**Retrain in progress (owner, 12 Oct, after 20261012-1917):** report to
-come.
+**Latest model report (20261012-2209, trained on prod 12 Oct, before the
+#29 diagnostics were merged; 4,759 rows, data to 12 Oct): ALL buckets
+FAIL.** short (1d): lift 0.95 [0.64, 1.33] (runner AUC 0.47, no signal),
+collapses removed 0.52, WF 3/6 counted, top-10% −6.3% vs all −18.3%. 3day:
+lift 1.66 [0.95, 2.76], collapses removed 0.52, WF 6/6, top-10% −3.7% vs
+all −28.6%. medium (7d): lift 1.998 [1.19, 3.22] (gate 2), collapses
+removed 0.48, WF 4/4 counted, top-10% −4.7% vs all −41.3%. long skipped
+(2,946 rows over 46 days). Variant "raw dex + dex_family" PASSES 3day on
+the test part only (lift 2.27; WF mean lift 2.08 < baseline 2.12), so it is
+not adopted (test-period overfitting). Medium went 2.60 PASS (10 Oct) →
+1.88 (12 Oct, 1917) → 1.998 (12 Oct, 2209): noise around the gate. The
+report-only diagnostics merged in PR #29 (pooled walk-forward with
+bootstrap CI, seeds, no-dead evaluation, adversarial validation) are meant
+to settle the gate decision; the next retrain on 228b3e0 is the first with
+them.
 
-**Latest model report (20261012-1917, trained on prod 12 Oct after the
-deploy; 4,755 rows, data to 12 Oct): ALL buckets FAIL.** short (1d): lift
-1.04, collapses removed 0.50, WF 2/6, top-10% −20.5% vs all −18.3%. 3day:
-lift 1.51, collapses removed 0.52, WF 6/6, top-10% +2.5% vs all −28.6%.
-medium (7d): lift 1.88 [1.09, 3.09] (was 2.60 PASS two days earlier),
-collapses removed 0.49, WF 4/4 counted, top-10% +1.6% vs all −42.2% (first
-positive). long skipped (2,931 rows over 46 days). Variant "raw dex +
-dex_family" passes 3day on the test part only (WF mean lift 1.92 < baseline
-2.02), so it is not adopted (test-period overfitting). Lesson: the medium
-pass was within noise; stability work is the next ML priority.
+**Previous model report (20261012-1917, trained on prod 12 Oct after the
+deploy; 4,755 rows, data to 12 Oct; history): ALL buckets FAIL.** short
+(1d): lift 1.04, collapses removed 0.50, WF 2/6, top-10% −20.5% vs all
+−18.3%. 3day: lift 1.51, collapses removed 0.52, WF 6/6, top-10% +2.5% vs
+all −28.6%. medium (7d): lift 1.88 [1.09, 3.09] (was 2.60 PASS two days
+earlier), collapses removed 0.49, WF 4/4 counted, top-10% +1.6% vs all
+−42.2%. long skipped (2,931 rows over 46 days). Variant "raw dex +
+dex_family" passed 3day on the test part only (WF mean lift 1.92 < baseline
+2.02), not adopted.
 
-**Previous model report (20261010-0621, trained on prod 10 Oct, 4,727 usable
+**Older model report (20261010-0621, trained on prod 10 Oct, 4,727 usable
 first calls; history):** short (1d) FAIL (runner AUC 0.47 = no signal; lift 1.00;
 collapses removed 0.49; WF 2/6); 3day FAIL (lift 1.73; collapses removed
 0.52; WF 5/5); medium (7d) PASS (lift 2.60 [1.67, 3.91]; collapses removed
@@ -175,11 +238,9 @@ Two of four medium variants fail (raw dex; runners must be tradeable). The
 dead-score proposal would pass for LightGBM but is driven by one uniswap_v4
 wave (136/148), so it stays report-only.
 
-**ML research (fable, 10 Oct): next ML plan, report-only variants; the
-prod retrain is done (20261012-1917) and the line-all change is merged
-(PR #23); the first variants are not started; the owner's subagent-setup
-change is committed and rebased, awaiting re-review and merge; the variants
-start after it merges and Claude Code is restarted (see "Still to do"):**
+**ML research (fable, 10 Oct): next ML plan, report-only variants; items
+(1)-(3) are merged as report-only diagnostics (PR #29, 27404b6); (4)-(8)
+are not started:**
 (1) seed stability (3 seeds) +
 stronger regularisation;
 (2) regime diagnostics: adversarial validation, pooled walk-forward with
@@ -197,16 +258,28 @@ intercept weekly). Proposed gate changes for the OWNER to decide: pooled WF
 lift with bootstrap CI; ≥ 75% of counted weeks + pooled sim beats buy-all;
 absolute check (pooled top-10% mean net return > 0) before showing scores
 (today's 7d would fail that). PM leaned (a) keep current gates + run the
-stability checks. The 20261012-1917 report (medium fell from lift 2.60 PASS
-to 1.88 FAIL in two days) makes the (b)-style pooled WF / bootstrap-CI
-gates more relevant; the ML stability variants (seeds, pooled WF +
-bootstrap CI, no-dead re-evaluation) are not started; they start after the
-subagent-setup change (committed and rebased, awaiting re-review and merge)
-merges and Claude Code is restarted.
+stability checks. The 20261012-1917 and -2209 reports (medium 2.60 PASS →
+1.88 → 1.998 FAIL) make the (b)-style pooled WF / bootstrap-CI gates more
+relevant. The stability diagnostics (seeds 7/11/23, pooled WF + week-block
+bootstrap CI, rolling 4-week WF, `EVAL_EXCLUDE_DEAD` evaluation,
+adversarial validation, stronger regularisation, late-bound config reads)
+are merged as report-only (PR #29); the gate decision waits for the first
+report that has them (next retrain on 228b3e0).
 
 **Owner decisions still open:** ML gates (a) keep current + stability
 checks / (b) stricter pooled-WF/bootstrap-CI gates (see the 12 Oct note
-above); GCP public site content: (b) publish scrubbed sAlpha text +
+above; to be settled with the first report that has the PR #29
+diagnostics); persist the Perceptor re-check score line across listener
+restarts (PR #28 keeps it in memory only, so a full listener restart loses
+it for calls held at that moment): (a) a `score_line` key in the held
+Perceptor investigation's `details` JSONB, written in `MarkHeldForRecheck`,
+or (b) a column; shipping without it for now; pull `botAPIRedact` forward
+from the sAlpha re-ask branch as its own small fix (pre-existing issue: a
+network-level Bot API send error, a `*url.Error` from
+`http.DefaultClient.Do`, contains the full URL including the bot token and
+can reach the listener logs); the Timing tab's "0 held" reading for calls
+that touched 2× but held under 1 h (kept as built in PR #27 unless the
+owner objects); GCP public site content: (b) publish scrubbed sAlpha text +
 Perceptor links as merged, or (a) verdict labels only with an opt-in (PM
 recommends (a): both are paid bots); Perceptor re-scan 250/day + 1440 h max
 age (current 100/day, 30 days); public-site stopgap; price providers; DNS
@@ -226,10 +299,14 @@ Desktop stash ("On work/2026-10-09-ml-variants: !!GitHub_Desktop<…>",
 `stash@{1}` today, `stash@{0}` after the drop).
 
 **Worktree and branch clean-up (owner, when convenient; from the main
-checkout):** on 12 Oct every local `work/*` branch (21) was in
-`git branch --merged 68a4954`, and the merged worktrees below had an empty
-`git status --short`.
+checkout):** checked 12 Oct end of session (main 228b3e0):
+`git branch --no-merged main` printed nothing, so every local branch is
+merged; `git branch -r --no-merged main` printed nothing either. The
+worktrees to remove below had an empty `git status --short`.
 
+0. Delete the stray folder `D:\c` (created by an agent's path mix-up; it
+   holds only empty nested folders `Users\<user>\AppData\Local\Temp\claude`,
+   0 files on 12 Oct).
 1. `git fetch --prune`
 2. Remove the merged worktrees (check `git -C <wt> status --short` is empty
    first; a worktree shown as `locked` by `git worktree list` needs
@@ -242,33 +319,47 @@ checkout):** on 12 Oct every local `work/*` branch (21) was in
    `...\agent-ae1d8c7d8de93a35b` (#5 gcp-site),
    `...\agent-adc7b7e6c79d4bb23` (timing-backend),
    `...\agent-af53dbd18b713cb60` (ml-wf-min),
-   `...\agent-a91f7f4e909abfd02` (#7 ml-line-all, PR #23; clean on 12 Oct),
-   `...\agent-ab0f0dba0692e4540` (#6 scoring-service, PR #24; locked, so
-   unlock it first) and `...\agent-af197a4c6cbe0f7db` (12 Oct handoff,
-   PR #25).
-3. `git branch -d` every merged branch: `work/2026-10-08-ml-pool-web`,
+   `...\agent-a91f7f4e909abfd02` (#7 ml-line-all, PR #23),
+   `...\agent-ab0f0dba0692e4540` (#6 scoring-service, PR #24; locked
+   "claude agent agent-ab0f0dba0692e4540 (pid 131248)", so unlock it
+   first), `...\agent-af197a4c6cbe0f7db` (12 Oct handoff, PR #25) and
+   `...\agent-setup-20261012` (`work/2026-10-12-agent-setup`, PR #26).
+   The worktrees of PRs #27-#30 no longer exist on disk.
+3. `git branch -d` every merged local branch: `work/2026-10-08-ml-pool-web`,
    all `work/2026-10-09-*` (agent-setup, analytics-charts, analytics-page,
    flaky-pacing-test, gcp-site, handoff-queue, mcap-supply,
    ml-dead-dex-calib, ml-dead-score, ml-variants, ml-wf-min,
    perceptor-recheck, perceptor-rescan, perceptor-today-label,
-   salpha-capture, timing-backend) and all `work/2026-10-10-*`
-   (handoff-pause, ml-score-gating, score-live-fixes, timing-tab);
-   `work/2026-10-12-ml-line-all` (merged as PR #23; remove its worktree
-   first if it still has one); `work/2026-10-12-scoring-service` (PR #24)
-   and `work/2026-10-12-handoff` (PR #25).
+   salpha-capture, timing-backend), all `work/2026-10-10-*`
+   (handoff-pause, ml-score-gating, score-live-fixes, timing-tab),
+   `work/2026-10-12-ml-line-all` (PR #23), `work/2026-10-12-scoring-service`
+   (PR #24), `work/2026-10-12-handoff` (PR #25),
+   `work/2026-10-12-agent-setup` (PR #26) and
+   `work/2026-10-12-pm-git-commands` (PR #30; no worktree). The branches
+   of PRs #27-#29 exist only on origin. Also the leftover merged
+   `worktree-agent-a0bdbe5e67a6d0034`, `worktree-agent-a8cd1f54c100d5817`,
+   `worktree-agent-a91f7f4e909abfd02`, `worktree-agent-ab0f0dba0692e4540`
+   and `worktree-agent-af197a4c6cbe0f7db` (not checked out anywhere).
    Note: GitHub Desktop shows its
    stash only on `work/2026-10-09-ml-variants`; deleting that branch keeps
    the stash in `git stash list` but hides it in Desktop, so the owner may
    keep that one branch until he has decided about the stash.
-4. `git push origin --delete` the same ones that exist on origin (all of
-   them except `work/2026-10-08-ml-pool-web`, which has no remote branch).
+4. `git push origin --delete` the merged `work/*` branches on origin (28 on
+   12 Oct, all merged): the `work/*` branches of step 3 except
+   `work/2026-10-08-ml-pool-web` (no remote branch), plus
+   `work/2026-10-12-timing-touch-drop` (PR #27),
+   `work/2026-10-12-recheck-score-line` (PR #28) and
+   `work/2026-10-12-ml-stability` (PR #29).
 
 Keep: `agent-ae167c3d46439a04d`
-(sAlpha re-ask), `agent-afcf62469a29564cf` and `agent-aa31691b57e3bc7ff`
-(paused testing), `agent-setup-20261012` (`work/2026-10-12-agent-setup`,
-committed, awaiting re-review, push and merge) and `timing-touchdrop-20261012`
-(`work/2026-10-12-timing-touch-drop`, in review), the
-`worktree-agent-*` branches of the first three, and the GitHub Desktop stash. No agent test Postgres servers were
+(sAlpha re-ask; 18 uncommitted entries), `agent-afcf62469a29564cf` and
+`agent-aa31691b57e3bc7ff` (paused testing; uncommitted),
+`handoff-session-20261012` (`work/2026-10-12-handoff-session`, this update,
+until it is merged), the `worktree-agent-*` branches checked out in the
+first three (`worktree-agent-ae167c3d46439a04d`,
+`worktree-agent-afcf62469a29564cf`, `worktree-agent-aa31691b57e3bc7ff`;
+merged at their base commits, but their worktrees hold uncommitted work),
+and the GitHub Desktop stash. No agent test Postgres servers were
 running on 12 Oct (only the owner's own Windows service). Old agent
 scratchpads take ~5.5 GB under `...\AppData\Local\Temp\claude\...`; the
 owner may delete old session folders there (not the current session's).
@@ -276,50 +367,35 @@ Never touch the owner's own Postgres server.
 
 **Still to do:**
 
-- Subagent-setup change (worktree `agent-setup-20261012`): rebased onto
-  41a27b0, committed on `work/2026-10-12-agent-setup`; re-review, then the
-  owner pushes/merges and restarts Claude Code.
-- Timing tab "reached 2×" rule (≥ 1 h at or above 2×; section 3
-  "Decisions 12 October"): built, in review in worktree
-  `timing-touchdrop-20261012`; owner to choose how the 1h window is
-  handled.
-- sAlpha re-ask (worktree `agent-ae167c3d46439a04d`, at d5d96ac, 29
-  commits behind main 68a4954): update onto main (which now has the
-  Perceptor re-check and its `sending` delivery status), then
+- Owner: deploy 228b3e0 and retrain ("Owner to-do: deploy 228b3e0"
+  above).
+- sAlpha re-ask (worktree `agent-ae167c3d46439a04d`, at d5d96ac, 45
+  commits behind main 228b3e0): update onto main (which now has the
+  Perceptor re-check, its `sending` delivery status, the re-check score
+  line and `splitMessage`), then
   `notify_message_id` for re-check deliveries, treat `sending` as not sent
   in `FirstSentDelivery`, live-path Bot API 429 pause, review.
+- Bot token redaction (owner to decide whether to pull it forward):
+  `botAPIRedact` exists only on the sAlpha re-ask branch (`main.go` in
+  worktree `agent-ae167c3d46439a04d`); on `main` a network-level Bot API
+  send error (`*url.Error` from `http.DefaultClient.Do`) contains the full
+  URL including the bot token and can reach the listener logs
+  (pre-existing). Proposed as its own small fix (`implement` with
+  `scout-go`).
+- Persist the re-check score line across listener restarts, if the owner
+  chooses it (open decision above: `details` JSONB `score_line` in
+  `MarkHeldForRecheck`, or a column).
 - Persist the ML `passed` flag in `scout_call_predictions` (schema change;
   unblocked now that #1-#3 are on main).
 - ML timing outcome columns in the dataset view (the `timing_`/rug leakage
   guard is on main since PR #19).
 - GCP Go export per `deploy/gcp/INTERFACE.md` (after the publish decision).
-- ML stability variants (`implement` with `scout-ml`; research plan
-  above): not started; they start after the owner's subagent-setup change
-  (committed and rebased, awaiting re-review and merge) merges and Claude
-  Code is restarted (the worktrees could
-  not be created on 12 Oct: "Could not read the repository git config to
-  neutralize filter drivers", likely a transient git lock; the owner then
-  asked to change the subagent setup first). Task: seeds (3) plus a
-  stronger-regularisation knob; pooled walk-forward with a week-block
-  bootstrap CI; re-evaluation without dead calls (`EVAL_EXCLUDE_DEAD`);
-  adversarial validation; late-bound config reads (model.py/validate.py
-  bind some config at import); report-only, no gate change. The prod
-  retrain is done (20261012-1917).
 - Scoring-service unit #6: merged (PR #24, 77dce3d). Next the owner
   installs it per `ops/scout-model.md`, then sets `SCOUT_MODEL_URL` in
   `.env` and restarts the listener (the "switch scores on" steps above).
-- Perceptor re-check deliveries carry no score line today: `recheck.go`
-  builds its own header without `scoreCall`, and `main.go` drops
-  `scoreLine` when it defers a call for the re-check (the score is still
-  stored). Not started; starts after the owner's subagent-setup change
-  (committed and rebased, awaiting re-review and merge) merges and Claude
-  Code is restarted (its worktree could not be created on 12 Oct, same git
-  error as above). Task (`implement` with `scout-go`): keep the score line
-  computed at the first pass and append it to the re-check delivery; no recomputation from re-check data. If the change
-  touches `main.go`, also fix the Bot API byte split (next item).
-- Bot API chunking (`botAPISend` in `main.go`) splits by bytes
-  (`chunk[:limit]`, limit 4000) and can cut a multi-byte rune
-  (pre-existing; small fix).
+- ML: the gate decision after the first report with the PR #29
+  diagnostics; the remaining report-only variants (4)-(8) of the ML
+  research plan above are not started.
 - Small fixes: `recheck.go` `paceWait` should only lower `nextLook` (now on
   main); Timing tab KM caption wording and the unused `ech-tip-box` class;
   narrow `isNoSuchValue`, "0 red flags" parser, `reply_to_msg_id`
@@ -336,7 +412,8 @@ Never touch the owner's own Postgres server.
 
 ## Introduction
 
-Up to date as of 12 October 2026 (main at 41a27b0; prod at 68a4954). Start Claude
+Up to date as of 12 October 2026, end of session (main at 228b3e0; prod at
+68a4954 at the last confirmation, 228b3e0 deploy pending). Start Claude
 Code in the repo root; `.claude/settings.json` makes the session the product
 manager, which delegates to the agents in `.claude/agents/` (see "Agent setup").
 
@@ -363,23 +440,26 @@ are on `main` (68a4954) and deployed on prod (owner, 12 Oct); the owner
 checks still open from that deploy are at the top. `SCOUT_MODEL_LINE`
 (PR #23, `ml/` only) is on `main` (c31d859); it takes effect once the
 scoring service runs from a checkout that has it. The scoring-service unit
-and runbook `ops/scout-model.*` (PR #24, 77dce3d) are on `main` (41a27b0)
+and runbook `ops/scout-model.*` (PR #24, 77dce3d) are on `main`
 but not installed on prod yet ("Then switch scores on" at the top).
+Merged 12 Oct, on `main` (228b3e0) but not deployed yet: the agent setup
+(PR #26; in use since the Claude Code restart), the Timing tab "reached 2×"
+rule (PR #27; needs `-web` restarted), the re-check score line and the
+rune-safe Bot API split (PR #28; needs the listener restarted), the ML
+stability diagnostics (PR #29; take effect at the next retrain) and the PM
+git commands (PR #30; take effect after a Claude Code restart). Owner
+to-do at the top ("Owner to-do: deploy 228b3e0").
 
 - **Not on `main`** (each item exists as uncommitted changes, or a local
   commit not yet pushed, in an agent worktree under `.claude/worktrees/` —
   see the Session state at the top):
-  - Agent setup redone by function on 12 October (5 agents + 5 skills),
-    committed on branch `work/2026-10-12-agent-setup` (worktree
-    `agent-setup-20261012`), rebased onto 41a27b0; takes effect only after
-    the merge and a Claude Code restart.
   - Throwaway-Postgres scripts `scripts/testdb.ps1` / `scripts/testdb.sh`
     (agent-afcf62469a29564cf) (paused, see Session state).
   - CI draft `.github/workflows/test.yml` (agent-aa31691b57e3bc7ff; owner
     approval) (paused, see Session state).
   - sAlpha re-ask (re-ask when the first answer was declined, empty or timed
     out; section 3 "Decisions 9 October"): update onto main first (the
-    worktree is 29 commits behind 68a4954). Still to do on that branch: store
+    worktree is 45 commits behind 228b3e0). Still to do on that branch: store
     `notify_message_id` for re-check deliveries; treat the `sending` status
     as not sent in `FirstSentDelivery`; Bot API 429 pause on the live path;
     then review. `notify_message_id`, `FirstSentDelivery` and `botAPIRedact`
@@ -389,6 +469,17 @@ but not installed on prod yet ("Then switch scores on" at the top).
 - **Should-fix, deferred:** in `recheck.go` (on `main` since PR #20), the
   `paceWait` branch should only lower `nextLook`:
   `if at := now.Add(wait); at.Before(l.nextLook) { l.nextLook = at }`.
+- **Should-fix, owner to decide (12 Oct):** bot-token redaction: on `main`
+  a network-level Bot API send error (`*url.Error` from
+  `http.DefaultClient.Do`) contains the full URL including the bot token
+  and can reach the listener logs (pre-existing); `botAPIRedact` exists
+  only on the sAlpha re-ask branch; proposed: pull it forward as its own
+  small fix.
+- **Owner decision pending (12 Oct):** persist the Perceptor re-check score
+  line (PR #28 keeps it in memory; lost after a full listener restart):
+  (a) a `score_line` key in the held Perceptor investigation's `details`
+  JSONB written in `MarkHeldForRecheck`, or (b) a column (schema change).
+  Shipped without it for now.
 - **Small fixes:**
   - narrow `isNoSuchValue` (`onchain.go`);
   - the "0 red flags" parser bug: a Perceptor report with zero red flags is
@@ -410,7 +501,12 @@ but not installed on prod yet ("Then switch scores on" at the top).
     only with an opt-in in `deploy/gcp/INTERFACE.md`, before the Go export
     is written (section 4 item 8; PM recommends (a): both are paid bots);
   - ML gates: (a) keep current + stability checks, or (b) stricter
-    pooled-WF/bootstrap-CI gates (Session state, "ML research");
+    pooled-WF/bootstrap-CI gates (Session state, "ML research"); settle it
+    with the first report that has the PR #29 diagnostics;
+  - Timing tab: the "0 held" reading for calls that touched 2× but held
+    under 1 h (PR #27) stays as built unless the owner objects;
+  - after the 228b3e0 deploy: Timing 1h shows "n/a — needs 1 hour held",
+    1d shows numbers, legend at 1280/390 px light/dark, no CSP errors;
   - disk space: ~318 GB free on C: (12 Oct; was ~100 MB before the
     owner's 10 Oct clean-up, which blocked Go builds); old agent
     scratchpads under `...\AppData\Local\Temp\claude\...` (~5.5 GB) may be
@@ -428,7 +524,8 @@ but not installed on prod yet ("Then switch scores on" at the top).
     settings"); the owner decides.
 - **Later:** Timing tab frontend (`/api/analytics` format 4): merged (PR
   #22) and deployed 12 Oct; the owner still records the real gzipped size
-  (top); ML timing outcome columns: the
+  (top); the "reached 2×" rule (PR #27) is merged, not deployed; ML timing
+  outcome columns: the
   leakage guard (`FORBIDDEN_PREFIXES`/`FORBIDDEN_COLUMNS`) for the timing and
   rug columns (`peak_late_after_s`, `first_2x_after_s`, `above_2x_s`,
   `fall_below_2x_after_s`, `above_2x_censored`, `timing_at`, `rug_at`,
@@ -619,9 +716,11 @@ the timing negative-values check returned 0.
 Done 12 October (owner): prod checkout at **68a4954**; listener, tracker
 and `-web` restarted on it (Perceptor re-check, score live fixes, Timing
 tab). The listener start relabelled the 54 "not enough data yet" Perceptor
-rows to `insufficient`. Model 20261012-1917 trained on prod after the
-deploy (all buckets FAIL; Session state at the top). Owner checks from the
-deploy are listed at the top.
+rows to `insufficient`. Models 20261012-1917 and 20261012-2209 trained on
+prod after the deploy (all buckets FAIL; Session state at the top). Owner
+checks from the deploy are listed at the top. Main moved on to 228b3e0
+(PRs #26-#30) the same evening; its deploy is not confirmed yet ("Owner
+to-do: deploy 228b3e0" at the top).
 
 Still to confirm in prod:
 
@@ -709,14 +808,47 @@ Decisions 12 October (owner):
   least 1 hour. A call that touched 2× but held less than 1 h counts as
   "did not reach 2×": it stays in the totals/denominators and is left out of
   the time-to-2×, time-held, fell-back and "still at 2× after t" figures.
-  Being implemented in `timing-touchdrop-20261012`; no data change, no
-  re-track.
+  The rule applies in every window; windows too short for it (1h) show
+  "n/a — needs 1 hour held"; touch-and-drop calls count as 0 held (the
+  owner may still object to that reading). Merged as PR #27 (de62901; head
+  8368747): frontend, README and tests only, no API or schema change, no
+  re-track; not deployed yet (needs `-web` restarted on 228b3e0).
 - Relabel re-check: the owner's read-only count of `unknown` + "not enough
   data yet" Perceptor rows returned 0 (consistent with the 54-row relabel
   at the 68a4954 listener start).
 - Disk: C: has ~318 GB free; Go builds and throwaway Postgres work again.
   The testing setup stays PAUSED (`verify` agent, testdb scripts, CI).
-- ML: the owner is retraining on prod (after 20261012-1917); report to come.
+- ML: retrained on prod after 20261012-1917: model 20261012-2209, all
+  buckets FAIL (medium lift 1.998 against a gate of 2). The stability
+  diagnostics are merged report-only (PR #29, 27404b6; saved model, gates
+  and scores unchanged; `SCOUT_ML_DIAGNOSTICS=0` turns them off for one
+  run); the gate decision (a)/(b) waits for the first report with them.
+- Agent setup redone by function (PR #26, 57fdced): 5 agents + `scout-*`
+  skills; Claude Code restarted on it.
+- Perceptor re-check deliveries carry the first-pass score line (PR #28,
+  1328ff1), kept in memory by the re-check lane and never recomputed; it
+  is lost after a full listener restart. Persisting it ((a) a `score_line`
+  key in the held Perceptor investigation's `details` JSONB written in
+  `MarkHeldForRecheck`, or (b) a column) is an open owner decision;
+  shipped without it for now. The same PR makes `botAPISend` UTF-8 safe
+  (`splitMessage`).
+- PM git commands (PR #30, 228b3e0): the PM has Bash for read-only git and
+  `git worktree add`, Edit/Write for `HANDOFF.md` and `.claude/skills/**`
+  only; `settings.json` denies `git commit`/`add`/`push`/`stash`; every
+  commit hand-off has exact commands with an absolute `cd`, checks and the
+  PR link; a second branch on the same files gets `git merge --no-edit
+  main`, run by the owner (merge only, never rebase). Takes effect after a
+  Claude Code restart.
+- Open (new): pull `botAPIRedact` forward from the sAlpha re-ask branch as
+  its own small fix (the bot token can reach the listener logs through a
+  `*url.Error`; pre-existing).
+- Lessons: the Agent tool's `isolation: "worktree"` fails on this PC
+  ("Could not read the repository git config to neutralize filter
+  drivers", every time on 12 Oct; the repo has no filter drivers), so
+  worktrees are created with `git worktree add` (by the PM, after the
+  restart on PR #30). A relative `cd` in a commit hand-off ran git in the
+  wrong worktree (12 Oct); hand-offs now use absolute paths and check
+  `git log -1` before the push.
 
 **Prod settings** (for reference):
 
@@ -747,7 +879,15 @@ owner keeps them in local notes (reviewed and tightened by the owner on
    validated)"); prod is to run `all` once the scoring service is
    installed (owner decision 12 Oct, section 3
    "Decisions 12 October"; only he reads the delivery group). Latest
-   report: 20261012-1917, all buckets FAIL (Session state at the top).
+   report: 20261012-2209 (trained on prod 12 Oct, 4,759 rows), all buckets
+   FAIL: short lift 0.95, WF 3/6; 3day lift 1.66 [0.95, 2.76], WF 6/6;
+   medium lift 1.998 [1.19, 3.22], WF 4/4; long skipped (Session state at
+   the top; previous 20261012-1917). From the next retrain on 228b3e0 the
+   report also has the report-only stability diagnostics (PR #29; seeds,
+   pooled and rolling walk-forward with bootstrap CI, no-dead evaluation,
+   adversarial validation, stronger regularisation; `SCOUT_ML_DIAGNOSTICS=0`
+   turns them off for one run; the `[diagnostics] …` line gives their
+   runtime, not measured on prod yet).
    - **First training on prod, 8 October:** model 20261008-1852, all four
      buckets FAIL. 4,709 first calls after exclusions. Train time 6 s.
      Python 3.11 was installed alongside the system 3.10 (Ubuntu 22.04);
@@ -1034,6 +1174,17 @@ owner keeps them in local notes (reviewed and tightened by the owner on
      68a4954) and deployed 12 Oct** (`-web` restarted by the owner on
      68a4954); the owner still records the real `/api/analytics` size
      (owner checks at the top).
+   - Status (12 October, evening): the "reached 2×" rule is **merged
+     (8368747, PR #27, merge de62901)**, not deployed yet (needs `-web`
+     restarted on 228b3e0). Reached 2× = at or above 2× for at least 1 h in
+     total, in every window; windows too short for it (1h) show "n/a —
+     needs 1 hour held" (`can2xReach`); touch-and-drop calls count as 0
+     held (the owner may object to that reading); calls under 1 h held stay
+     in the totals and are left out of the time-to-2×, time-held,
+     fell-back and "still at 2× after t" figures. Frontend, README and
+     tests only; no API or schema change, no re-track. Checks after the
+     deploy: 1h shows the n/a text, 1d shows numbers, legend at 1280/390 px
+     light/dark, no CSP errors.
    - Backfill (prod, 9 October): the owner ran `-backfill-timing` (dry run
      and real run) and checked it with read-only SQL:
      - every first call has timing in every horizon (5,247 calls);
@@ -1230,9 +1381,10 @@ Later:
   `POST /api/refresh`). Keep p95 under 10 ms; rerun
   `go test -run xxx -bench BenchmarkWebSnapshot -benchmem` after touching it.
 - Only real calls are scanned, delivered and tracked; one row per token.
-- Agents never push (`git push` is denied in `.claude/settings.json`); with
-  the owner's approval they commit on `work/...` branches, never on `main`;
-  the owner pushes and merges.
+- Agents never commit or push (`git commit`, `git add`, `git push` and
+  `git stash` are denied in `.claude/settings.json`); the PM gives exact
+  commands and the owner commits on `work/...` branches, never on `main`,
+  then pushes and merges.
 - Wait for all checks (tests, `review`) before committing; separate clean
   commits per change.
 - Say "tested locally" unless it ran on the prod server. Flag anything that
@@ -1320,12 +1472,21 @@ Checks after deploying `work/2026-10-08-ml-pool-web` (deployed 8 October in
 
 ## Agent setup
 
-- Redone by function on 12 October 2026 (replacing the role-based `coder`,
+- Redone by function on 12 October 2026 (PR #26, 57fdced; replacing the
+  role-based `coder`,
   `ml-coder`, `react-coder`, `infra`, `tester`, `reviewer` and `researcher`).
   An agent exists only to isolate context, restrict tools or give fresh eyes.
   `.claude/agents/`:
   - `product-manager`: the main session (`"agent"` in
-    `.claude/settings.json`); delegates only, to the five below.
+    `.claude/settings.json`); delegates to the five below. Tools (PR #30):
+    `Agent(investigate, implement, simplify, verify, review), Read, Glob,
+    Grep, Bash, Edit, Write`. Bash is for read-only git (status, log,
+    diff, show, rev-parse, merge-base, branch --list, worktree list,
+    fetch) plus `git worktree add -b work/...` to create worktrees for
+    `implement`; Edit/Write only on `HANDOFF.md` and `.claude/skills/**`
+    (in a worktree, never the main checkout). Never add, commit, push,
+    stash, switch, reset, rebase or merge. The authoritative PM rules are
+    in `.claude/skills/scout-product-manager/SKILL.md`.
   - `investigate`: read-only answers about code, data, model reports and
     outside sources; drafts plans and specs (`model: opus`).
   - `implement`: changes files in a worktree to the PM's spec, any area.
@@ -1355,9 +1516,11 @@ Checks after deploying `work/2026-10-08-ml-pool-web` (deployed 8 October in
   every commit (at most 3 fix rounds, then the owner decides).
 - One writer at a time per worktree. At most 10 writing agents in parallel
   (owner's limit, raised 9 Oct 2026).
-- `settings.json`: read-only git, `node --check` and the ml venv pytest
+- `settings.json`: read-only git, `git fetch`, `git worktree add`,
+  `node --check`, go vet/test/build, gofmt and the ml venv pytest
   (`ml/.venv`, or `.venv` from inside `ml/`) are allowed; secrets are denied in
-  any folder; `git push` is denied for both Bash and PowerShell. Binaries,
+  any folder; `git push`, `git commit`, `git add` and `git stash` are denied
+  for both Bash and PowerShell (PR #30). Binaries,
   secrets, state, CSVs and the venv are in `.gitignore`.
 - New or changed agents and skills load only after a Claude Code restart.
 - Lessons:
@@ -1378,6 +1541,15 @@ Checks after deploying `work/2026-10-08-ml-pool-web` (deployed 8 October in
     the Edit tool and recheck CRLF afterwards.
   - The owner merged the stacked branch directly (PR #1). A PR from a
     stacked branch includes the base branch's commits.
+  - The Agent tool's `isolation: "worktree"` fails on this PC ("Could not
+    read the repository git config to neutralize filter drivers", every
+    time on 12 Oct; the repo has no filter drivers). Worktrees are created
+    with `git worktree add` from the main checkout with an absolute target
+    path (by the PM since PR #30), and agents are launched without
+    isolation.
+  - A relative `cd` in a commit hand-off ran git in the wrong worktree
+    (12 Oct; the push sent only the old base commit). Hand-offs use an
+    absolute `cd` and check `git log -1 --oneline` before the push.
 
 ## Reference
 
