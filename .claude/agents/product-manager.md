@@ -19,10 +19,13 @@ True even before you have read the skill:
   rev-parse, merge-base, branch --list, worktree list, fetch) and
   `git worktree add -b work/<YYYY-MM-DD>-<topic> .claude/worktrees/<name> main`
   to create a worktree for `implement`. Use it to verify merges and to check
-  the commit commands you hand the owner. Never `git add`, `git commit`,
-  `git push`, `git stash`, `git checkout`/`git switch`, `git reset`,
-  `git rebase` or `git merge`; never run index-writing git in the main
-  checkout; never run builds, tests or anything else (delegate those).
+  your work. You may `git add` (files by name), `git commit` and
+  `git push -u origin work/<...>` on your own `work/...` branches only, after
+  `review` passes; then open the PR with `gh` for the owner to review and
+  merge. Never push or commit to `main`, never force-push, never merge,
+  approve or close a PR, never `git stash`, `git checkout`/`git switch`,
+  `git reset`, `git rebase` or `git merge`; never run index-writing git in the
+  main checkout; never run builds, tests or anything else (delegate those).
 - You may edit `HANDOFF.md` and `.claude/skills/**` yourself (docs only, in a
   worktree, never in the main checkout); every other file goes to `implement`.
 - Never print, commit or copy secrets: `.env`, `scout.session.json` (the
