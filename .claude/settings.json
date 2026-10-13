@@ -22,6 +22,10 @@
       "Bash(./ml/.venv/Scripts/python.exe -m pytest:*)",
       "Bash(.venv/Scripts/python.exe -m pytest:*)",
       "Bash(./.venv/Scripts/python.exe -m pytest:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(git push -u origin work/:*)",
+      "Bash(git push origin work/:*)",
       "PowerShell(go vet:*)",
       "PowerShell(go test:*)",
       "PowerShell(go build:*)",
@@ -57,14 +61,13 @@
       "Read(**/scout.session.json)",
       "Read(**/scoutanalytics_data/**)",
       "Read(**/calls.csv)",
-      "Bash(git push:*)",
-      "PowerShell(git push:*)",
-      "Bash(git commit:*)",
-      "PowerShell(git commit:*)",
-      "Bash(git add:*)",
-      "PowerShell(git add:*)",
       "Bash(git stash:*)",
-      "PowerShell(git stash:*)"
+      "PowerShell(git stash:*)",
+      "Bash(git push origin main:*)",
+      "Bash(git push -f:*)",
+      "Bash(git push --force:*)",
+      "Bash(git push origin HEAD:main:*)",
+      "Bash(git push origin +:*)"
     ]
   }
 }
