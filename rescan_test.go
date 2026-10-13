@@ -165,7 +165,7 @@ func TestRescanSummaryAndPerDay(t *testing.T) {
 }
 
 func TestRescanDetailsAndAge(t *testing.T) {
-	base := replyDetails(nil, 1, nil)
+	base := replyDetails(&toolResult{Attempts: 1})
 	got := rescanDetails(base, 12*24*time.Hour+time.Hour)
 	var m map[string]any
 	if err := json.Unmarshal(got, &m); err != nil {

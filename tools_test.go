@@ -159,7 +159,7 @@ func TestReplyDetailsMedia(t *testing.T) {
 		edited,
 		noID,
 	}
-	got := replyDetails(msgs, 1, nil)
+	got := replyDetails(&toolResult{Replies: msgs, Attempts: 1})
 	var d struct {
 		Attempts int              `json:"attempts"`
 		Replies  []map[string]any `json:"replies"`

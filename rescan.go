@@ -251,10 +251,7 @@ func (s *scanner) newRescanLane(c rescanConfig) *rescanLane {
 		return nil
 	}
 	l := &rescanLane{cfg: c, runner: r, toolID: *r.toolID, now: time.Now,
-		send: func(ctx context.Context, r *toolRunner, text string) error {
-			_, err := s.sender.To(r.botPeer).Text(ctx, text)
-			return err
-		},
+		send: s.sendToBot,
 		judge: func(ctx context.Context, spec ToolSpec, res *toolResult) verdict {
 			return s.judge(ctx, spec, res.Replies)
 		},

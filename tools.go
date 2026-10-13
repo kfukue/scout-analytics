@@ -7,6 +7,7 @@ import (
 	"log"
 	"os"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -216,6 +217,15 @@ type toolRunner struct {
 	since   int
 	replies map[int]*tg.Message
 	bump    chan struct{}
+	// floor is the message id of the first attempt's request of the current
+	// investigateWithRetryN call (0 = unknown: no reply is filtered); request
+	// is the current attempt's (0 = unknown). Both are set by noteRequest.
+	// unfiltered is set when the first attempt's id was unknown: floor then
+	// stays 0 for every retry of that token, since a later attempt's id
+	// would drop late replies to the first attempt. See staleReply.
+	floor      int
+	request    int
+	unfiltered bool
 }
 
 func newToolRunner(spec ToolSpec) *toolRunner {
@@ -241,6 +251,18 @@ type toolResult struct {
 
 	Attempts       int   // requests sent (1 + rate-limit retries)
 	RateLimitWaits []int // seconds waited after each rate-limit reply
+
+	// RequestMsgID: the message id of the request the stored attempt sent
+	// (0 = unknown). Ignored: bot messages left out because they cannot
+	// answer this request (staleReply), across all attempts.
+	RequestMsgID int
+	Ignored      []ignoredReply
+}
+
+// ignoredReply is a bot message left out of a result by staleReply.
+type ignoredReply struct {
+	MessageID    int `json:"message_id"`
+	ReplyToMsgID int `json:"reply_to_msg_id,omitempty"`
 }
 
 // ReportText returns the replies' texts joined, or StoredText (trimmed) when
@@ -278,7 +300,18 @@ func (r *toolRunner) onMessage(msg *tg.Message) {
 	}
 }
 
+// snapshot returns the replies collected for the current request, sorted by
+// message id, without those that cannot answer it (staleReply). The rule is
+// applied here, when the replies are read, not when they arrive: a reply can
+// arrive before the send returns the request's id.
 func (r *toolRunner) snapshot() []*tg.Message {
+	kept, _, _ := r.split()
+	return kept
+}
+
+// split is snapshot plus the messages it leaves out (sorted by message id)
+// and, for each of them, why (staleReply).
+func (r *toolRunner) split() (kept, stale []*tg.Message, why []string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	all := make([]*tg.Message, 0, len(r.replies))
@@ -286,10 +319,82 @@ func (r *toolRunner) snapshot() []*tg.Message {
 		all = append(all, m)
 	}
 	sort.Slice(all, func(i, j int) bool { return all[i].ID < all[j].ID })
-	return all
+	kept = all[:0]
+	for _, m := range all {
+		if reason := staleReply(m, r.floor); reason != "" {
+			stale, why = append(stale, m), append(why, reason)
+			continue
+		}
+		kept = append(kept, m)
+	}
+	return kept, stale, why
 }
 
-// sendFunc sends text to the tool's bot.
+// noteRequest records the message id of the request just sent (0 = unknown:
+// nothing is recorded). A send that knows the id calls it before it returns
+// (scanner.sendToBot does). The id becomes the floor only on a token's first
+// attempt: when that attempt's id was unknown (unfiltered), a retry's id does
+// not start filtering.
+func (r *toolRunner) noteRequest(id int) {
+	if id <= 0 {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.request = id
+	if r.floor == 0 && !r.unfiltered {
+		r.floor = id
+	}
+}
+
+// staleReply says why bot message m cannot answer the request whose message
+// id is floor ("" = it can, or floor is 0: unknown). Message ids in a private
+// chat come from one counter of our account, shared by both sides, so:
+//   - a message with a lower id than our request was sent before it;
+//   - a message that replies to (reply_to) a message older than our request
+//     answers something earlier: one of our earlier requests (a previous
+//     token, a re-check, a re-scan or a re-ask), even one sent before a
+//     restart.
+//
+// A message without reply_to is kept (nothing in the code or data shows that
+// Perceptor or sAlpha always set it), and so is one that replies to our
+// request or to a later message (e.g. the bot's own photo). floor is the
+// first request of an investigateWithRetryN call: a reply to an earlier
+// attempt for the same token (a rate-limit retry) still counts.
+func staleReply(m *tg.Message, floor int) string {
+	if floor == 0 {
+		return ""
+	}
+	if m.ID < floor {
+		return fmt.Sprintf("message %d was sent before our request %d", m.ID, floor)
+	}
+	if to := replyToMsgID(m); to != 0 && to < floor {
+		return fmt.Sprintf("message %d replies to message %d, older than our request %d", m.ID, to, floor)
+	}
+	return ""
+}
+
+// replyToMsgID returns the id of the message m replies to in the same chat
+// (0 = none).
+func replyToMsgID(m *tg.Message) int {
+	rt, ok := m.GetReplyTo()
+	if !ok {
+		return 0
+	}
+	h, ok := rt.(*tg.MessageReplyHeader)
+	if !ok {
+		return 0
+	}
+	if _, other := h.GetReplyToPeerID(); other {
+		return 0 // a reply to a message in another chat: not one of ours here
+	}
+	id, _ := h.GetReplyToMsgID() // 0 when the header names no message
+	return id
+}
+
+// sendFunc sends text to the tool's bot. A send that learns the id of the
+// message it sent reports it with r.noteRequest before returning, so that
+// replies to an earlier request are not taken for this one (staleReply).
 type sendFunc func(ctx context.Context, text string) error
 
 func sleepCtx(ctx context.Context, d time.Duration) error {
@@ -347,7 +452,11 @@ func (r *toolRunner) investigateWithRetry(ctx context.Context, send sendFunc, ca
 // attempt as rate_limited at once).
 func (r *toolRunner) investigateWithRetryN(ctx context.Context, send sendFunc, ca string, maxRetries int) *toolResult {
 	var waits []int
+	var ignored []ignoredReply
 	first := time.Time{}
+	r.mu.Lock()
+	r.floor, r.unfiltered = 0, false // a new token (or a re-check, re-scan, re-ask): earlier requests are stale
+	r.mu.Unlock()
 	for attempt := 1; ; attempt++ {
 		if r.spec.MinInterval > 0 && !r.lastSent.IsZero() {
 			if d := r.spec.MinInterval - time.Since(r.lastSent); d > 0 {
@@ -362,7 +471,17 @@ func (r *toolRunner) investigateWithRetryN(ctx context.Context, send sendFunc, c
 		if first.IsZero() {
 			first = res.RequestedAt
 		}
-		res.RequestedAt, res.Attempts, res.RateLimitWaits = first, attempt, waits
+		if attempt == 1 && res.RequestMsgID == 0 {
+			r.mu.Lock()
+			r.unfiltered = true // first request's id unknown: no filtering for this token, retries included
+			r.mu.Unlock()
+		}
+		for _, ig := range res.Ignored { // a message seen again in a retry (an edit) is listed once
+			if !slices.ContainsFunc(ignored, func(x ignoredReply) bool { return x.MessageID == ig.MessageID }) {
+				ignored = append(ignored, ig)
+			}
+		}
+		res.RequestedAt, res.Attempts, res.RateLimitWaits, res.Ignored = first, attempt, waits, ignored
 		wait, limited := r.rateLimitWait(res)
 		if !limited {
 			return res
@@ -391,6 +510,7 @@ func (r *toolRunner) investigate(ctx context.Context, send sendFunc, ca string) 
 	r.active = true
 	r.since = int(time.Now().Unix()) - 2
 	r.replies = map[int]*tg.Message{}
+	r.request = 0
 	select {
 	case <-r.bump:
 	default:
@@ -407,6 +527,9 @@ func (r *toolRunner) investigate(ctx context.Context, send sendFunc, ca string) 
 		res.Status, res.Err = investigationFailed, fmt.Errorf("send %q to @%s: %w", res.Command, r.spec.Bot, err)
 		return res
 	}
+	r.mu.Lock()
+	res.RequestMsgID = r.request
+	r.mu.Unlock()
 	log.Printf("[%s] sent to @%s: %s", r.spec.Code, r.spec.Bot, res.Command)
 
 	hard := time.NewTimer(r.spec.MaxWait)
@@ -423,7 +546,14 @@ func (r *toolRunner) investigate(ctx context.Context, send sendFunc, ca string) 
 	}
 	got := false
 	finish := func(status string, err error) *toolResult {
-		all := r.snapshot()
+		all, stale, why := r.split()
+		if len(stale) > 0 {
+			for _, m := range stale {
+				res.Ignored = append(res.Ignored, ignoredReply{MessageID: m.ID, ReplyToMsgID: replyToMsgID(m)})
+			}
+			log.Printf("[%s] ignored %d message(s) from @%s that cannot answer this request: %s",
+				r.spec.Code, len(stale), r.spec.Bot, strings.Join(why, "; "))
+		}
 		res.Replies = r.reportMessages(all)
 		for _, m := range res.Replies {
 			if res.Best == nil || len(m.Message) > len(res.Best.Message) {
@@ -438,9 +568,13 @@ func (r *toolRunner) investigate(ctx context.Context, send sendFunc, ca string) 
 		case <-ctx.Done():
 			return finish(investigationFailed, ctx.Err())
 		case <-r.bump:
+			msgs := r.snapshot()
+			if len(msgs) == 0 {
+				continue // only messages that cannot answer this request: the first-reply timeout runs on
+			}
 			got = true
 			stopTimer(wait)
-			if r.isComplete(r.snapshot()) {
+			if r.isComplete(msgs) {
 				wait.Reset(r.spec.Settle) // report is here; wait for trailing edits/parts
 			}
 			// still only "Scanning…": keep waiting (bounded by MaxWait)

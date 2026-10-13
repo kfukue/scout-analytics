@@ -1095,9 +1095,40 @@ edited (unix seconds, left out when never edited); `reply_to_msg_id`, the messag
 replies to (left out when it replies to none); `media`, its media type
 (`"messageMediaPhoto"`, `""` for none); and `text_len`, its text length in characters.
 The dates give sAlpha's gap between its photo and its text (to tune `_MAX_WAIT`), and
-`reply_to_msg_id` shows whether a reply names the request it answers (a late reply could
-otherwise be taken for the next CA's). `details.media` lists media of any type (not only
-photos and documents).
+`reply_to_msg_id` shows whether a reply names the request it answers. `details.media` lists
+media of any type (not only photos and documents). `details.request_msg_id` is the message
+id of the request the stored attempt sent: after rate-limit retries, the **last** attempt's
+(left out when Telegram's answer did not name it). The rule below compares with the token's
+**first** attempt's id, which a retried row does not store (`attempts` > 1 shows a retry), and
+`details.ignored_replies` lists the bot messages left out by the rule below (`message_id`,
+and `reply_to_msg_id` when it had one).
+
+**Which replies count (late replies to an earlier request).** Each bot has one runner, shared
+by every lane that asks it: live calls, the Perceptor re-check, the rescan lane and the sAlpha
+re-ask. Replies are collected while a request waits, so a late reply to an *earlier* request
+(the previous token, a re-check, a re-scan or a re-ask) could be taken for the current one. The
+scanner keeps the message id of every request it sends, and a bot message does **not** count
+for the current request when:
+
+- it **replies to a message older than the request** (`reply_to_msg_id` lower than the
+  request's id): it answers one of our earlier requests, even one sent before a restart; or
+- it **was sent before the request** (its own id is lower: message ids in a private chat come
+  from one counter). Edits of older messages were already dropped by their date; this covers a
+  bot message sent in the 2 seconds before our request, which the date check lets through.
+
+Everything else counts as today: a message that replies to our request, a message that replies
+to a later message (e.g. sAlpha's text replying to its own photo), and a message **without**
+`reply_to`. Neither bot is required to set `reply_to`: nothing in the code or stored data yet
+shows whether Perceptor or sAlpha always sets it (or sets it on every part of a multi-message
+report), so requiring it could drop real reports. A rate-limit retry asks again for the same
+token, so a reply to that token's first attempt still counts. Ignored messages are logged
+(`[salpha] ignored 1 message(s) from @salpha_research_bot that cannot answer this request: …`),
+stored under `details.ignored_replies`, and never judged, stored as the report or forwarded;
+if only ignored messages arrive, the result is "no reply" after `_TIMEOUT`. When Telegram's
+answer to a token's first send names no message id (logged), no reply is filtered for that
+token, its rate-limit retries included.
+**Still possible:** a late reply **without** `reply_to` that arrives during the next request
+counts for it, as before.
 
 ### Rate limits
 
@@ -1280,14 +1311,15 @@ Telegram `FLOOD_WAIT` stores nothing and pauses the lane for an hour or the wait
 asks for, whichever is longer. A stop during a re-ask stores nothing. With no candidate
 left, the lane looks again every 10 minutes.
 
-**Late replies can be misattributed, both ways.** sAlpha replies are matched to the request
-waiting for them, not to the CA they answer. A late sAlpha reply to the previous live call
-that arrives during a re-ask could be taken for the re-ask's (the 5-minute idle time makes
-this unlikely). The other way round, a re-ask that times out can have its late reply picked
-up by the next live call, whose sAlpha result (and delivery) would then show the re-asked
-token's report. Planned mitigation: `details.replies` stores each reply's
-`reply_to_msg_id`; once prod data shows whether sAlpha sets it, replies will be filtered by
-the request they reply to. Until then the lane stays off by default.
+**Late replies.** sAlpha replies are matched to the request waiting for them. A late sAlpha
+reply that **replies to** an earlier request (the previous live call's, or a timed-out
+re-ask's) is ignored by the rule in "Which replies count" above, in both directions. A late
+reply **without** `reply_to` can still be taken for the request that is waiting: one to the
+previous live call arriving during a re-ask (the 5-minute idle time makes this unlikely), or
+one to a timed-out re-ask arriving during the next live call (whose sAlpha result and delivery
+would then show the re-asked token's report). How often sAlpha leaves `reply_to` out is not
+known yet: `details.replies` (each reply's `reply_to_msg_id`) and `details.request_msg_id` show
+it. Until that is checked the lane stays off by default.
 
 **What a re-ask writes.** One `scout_investigations` row (tool `salpha`, `scan_kind =
 'reask'`, `call_id` = the first call, `details` with `"reask": true`, `call_age_s` and

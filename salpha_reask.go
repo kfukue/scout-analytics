@@ -249,10 +249,7 @@ func (s *scanner) newReaskLane(c reaskConfig) *reaskLane {
 		return nil
 	}
 	l := &reaskLane{cfg: c, runner: r, toolID: *r.toolID, now: time.Now, target: deliveryLabel(s.cfg), noFollowUp: s.cfg.DryRun,
-		send: func(ctx context.Context, r *toolRunner, text string) error {
-			_, err := s.sender.To(r.botPeer).Text(ctx, text)
-			return err
-		},
+		send: s.sendToBot,
 		judge: func(ctx context.Context, spec ToolSpec, res *toolResult) verdict {
 			return s.judge(ctx, spec, res.Replies)
 		},
