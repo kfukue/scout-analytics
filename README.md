@@ -1789,7 +1789,7 @@ program like the page's other files; nothing is loaded from other sites; how it 
 sha256 and its licences: `frontend/vendor/README.md`, `ECHARTS-LICENSE.txt`,
 `ECHARTS-NOTICE.txt`). The pure calculations (mean and median, equal-count groups, histogram
 bands, symmetric-log scale, UTC weeks, "$100 on every call", and for the Timing tab the time
-bands, the 0-held rule, Kaplan–Meier and the share rugged by t) are
+bands, the time held at 2× and its histogram, Kaplan–Meier and the share rugged by t) are
 in `frontend/analytics-stats.js`, tested by `node testdata/analytics-stats.test.js` (no
 dependencies; `go test` runs it when `node` is on the PATH). Only the visible tab is drawn
 (under 0.2 s per tab change on 5,600 calls in headless Edge).
@@ -1850,7 +1850,8 @@ dependencies; `go test` runs it when `node` is on the PATH). Only the visible ta
   - **How long it took:** five histograms in log bands (< 5m, 5–15m, 15–60m, 1–4h, 4–24h,
     1–3d, 3–7d, 7–30d; a time on a boundary goes to the band above it), each bar a share of its
     chart's n: **time to peak** (every timed call), **time to the first 2×** (the calls that
-    reached 2×), **time held at 2×** on closes (every timed call), **time to fall back below
+    reached 2×), **time held at 2×** on closes (every timed call, at the time it really held;
+    see "Time held at 2×" below), **time to fall back below
     2×** (the calls that reached 2× and fell back within the window; the censored ones are left
     out) and **time to rug** (event rug times within the window).
   - **Reached 2×** (owner decision, 12 October 2026: at or above 2× for at least 1 hour in
@@ -1875,10 +1876,22 @@ dependencies; `go test` runs it when `node` is on the PATH). Only the visible ta
     drop (`above_2x_s` 0), counts as **not** reaching 2×, exactly like a call that never
     touched it: it stays in every total and in the denominator of the 2× rate, and is left out
     of the time to the first 2×, the time to fall back below 2× and the "still at 2× after t"
-    curve.
-  - **The 0-held rule:** a call that did not reach 2× (never touched it, or touched it without
-    reaching it by the rule above) counts as **0 held** (owner decision; the grey part of the
-    "0" bar).
+    curve; only its time held is its own (next point).
+  - **Time held at 2×** (owner decision, 13 October 2026; it replaces the earlier rule that
+    counted every call that did not reach 2× as 0 held): the time-held figures (the time held
+    histogram, the Held at 2× column of the group table and its median and mean) use the
+    stored `above_2x_s` of **every timed call that touched 2×**, whether or not it reached 2×
+    by the rule above, so a touch and drop held under 1 hour shows its real time held (in the
+    < 5m, 5–15m or 15–60m bands, or 0 when no close was at or above 2×). A call that never
+    touched 2× counts as **0 held**; a call that touched 2× with no held time stored is left
+    out of the time-held figures (as before). In the histogram, blue bars are the calls that
+    reached 2× (1 hour or more held), amber bars the calls that touched 2× and held over 0
+    but under 1 hour, and the grey "0" bar the calls with 0 held (never touched, or touched without a
+    close at or above 2×); a key under the chart gives the three counts. Only the time-held
+    figures change: whether a call reached 2×, the counts and rates, the time to the first
+    2×, the time to fall back below 2×, still at 2× at the end, the Kaplan–Meier curve and
+    the 1h window's "n/a" figures follow the rule above as before (`heldValue`,
+    `heldHistogram` and `timing2x` in `frontend/analytics-stats.js`).
   - **Rugs by kind of rug time** (a table): event rug times within the window, event rug
     times after it, rugs **at the call** (drained at or before the post), rugs only
     **detected** at the end of tracking (their time is that check's, an upper bound), any
@@ -1889,8 +1902,8 @@ dependencies; `go test` runs it when `node` is on the PATH). Only the visible ta
     week or month (the Period choice), the pool family, the DEX named in the post, or any
     number factor of the By factor tab in 4, 5 or 10 equal-count groups (the same choice as
     on By factor). Per group: timed calls, the share that reached 2×, and the median and mean
-    (with n) of the time to peak, to the first 2×, held at 2× (0 for calls that did not reach
-    it), to fall below 2× and to rug; the share still at 2× at the end; and the Kaplan–Meier
+    (with n) of the time to peak, to the first 2×, held at 2× (the real time held; 0 for calls
+    that never touched 2×), to fall below 2× and to rug; the share still at 2× at the end; and the Kaplan–Meier
     median of the time held ("half fell back by").
   - **Still at 2× after t:** a Kaplan–Meier curve per group (and all timed calls) over the
     calls that reached 2×, t counted from the first 2×. A call that fell back counts at the
