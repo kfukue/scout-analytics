@@ -8,6 +8,7 @@ import pytest
 
 import make_synthetic
 import train as train_mod
+from conftest import with_shipped_seeds
 from scout_ml import config as C
 from scout_ml import diagnostics as D
 from scout_ml import validate as V
@@ -187,9 +188,11 @@ def small_df():
 
 @pytest.fixture(scope="module")
 def off_and_on(small_df, tmp_path_factory):
-    """The same data trained without and with the diagnostics (same version name)."""
-    off = train_mod.train(small_df, tmp_path_factory.mktemp("off"), "v1", diagnostics=False)
-    on = train_mod.train(small_df, tmp_path_factory.mktemp("on"), "v1", diagnostics=True)
+    """The same data trained without and with the diagnostics (same version name),
+    with the shipped STABILITY_SEEDS."""
+    with with_shipped_seeds():
+        off = train_mod.train(small_df, tmp_path_factory.mktemp("off"), "v1", diagnostics=False)
+        on = train_mod.train(small_df, tmp_path_factory.mktemp("on"), "v1", diagnostics=True)
     return off, on
 
 
@@ -226,12 +229,12 @@ def test_diagnostics_never_change_the_saved_model_meta_gates_or_scores(off_and_o
     assert C.LGBM_SEED == 7 and list(C.FEATURES) == m_on["features"]   # config restored
 
 
-def test_seed_stability_contents(off_and_on):
+def test_seed_stability_contents(off_and_on, shipped_seeds):
     _, on = off_and_on
     meta = json.loads((on / "meta.json").read_text())
     sd = meta["diagnostics"]["seeds"]
-    assert sd["seeds"] == list(C.STABILITY_SEEDS) and sd["saved_seed"] == C.LGBM_SEED
-    assert set(sd["runs"]) == {str(s) for s in C.STABILITY_SEEDS}
+    assert sd["seeds"] == list(shipped_seeds) and sd["saved_seed"] == C.LGBM_SEED
+    assert set(sd["runs"]) == {str(s) for s in shipped_seeds}
     saved = sd["runs"][str(C.LGBM_SEED)]
     assert saved["saved_model"] is True
     trained = [b for b, m in meta["metrics"].items() if not m.get("skipped")]
@@ -242,13 +245,23 @@ def test_seed_stability_contents(off_and_on):
         assert s["top_lift"] == m["trading"]["top_lift"]          # the saved model's own numbers
         assert s["collapse_removed"] == m["trading"]["collapse_removed"]
         assert s["runner_auc"] == m["labels"]["runner"]["lightgbm"]["roc_auc"]
-        assert s["windows_beating"] == m["gates"]["windows_beating"]
-        for seed in C.STABILITY_SEEDS:
+        assert s["windows_beating"] == m["gates"]["old"]["windows_beating"]
+        assert s["passed"] == m["gates"]["old"]["passed"]           # single-run gate column
+        # the gate's median is over exactly these runs' pooled walk-forward lifts
+        lifts = {str(seed): sd["runs"][str(seed)]["buckets"][b]["wf_pooled_lift"]
+                 for seed in shipped_seeds}
+        assert m["gates"]["pooled_lift_seeds"] == pytest.approx(lifts)
+        if None in lifts.values():                                # no counted week: undefined
+            assert m["gates"]["pooled_lift_median"] is None and m["gates"]["passed"] is False
+        else:
+            assert m["gates"]["pooled_lift_median"] == pytest.approx(
+                float(np.median(list(lifts.values()))))
+        for seed in shipped_seeds:
             r = sd["runs"][str(seed)]["buckets"][b]
             assert r["sim_all_mean"] == pytest.approx(s["sim_all_mean"])
             differs |= r["runner_auc"] != s["runner_auc"]
         sp = sd["spread"][b]
-        assert sp["top_lift"]["n"] == len(C.STABILITY_SEEDS)
+        assert sp["top_lift"]["n"] == len(shipped_seeds)
         assert sp["top_lift"]["min"] <= sp["top_lift"]["median"] <= sp["top_lift"]["max"]
     assert differs                                                # the seed really changed something
     for b, m in meta["metrics"].items():
@@ -266,8 +279,15 @@ def test_pooled_walk_forward_matches_the_gate_weeks(off_and_on):
             continue
         e = wd[b]["expanding"]
         counted = [w for w in m["walk_forward"] if w["counted"]]
-        assert e["weeks"] == len(counted) == m["gates"]["windows_evaluated"]
-        assert e.get("weeks_beating", 0) == m["gates"]["windows_beating"]
+        assert e["weeks"] == len(counted) == m["gates"]["old"]["windows_evaluated"]
+        assert e.get("weeks_beating", 0) == m["gates"]["old"]["windows_beating"]
+        assert e["weeks"] == m["gates"]["pooled_weeks"]
+        # the gate's interval lower ends are this expanding row's
+        assert m["gates"]["pooled_lift_lo"] == e.get("lift_lo")      # null with < 2 weeks
+        assert m["gates"]["sim_diff"] == e.get("sim_gain")
+        assert m["gates"]["sim_diff_lo"] == e.get("sim_gain_lo")
+        if e["weeks"] < C.GATE_MIN_POOLED_WEEKS:
+            assert m["gates"]["passed"] is False and m["gates"]["reasons"]
         assert e["rows"] == sum(w["n_test"] for w in counted)
         if len(counted) == 1:
             assert e["lift"] == pytest.approx(counted[0]["top_lift"])
@@ -315,13 +335,15 @@ def test_adversarial_section_uses_model_inputs_only(off_and_on):
         assert s["n_test"] == m["split"]["n_test"] and s["n_train"] == m["split"]["n_train"]
         for f, _ in s["top"]:
             assert f in meta["features"] and f not in C.ADV_EXCLUDE and not C.is_forbidden(f)
-        assert len(ad[b]["weeks"]) == min(m["gates"]["windows_evaluated"], C.ADV_MAX_WEEKS)
+        assert len(ad[b]["weeks"]) == min(m["gates"]["old"]["windows_evaluated"], C.ADV_MAX_WEEKS)
 
 
 def test_report_has_the_diagnostics_sections(off_and_on):
     _, on = off_and_on
     report = (on / "report.md").read_text(encoding="utf-8")
-    for title in ("## Stability diagnostics (report only; not saved, not served, never a gate)",
+    for title in ("## Stability diagnostics (not saved, not served; only the seeds' pooled lifts "
+                  "and the pooled expanding walk-forward feed the gates)",
+                  "| single-run (old) gate, information |", "pooled WF lift (gate input)",
                   "### Seed stability", "### Pooled walk-forward (expanding and rolling)",
                   "### Evaluation without dead calls", "### Adversarial validation",
                   "| seed 7 (saved model) |", "| expanding (the gate's) |", "| rolling (4 weeks) |",

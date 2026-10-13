@@ -58,7 +58,8 @@ def test_each_variant_changes_exactly_one_knob():
     assert C.VARIANTS["baseline"] == {}
     assert list(C.VARIANTS) == ["baseline", "dead rule on (collapse OR dead)",
                                 "raw dex instead of dex_family", "raw dex + dex_family",
-                                "runners must be tradeable", "stronger regularisation"]
+                                "runners must be tradeable", "stronger regularisation",
+                                "no calls_prev inputs"]
     for name, knobs in C.VARIANTS.items():
         if name == "baseline":
             continue
@@ -90,7 +91,10 @@ def test_overrides_rebuild_features_never_leak_and_restore():
         with C.overrides(**knobs):
             assert_no_leakage(C.FEATURES)                       # trades_24h etc. never inputs
             assert "trades_24h" not in C.FEATURES
-            assert C.FEATURES == C.NUMERIC_RAW + C.DERIVED + C.CATEGORICAL
+            assert C.FEATURES == C.NUMERIC_FEATURES + C.CATEGORICAL
+            assert C.LOG1P_FEATURES == [c for c in C.NUMERIC_FEATURES if c not in C.NO_LOG]
+            dropped = set(knobs.get("EXCLUDED_INPUTS", ()))
+            assert C.NUMERIC_FEATURES == [c for c in C.NUMERIC_RAW + C.DERIVED if c not in dropped]
             has, lacks = want.get(name, want["baseline"])
             assert has <= set(C.CATEGORICAL) and not lacks & set(C.CATEGORICAL), name
     with pytest.raises(RuntimeError):
@@ -161,11 +165,16 @@ def test_variant_table_contents(plain_and_variants):
         # the baseline row is the saved model's own numbers
         assert base[b]["top_lift"] == m["trading"]["top_lift"]
         assert base[b]["collapse_removed"] == m["trading"]["collapse_removed"]
-        assert base[b]["windows_beating"] == m["gates"]["windows_beating"]
-        assert base[b]["passed"] == m["gates"]["passed"]
+        # the variant gate columns are the old single-run gates, also for the baseline row
+        assert base[b]["windows_beating"] == m["gates"]["old"]["windows_beating"]
+        assert base[b]["passed"] == m["gates"]["old"]["passed"]
+        # the baseline's pooled walk-forward column is the gate's (saved seed)
+        assert base[b]["wf_pooled_lift"] == m["gates"]["pooled_lift"]
+        assert base[b]["wf_pooled_lift_lo"] == m["gates"]["pooled_lift_lo"]
+        assert base[b]["wf_pooled_sim_gain_lo"] == m["gates"]["sim_diff_lo"]
         assert base[b]["runner_auc_lightgbm"] == m["labels"]["runner"]["lightgbm"]["roc_auc"]
         # logistic uses numeric inputs only and no LightGBM setting: unchanged by these variants
-        for name in DEX_VARIANTS + ("stronger regularisation",):
+        for name in DEX_VARIANTS + ("stronger regularisation",):   # numeric inputs unchanged
             s = v[name]["buckets"][b]
             assert s["runner_auc_logistic"] == base[b]["runner_auc_logistic"], (name, b)
             assert s["collapse_auc_plain_logistic"] == base[b]["collapse_auc_plain_logistic"]
@@ -184,14 +193,25 @@ def test_variant_table_contents(plain_and_variants):
             for k in ("top_lift", "top_lift_lo", "top_lift_hi", "runner_auc_lightgbm",
                       "runner_auc_logistic", "collapse_auc_plain_lightgbm",
                       "collapse_auc_plain_logistic", "collapse_removed", "windows_beating",
-                      "windows_evaluated", "sim_top_mean", "sim_all_mean", "passed"):
+                      "windows_evaluated", "sim_top_mean", "sim_all_mean", "passed",
+                      "wf_pooled_lift", "wf_pooled_lift_lo", "wf_pooled_sim_gain",
+                      "wf_pooled_sim_gain_lo"):
                 assert k in s, (name, b, k)
+            if s["wf_pooled_lift_lo"] is not None:                 # null with < 2 weeks
+                assert s["wf_pooled_lift_lo"] <= s["wf_pooled_lift"] <= s["wf_pooled_lift_hi"]
+        # without the calls_prev inputs the model differs, the rows and simulation do not
+        ncp = v["no calls_prev inputs"]["buckets"][b]
+        assert ncp["sim_all_mean"] == base[b]["sim_all_mean"]
+        assert ncp["runner_auc_logistic"] != base[b]["runner_auc_logistic"]   # fewer inputs
     assert all(v[n].get("seconds") is not None for n in C.VARIANTS if n != "baseline")
     report = (var / "report.md").read_text(encoding="utf-8")
     assert "## Variant comparison (report only; not saved, not served)" in report
     assert "risks fitting the test period" in report and "walk-forward weeks" in report
     for name in C.VARIANTS:
         assert f"| {name} |" in report
+    assert "| single-run (old) gate, information |" in report
+    assert "pooled WF lift [95%]; sim difference [95%] (seed 7 only; information)" in report
+    assert "| no calls_prev inputs | EXCLUDED_INPUTS = ('calls_prev_1h', 'calls_prev_24h') |" in report
     plain_report = (plain_and_variants[0] / "report.md").read_text(encoding="utf-8")
     assert "Variant comparison" not in plain_report
 
@@ -295,7 +315,8 @@ def test_all_variants_failing_still_exits_0_with_a_clear_warning(small_df, tmp_p
     meta = json.loads((vdir / "meta.json").read_text())
     assert "short_runner" in meta["models"]
     assert all(meta["variants"][n]["error"].startswith("error: RuntimeError") for n in DEX_VARIANTS)
-    assert meta["variants"]["baseline"]["buckets"]["short"]["passed"] == meta["metrics"]["short"]["gates"]["passed"]
+    assert (meta["variants"]["baseline"]["buckets"]["short"]["passed"]
+            == meta["metrics"]["short"]["gates"]["old"]["passed"])     # the single-run gate
 
 
 def test_variant_error_text_is_short_and_table_safe():
@@ -304,3 +325,34 @@ def test_variant_error_text_is_short_and_table_safe():
     assert variant_error(KeyError()) == "error: KeyError"
     long = variant_error(RuntimeError("x" * 500))
     assert long.startswith("error: RuntimeError: xxx") and len(long) <= len("error: ") + 150
+
+
+# --- "no calls_prev inputs" (report-only variant) ---------------------------------
+
+def test_no_calls_prev_variant_drops_exactly_those_inputs_and_keeps_the_guard(synthetic_df):
+    from scout_ml.features import build_features
+    from scout_ml.model import fit_baseline
+    knobs = C.VARIANTS["no calls_prev inputs"]
+    assert knobs == {"EXCLUDED_INPUTS": ("calls_prev_1h", "calls_prev_24h")}
+    assert C.EXCLUDED_INPUTS == ()                              # the saved model: every input
+    assert {"calls_prev_1h", "calls_prev_24h"} <= set(C.FEATURES)
+    before = (list(C.FEATURES), list(C.NUMERIC_FEATURES), list(C.LOG1P_FEATURES))
+    rows = synthetic_df.head(400)
+    with C.overrides(**knobs):
+        gone = {"calls_prev_1h", "calls_prev_24h"}
+        assert not gone & set(C.FEATURES) and not gone & set(C.NUMERIC_FEATURES)
+        assert not gone & set(C.LOG1P_FEATURES)
+        assert set(before[0]) - set(C.FEATURES) == gone           # nothing else removed
+        assert not set(C.FEATURES) - set(before[0])               # and nothing added
+        assert_no_leakage(C.FEATURES)
+        X = build_features(rows, {})
+        assert list(X.columns) == C.FEATURES and not gone & set(X.columns)
+        y = (np.arange(len(X)) % 3 == 0).astype(int)
+        fit_baseline(X, y)                                       # the logistic baseline follows
+    assert (list(C.FEATURES), list(C.NUMERIC_FEATURES), list(C.LOG1P_FEATURES)) == before
+    # it can only remove numeric inputs: an outcome, a categorical or an unknown name raises
+    for bad in (("ret_late_1d",), ("dex_family",), ("nonsense",)):
+        with pytest.raises(ValueError, match="EXCLUDED_INPUTS"):
+            with C.overrides(EXCLUDED_INPUTS=bad):
+                pass
+        assert list(C.FEATURES) == before[0]

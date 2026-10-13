@@ -3,7 +3,7 @@ import math
 
 from . import config as C
 from .config import (BUCKETS, CALIB_RECENT_DAYS, DEAD_COLUMN,
-                     GATES, KFOLD_MIN_FOLDS, LABELS, LIFT_CI_Z, MAX_OUTCOME_PCT,
+                     KFOLD_MIN_FOLDS, LABELS, LIFT_CI_Z, MAX_OUTCOME_PCT,
                      SIM_MAX_RET_PCT, SKIP_FRAC, TOP_FRAC, UNUSED_VIEW_COLUMNS)
 
 # DEAD_TRADES_24H and RUNNER_MIN_TRADES_24H are read from config (C.) when a
@@ -141,9 +141,87 @@ def calib_table(m) -> str:
 
 def wf_rule_line() -> str:
     """The one-line rule under the gate tables (owner decision, 9 Oct 2026)."""
-    return (f"Walk-forward gate: a week counts toward \"beats buy-all in every week\" only when "
-            f"its training part has at least {C.WF_MIN_TRAIN_ROWS} rows (WF_MIN_TRAIN_ROWS, set "
-            f"on {C.WF_MIN_TRAIN_ROWS_SET_ON}); weeks below are shown, marked \"not counted\".\n")
+    return (f"Walk-forward weeks: a week counts toward the pooled walk-forward gates (and the old "
+            f"\"beats buy-all in every week\" count, information only) only when its training "
+            f"part has at least {C.WF_MIN_TRAIN_ROWS} rows (WF_MIN_TRAIN_ROWS, set on "
+            f"{C.WF_MIN_TRAIN_ROWS_SET_ON}); weeks below are shown, marked \"not counted\".\n")
+
+
+def _seeds_text() -> str:
+    """C.STABILITY_SEEDS as "7 / 11 / 23"."""
+    return " / ".join(str(s) for s in C.STABILITY_SEEDS)
+
+
+def gate_rule_text() -> str:
+    """How the verdict is decided (owner decision of 13 Oct 2026; thresholds read now)."""
+    seeds = _seeds_text()
+    return (f"Gates (owner decision of {C.GATES_SET_ON}): a bucket PASSes when all of these hold. "
+            f"(1) Runner lift: the median over the LightGBM seeds {seeds} (STABILITY_SEEDS) of "
+            f"the pooled expanding walk-forward top-{TOP_FRAC:.0%} lift >= "
+            f"{C.GATES['min_top_lift']:g}, and the lower end of the 95% week-block bootstrap "
+            f"interval of the saved seed's ({C.LGBM_SEED}) pooled lift > "
+            f"{C.GATE_POOLED_LIFT_LOWER:g} (GATE_POOLED_LIFT_LOWER). (2) Beats buy-all: the lower "
+            f"end of the 95% bootstrap interval of the pooled simulation difference (mean net "
+            f"return of the per-week top {TOP_FRAC:.0%} minus that of all calls, each call capped "
+            f"at +{SIM_MAX_RET_PCT:,.0f} %) > {C.GATE_SIM_DIFF_LOWER:g} (GATE_SIM_DIFF_LOWER). "
+            f"(3) Collapses removed >= {C.GATES['min_collapse_removed']:.0%} on the test part "
+            f"(saved model). Pooled = the test rows of all counted walk-forward weeks, each week "
+            f"ranked by its own model; bootstrap: {C.POOLED_BOOTSTRAP_REPS} resamples of whole "
+            f"weeks, seed {C.POOLED_BOOTSTRAP_SEED}. Fewer than {C.GATE_MIN_POOLED_WEEKS} counted "
+            "weeks, a failed seed retrain or any undefined value: FAIL, with the reason listed "
+            "under the table; "
+            "never a PASS on missing data. The absolute return (pooled top-10% mean net return) "
+            "and the old single-run gates (test-part lift, beats buy-all in every counted week) "
+            "are information only.\n")
+
+
+def _signed(v, digits=1) -> str:
+    if v is None or (isinstance(v, float) and math.isnan(v)):
+        return "n/a"
+    return f"{v:+.{digits}f}"
+
+
+def _signed_ci(v, lo, hi) -> str:
+    return f"{_signed(v)} [{_signed(lo)}, {_signed(hi)}]"
+
+
+def _seed_values(g) -> str:
+    return " / ".join(fmt(v, 2) for v in (g.get("pooled_lift_seeds") or {}).values())
+
+
+def gate_cells(g) -> list:
+    """Verdict-table cells of a bucket with pooled gates (see V.pooled_gates)."""
+    old = g.get("old") or {}
+    top = g.get("abs_return_top")
+    pos = g.get("abs_return_positive")
+    return [f"{fmt(g['pooled_lift_ok'])}: {fmt(g['pooled_lift_median'], 2)} ({_seed_values(g)})",
+            f"{fmt(g['pooled_lift_lower_ok'])}: {fmt(g['pooled_lift_lo'], 2)}",
+            f"{fmt(g['sim_diff_ok'])}: "
+            + _signed_ci(g["sim_diff"], g["sim_diff_lo"], g["sim_diff_hi"]),
+            f"{fmt(g['collapse_ok'])}: {fmt(g['collapse_removed'])}",
+            _signed(top) + ("" if pos is None else (" (> 0)" if pos else " (<= 0)")),
+            f"{fmt(old.get('lift_ok'))}: {fmt(old.get('top_lift'), 2)}",
+            wf_cell(old) if old else "n/a"]
+
+
+def verdict_headers() -> list:
+    return ["bucket", "result",
+            f"runner lift: median pooled WF lift >= {C.GATES['min_top_lift']:g} "
+            f"(seeds {_seeds_text()})",
+            f"pooled lift 95% lower end > {C.GATE_POOLED_LIFT_LOWER:g} (seed {C.LGBM_SEED})",
+            f"beats buy-all: pooled sim top {TOP_FRAC:.0%} minus all (%) [95%], lower end > "
+            f"{C.GATE_SIM_DIFF_LOWER:g}",
+            f"collapses removed >= {C.GATES['min_collapse_removed']:.0%} (test)",
+            "absolute return: pooled top-10% mean net % (information, not a gate)",
+            f"old gate, information only: test-part lift >= {C.GATES['min_top_lift']:g}",
+            "old gate, information only: beats buy-all in every counted week"]
+
+
+def reasons_lines(buckets) -> str:
+    """One line per FAILing bucket with the reasons of its gates."""
+    lines = [f"- `{b}` FAIL: " + "; ".join(r["gates"].get("reasons") or ["see the gate table"])
+             for b, r in buckets.items() if not r.get("skipped") and not r["gates"]["passed"]]
+    return ("\n".join(lines) + "\n") if lines else ""
 
 
 def wf_not_counted_mark() -> str:
@@ -185,12 +263,12 @@ def render(res: dict) -> str:
     d = res["data"]
     out = [f"# Scout model report — version {res['version']}\n",
            "## Verdict\n",
-           table(["bucket", "result", "top-10% lift >= 2", "collapses removed >= 40%",
-                  "beats buy-all in every week"],
+           table(verdict_headers(),
                  [[b, "skipped" if r.get("skipped") else ("PASS" if r["gates"]["passed"] else "FAIL")]
-                  + ([""] * 3 if r.get("skipped") else
-                     [r["gates"]["lift_ok"], r["gates"]["collapse_ok"], wf_cell(r["gates"])])
+                  + ([""] * 7 if r.get("skipped") else gate_cells(r["gates"]))
                   for b, r in res["buckets"].items()]),
+           reasons_lines(res["buckets"]),
+           gate_rule_text(),
            wf_rule_line(),
            ("The saved model and these gates are the baseline configuration. Variant comparison "
             "(report only): see the last section.\n" if res.get("variants") else ""),
@@ -249,20 +327,39 @@ def render(res: dict) -> str:
         out.append("### Test metrics\n")
         out.append(table(["label", "model", "n", "base rate", "ROC AUC", "PR AUC", "Brier"], rows))
         t, g = r["trading"], r["gates"]
-        out.append(table(["check (LightGBM, test part)", "value", "needed", "ok"], [
-            [f"runner lift, top {TOP_FRAC:.0%} by runner score", t["top_lift"],
-             f">= {GATES['min_top_lift']:g}", g["lift_ok"]],
-            ["  95% interval of that lift; runners top/calls top of runners/calls",
-             f"{lift_ci(t)}; {lift_counts(t)}", "", ""],
-            [f"collapses removed by skipping top {SKIP_FRAC:.0%} collapse score",
-             t["collapse_removed"], f">= {GATES['min_collapse_removed']:g}", g["collapse_ok"]]]
+        old = g.get("old") or g
+        out.append(table(["check (LightGBM)", "value", "needed", "ok"], [
+            [f"runner lift: median over seeds {_seeds_text()} of the pooled walk-forward top-"
+             f"{TOP_FRAC:.0%} lift ({g.get('pooled_weeks', 0)} counted weeks; per seed)",
+             f"{fmt(g.get('pooled_lift_median'), 2)} ({_seed_values(g)})",
+             f">= {C.GATES['min_top_lift']:g}", g.get("pooled_lift_ok")],
+            [f"  pooled lift of the saved seed ({C.LGBM_SEED}) [95% week-block bootstrap]",
+             _ci(g.get("pooled_lift"), g.get("pooled_lift_lo"), g.get("pooled_lift_hi")),
+             f"lower end > {C.GATE_POOLED_LIFT_LOWER:g}", g.get("pooled_lift_lower_ok")],
+            [f"beats buy-all: pooled simulation, top {TOP_FRAC:.0%} minus all calls, mean net % "
+             "[95% week-block bootstrap]",
+             _signed_ci(g.get("sim_diff"), g.get("sim_diff_lo"), g.get("sim_diff_hi")),
+             f"lower end > {C.GATE_SIM_DIFF_LOWER:g}", g.get("sim_diff_ok")],
+            [f"collapses removed by skipping top {SKIP_FRAC:.0%} collapse score (test part)",
+             t["collapse_removed"], f">= {C.GATES['min_collapse_removed']:g}", g["collapse_ok"]]]
             + ([["  bad outcomes removed incl. dead (collapse OR dead; information, not a gate)",
                  t["collapse_removed_with_dead"], "", ""]]
                if "collapse_removed_with_dead" in t else [])
-            + [["simulation beats buy-everything in every counted walk-forward week",
-                f"{g['windows_beating']}/{g['windows_evaluated']}"
-                + (f" ({g['windows_not_counted']} not counted)" if g.get("windows_not_counted")
-                   else ""), "all", g["walk_forward_ok"]]]))
+            + [[f"absolute return: pooled top-{TOP_FRAC:.0%} mean net % (vs all calls; "
+                "information, not a gate)",
+                f"{_signed(g.get('abs_return_top'))} (all calls {_signed(g.get('abs_return_all'))})",
+                "", ""],
+               [f"old gate, information only: runner lift, top {TOP_FRAC:.0%} by runner score "
+                "(test part)", t["top_lift"], f">= {C.GATES['min_top_lift']:g}", old["lift_ok"]],
+               ["  95% interval of that lift; runners top/calls top of runners/calls",
+                f"{lift_ci(t)}; {lift_counts(t)}", "", ""],
+               ["old gate, information only: simulation beats buy-everything in every counted "
+                "walk-forward week",
+                f"{old['windows_beating']}/{old['windows_evaluated']}"
+                + (f" ({old['windows_not_counted']} not counted)" if old.get("windows_not_counted")
+                   else ""), "all", old["walk_forward_ok"]]]))
+        if not g["passed"] and g.get("reasons"):
+            out.append("Why FAIL: " + "; ".join(g["reasons"]) + ".\n")
         out.append(wf_rule_line())
         out.append(f"Money simulation on test (mean net {cfg['ret_col']}, %): top {TOP_FRAC:.0%} "
                    f"by runner score = {fmt(t['sim_top_mean'], 1)} over {t['sim_n_top']} calls; "
@@ -437,7 +534,9 @@ def proposal_text(p: dict) -> str:
              f"and in more than half of the walk-forward weeks with at least "
              f"{C.DEAD_SCORE_MIN_WEEK_DEAD} dead calls and at least "
              f"{p.get('wf_min_train_rows', C.WF_MIN_TRAIN_ROWS)} training rows (weeks marked "
-             "\"not counted\" are left out, as for the bucket gates). On this run:\n"]
+             "\"not counted\" are left out, as for the bucket gates' walk-forward weeks; unlike "
+             f"the bucket gates since {C.GATES_SET_ON}, which pool the weeks, this proposal "
+             "still judges week by week). On this run:\n"]
     for model in ("lightgbm", "logistic"):
         q = p[model]
         lines.append(f"- {model}: test lift {fmt(q['test_lift'], 2)} ({'meets' if q['test_ok'] else 'below'} "
@@ -446,7 +545,8 @@ def proposal_text(p: dict) -> str:
     return "\n".join(lines) + "\n"
 
 
-DIAGNOSTICS_TITLE = "## Stability diagnostics (report only; not saved, not served, never a gate)\n"
+DIAGNOSTICS_TITLE = ("## Stability diagnostics (not saved, not served; only the seeds' pooled lifts "
+                     "and the pooled expanding walk-forward feed the gates)\n")
 
 
 def _ci(v, lo, hi, digits=2) -> str:
@@ -475,10 +575,17 @@ def diagnostics_section(dg: dict, buckets: dict) -> str:
     st = dg["settings"]
     secs = dg.get("seconds") or {}
     out.append(
-        "These sections help tell whether the results above are real or noise. They are report "
-        "only: nothing here is saved or served, the gates and the verdict above are unchanged, and "
-        "no number here passes or fails anything. Switch them off for a run with "
-        f"{C.DIAGNOSTICS_ENV}=0 (config DIAGNOSTICS). Time: "
+        "These sections help tell whether the results above are real or noise. Nothing here is "
+        "saved or served. Since the owner decision of "
+        f"{C.GATES_SET_ON}, the pooled walk-forward lift of each seed (\"Seed stability\") and "
+        "the pooled expanding walk-forward with its bootstrap interval (\"Pooled walk-forward\") "
+        "are the inputs of the gates above; they are computed in every training, also with this "
+        "section switched off, and the verdict is the same either way. Everything else here "
+        "(the seed table's other columns and its single-run gate column, the rolling "
+        "walk-forward, the evaluation without dead calls, adversarial validation) is report "
+        f"only and passes or fails nothing. Switch the section off for a run with "
+        f"{C.DIAGNOSTICS_ENV}=0 (config DIAGNOSTICS). Time (seeds = the seed retrains, done for "
+        "the gates): "
         + "; ".join(f"{k} {v:.0f} s" for k, v in secs.items())
         + f" (total {sum(secs.values()):.0f} s).\n")
     out.append(seed_section(dg.get("seeds"), buckets))
@@ -500,11 +607,14 @@ def seed_section(sd, buckets) -> str:
         "seed changes (bagging and feature sampling, and so the rounds from early stopping / the "
         "purged k-fold): same rows, splits, labels and walk-forward weeks. If the lift or the "
         "pass/fail moves a lot between seeds, a single run's number is mostly noise. Counted "
-        "weeks beating = walk-forward weeks beating buy-all (counted weeks only, as the gate); "
-        "pooled WF lift = see \"Pooled walk-forward\" below.\n")
+        "weeks beating = walk-forward weeks beating buy-all (counted weeks only); "
+        "pooled WF lift = see \"Pooled walk-forward\" below: its median over the seeds is the "
+        f"runner-lift gate (>= {C.GATES['min_top_lift']:g}). The last column is the old "
+        "single-run gate of each run (test-part lift, collapses removed, every counted week "
+        "beating buy-all): information only.\n")
     head = ["run", "top-10% lift [95%]", "collapses removed", "runner AUC",
-            "sim top 10% vs all (%)", "counted weeks beating buy-all", "pooled WF lift",
-            "gates (information)"]
+            "sim top 10% vs all (%)", "counted weeks beating buy-all",
+            "pooled WF lift (gate input)", "single-run (old) gate, information"]
     for b in buckets:
         out.append(f"#### Bucket `{b}`\n")
         if buckets[b].get("skipped"):
@@ -575,10 +685,13 @@ def pooled_section(wd, st, buckets) -> str:
     if err:
         return "\n".join(out + [err])
     out.append(
+        "The expanding row is a gate input (see Verdict): the lower end of its lift interval and "
+        "the lower end of its simulation-difference interval are gates; the rolling row is "
+        "report only. "
         "Pooled = the test rows of all counted walk-forward weeks of a bucket together (counted: "
-        f"training part of at least {C.WF_MIN_TRAIN_ROWS} rows, as the gate). Each week is ranked "
+        f"training part of at least {C.WF_MIN_TRAIN_ROWS} rows). Each week is ranked "
         "by its own model (the top 10% by runner score and the top 30% by collapse score are taken "
-        "per week, as the gate does: the week models' scores are not on one scale); pooled lift = "
+        "per week: the week models' scores are not on one scale); pooled lift = "
         "runner rate in the per-week tops / runner rate of all pooled rows. 95% interval: "
         f"week-block bootstrap ({st['reps']} resamples of the weeks with replacement, seed "
         f"{st['bootstrap_seed']}); with few weeks it is rough, with one week n/a. Expanding = the "
@@ -698,7 +811,11 @@ def adversarial_section(ad, st, buckets) -> str:
 VARIANT_NOTE = (
     "Each variant changes exactly one setting of the baseline (the saved model) and is trained "
     "on the same rows, splits and seed. Variants are report only: not saved, not served, and "
-    "their gate result is not the verdict above. **All variants are compared on the same test "
+    "never a gate. Their gate column is the old single-run gate (test-part lift, collapses "
+    "removed, every counted week beating buy-all), information only, also for the baseline row; "
+    "the verdict above uses the pooled gates, which would need each variant retrained with every "
+    "seed. The pooled walk-forward column is each variant's own pooled walk-forward (its "
+    "LGBM_SEED run only), comparable with the baseline's. **All variants are compared on the same test "
     "part, so choosing the best one by these numbers alone risks fitting the test period; prefer "
     "a variant that also wins in the walk-forward weeks** (weeks beating buy-all, walk-forward "
     "mean lift and mean collapses removed).")
@@ -716,7 +833,7 @@ def variant_read() -> str:
         "rule on). The logistic baseline uses numeric inputs only, so its numbers do not change "
         "between the DEX variants. Sim = mean net return (%) of the top 10% by runner score vs all "
         "calls of the test part. The walk-forward columns use the counted weeks only (training "
-        f"part of at least {C.WF_MIN_TRAIN_ROWS} rows), as the gate does.")
+        f"part of at least {C.WF_MIN_TRAIN_ROWS} rows), as the gates do.")
 
 
 def variant_error(exc: BaseException) -> str:
@@ -737,12 +854,12 @@ def variant_table(variants: dict, bucket: str) -> str:
     for name, v in variants.items():
         changes = ", ".join(f"{k} = {val}" for k, val in v["changes"].items()) or "(as configured)"
         if v.get("error"):
-            rows.append([name, changes, v["error"]] + [""] * 10)
+            rows.append([name, changes, v["error"]] + [""] * 11)
             continue
         s = (v.get("buckets") or {}).get(bucket)
         if v.get("not_applicable") or s is None or s.get("skipped"):
             why = v.get("not_applicable") or (s or {}).get("skipped") or "not trained"
-            rows.append([name, changes, f"n/a: {why}"] + [""] * 10)
+            rows.append([name, changes, f"n/a: {why}"] + [""] * 11)
             continue
         rows.append([
             name, changes, s["runner_rate_test"],
@@ -754,6 +871,9 @@ def variant_table(variants: dict, bucket: str) -> str:
             f"{s['windows_beating']}/{s['windows_evaluated']}",
             fmt(s["wf_mean_lift"], 2), s["wf_mean_collapse_removed"],
             f"{fmt(s['sim_top_mean'], 1)} vs {fmt(s['sim_all_mean'], 1)}",
+            _ci(s.get("wf_pooled_lift"), s.get("wf_pooled_lift_lo"), s.get("wf_pooled_lift_hi"))
+            + "; " + _signed_ci(s.get("wf_pooled_sim_gain"), s.get("wf_pooled_sim_gain_lo"),
+                                s.get("wf_pooled_sim_gain_hi")),
             "PASS" if s["passed"] else "FAIL"])
     return table(["variant", "change", "runner rate (test)", "runner lift top 10% [95%]",
                   "runner AUC LightGBM / logistic", "collapse AUC, plain label: LightGBM / logistic",
@@ -761,7 +881,9 @@ def variant_table(variants: dict, bucket: str) -> str:
                   "collapses removed (plain; gate)", "counted weeks beating buy-all",
                   "walk-forward mean lift (counted weeks)",
                   "walk-forward mean collapses removed (counted weeks)",
-                  "sim top 10% vs all (%)", "gates"], rows)
+                  "sim top 10% vs all (%)",
+                  f"pooled WF lift [95%]; sim difference [95%] (seed {C.LGBM_SEED} only; "
+                  "information)", "single-run (old) gate, information"], rows)
 
 
 def variants_section(variants: dict, buckets: dict) -> str:
