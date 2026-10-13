@@ -1784,9 +1784,11 @@ const (
 	// Perceptor re-check, recheck.go, over its first "not enough data yet").
 	// Live scans only (scan_kind 'live'): a late re-scan is today's verdict,
 	// not the one at the time of the call (webPerceptorTodaySQL has those).
+	// at is completed_at, else requested_at (for the Perceptor filter's
+	// "latest report" rule, webLatestPerceptor).
 	webPerceptorSQL = `(SELECT DISTINCT ON (lower(i.contract_address)) lower(i.contract_address) AS ca,
 		CASE WHEN i.verdict_level IN ('clean', 'caution', 'red_flags', 'insufficient') THEN i.verdict_level ELSE 'unknown' END AS verdict,
-		i.report_url, i.id
+		i.report_url, i.id, COALESCE(i.completed_at, i.requested_at) AS at
 		FROM scout_investigations i JOIN scout_investigation_tools pt ON pt.id = i.tool_id AND pt.code = 'perceptor'
 		WHERE i.status = 'completed' AND i.scan_kind = 'live'
 		ORDER BY lower(i.contract_address), (i.verdict_level IN ('clean', 'caution', 'red_flags')) DESC, i.requested_at DESC, i.id DESC)`
@@ -1861,7 +1863,7 @@ const (
 // webRowsSQL loads the website's whole list in one statement: each token's
 // first call with its tracking row (and its latest price), the late-entry
 // results of the five windows, how often the token was called, its latest
-// live Perceptor report and its latest Perceptor re-scan ("Perceptor today"), the id, scan kind and request time of its
+// live Perceptor report (and when it completed) and its latest Perceptor re-scan ("Perceptor today"), the id, scan kind and request time of its
 // latest sAlpha report with text (a real report before a decline, a call's own before a re-ask; $1, $2, $3 =
 // salphaDeclinePhrases, salphaDeclineMaxLen, salphaDeclineTrim) and the
 // market caps of the post; and, for the Analytics page, the posted DEX, the
@@ -1888,7 +1890,7 @@ var webRowsSQL = `WITH fc AS ` + webFirstCallsSQL + `
 	p.verdict, p.report_url, p.id, sa.id, sa.scan_kind, sa.requested_at, n.call_count, n.last_call_date,
 	t.latest_return_pct::float8, t.latest_price_usd::float8, t.latest_checked_at, t.latest_trade_at,
 	m.called_at_mcap_usd::float8, m.mcap_usd::float8, t.entry_price_usd::float8,
-	ptd.verdict, ptd.report_url, ptd.at,
+	ptd.verdict, ptd.report_url, ptd.at, p.at,
 	NULLIF(btrim(m.dex), ''), t.entry_price_source, NULLIF(t.onchain->>'quote_sym', ''), COALESCE(r.no_data, 0), vac.verdict,
 	(t.entry_price_source LIKE 'onchain-%' AND COALESCE((t.onchain->>'v')::int, 0) >= 2 AND COALESCE(r.has_1d, false)) IS TRUE,
 	m.holders, m.proof_elite, m.proof_good, m.live_buys_elite_count, m.live_buys_good_count,
@@ -2007,7 +2009,7 @@ func (st *ScoutStore) SelectWebRows(ctx context.Context) ([]ScoutWebRow, int, er
 		}
 		dest = append(dest, &r.PerceptorVerd, &r.PerceptorURL, &r.PerceptorID, &r.SAlphaID, &r.SAlphaKind, &r.SAlphaAt, &r.CallCount, &r.LastCallDate,
 			&r.LatestReturn, &r.LatestPrice, &r.LatestAt, &r.LatestTradeAt,
-			&r.CalledAtMcap, &r.PostMcap, &r.PostPrice, &r.PerceptorTodayVerd, &r.PerceptorTodayURL, &r.PerceptorTodayAt,
+			&r.CalledAtMcap, &r.PostMcap, &r.PostPrice, &r.PerceptorTodayVerd, &r.PerceptorTodayURL, &r.PerceptorTodayAt, &r.PerceptorAt,
 			&r.PostedDex, &r.EntrySource, &r.QuoteSym, &noData, &r.VerdictAtCall, &r.TradesFinal,
 			&r.Holders, &r.ProofElite, &r.ProofGood, &r.LiveBuysEliteCount, &r.LiveBuysGoodCount,
 			&r.LiveBuysEliteUSD, &r.LiveBuysGoodUSD,

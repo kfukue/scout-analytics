@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"testing"
@@ -510,10 +511,12 @@ func TestRescanLaneSideEffects(t *testing.T) {
 	}
 }
 
-// The website keeps rescans out of everything it showed before (the verdict,
-// its link and report id, the Perceptor filter and its counts, the detail of
-// GET /api/call) and shows them only as "Perceptor today"
-// (perceptor_today_verdict, _url, _at), which is part of the snapshot version.
+// The website keeps rescans out of the call-time fields (the verdict, its
+// link and report id, the detail of GET /api/call) and shows them as
+// "Perceptor today" (perceptor_today_verdict, _url, _at), which is part of the
+// snapshot version. The Perceptor filter and its counts use the latest
+// report with a verdict (perceptor_latest_verdict), so a completed rescan with
+// a verdict moves its row; a rescan that did not complete does not.
 func TestRescanWebFields(t *testing.T) {
 	fx := newWebFixture(t, webConfig{GMGNTemplate: defaultGMGNTemplate})
 	ctx := context.Background()
@@ -553,6 +556,7 @@ func TestRescanWebFields(t *testing.T) {
 	type want struct {
 		verdict, url, reportID   string
 		today, todayURL, todayAt string
+		latest                   string
 	}
 	str := func(p *string) string {
 		if p == nil {
@@ -567,11 +571,11 @@ func TestRescanWebFields(t *testing.T) {
 		return strconv.Itoa(*p)
 	}
 	wants := map[string]want{
-		"alpha": {levelClean, "https://www.perceptor.info/r/live", strconv.Itoa(live), levelCaution, "https://www.perceptor.info/r/today", "2026-10-01T00:00:00Z"},
-		"beta":  {"<nil>", "<nil>", "<nil>", levelRedFlags, "https://www.perceptor.info/r/beta", "2026-10-01T00:00:00Z"},
-		"virt":  {"<nil>", "<nil>", "<nil>", levelClean, "<nil>", "2026-10-01T00:00:00Z"},
-		"gamma": {"<nil>", "<nil>", "<nil>", "<nil>", "<nil>", "<nil>"},
-		"xss":   {"<nil>", "<nil>", "<nil>", "<nil>", "<nil>", "<nil>"},
+		"alpha": {levelClean, "https://www.perceptor.info/r/live", strconv.Itoa(live), levelCaution, "https://www.perceptor.info/r/today", "2026-10-01T00:00:00Z", levelCaution},
+		"beta":  {"<nil>", "<nil>", "<nil>", levelRedFlags, "https://www.perceptor.info/r/beta", "2026-10-01T00:00:00Z", levelRedFlags},
+		"virt":  {"<nil>", "<nil>", "<nil>", levelClean, "<nil>", "2026-10-01T00:00:00Z", levelClean},
+		"gamma": {"<nil>", "<nil>", "<nil>", "<nil>", "<nil>", "<nil>", "<nil>"},
+		"xss":   {"<nil>", "<nil>", "<nil>", "<nil>", "<nil>", "<nil>", "<nil>"},
 	}
 	res := fx.calls(t, "per=100")
 	byKey := map[string]webCallJSON{}
@@ -583,21 +587,28 @@ func TestRescanWebFields(t *testing.T) {
 		if !ok {
 			t.Fatalf("%s not listed", k)
 		}
-		got := want{str(c.Perceptor), str(c.PerceptorURL), num(c.PerceptorReportID), str(c.PerceptorTodayVerd), str(c.PerceptorTodayURL), str(c.PerceptorTodayAt)}
+		got := want{str(c.Perceptor), str(c.PerceptorURL), num(c.PerceptorReportID), str(c.PerceptorTodayVerd), str(c.PerceptorTodayURL), str(c.PerceptorTodayAt), str(c.PerceptorLatest)}
 		if got != w {
-			t.Errorf("%s: perceptor (verdict, url, report id, today, today url, today at) = %v, want %v", k, got, w)
+			t.Errorf("%s: perceptor (verdict, url, report id, today, today url, today at, latest) = %v, want %v", k, got, w)
 		}
 	}
-	// the Perceptor filter and its counts: only alpha's live scan changed them
+	// the Perceptor filter and its counts: the latest report with a verdict,
+	// alpha's newer rescan (caution) over its live clean, beta's and virt's
+	// rescans; gamma's timed-out rescan does not count
 	after := map[string]int{}
 	for _, v := range []string{"not_scanned", "clean", "caution", "red_flags"} {
 		after[v] = fx.calls(t, "per=100&verdict="+v).Total
 	}
-	wantAfter := map[string]int{"not_scanned": before["not_scanned"] - 1, "clean": before["clean"] + 1,
-		"caution": before["caution"], "red_flags": before["red_flags"]}
+	wantAfter := map[string]int{"not_scanned": before["not_scanned"] - 3, "clean": before["clean"] + 1,
+		"caution": before["caution"] + 1, "red_flags": before["red_flags"] + 1}
 	for v, n := range wantAfter {
 		if after[v] != n {
-			t.Errorf("verdict=%s: %d calls, want %d (before the scans %d; rescans must not count)", v, after[v], n, before[v])
+			t.Errorf("verdict=%s: %d calls, want %d (before the scans %d)", v, after[v], n, before[v])
+		}
+	}
+	for v, wantKeys := range map[string][]string{"clean": {"virt"}, "caution": {"alpha"}, "red_flags": {"beta"}} {
+		if got := fx.keys(fx.calls(t, "per=100&verdict="+v).Calls); !reflect.DeepEqual(got, wantKeys) {
+			t.Errorf("verdict=%s: %v, want %v", v, got, wantKeys)
 		}
 	}
 	// the detail: the live report, or none

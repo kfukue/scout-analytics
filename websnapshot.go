@@ -30,9 +30,59 @@ const (
 	webBucketClean uint8 = iota
 	webBucketCaution
 	webBucketRedFlags
-	webBucketNotScanned // no completed report, or one without a readable verdict or with "not enough data yet" (insufficient)
+	webBucketNotScanned // no completed report with a verdict: none, or only ones without a readable verdict or with "not enough data yet" (insufficient)
 	webBuckets
 )
+
+// webRealVerdict is verdictUsable for a verdict that may be missing (nil).
+func webRealVerdict(v *string) bool {
+	return v != nil && verdictUsable(*v)
+}
+
+// webLatestPerceptor returns the verdict the Perceptor filter and its counts
+// use for a token: that of its latest Perceptor report with a verdict, out of
+// the two the snapshot has, the call-time one (live, the call's scan or the
+// 12-minute re-check: verdict live, completed at liveAt) and "Perceptor today"
+// (rescan, the rescan lane or the 2-hour re-check: verdict today, completed
+// at todayAt). Only completed reports get here: a failed, timed-out or
+// rate-limited scan is never one of them, so it never replaces a verdict.
+//
+//   - A real verdict (clean, caution, red_flags) always beats one without
+//     (insufficient = "not enough data yet", unknown = no readable verdict),
+//     whichever is newer: a later insufficient or unknown never replaces a
+//     real verdict, and a later real verdict replaces them.
+//   - Between two real verdicts, or two without one, the newer completion time
+//     wins; a missing time counts as older than any, and on a tie the re-scan
+//     wins (it is the later lane by design).
+//   - nil when the token has neither.
+//
+// insufficient and unknown both put the token under "not scanned".
+func webLatestPerceptor(live *string, liveAt *time.Time, today *string, todayAt *time.Time) *string {
+	switch lr, tr := webRealVerdict(live), webRealVerdict(today); {
+	case live == nil:
+		return today
+	case today == nil:
+		return live
+	case lr && !tr:
+		return live
+	case tr && !lr:
+		return today
+	}
+	if liveAt != nil && (todayAt == nil || liveAt.After(*todayAt)) {
+		return live
+	}
+	return today
+}
+
+// webBucketOf returns the Perceptor filter bucket of a verdict.
+func webBucketOf(v *string) uint8 {
+	if v != nil {
+		if b, ok := webVerdictBuckets[*v]; ok {
+			return b
+		}
+	}
+	return webBucketNotScanned
+}
 
 // verdict filter → bucket
 var webVerdictBuckets = map[string]uint8{
@@ -131,8 +181,13 @@ func webHorizonIndex(h string) (int, bool) {
 type webSnapshot struct {
 	n   int
 	ids []int32 // call id
-	// flags: the Perceptor filter bucket (webBucket…) and webFlagUSD
+	// flags: the Perceptor filter bucket (webBucket… of the latest report with
+	// a verdict, webLatestPerceptor) and webFlagUSD
 	flags []uint8
+	// callVerd[i]: the bucket of row i's call-time verdict alone
+	// (perceptor_verdict), which may differ from the filter's; only
+	// webSnapshotEvents reads it (a change is a call-time "report" event).
+	callVerd []uint8
 	// perf[i*15+j] is ScoutWebRow.Perf[j] of row i (USD-priced rows only); bit j
 	// of hasPerf[i] says the value is there.
 	perf    []float64
@@ -474,6 +529,7 @@ func (c webConfig) webCall(r *ScoutWebRow) ScoutWebCall {
 		HasSAlpha: r.SAlphaID != nil && !r.salphaDeclined, PerceptorReportID: r.PerceptorID, SAlphaReportID: r.SAlphaID,
 		SAlphaReaskAfterS:  reaskAfter,
 		PerceptorTodayVerd: r.PerceptorTodayVerd, PerceptorTodayURL: r.PerceptorTodayURL, PerceptorTodayAt: r.PerceptorTodayAt,
+		PerceptorLatestVerd: r.latestVerd,
 	}
 }
 
@@ -594,12 +650,13 @@ func newWebSnapshot(rows []ScoutWebRow, updatePosts int, prev *webSnapshot, cfg 
 		if r.PerceptorTodayAt != nil {
 			*r.PerceptorTodayAt = r.PerceptorTodayAt.UTC()
 		}
-		r.verdict = webBucketNotScanned
-		if r.PerceptorVerd != nil {
-			if b, ok := webVerdictBuckets[*r.PerceptorVerd]; ok {
-				r.verdict = b
-			}
+		if r.PerceptorVerd == nil {
+			r.PerceptorAt = nil // the time of a report the row does not have
 		}
+		// the Perceptor filter: the latest report with a verdict (call-time
+		// or "Perceptor today")
+		r.latestVerd = webLatestPerceptor(r.PerceptorVerd, r.PerceptorAt, r.PerceptorTodayVerd, r.PerceptorTodayAt)
+		r.verdict = webBucketOf(r.latestVerd)
 	}
 	sum.RepeatCalls = sum.TotalCalls - sum.Imported
 	counts := sha256.Sum256([]byte(fmt.Sprint(sum.Imported, sum.Tracked, sum.Pending, sum.Tracking, sum.Done, sum.NoPool,
@@ -616,6 +673,7 @@ func newWebSnapshot(rows []ScoutWebRow, updatePosts int, prev *webSnapshot, cfg 
 
 	s.ids = make([]int32, n)
 	s.flags = make([]uint8, n)
+	s.callVerd = make([]uint8, n)
 	s.hasPerf = make([]uint16, n)
 	s.perf = make([]float64, n*webPerfPerRow)
 	s.rowAt = make([]uint32, n+1)
@@ -625,7 +683,7 @@ func newWebSnapshot(rows []ScoutWebRow, updatePosts int, prev *webSnapshot, cfg 
 	s.salphaID = make([]int32, n)
 	s.todayVerd = make([]uint8, n)
 	s.todayAt = make([]int64, n)
-	s.rowJSON = make([]byte, 0, n*1030) // about 955 bytes a row
+	s.rowJSON = make([]byte, 0, n*1070) // about 990 bytes a row (1,034 in BenchmarkWebSnapshot's rows)
 	s.search = make([]byte, 0, n*72)
 	var one bytes.Buffer // one encoded row
 	enc := json.NewEncoder(&one)
@@ -637,6 +695,7 @@ func newWebSnapshot(rows []ScoutWebRow, updatePosts int, prev *webSnapshot, cfg 
 		}
 		s.ids[i] = int32(r.CallID)
 		s.flags[i] = r.verdict
+		s.callVerd[i] = webBucketOf(r.PerceptorVerd)
 		s.counts[0][r.verdict]++
 		s.counts[0][webBuckets]++
 		if r.usd {
@@ -794,6 +853,7 @@ func hashWebRows(rows []ScoutWebRow, updatePosts int, gmgn string) string {
 		opt(r.PerceptorTodayVerd)
 		opt(r.PerceptorTodayURL)
 		optTime(r.PerceptorTodayAt)
+		optTime(r.PerceptorAt) // with the verdicts above, decides perceptor_latest_verdict
 		num(int64(r.CallCount))
 		num(r.LastCallDate.UnixNano())
 		optFlt(r.LatestReturn)

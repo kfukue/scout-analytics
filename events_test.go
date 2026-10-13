@@ -271,10 +271,13 @@ func TestWebSnapshotEvents(t *testing.T) {
 			[]gotEvent{{"report", base[plain].CallID, "perceptor_today"}}},
 		{"another verdict", setToday(plain, "red_flags", todayAt),
 			[]gotEvent{{"report", base[plain].CallID, "perceptor_today"}}},
+		// the row had no call-time report: its Perceptor filter verdict was the
+		// re-scan's clean, now it is "not scanned" again, so the row is sent
+		// (quietly) and may leave a filtered page
 		{"the re-scan went away", func(rows []ScoutWebRow, _ map[int]*ScoutWebReport) []ScoutWebRow {
 			rows[plain].PerceptorTodayVerd, rows[plain].PerceptorTodayURL, rows[plain].PerceptorTodayAt = nil, nil, nil
 			return rows
-		}, nil},
+		}, []gotEvent{{"report", base[plain].CallID, "perceptor_today"}}},
 	} {
 		t.Run("today: "+tc.name, func(t *testing.T) {
 			prevRows := setToday(plain, "clean", todayAt)(cloneWebRows(base), nil)

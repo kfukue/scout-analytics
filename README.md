@@ -1196,9 +1196,10 @@ overwrite the status and would make today's verdict look like one from the time 
 **No leakage into the model.** A re-scan's verdict is today's, not one known when the call
 was made. `scout_call_dataset_v` (and so `-export-dataset`, the training data and the model's
 scoring row), the requeue's "already investigated" check, the website's `perceptor_verdict`
-/ Perceptor filter / `GET /api/call` all read `scan_kind = 'live'` rows only (the sAlpha
-lookup reads sAlpha rows only: `live`, and `reask` from the re-ask lane). The website shows a
-re-scan only as `perceptor_today_*`.
+/ `GET /api/call` / Analytics "verdict at the call" all read `scan_kind = 'live'` rows only
+(the sAlpha lookup reads sAlpha rows only: `live`, and `reask` from the re-ask lane). The
+website shows a re-scan as `perceptor_today_*`; only its Perceptor filter (display only) can
+use a re-scan's verdict (`perceptor_latest_verdict`, see the website API).
 
 **Dry run** (database only: no Telegram login, no node; nothing is scanned, and no call,
 investigation or delivery is written):
@@ -1387,7 +1388,8 @@ says the token is too new to judge:
 
 `insufficient` is no verdict: it never passes the gate unless `SCOUT_DELIVER_LEVELS` names it,
 and on the website it shows as "not enough data yet" but counts as "Not scanned" in the
-Perceptor filter. Rows stored as `unknown` before this level existed are relabelled from
+Perceptor filter, unless another report of the token has a verdict (`perceptor_latest_verdict`).
+Rows stored as `unknown` before this level existed are relabelled from
 their stored text by `scoutanalytics.sql` at every start (completed Perceptor rows still
 `unknown` whose `report_text` contains "not enough data yet"; only `verdict_level` and
 `verdict_label` change).
@@ -1416,7 +1418,8 @@ Perceptor again:
   pause or a reconnect still runs once; only a restart of the listener drops it).
 - **`SCOUT_PERCEPTOR_RECHECK2_AFTER` (2h) after the call**, only while there is still no
   real verdict: website only, never delivered. Stored as `scan_kind = 'rescan'` (`details`
-  `{"recheck":2,…}`), so it shows as "Perceptor today" and never feeds the model. After
+  `{"recheck":2,…}`), so it shows as "Perceptor today" and never feeds the model (the
+  website's Perceptor filter can use it: `perceptor_latest_verdict`). After
   that the rescan lane covers the call (if `SCOUT_RESCAN=on`).
 
 A Perceptor scan that did not complete (timeout, failed, rate-limited after its retries) is
@@ -1769,7 +1772,9 @@ other sites):
     in place (verdict, "sA" badge, an open detail panel). So does a **new or changed
     "Perceptor today"** (a re-scan; a `report` event with `"tool":"perceptor_today"`), but
     quietly: no notice, no beep and no desktop alert, since re-scans are about old calls
-    (up to 100 a day) and would push the call-time notices out of the corner.
+    (up to 100 a day) and would push the call-time notices out of the corner. With a
+    Perceptor filter on, a row whose latest Perceptor verdict moves it out of the filter
+    leaves the list, and one that moves into it appears (the list reloads quietly).
   - Each of the others also shows a **notice in the bottom-right corner**: token, verdict
     (or "sAlpha: report available" / "did not generate a report") and a GMGN link. At most
     4 are kept (2 on a narrow screen); each goes after a minute or with its × button.
@@ -1852,8 +1857,10 @@ other sites):
   - **Perceptor today (re-scan)**, only when the token has one: the re-scan's verdict in the
     same outlined label as the list ("today: caution"), its date, a line saying it is a
     re-scan made long after the call and not the verdict at call time, and "Open the re-scan
-    report" (https links only). It comes from the row (`perceptor_today_*`), not from
-    `GET /api/call`, and is redrawn with every refresh, like the performance block.
+    report" (https links only), and a line saying which verdict the Perceptor filter uses
+    (this re-scan's, the call-time one, or none: "Not scanned"). It comes from the row
+    (`perceptor_today_*`, `perceptor_latest_verdict`), not from `GET /api/call`, and is
+    redrawn with every refresh, like the performance block.
   - **sAlpha**: the text of the token's latest completed sAlpha report, as plain text with its
     line breaks, its time and "Open the sAlpha report" (https links only). **About half of
     sAlpha's replies are empty; an empty reply (or one of white space only) counts as no
@@ -1898,7 +1905,10 @@ other sites):
   "no red flags", "caution", "red flags" (linked to the report, in a new tab), or "–" when
   there is none. The "Perceptor" button next to the search box filters the list: it opens a
   small panel of checkboxes (No red flags, Caution, Red flags, Not scanned), and the list shows
-  the tokens whose verdict is any of those ticked, e.g. No red flags **and** Caution. None
+  the tokens whose **latest Perceptor verdict** (`perceptor_latest_verdict`, see the API) is
+  any of those ticked, e.g. No red flags **and** Caution. That is usually the verdict the
+  column shows, but a token with "–" or "not enough data yet" at the call and a later
+  "today: caution" re-scan is listed under Caution, not Not scanned. None
   ticked (or all four) = all; "All (clear)" unticks them. The button names the choice
   ("Perceptor: No red flags + Caution", "Perceptor: all"). It opens with Enter or Space, Esc
   or a click elsewhere closes it, and the choice is kept in the browser (localStorage) across
@@ -1920,8 +1930,9 @@ other sites):
   pills: smaller, outlined with a dashed line, square corners, no fill, and always with
   "today:" in front. It links to the re-scan report (in a new tab, https only; plain text
   otherwise), and its tooltip says "Perceptor re-scan on <date>, not the verdict at call
-  time". **The Perceptor filter and its counts ignore it**: such a token stays under "Not
-  scanned". The legend under the table has an entry for it ("today: caution").
+  time" (and, when the Perceptor filter goes by it, that the filter uses this verdict).
+  **The Perceptor filter and its counts use it** when it is the token's latest report with a
+  verdict (see above). The legend under the table has an entry for it ("today: caution").
 - Every number is **in USD and measured from the entry 60 seconds after the post** (the
   `*_late_*` columns). A call tracked in another asset (no USD source for its pair) shows
   "no USD price" in Latest %, a dash for Latest MC, Call MC and Entry $, and one dash across
@@ -2115,7 +2126,8 @@ dependencies; `go test` runs it when `node` is on the PATH). Only the visible ta
   collapse), a peak of +99.96% as +100.0%. The legend says so too.
 - **Rugged calls:** their returns after the rug count as −100% (as stored), and, unlike the
   list (which shows no peak for them), their peak before the rug counts.
-- **Verdict at the call** is not the list's Perceptor column: it is the call's own live
+- **Verdict at the call** is not the list's Perceptor column, nor its Perceptor filter (which
+  goes by the latest report, re-scans included): it is the call's own live
   Perceptor scan, else the latest live scan of the same address made before the call (the rule
   of `scout_call_dataset_v`). A repeat call's later scan, a re-scan ("Perceptor today") or a
   scan made after the call never count. Calls imported from history show as "Not scanned".
@@ -2235,7 +2247,7 @@ returned and cannot be found by its own name or symbol:
 | `dir` | `desc`, `asc` | `desc` | |
 | `horizon` | `1h`, `1d`, `3d`, `7d`, `30d` | `1d` | which window `return_pct` / `peak_pct` / `drawdown_pct` (and `sort=return` / `peak`) are for; the page sets it with its Peak / worst drop selector |
 | `usd_only` | `1`, `0` | `1` for every `sort` but `date`, else `0` | `1` = only tokens whose first call has `price_unit = usd` |
-| `verdict` | `clean`, `caution`, `red_flags`, `not_scanned`, or several separated by commas (`verdict=clean,caution`) | *(none = all)* | the token's Perceptor verdict (see below); with several, a token with any of them. The parameter may also be repeated (`verdict=clean&verdict=caution`); all values add up, repeats and empty items are ignored, so `verdict=` = all, and so do all four. `clean` = no red flags found; `not_scanned` = no completed Perceptor report, or one whose verdict is `unknown` or `insufficient` ("not enough data yet"). The order does not matter: `caution,clean` is the same question, with the same `ETag`, as `clean,caution` |
+| `verdict` | `clean`, `caution`, `red_flags`, `not_scanned`, or several separated by commas (`verdict=clean,caution`) | *(none = all)* | the token's **latest** Perceptor verdict, `perceptor_latest_verdict` (see below); with several, a token with any of them. The parameter may also be repeated (`verdict=clean&verdict=caution`); all values add up, repeats and empty items are ignored, so `verdict=` = all, and so do all four. `clean` = no red flags found; `not_scanned` = no completed Perceptor report with a verdict (none, or only ones whose verdict is `unknown` or `insufficient`, "not enough data yet"). The order does not matter: `caution,clean` is the same question, with the same `ETag`, as `clean,caution` |
 | `days` | 1 – 3650 (whole days) | *(none = all)* | only tokens whose first call was posted within the last `days` × 24 hours, counted back from the snapshot time (`snapshot_at`), not the time of the request; `days=0` is a 400 (leave it out for all) |
 | `page` | 1 … | `1` | |
 | `per` | 1 – 200 | `50` | |
@@ -2258,7 +2270,8 @@ Any other value or parameter, or any parameter but `verdict` given twice → HTT
    "latest_at": "2026-11-30T14:31:10.52Z", "latest_trade_at": "2026-11-30T13:02:44Z",
    "latest_age_seconds": 5184070, "call_mcap_usd": 45200, "latest_mcap_usd": 61110.4,
    "has_salpha_report": true, "perceptor_report_id": 5120, "salpha_report_id": 5121,
-   "salpha_reask_after_s": null, "perceptor_today_verdict": null, "perceptor_today_url": null, "perceptor_today_at": null}]}
+   "salpha_reask_after_s": null, "perceptor_today_verdict": null, "perceptor_today_url": null, "perceptor_today_at": null,
+   "perceptor_latest_verdict": "clean"}]}
 ```
 `call_count` = how many real calls of that token exist in total (1 or more; update posts are
 not counted); `last_call_date` = the date of the most recent one (equal to `message_date` when there is only one). Everything else
@@ -2315,8 +2328,9 @@ call's own. Both are `null` when the token was never scanned at the time of a ca
 the normal case for calls imported from history (only live calls are scanned).
 `perceptor_url` is also `null` when the stored link does not start with `https://`. This is a
 rule of the website only: `scout_call_dataset_v.perceptor_verdict` is unchanged and still
-belongs to the single call. The Perceptor filter (`verdict=`) and its counts use the same
-live verdict.
+belongs to the single call. The Perceptor filter (`verdict=`) and its counts use
+`perceptor_latest_verdict` (below): this verdict, unless a re-scan is the token's latest report
+with a verdict (a real verdict beats a later "not enough data yet").
 
 `perceptor_today_verdict`, `perceptor_today_url` and `perceptor_today_at` are **"Perceptor
 today"**: the token's latest completed Perceptor re-scan by the rescan lane or the 2-hour
@@ -2325,10 +2339,23 @@ re-check (`scan_kind = 'rescan'`, see "Re-scanning calls without a Perceptor rep
 its verdict is today's, not the one at the time of the call. Same verdict values and link rule
 as above; `perceptor_today_at` = when it ran (`completed_at`, else `requested_at`). All three
 are `null` without a completed re-scan. A re-scan never fills `perceptor_verdict`,
-`perceptor_url` or `perceptor_report_id`, never moves a row in the Perceptor filter, and is
-not shown by `GET /api/call`. A new re-scan changes the `ETag` of `/api/calls` and sends a
-live `report` event with `"tool":"perceptor_today"` (also when a newer re-scan has the same
-verdict); the page shows it as the "Perceptor today" label (see "Website").
+`perceptor_url` or `perceptor_report_id`, and is not shown by `GET /api/call`, but it can
+move the row in the Perceptor filter (`perceptor_latest_verdict`). A new re-scan changes the
+`ETag` of `/api/calls` and sends a live `report` event with `"tool":"perceptor_today"` (also
+when a newer re-scan has the same verdict); the page shows it as the "Perceptor today" label
+(see "Website").
+
+`perceptor_latest_verdict` (added 13 October 2026) is the verdict the **Perceptor filter**
+(`verdict=`) and its counts use, picked from the two above: `perceptor_verdict` (live scans
+and the 12-minute re-check) and `perceptor_today_verdict` (re-scans and the 2-hour re-check).
+A real verdict (`clean`, `caution`, `red_flags`) beats `insufficient` or `unknown` whichever
+is newer; otherwise the one that completed later wins (`completed_at`, else `requested_at`; a
+tie goes to the re-scan). Failed, timed-out or rate-limited scans are never read. `null`
+without a completed Perceptor report; `insufficient`, `unknown` and `null` are the filter's
+`not_scanned`. Display only: `GET /api/call`, the Analytics "verdict at the call",
+`scout_call_dataset_v`, the export and the model never use a re-scan. A change of it changes
+the `ETag` of `/api/calls`, and a change of its filter bucket sends a live `report` event
+(`GET /api/events` below), so a row can enter or leave a filtered list.
 
 `has_salpha_report`, `perceptor_report_id` and `salpha_report_id` are three fields of
 a call that say which reports `GET /api/call` returns for it (per token, like the verdict):
@@ -2487,7 +2514,8 @@ data: {"call_id":812,"tool":"perceptor","horizon":"1d","row":{…}}
   listed token is not one). `report` = a listed token whose Perceptor verdict or report changed
   (`tool: "perceptor"`), or that got a new sAlpha report or decline (`tool: "salpha"`), or a
   new or changed Perceptor re-scan ("Perceptor today", `tool: "perceptor_today"`: a newer
-  re-scan or another verdict; never the call-time verdict); one row can give several. `row`
+  re-scan or another verdict; never the call-time verdict), also sent when only the row's
+  Perceptor filter verdict (`perceptor_latest_verdict`) changed; one row can give several. `row`
   is the row exactly as `GET /api/calls?horizon=1d` returns it (so `return_pct`, `peak_pct`
   and `drawdown_pct` are those of `horizon`, always `1d`). Rows that leave the list send
   nothing.
