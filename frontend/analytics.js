@@ -1264,7 +1264,8 @@
   // "Reached 2×" and everything that hangs on it come from A.timing2x (the
   // rule of A.reached2x: held at least A.MIN_HELD_2X_S in total, in every
   // window; a call that touched 2× without reaching it is treated like one
-  // that never touched 2×, and counted as 0 held).
+  // that never touched 2×, except that its real time held counts in the
+  // time-held figures: owner decision, 13 October 2026).
   function timingOf(r, hIdx, hz) {
     if (!((r[col.timed] >> hIdx) & 1)) { return null; }
     var cens = ((r[col.cens_2x] >> hIdx) & 1) === 1;
@@ -1285,7 +1286,7 @@
 
   function newTm() {
     return {
-      n: 0, reached: 0, cens: 0, short: 0, peaks: [], t2xs: [], helds: [], heldsReached: [], falls: [], holds: [],
+      n: 0, reached: 0, cens: 0, short: 0, peaks: [], t2xs: [], helds: [], heldsShort: [], heldsReached: [], falls: [], holds: [],
       rugIn: [], rugLater: [], atCall: [], detected: [], other: 0, noTime: 0
     };
   }
@@ -1294,7 +1295,10 @@
     acc.n++;
     if (isNum(tm.peak)) { acc.peaks.push(tm.peak); }
     if (isNum(tm.held)) { acc.helds.push(tm.held); }
-    if (tm.short) { acc.short++; }
+    if (tm.short) {
+      acc.short++;
+      if (isNum(tm.held)) { acc.heldsShort.push(tm.held); }
+    }
     if (tm.reached) {
       acc.reached++;
       acc.t2xs.push(tm.t2x);
@@ -1509,7 +1513,8 @@
       stat(dl, 'Still at 2× at the end', fmtInt(all.cens), 'Reached 2× and had not closed under it when the window ended (censored)');
     }
     stat(dl, 'Touched 2×, under ' + hold, fmtInt(all.short),
-      'Touched 2× but held it less than ' + hold + ' in total (also those still at 2× at the window\'s end): counted as not reaching 2× (0 held)');
+      'Touched 2× but held it less than ' + hold + ' in total (also those still at 2× at the window\'s end): counted as not reaching 2×; ' +
+      'their real time held is in the time held at 2× figures');
     stat(dl, 'Rugged in the window', fmtInt(all.rugIn.length), 'Event rug times within the window (at-the-call and detected rugs are counted apart, below)');
     $('tm-counts-note').textContent = 'n timed = ' + fmtInt(all.n) + ': first calls priced in USD with a ' + hz + ' return whose timing is computed. ' +
       (notTimed ? fmtInt(notTimed) + ' calls with a ' + hz + ' return have no timing yet (tracked before the timing existed, or the candles did not match the stored peak) and are left out. ' : '') +
@@ -1517,7 +1522,8 @@
       rule2x() + ' Held is measured on closes, within the window. ' +
       (na ? x.why + ' So the reached-2× figures of the ' + hz + ' window show "' + x.text + '" instead of a misleading 0. ' : '') +
       fmtInt(all.short) + ' calls touched 2× but did not reach it by this rule: ' +
-      'they count as not reaching 2×, like a call that never touched it, and stay in every total.';
+      'they count as not reaching 2×, like a call that never touched it, and stay in every total; ' +
+      'the time held at 2× figures count the time they really held.';
   }
 
   // The five distributions: one small bar chart each (shares of its n).
@@ -1540,6 +1546,13 @@
       c.id = 'ch-tm-d' + i;
       c.setAttribute('role', 'img');
       card.appendChild(c);
+      // the time held at 2× has three kinds of bars: its key under the chart
+      // (after it, so the chart stays card.children[1])
+      if (d.key === 'held') {
+        var key = el('ul', 'ana-key');
+        key.id = 'key-tm-held';
+        card.appendChild(key);
+      }
       box.appendChild(card);
     });
   }
@@ -1550,27 +1563,35 @@
     distCards();
     var cards = $('tm-dist').children;
     var bandLabels = A.TIME_BANDS.map(function (b) { return b.label; });
+    var hold = A.holdWords(A.MIN_HELD_2X_S);
     var narrow = $('tm-dist').clientWidth < 520;
     TM_DIST.forEach(function (d, i) {
       var cats = bandLabels.slice();
       var series;
       var n;
       if (d.key === 'held') {
-        // 0 first: the calls that did not reach 2× by A.reached2x (never
-        // touched it, or touched it without reaching it; counted as 0 held);
-        // then the bands above 0: the calls that reached 2× (always at least
-        // A.MIN_HELD_2X_S held, so in the 1–4h band or above). The grey count is
-        // taken from the same held values as n, so a call with held missing
-        // is in neither.
-        cats = ['0'].concat(bandLabels);
+        // the real time held of every timed call (owner decision, 13 October
+        // 2026), from A.heldHistogram: grey = 0 held (never touched 2×, or
+        // touched it without a close at or above it); second tone = touched
+        // 2× and held more than 0 but under A.MIN_HELD_2X_S (did not reach
+        // 2×; only in the bands under 1 hour); accent = reached 2× (at least
+        // A.MIN_HELD_2X_S held, so 1–4h or above). All three come from the
+        // same held values as n, so a call with held missing is in none.
+        var hh = A.heldHistogram(all.helds, all.heldsShort, all.heldsReached);
+        cats = hh.labels;
         n = all.helds.length;
-        var reachedCounts = [0].concat(A.timeHistogram(all.heldsReached));
-        var zeros = all.helds.filter(function (v) { return v === 0; }).length;
-        var never = cats.map(function (c, j) { return j === 0 ? zeros : 0; });
         series = [
-          { name: 'Did not reach 2× (counted as 0)', counts: never, sw: 'sw-never', color: cssVar('--muted') },
-          { name: 'Reached 2×', counts: reachedCounts, sw: 'sw-acc', color: cssVar('--accent') }
+          { name: '0 held', counts: hh.zero, sw: 'sw-never', color: cssVar('--muted') },
+          { name: 'Touched 2×, held over 0 but under ' + hold, counts: hh.short, sw: 'c1', color: cssVar('--c1') },
+          { name: 'Reached 2× (' + hold + ' or more)', counts: hh.reached, sw: 'sw-acc', color: cssVar('--accent') }
         ];
+        var hkey = $('key-tm-held');
+        hkey.replaceChildren();
+        series.forEach(function (s) {
+          var k = 0;
+          s.counts.forEach(function (v) { k += v; });
+          keyItem(hkey, s.sw, s.name + ' (' + fmtInt(k) + ')');
+        });
       } else {
         var list = d.key === 'peak' ? all.peaks : d.key === 't2x' ? all.t2xs : d.key === 'fall' ? all.falls : all.rugIn;
         n = list.length;
@@ -1630,8 +1651,10 @@
       'Time to peak: every timed call. ' +
       (na ? 'Time to first 2× and time to fall back below 2×: "' + A.na2x().text + '". ' + A.na2x().why + ' '
         : 'Time to first 2×: the calls that reached 2× (the time of their first touch of 2×). ') +
-      'Time held at 2×: every timed call; the ' + fmtInt(all.helds.length - all.heldsReached.length) + ' calls that did not reach 2× count as 0 held (grey part of the 0 bar), ' +
-      'including the ' + fmtInt(all.short) + ' that touched 2× without reaching it. ' +
+      'Time held at 2×: every timed call, at the time it really held on closes: blue = reached 2× (' + fmtInt(all.heldsReached.length) + ' calls, ' +
+      hold + ' or more); amber = touched 2×, held over 0 but under ' + hold + ' (' +
+      fmtInt(all.heldsShort.filter(function (v) { return v > 0; }).length) + ' calls; they did not reach 2×); grey = 0 held (' +
+      fmtInt(all.helds.filter(function (v) { return v === 0; }).length) + ' calls: never touched 2×, or touched it without a close at or above it). ' +
       (na ? '' : 'Time to fall back below 2×: the calls that reached 2× and fell back within the window (' + fmtInt(all.cens) + ' still at 2× at the end are left out). ') +
       'Time to rug: the event rug times within the window; rugs at the call and rugs only detected at the end of tracking are in the table below, not here. Grey: n under ' + MIN_N + '.';
   }
@@ -1678,7 +1701,7 @@
     ['Reached 2×', 'Share that reached 2× the entry within the window. ' + rule2x()],
     ['Time to peak', 'Median, the mean under it, n'],
     ['First 2×', 'Time to the first 2×: median and mean over the calls that reached 2×'],
-    ['Held at 2×', 'Time at or above 2× on closes: median and mean over every timed call (did not reach 2× = 0)'],
+    ['Held at 2×', 'Time at or above 2× on closes: median and mean over every timed call, at the time it really held (also under ' + A.holdWords(A.MIN_HELD_2X_S) + '; never touched 2× = 0)'],
     ['Fell below 2×', 'Time to fall back below 2×, from the post: median and mean over the calls that reached 2× and fell back'],
     ['Still at 2× at end', 'Of the calls that reached 2×: still at 2× when the window ended (censored)'],
     ['Half fell back by', 'Kaplan–Meier median of the time held after the first 2× (censored calls counted)'],
@@ -1715,7 +1738,7 @@
     tr.appendChild(na ? naCell() : rateCell(a.reached, a.n, 'timed calls reached 2×'));
     tr.appendChild(durCell(a.peaks, 'Time to peak'));
     tr.appendChild(na ? naCell() : durCell(a.t2xs, 'Time to first 2×'));
-    tr.appendChild(durCell(a.helds, 'Time held at 2× (did not reach 2× = 0)'));
+    tr.appendChild(durCell(a.helds, 'Time held at 2× (never touched 2× = 0)'));
     tr.appendChild(na ? naCell() : durCell(a.falls, 'Time to fall back below 2×'));
     tr.appendChild(na ? naCell() : rateCell(a.cens, a.reached, 'calls that reached 2× were still at 2× at the end'));
     if (na) {
@@ -1747,7 +1770,8 @@
       ? ', ' + gr.groups.length + ' groups of about the same number of timed calls' : '') + '. ' +
       (gr.noValue ? fmtInt(gr.noValue) + ' of ' + fmtInt(all.n) + ' timed calls have no value for it and are left out of the groups (not of "All").' : '');
     $('cap-tm-group').textContent = 'Each cell: the median, the mean under it, and n. ' + rule2x() + ' ' +
-      'Time held at 2× counts the calls that did not reach 2× as 0 (so its median is often 0), also those that touched 2× without reaching it. ' +
+      'Held at 2× is the time each timed call really held: also the time held by the calls that touched 2× without reaching it (under ' +
+      A.holdWords(A.MIN_HELD_2X_S) + '); the calls that never touched 2× count as 0 (so its median is often 0). ' +
       (na ? 'Reached 2×, First 2×, Fell below 2×, Still at 2× at end and Half fell back by: "' + A.na2x().text + '". ' + A.na2x().why + ' '
         : 'Fell below 2× is counted from the post and leaves out the calls still at 2× at the end; "Half fell back by" counts them (Kaplan–Meier). ') +
       'Grey: fewer than ' + MIN_N + ' calls.';

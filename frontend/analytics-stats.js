@@ -3,8 +3,9 @@
 // outcome classes, the symmetric-log and log scales, UTC weeks and hours,
 // "$100 on every call" and "gave back more than half"; and for the Timing tab
 // the time bands, the "reached 2×" rule (at least MIN_HELD_2X_S at 2×) and
-// the windows too short for it (can2xReach), the 0-held rule, Kaplan–Meier and the share rugged by t,
-// the time axis and short durations. Plain JavaScript,
+// the windows too short for it (can2xReach), the time held at 2× (the real
+// one; 0 for a call that never touched 2×) and its histogram, Kaplan–Meier and the
+// share rugged by t, the time axis and short durations. Plain JavaScript,
 // loaded by analytics.html before analytics.js (window.AnaStats), and by
 // testdata/analytics-stats.test.js under Node (module.exports).
 (function (root) {
@@ -515,8 +516,12 @@
 
   // The 2× timing of a timed call by the rule above: the one place that
   // decides it. A call that did not reach 2× is treated exactly like one that
-  // never touched it (no time to 2×, 0 held, no fall, not censored, not in
-  // the "still at 2× after t" curve); it stays in every count of timed calls.
+  // never touched it for everything that hangs on "reached 2×" (no time to
+  // 2×, no fall, not censored, not in the "still at 2× after t" curve); it
+  // stays in every count of timed calls. Its time held is the real one
+  // (owner decision, 13 October 2026): held is the stored above_2x_s of
+  // every call that touched 2×, reached or not (0 when it never closed at or
+  // above 2×), and 0 for a call that never touched it (heldValue).
   // touched: first 2× set; short: touched with a known held but not reached
   // (held under MIN_HELD_2X_S, whether or not still at 2× at the window's end).
   function timing2x(t2x, held, tfall, censored) {
@@ -527,21 +532,44 @@
     return {
       touched: touched, reached: reached, short: short,
       t2x: reached ? t2x : NaN,
-      // touched with held missing: unknown (left out), as before the rule
-      held: touched && !isNum(held) ? NaN : heldValue(rt, held),
+      // the real time held when touched (NaN when missing: unknown, left out)
+      held: heldValue(t2x, held),
       tfall: reached && isNum(tfall) ? tfall : NaN,
       cens: reached && !!censored,
       hold: holdItem(rt, held, tfall, censored)
     };
   }
 
-  // The time held at 2× of a timed call: a call that never reached 2× (first
-  // 2× missing) counts as 0 held. NaN when held is missing although 2× was
-  // reached. timing2x passes null as t2x for a call that touched 2× but did
-  // not reach it by the rule above.
+  // The time held at 2× of a timed call: a call that never touched 2× (first
+  // 2× missing) counts as 0 held; a call that touched it, whether or not it
+  // reached 2× by the rule above, counts the time it really held (above_2x_s,
+  // which can be under 1 hour, or 0). NaN when held is missing although 2×
+  // was touched.
   function heldValue(t2x, held) {
     if (!isNum(t2x)) { return 0; }
     return isNum(held) ? held : NaN;
+  }
+
+  // The "time held at 2×" histogram: the category '0', then TIME_BANDS.
+  // helds = every held value (heldValue), short = those of the calls that
+  // touched 2× without reaching it, reached = those of the calls that
+  // reached it. Returns the labels and the counts per category (each
+  // 1 + TIME_BANDS.length long): zero = every 0 held (never touched 2×, or
+  // touched it without a close at or above it); short = the calls that
+  // touched 2× and held more than 0 but under MIN_HELD_2X_S (so only in the
+  // bands under 1 hour); reached = the calls that reached 2× (at least
+  // MIN_HELD_2X_S held, so 1–4h or above). Every held value is in exactly one
+  // of them, so the counts add up to helds.length.
+  function heldHistogram(helds, short, reached) {
+    var pos = function (v) { return isNum(v) && v > 0; };
+    var zero = [helds.filter(function (v) { return v === 0; }).length];
+    for (var i = 0; i < TIME_BANDS.length; i++) { zero.push(0); }
+    return {
+      labels: ['0'].concat(TIME_BANDS.map(function (b) { return b.label; })),
+      zero: zero,
+      short: [0].concat(timeHistogram(short.filter(pos))),
+      reached: [0].concat(timeHistogram(reached.filter(pos)))
+    };
   }
 
   // One call for the "still at 2× after t" curve, counted from the first 2×
@@ -645,6 +673,7 @@
   var api = {
     isNum: isNum, mean: mean, median: median, summarize: summarize,
     TIME_BANDS: TIME_BANDS, timeBand: timeBand, timeHistogram: timeHistogram, heldValue: heldValue,
+    heldHistogram: heldHistogram,
     MIN_HELD_2X_S: MIN_HELD_2X_S, holdWords: holdWords, reached2x: reached2x, timing2x: timing2x,
     FIRST_2X_CLOSE_MIN_S: FIRST_2X_CLOSE_MIN_S, can2xReach: can2xReach, na2x: na2x,
     holdItem: holdItem, kaplanMeier: kaplanMeier, stepAt: stepAt, cumulativeShare: cumulativeShare,

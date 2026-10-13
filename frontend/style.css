@@ -670,6 +670,8 @@ td.hm-n3 .ana-n, td.hm-n2 .ana-n, td.hm-n1 .ana-n, td.hm-z .ana-n, td.hm-p1 .ana
 .ana-multiple h4 { margin: 0 0 2px; font-size: 13px; font-weight: 600; overflow-wrap: anywhere; }
 .ana-multiple.is-few h4 { color: var(--muted); font-style: italic; font-weight: 500; }
 .ana-multiple.is-few .hist-bar { fill: var(--muted); }
+/* the key under a chart greys out with its bars (n under MIN_N) */
+.ana-multiple.is-few .ana-key .sw { --c: var(--muted); }
 .ana-figure { margin: 0; }
 .ana-figure figcaption { margin-top: 4px; }
 /* ECharts boxes (Timing tab): the library draws on a canvas as wide as the

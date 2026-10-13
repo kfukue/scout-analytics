@@ -985,11 +985,14 @@ func TestAnalyticsPageFiles(t *testing.T) {
 	}
 	// the Timing tab: its panel, the "reached 2×" rule (owner decision, 12
 	// October 2026: at or above 2× for at least 1 hour in total, in every
-	// window) and the 0-held rule said on the page, and the vendored chart
-	// library loaded (deferred) before the page's scripts, with its licence
-	// and notice, and nothing in it that the CSP would need 'unsafe-eval' or
-	// 'unsafe-inline' for
-	for _, want := range []string{`id="panel-timing"`, `id="tab-timing"`, "Calls that did not reach 2× count as 0 held",
+	// window) and the real time held of touched calls (owner decision, 13
+	// October 2026) said on the page, and the vendored chart library loaded
+	// (deferred) before the page's scripts, with its licence and notice, and
+	// nothing in it that the CSP would need 'unsafe-eval' or 'unsafe-inline'
+	// for
+	for _, want := range []string{`id="panel-timing"`, `id="tab-timing"`,
+		"<strong>Every call that touched 2× counts the time it really held</strong>",
+		"a call that never touched 2× counts as 0 held",
 		`Reached 2× = at or above 2× for at least <span id="lg-2x-hold">1 hour</span> in total within the window</strong> (the time held at 2×, below), in every window: a call still at 2× when the window ended needs it too.`} {
 		if !strings.Contains(html, want) {
 			t.Errorf("analytics.html: missing %q", want)
@@ -1036,6 +1039,46 @@ func TestAnalyticsPageFiles(t *testing.T) {
 	for name, src := range map[string]string{"analytics.html": html, "analytics.js": js, "analytics-stats.js": stats} {
 		if strings.Contains(src, "the window was left after the first 2×") {
 			t.Errorf("%s: still describes the rule scaled to the window", name)
+		}
+	}
+	// the time held figures use the real held of every call that touched 2×
+	// (owner decision, 13 October 2026): timing2x passes the first 2× touch,
+	// not only a reached one, and the histogram has its three kinds of bars
+	// from heldHistogram; the earlier "did not reach 2× = 0 held" wording is
+	// gone
+	if want := "held: heldValue(t2x, held),"; !strings.Contains(stats, want) {
+		t.Errorf("analytics-stats.js: missing %q (real time held for touched calls)", want)
+	}
+	for _, want := range []string{"function heldHistogram(helds, short, reached)", "heldHistogram: heldHistogram,"} {
+		if !strings.Contains(stats, want) {
+			t.Errorf("analytics-stats.js: missing %q", want)
+		}
+	}
+	for _, want := range []string{"A.heldHistogram(all.helds, all.heldsShort, all.heldsReached)",
+		"{ name: '0 held', counts: hh.zero, sw: 'sw-never', color: cssVar('--muted') }",
+		"{ name: 'Touched 2×, held over 0 but under ' + hold, counts: hh.short, sw: 'c1', color: cssVar('--c1') }",
+		"{ name: 'Reached 2× (' + hold + ' or more)', counts: hh.reached, sw: 'sw-acc', color: cssVar('--accent') }",
+		"key.id = 'key-tm-held';"} {
+		if !strings.Contains(js, want) {
+			t.Errorf("analytics.js: missing %q (the time held histogram's three kinds of bars and key)", want)
+		}
+	}
+	// the counts stat (all.short, includes held 0) and the histogram's amber
+	// series (held over 0 only) must not share a name
+	if got := strings.Count(js, "'Touched 2×, under ' + hold"); got != 1 {
+		t.Errorf("analytics.js: %q appears %d times, want 1 (the counts stat only; the held histogram has its own name)", "'Touched 2×, under ' + hold", got)
+	}
+	// the key under the time held chart greys out with its bars when n is
+	// under MIN_N
+	if css, want := read("style.css"), ".ana-multiple.is-few .ana-key .sw { --c: var(--muted); }"; !strings.Contains(css, want) {
+		t.Errorf("style.css: missing %q (the held chart's key in the few state)", want)
+	}
+	for name, src := range map[string]string{"analytics.html": html, "analytics.js": js, "analytics-stats.js": stats} {
+		for _, gone := range []string{"Calls that did not reach 2× count as 0 held", "did not reach 2× = 0", "counted as 0)",
+			"count as 0 held (grey part of the 0 bar)", "heldValue(rt, held)"} {
+			if strings.Contains(src, gone) {
+				t.Errorf("%s: still has %q (touched calls now count their real time held)", name, gone)
+			}
 		}
 	}
 	const echartsTag = `<script src="vendor/echarts-6.1.0.custom.min.js" defer></script>`
