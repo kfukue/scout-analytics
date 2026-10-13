@@ -15,6 +15,13 @@ only the essentials and point here.
   (`TestOpenScoutStoreSelection` needs that name); never at a database the
   owner uses. Run them with `-p 1`. Without the variable they are
   **skipped**, not failed, so always say which DB tests actually ran.
+  With it set, the shared helper `testDatabaseURL` (`testdb_test.go`) makes
+  every DB test **fail** before connecting unless the URL resolves (as pgx
+  parses it, URL or key=value form) to the database `scout_test` on
+  `localhost`, `127.0.0.1`, `::1` or a local unix socket, on a TCP port other
+  than 5432 (the local Postgres service). pgx uses 5432 when no port is given,
+  so always put the throwaway server's port in the URL; unix sockets are not
+  port-checked.
 - **On-chain:** on-chain code is tested only against the fake chain in
   `onchain_test.go`. Tests never call the real nodes.
 - **Telegram, Perceptor, sAlpha, Bot API:** never contacted from tests. Test
