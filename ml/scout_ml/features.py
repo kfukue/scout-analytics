@@ -84,6 +84,14 @@ def _ratio(a: pd.Series, b: pd.Series) -> pd.Series:
     return (a / b.where(b > 0)).replace([np.inf, -np.inf], np.nan)
 
 
+def calls_burst(prev_1h: pd.Series, prev_24h: pd.Series) -> pd.Series:
+    """C.CALLS_PREV_BURST from one row's own calls_prev_1h / calls_prev_24h:
+    prev_1h * 24 / max(prev_24h, 1) (the last hour's posting rate relative to
+    the last day's; 24 h = 0 gives 0, either count missing gives NaN). Reads
+    nothing else: known at the call like the two counts."""
+    return prev_1h * 24.0 / np.maximum(prev_24h, 1.0)
+
+
 def build_features(rows, cat_levels: dict, columns=None, exact_levels: bool = False,
                    dex_rules: dict | None = None) -> pd.DataFrame:
     """Raw view rows (DataFrame, dict or list of dicts) -> float feature matrix.
@@ -117,6 +125,9 @@ def build_features(rows, cat_levels: dict, columns=None, exact_levels: bool = Fa
         X[f"pre_buy_sell_ratio_{w}"] = (X[f"pre_buys_{w}"] + 1) / (X[f"pre_sells_{w}"] + 1)
         buy, sell = X[f"pre_buy_vol_{w}"], X[f"pre_sell_vol_{w}"]
         X[f"pre_buy_vol_share_{w}"] = _ratio(buy, buy + sell)
+    # an input only with C.CALLS_PREV_INPUTS = "burst" (a variant); computed always, so a
+    # model listing it also scores from one row at serve time
+    X[C.CALLS_PREV_BURST] = calls_burst(num(df, "calls_prev_1h"), num(df, "calls_prev_24h"))
 
     if "message_date" in df.columns:
         when = pd.to_datetime(df["message_date"], utc=True, errors="coerce", format="ISO8601")

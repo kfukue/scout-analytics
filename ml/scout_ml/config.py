@@ -245,9 +245,24 @@ def categorical_inputs(dex_inputs: str) -> list:
     return raw + (DERIVED_CATEGORICAL if dex_inputs != "raw" else [])
 
 
+# --- calls_prev inputs (a VARIANT_KNOB; report 20261013-0702 / -1909) --------------
+# calls_prev_1h / calls_prev_24h are known at the call but trend with calendar
+# time (adversarial validation AUC about 0.99). CALLS_PREV_BURST
+# (features.calls_burst) is the burst ratio of the same row's two counts;
+# build_features always computes it, but it is an input only with
+# CALLS_PREV_INPUTS = "burst" (the two counts replaced by it). "counts" (default):
+# the raw counts, as the saved model.
+CALLS_PREV_RAW = ["calls_prev_1h", "calls_prev_24h"]
+CALLS_PREV_BURST = "calls_burst_1h"
+CALLS_PREV_INPUTS = "counts"
+CALLS_PREV_INPUT_CHOICES = ("counts", "burst")
+# Derived inputs that are model inputs only when a knob selects them.
+OPTIONAL_DERIVED = [CALLS_PREV_BURST]
+
 # Inputs left out of new models (a VARIANT_KNOB; "no calls_prev inputs" sets
 # it). Empty: every input above (the saved model). Only numeric inputs
-# (NUMERIC_RAW + DERIVED) can be left out; it can only remove inputs, never add one.
+# (NUMERIC_RAW + DERIVED + OPTIONAL_DERIVED) can be left out; it can only
+# remove inputs, never add one.
 EXCLUDED_INPUTS = ()
 # Signed, bounded or already-small columns are standardised as is by the
 # logistic baseline; every other numeric feature is non-negative and skewed.
@@ -257,18 +272,27 @@ NO_LOG = set(["liq_pct", "tax_buy_pct", "tax_sell_pct", "proof_elite", "proof_go
              + [f"pre_buy_vol_share_{w}" for w in _WINDOWS])
 
 
-def numeric_inputs(excluded=()) -> list:
-    """The numeric model inputs without `excluded` (raises on a name that is not one)."""
-    allowed, excluded = NUMERIC_RAW + DERIVED, set(excluded)
-    bad = sorted(excluded - set(allowed))
+def numeric_inputs(excluded=(), calls_prev: str = "counts") -> list:
+    """The numeric model inputs for a CALLS_PREV_INPUTS setting (`calls_prev`;
+    "burst": CALLS_PREV_RAW replaced, in place, by CALLS_PREV_BURST), without
+    `excluded` (raises on a name that is not a numeric input, or a bad setting)."""
+    if calls_prev not in CALLS_PREV_INPUT_CHOICES:
+        raise ValueError(f"CALLS_PREV_INPUTS must be one of {CALLS_PREV_INPUT_CHOICES}, "
+                         f"not {calls_prev!r}")
+    excluded = set(excluded)
+    bad = sorted(excluded - set(NUMERIC_RAW + DERIVED + OPTIONAL_DERIVED))
     if bad:
         raise ValueError(f"EXCLUDED_INPUTS must name numeric inputs only, not {bad}")
-    return [c for c in allowed if c not in excluded]
+    base = NUMERIC_RAW + DERIVED
+    if calls_prev == "burst":
+        base = [CALLS_PREV_BURST if c == CALLS_PREV_RAW[0] else c
+                for c in base if c != CALLS_PREV_RAW[1]]
+    return [c for c in base if c not in excluded]
 
 
 # The model inputs of new models (rebuilt by `overrides`).
 CATEGORICAL = categorical_inputs(DEX_INPUTS)
-NUMERIC_FEATURES = numeric_inputs(EXCLUDED_INPUTS)
+NUMERIC_FEATURES = numeric_inputs(EXCLUDED_INPUTS, CALLS_PREV_INPUTS)
 FEATURES = NUMERIC_FEATURES + CATEGORICAL
 LOG1P_FEATURES = [c for c in NUMERIC_FEATURES if c not in NO_LOG]
 # Category levels are learned from the training rows of each split only (main
@@ -413,7 +437,7 @@ LIFT_CI_Z = 1.96
 # the gates of the saved model (that is always the baseline). "baseline" reuses
 # the results of the saved model. Knobs: VARIANT_KNOBS.
 VARIANT_KNOBS = ("DEAD_IS_COLLAPSE", "DEAD_TRADES_24H", "DEX_INPUTS", "RUNNER_NEEDS_TRADES",
-                 "LGBM_REGULARISATION", "LGBM_SEED", "EXCLUDED_INPUTS")
+                 "LGBM_REGULARISATION", "LGBM_SEED", "EXCLUDED_INPUTS", "CALLS_PREV_INPUTS")
 # "dead threshold 100" was dropped: DEAD_TRADES_24H only changes the labels
 # while the dead rule is on, so with the rule off it would equal the baseline.
 VARIANTS = {
@@ -426,6 +450,8 @@ VARIANTS = {
     # report 20261013-0702: adversarial validation found calls_prev_24h driving the
     # train/test drift (AUC 0.99; gain share 0.42-0.87)
     "no calls_prev inputs": {"EXCLUDED_INPUTS": ("calls_prev_1h", "calls_prev_24h")},
+    # the two raw counts replaced by calls_burst_1h (see "calls_prev inputs" above)
+    "calls_prev as a burst ratio": {"CALLS_PREV_INPUTS": "burst"},
 }
 # Variants that only differ from the baseline through trades_24h: not applicable
 # when the export has no trades_24h column.
@@ -505,8 +531,8 @@ def variant_settings(name: str) -> dict:
 @contextmanager
 def overrides(**knobs):
     """Temporarily set VARIANT_KNOBS (and rebuild CATEGORICAL, NUMERIC_FEATURES,
-    LOG1P_FEATURES and FEATURES from DEX_INPUTS / EXCLUDED_INPUTS); everything is
-    restored on exit, also after an error."""
+    LOG1P_FEATURES and FEATURES from DEX_INPUTS / EXCLUDED_INPUTS /
+    CALLS_PREV_INPUTS); everything is restored on exit, also after an error."""
     g = globals()
     bad = sorted(set(knobs) - set(VARIANT_KNOBS))
     if bad:
@@ -514,13 +540,14 @@ def overrides(**knobs):
     if "LGBM_REGULARISATION" in knobs and knobs["LGBM_REGULARISATION"] not in LGBM_REG_SETS:
         raise ValueError(f"LGBM_REGULARISATION must be one of {sorted(LGBM_REG_SETS)}, "
                          f"not {knobs['LGBM_REGULARISATION']!r}")
-    numeric_inputs(knobs.get("EXCLUDED_INPUTS", ()))       # raises before anything is changed
+    numeric_inputs(knobs.get("EXCLUDED_INPUTS", EXCLUDED_INPUTS),     # raises before anything
+                   knobs.get("CALLS_PREV_INPUTS", CALLS_PREV_INPUTS))  # is changed
     saved = {k: g[k] for k in (*VARIANT_KNOBS, "CATEGORICAL", "FEATURES", "NUMERIC_FEATURES",
                                "LOG1P_FEATURES")}
     try:
         g.update(knobs)
         g["CATEGORICAL"] = categorical_inputs(g["DEX_INPUTS"])
-        g["NUMERIC_FEATURES"] = numeric_inputs(g["EXCLUDED_INPUTS"])
+        g["NUMERIC_FEATURES"] = numeric_inputs(g["EXCLUDED_INPUTS"], g["CALLS_PREV_INPUTS"])
         g["LOG1P_FEATURES"] = [c for c in g["NUMERIC_FEATURES"] if c not in NO_LOG]
         g["FEATURES"] = g["NUMERIC_FEATURES"] + g["CATEGORICAL"]
         yield
