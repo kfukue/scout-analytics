@@ -39,6 +39,7 @@ const (
 const (
 	ScanKindLive   = "live"   // run when the call came in (or by -scan / -post)
 	ScanKindRescan = "rescan" // Perceptor re-scan long after the call (rescan lane): never a call-time feature
+	ScanKindReask  = "reask"  // sAlpha asked again hours after the call (re-ask lane, salpha_reask.go): never a call-time feature
 )
 
 // Delivery statuses.
@@ -144,7 +145,7 @@ type ScoutInvestigation struct {
 	CreatedAt       time.Time       `json:"created_at"`       //23
 	UpdatedBy       string          `json:"updated_by"`       //24
 	UpdatedAt       time.Time       `json:"updated_at"`       //25
-	// ScanKind: ScanKindLive (default when empty) or ScanKindRescan.
+	// ScanKind: ScanKindLive (default when empty), ScanKindRescan or ScanKindReask.
 	ScanKind string `json:"scan_kind"` //26
 
 	ToolCode string `json:"tool_code,omitempty"` // filled by selects (join), not a column
@@ -169,6 +170,10 @@ type ScoutDelivery struct {
 	UpdatedBy        string     `json:"updated_by"`        //12
 	UpdatedAt        time.Time  `json:"updated_at"`        //13
 	InvestigationIDs []int      `json:"investigation_ids"` // via scout_delivery_investigations
+	// NotifyMessageID: the id of the delivery's first message (the header) in
+	// the delivery chat, as the sender saw it; nil when unknown (older rows,
+	// failed sends, an answer that did not name it).
+	NotifyMessageID *int64 `json:"notify_message_id"`
 }
 
 // TableName returns the table name for this model.
@@ -307,8 +312,12 @@ type ScoutWebRow struct {
 	PerceptorTodayURL  *string
 	PerceptorTodayAt   *time.Time
 	SAlphaID           *int
-	CallCount          int
-	LastCallDate       time.Time
+	// SAlphaKind and SAlphaAt: the scan_kind (live | reask) and requested_at
+	// of the investigation SAlphaID names; nil without one.
+	SAlphaKind   *string
+	SAlphaAt     *time.Time
+	CallCount    int
+	LastCallDate time.Time
 	// The tracker's latest-price pass (in PriceUnit; nil until the first refresh):
 	// return as of the most recent pool price, measured like Perf from the late
 	// entry; that price; when it was read; and the time of the trade behind it.
@@ -394,6 +403,11 @@ type ScoutWebRow struct {
 	// salphaDeclined: the sAlpha report SAlphaID names only declines to report
 	// (set by webReportsFor from its text)
 	salphaDeclined bool
+	// salphaReask: the sAlpha report SAlphaID names was asked again by the
+	// re-ask lane (scan_kind 'reask'), salphaReaskAfterS seconds after the
+	// call (both set by newWebSnapshot)
+	salphaReask       bool
+	salphaReaskAfterS int64
 	// callMcap: CalledAtMcap, else PostMcap. latestMcap: an estimate,
 	// (PostMcap, else CalledAtMcap) × LatestPrice ÷ PostPrice. "Else" = when the
 	// first is missing, zero, negative or not finite. Both nil unless every input
@@ -471,6 +485,11 @@ type ScoutWebCall struct {
 	HasSAlpha         bool `json:"has_salpha_report"`
 	PerceptorReportID *int `json:"perceptor_report_id"`
 	SAlphaReportID    *int `json:"salpha_report_id"`
+	// SAlphaReaskAfterS: the sAlpha report named above was not given at the
+	// time of the call: sAlpha was asked again (re-ask lane,
+	// SCOUT_SALPHA_REASK) this many seconds after the call. nil for a report
+	// of the call itself, and without one.
+	SAlphaReaskAfterS *int64 `json:"salpha_reask_after_s"`
 	// "Perceptor today": the token's latest completed Perceptor re-scan by the
 	// rescan lane, run long after the call (SCOUT_RESCAN): its verdict (clean |
 	// caution | red_flags | unknown), report link (https only) and when it ran.
@@ -497,6 +516,7 @@ type ScoutWebReport struct {
 	Summary *string
 	Text    string
 	URL     *string
+	Kind    string // scan_kind: live | rescan | reask
 }
 
 // ScoutWebCallsFilter selects a page of the call list (first calls only). Sort, Dir and Horizon must be

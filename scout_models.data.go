@@ -799,6 +799,156 @@ func (st *ScoutStore) RescanStats(ctx context.Context, since time.Time) (int, *t
 }
 
 // ---------------------------------------------------------------------------
+// sAlpha re-ask lane (scan_kind 'reask'): sAlpha asked again hours after a
+// first call whose live sAlpha reply was no report. See salpha_reask.go.
+// ---------------------------------------------------------------------------
+
+// Why a first call's latest live sAlpha investigation is no report
+// (ReaskCandidate.Reason): its status when it did not complete (failed |
+// timeout | rate_limited), or one of these.
+const (
+	reaskReasonEmpty    = "empty"    // completed with no text (only white space)
+	reaskReasonDeclined = "declined" // completed with a decline (salphaDeclined)
+)
+
+// ReaskCandidate is a first call whose latest live sAlpha investigation is no
+// report, with what decides whether the re-ask lane asks again (a row of the
+// dry run's pool; NextReaskCandidate returns only rows that pass).
+type ReaskCandidate struct {
+	CallID          int
+	ContractAddress string
+	MessageDate     time.Time
+	MessageID       int
+	ChannelUsername string
+	Symbol          *string // as posted, else read from the token contract
+	Reason          string  // failed | timeout | rate_limited | empty | declined
+	Rugged          bool    // scout_call_tracking.rugged
+	Wiped           bool    // latest_return_pct <= rescanWipedPct
+	Reasked         bool    // the token was asked again before (any status): once per token
+	HasReport       bool    // the token has a real live sAlpha report (another call's)
+}
+
+// reaskPoolSQL lists the first calls (webFirstCallsSQL) whose latest live
+// sAlpha investigation (of the call itself) did not complete, completed with
+// no text, or only declined, with the columns of ReaskCandidate. A real
+// report is one the website shows as a report: completed, some text other
+// than white space, not a decline. Calls without a live sAlpha investigation
+// (backfill, catch-up stored only) are not in it. $1, $2, $3 = the decline
+// rule's parameters (salphaDeclinedSQL), $4 = rescanWipedPct.
+const reaskPoolSQL = `SELECT c.id, c.contract_address, c.message_date, c.message_id, c.channel_username,
+		COALESCE(NULLIF(m.token_symbol, ''), NULLIF(t.token_symbol_onchain, '')) AS symbol,
+		CASE WHEN i.status <> 'completed' THEN i.status
+			WHEN i.report_text !~ '[^[:space:]]' THEN '` + reaskReasonEmpty + `'
+			ELSE '` + reaskReasonDeclined + `' END AS reason,
+		COALESCE(t.rugged, false) AS rugged,
+		COALESCE(t.latest_return_pct <= $4, false) AS wiped,
+		EXISTS (SELECT 1 FROM scout_investigations r
+			WHERE lower(r.contract_address) = fc.ca AND r.scan_kind = 'reask') AS reasked,
+		EXISTS (SELECT 1 FROM scout_investigations i
+			JOIN scout_investigation_tools sat ON sat.id = i.tool_id AND sat.code = 'salpha'
+			WHERE lower(i.contract_address) = fc.ca AND i.status = 'completed' AND i.scan_kind = 'live'
+			  AND i.report_text ~ '[^[:space:]]' AND NOT ` + salphaDeclinedSQL + `) AS has_report
+	FROM ` + webFirstCallsSQL + ` fc
+	JOIN scout_calls c ON c.id = fc.id
+	JOIN LATERAL (SELECT i.status, i.report_text FROM scout_investigations i
+		JOIN scout_investigation_tools sat ON sat.id = i.tool_id AND sat.code = 'salpha'
+		WHERE i.call_id = fc.id AND i.scan_kind = 'live'
+		ORDER BY i.requested_at DESC, i.id DESC LIMIT 1) i ON true
+	LEFT JOIN scout_call_tracking t ON t.call_id = fc.id
+	LEFT JOIN scout_call_metrics m ON m.call_id = fc.id
+	WHERE i.status <> 'completed' OR i.report_text !~ '[^[:space:]]' OR ` + salphaDeclinedSQL
+
+// reaskColumns: the columns of reaskPoolSQL, in the order scanReaskCandidate reads them.
+const reaskColumns = `id, contract_address, message_date, message_id, channel_username, symbol, reason, rugged, wiped, reasked, has_report`
+
+func scanReaskCandidate(row pgx.Row) (*ReaskCandidate, error) {
+	var c ReaskCandidate
+	if err := row.Scan(&c.CallID, &c.ContractAddress, &c.MessageDate, &c.MessageID, &c.ChannelUsername, &c.Symbol,
+		&c.Reason, &c.Rugged, &c.Wiped, &c.Reasked, &c.HasReport); err != nil {
+		return nil, err
+	}
+	return &c, nil
+}
+
+// NextReaskCandidate returns the oldest first call the re-ask lane may ask
+// sAlpha about again (nil when there is none): from reaskPoolSQL, posted
+// between from and to (both included), its token never asked again and
+// without a real live sAlpha report, not rugged and its latest return above
+// rescanWipedPct (or none yet). Ties on the time go to the lower id.
+func (st *ScoutStore) NextReaskCandidate(ctx context.Context, from, to time.Time) (*ReaskCandidate, error) {
+	c, err := scanReaskCandidate(st.Pool.QueryRow(ctx, `SELECT `+reaskColumns+` FROM (`+reaskPoolSQL+`) p
+		WHERE message_date >= $5 AND message_date <= $6 AND NOT reasked AND NOT has_report AND NOT rugged AND NOT wiped
+		ORDER BY message_date, id LIMIT 1`,
+		salphaDeclinePhrases, salphaDeclineMaxLen, salphaDeclineTrim, rescanWipedPct, from, to))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("selecting the next sAlpha re-ask candidate: %w", err)
+	}
+	return c, nil
+}
+
+// SelectReaskPool returns every row of reaskPoolSQL (any age), oldest first,
+// for the dry run's summary.
+func (st *ScoutStore) SelectReaskPool(ctx context.Context) ([]ReaskCandidate, error) {
+	rows, err := st.Pool.Query(ctx, `SELECT `+reaskColumns+` FROM (`+reaskPoolSQL+`) p ORDER BY message_date, id`,
+		salphaDeclinePhrases, salphaDeclineMaxLen, salphaDeclineTrim, rescanWipedPct)
+	if err != nil {
+		return nil, fmt.Errorf("reading the first calls without an sAlpha report: %w", err)
+	}
+	defer rows.Close()
+	var out []ReaskCandidate
+	for rows.Next() {
+		c, err := scanReaskCandidate(rows)
+		if err != nil {
+			return nil, fmt.Errorf("scanning a first call without an sAlpha report: %w", err)
+		}
+		out = append(out, *c)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("reading the first calls without an sAlpha report: %w", err)
+	}
+	return out, nil
+}
+
+// ReaskStats returns how many re-asks (scan_kind 'reask', any status) were
+// requested after since, and when the newest one was requested (nil = none
+// yet). The re-ask lane's daily cap and gap come from it, so they survive
+// restarts.
+func (st *ScoutStore) ReaskStats(ctx context.Context, since time.Time) (int, *time.Time, error) {
+	var n int
+	var last *time.Time
+	if err := st.Pool.QueryRow(ctx, `SELECT count(*) FILTER (WHERE requested_at > $1), max(requested_at)
+		FROM scout_investigations WHERE scan_kind = 'reask'`, since).Scan(&n, &last); err != nil {
+		return 0, nil, fmt.Errorf("reading the sAlpha re-ask count: %w", err)
+	}
+	return n, last, nil
+}
+
+// FirstSentDelivery returns the first delivery of a call that was sent (its
+// id, contract address, target and notify_message_id), nil when the call was
+// never delivered. The re-ask lane's follow-up replies to it. Only status
+// sent counts: failed does not, and neither does sending (a live Perceptor
+// re-check delivery recorded before its send whose outcome was never stored:
+// whether it reached the chat is unknown, so no follow-up replies to it).
+func (st *ScoutStore) FirstSentDelivery(ctx context.Context, callID int) (*ScoutDelivery, error) {
+	var d ScoutDelivery
+	var id int
+	err := st.Pool.QueryRow(ctx, `SELECT id, contract_address, target, notify_message_id FROM scout_deliveries
+		WHERE call_id = $1 AND status = $2 ORDER BY created_at, id LIMIT 1`, callID, DeliveryStatusSent).
+		Scan(&id, &d.ContractAddress, &d.Target, &d.NotifyMessageID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("reading the delivery of call %d: %w", callID, err)
+	}
+	d.ID, d.CallID, d.Status = &id, &callID, DeliveryStatusSent
+	return &d, nil
+}
+
+// ---------------------------------------------------------------------------
 // scout_deliveries (+ scout_delivery_investigations)
 // ---------------------------------------------------------------------------
 
@@ -823,10 +973,10 @@ func (st *ScoutStore) InsertScoutDelivery(ctx context.Context, d *ScoutDelivery)
 	var id int
 	if err := tx.QueryRow(ctx, `INSERT INTO scout_deliveries (
 		uuid, call_id, contract_address, target, status, header_text, delivered_at, error,
-		created_by, created_at, updated_by, updated_at
-	) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING id`,
+		created_by, created_at, updated_by, updated_at, notify_message_id
+	) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING id`,
 		d.UUID, d.CallID, d.ContractAddress, d.Target, d.Status, d.HeaderText, d.DeliveredAt, d.Error,
-		d.CreatedBy, now, d.UpdatedBy, now,
+		d.CreatedBy, now, d.UpdatedBy, now, d.NotifyMessageID,
 	).Scan(&id); err != nil {
 		return nil, err
 	}
@@ -845,11 +995,13 @@ func (st *ScoutStore) InsertScoutDelivery(ctx context.Context, d *ScoutDelivery)
 
 // FinishScoutDelivery sets the outcome of a delivery recorded before it was
 // sent (status sending, by the live Perceptor re-check): status sent or
-// failed, delivered_at and error. It fails when no sending row has that id.
-func (st *ScoutStore) FinishScoutDelivery(ctx context.Context, id int, status string, deliveredAt *time.Time, errText *string) error {
+// failed, delivered_at, error and notify_message_id (the id of its header
+// message in the delivery chat; nil = unknown, stored as NULL), so a later
+// sAlpha re-ask can reply to it. It fails when no sending row has that id.
+func (st *ScoutStore) FinishScoutDelivery(ctx context.Context, id int, status string, deliveredAt *time.Time, errText *string, notifyMsgID *int64) error {
 	tag, err := st.Pool.Exec(ctx, `UPDATE scout_deliveries SET status = $2, delivered_at = $3, error = $4,
-		updated_by = $5, updated_at = now() WHERE id = $1 AND status = $6`,
-		id, status, deliveredAt, errText, scoutDBUser, DeliveryStatusSending)
+		updated_by = $5, updated_at = now(), notify_message_id = $7 WHERE id = $1 AND status = $6`,
+		id, status, deliveredAt, errText, scoutDBUser, DeliveryStatusSending, notifyMsgID)
 	if err != nil {
 		return fmt.Errorf("finishing delivery %d: %w", id, err)
 	}
@@ -875,7 +1027,7 @@ func (st *ScoutStore) SelectScoutDeliveries(ctx context.Context, callID *int, li
 		limit = 100
 	}
 	q := `SELECT d.id, d.uuid, d.call_id, d.contract_address, d.target, d.status, d.header_text,
-		d.delivered_at, d.error, d.created_by, d.created_at, d.updated_by, d.updated_at,
+		d.delivered_at, d.error, d.created_by, d.created_at, d.updated_by, d.updated_at, d.notify_message_id,
 		COALESCE(array_agg(di.investigation_id ORDER BY di.investigation_id)
 			FILTER (WHERE di.investigation_id IS NOT NULL), '{}')
 	FROM scout_deliveries d
@@ -898,7 +1050,7 @@ func (st *ScoutStore) SelectScoutDeliveries(ctx context.Context, callID *int, li
 		var u uuid.UUID
 		var ids []int32
 		if err := rows.Scan(&id, &u, &d.CallID, &d.ContractAddress, &d.Target, &d.Status, &d.HeaderText,
-			&d.DeliveredAt, &d.Error, &d.CreatedBy, &d.CreatedAt, &d.UpdatedBy, &d.UpdatedAt, &ids); err != nil {
+			&d.DeliveredAt, &d.Error, &d.CreatedBy, &d.CreatedAt, &d.UpdatedBy, &d.UpdatedAt, &d.NotifyMessageID, &ids); err != nil {
 			return nil, err
 		}
 		d.ID, d.UUID = &id, u.String()
@@ -1652,20 +1804,25 @@ const (
 	// webSAlphaSQL: each token's latest completed sAlpha investigation by the
 	// same rule, among those whose report_text has something other than white
 	// space (about half of sAlpha's replies are empty: they count as no report,
-	// so an older one with text is taken instead). A reply that only declines
-	// ("Not enough public signals …": its text, trimmed of the characters of
-	// $3, has at most $2 characters and contains one of the phrases of $1,
-	// lower case; see salphaDeclinePhrases, salphaDeclineMaxLen and
-	// salphaDeclineTrim, the same rule as salphaDeclined) is taken only when
-	// the token has no real report: any real report, however old, comes first.
-	webSAlphaSQL = `(SELECT DISTINCT ON (lower(i.contract_address)) lower(i.contract_address) AS ca, i.id
+	// so an older one with text is taken instead), of a call (scan_kind 'live')
+	// or asked again later by the re-ask lane ('reask'). A reply that only
+	// declines ("Not enough public signals …", salphaDeclinedSQL) is taken only
+	// when the token has no real report: any real report, however old, comes
+	// first. Among real reports, and among declines, a call's own comes before
+	// a re-ask. With its scan_kind and requested_at.
+	webSAlphaSQL = `(SELECT DISTINCT ON (lower(i.contract_address)) lower(i.contract_address) AS ca, i.id, i.scan_kind, i.requested_at
 		FROM scout_investigations i JOIN scout_investigation_tools sat ON sat.id = i.tool_id AND sat.code = 'salpha'
-		WHERE i.status = 'completed' AND i.scan_kind = 'live' AND i.report_text ~ '[^[:space:]]'
-		ORDER BY lower(i.contract_address),
-			(char_length(btrim(i.report_text, $3::text)) <= $2::int
-				AND EXISTS (SELECT 1 FROM unnest($1::text[]) AS d(phrase) WHERE strpos(lower(i.report_text), d.phrase) > 0)),
-			i.requested_at DESC, i.id DESC)`
+		WHERE i.status = 'completed' AND i.scan_kind IN ('live', 'reask') AND i.report_text ~ '[^[:space:]]'
+		ORDER BY lower(i.contract_address), ` + salphaDeclinedSQL + `, i.scan_kind <> 'live', i.requested_at DESC, i.id DESC)`
 	webSAlphaJoinSQL = ` LEFT JOIN ` + webSAlphaSQL + ` sa ON sa.ca = fc.ca`
+	// salphaDeclinedSQL is salphaDeclined in SQL, for the sAlpha investigation
+	// aliased i: its text, trimmed of the characters of $3, has at most $2
+	// characters and contains one of the phrases of $1 (lower case). $1, $2, $3
+	// = salphaDeclinePhrases, salphaDeclineMaxLen, salphaDeclineTrim; the
+	// website's list and the re-ask lane pass them (TestSAlphaDeclineSQLParity
+	// runs this and salphaDeclined on the same texts).
+	salphaDeclinedSQL = `(char_length(btrim(i.report_text, $3::text)) <= $2::int
+			AND EXISTS (SELECT 1 FROM unnest($1::text[]) AS d(phrase) WHERE strpos(lower(i.report_text), d.phrase) > 0))`
 	// webVerdictAtCallJoinSQL: the Perceptor verdict known at the time of the
 	// first call (Analytics page), by the rule of scout_call_dataset_v: the
 	// call's own completed live scan, else the latest completed live scan of
@@ -1704,9 +1861,9 @@ const (
 // webRowsSQL loads the website's whole list in one statement: each token's
 // first call with its tracking row (and its latest price), the late-entry
 // results of the five windows, how often the token was called, its latest
-// live Perceptor report and its latest Perceptor re-scan ("Perceptor today"), the id of its latest sAlpha report with text (a real
-// report before a decline; $1, $2, $3 = salphaDeclinePhrases, salphaDeclineMaxLen,
-// salphaDeclineTrim) and the
+// live Perceptor report and its latest Perceptor re-scan ("Perceptor today"), the id, scan kind and request time of its
+// latest sAlpha report with text (a real report before a decline, a call's own before a re-ask; $1, $2, $3 =
+// salphaDeclinePhrases, salphaDeclineMaxLen, salphaDeclineTrim) and the
 // market caps of the post; and, for the Analytics page, the posted DEX, the
 // price source, the quote asset, which windows are stored as no_data, the
 // verdict at the time of the call, whether the first 24 hours of candles
@@ -1728,7 +1885,7 @@ var webRowsSQL = `WITH fc AS ` + webFirstCallsSQL + `
 	t.price_unit, COALESCE(t.entry_late_price_usd, t.entry_price_usd)::float8, t.entry_price_usd IS NOT NULL,
 	t.rugged, t.status,
 	` + webReturnsPivotSQL("r.") + `,
-	p.verdict, p.report_url, p.id, sa.id, n.call_count, n.last_call_date,
+	p.verdict, p.report_url, p.id, sa.id, sa.scan_kind, sa.requested_at, n.call_count, n.last_call_date,
 	t.latest_return_pct::float8, t.latest_price_usd::float8, t.latest_checked_at, t.latest_trade_at,
 	m.called_at_mcap_usd::float8, m.mcap_usd::float8, t.entry_price_usd::float8,
 	ptd.verdict, ptd.report_url, ptd.at,
@@ -1848,7 +2005,7 @@ func (st *ScoutStore) SelectWebRows(ctx context.Context) ([]ScoutWebRow, int, er
 		for i := range perf {
 			dest = append(dest, &perf[i])
 		}
-		dest = append(dest, &r.PerceptorVerd, &r.PerceptorURL, &r.PerceptorID, &r.SAlphaID, &r.CallCount, &r.LastCallDate,
+		dest = append(dest, &r.PerceptorVerd, &r.PerceptorURL, &r.PerceptorID, &r.SAlphaID, &r.SAlphaKind, &r.SAlphaAt, &r.CallCount, &r.LastCallDate,
 			&r.LatestReturn, &r.LatestPrice, &r.LatestAt, &r.LatestTradeAt,
 			&r.CalledAtMcap, &r.PostMcap, &r.PostPrice, &r.PerceptorTodayVerd, &r.PerceptorTodayURL, &r.PerceptorTodayAt,
 			&r.PostedDex, &r.EntrySource, &r.QuoteSym, &noData, &r.VerdictAtCall, &r.TradesFinal,
@@ -1943,7 +2100,7 @@ func (st *ScoutStore) SelectWebReports(ctx context.Context, ids []int) (map[int]
 		CASE WHEN i.verdict_level IN ('clean', 'caution', 'red_flags', 'insufficient') THEN i.verdict_level ELSE 'unknown' END,
 		left(i.verdict_label, $2), left(i.verdict_summary, $2),
 		CASE WHEN t.code = 'salpha' THEN left(i.report_text, $2) ELSE '' END,
-		i.report_url
+		i.report_url, i.scan_kind
 		FROM scout_investigations i JOIN scout_investigation_tools t ON t.id = i.tool_id
 		WHERE i.id = ANY($1)`, ids, webReportReadChars)
 	if err != nil {
@@ -1952,7 +2109,7 @@ func (st *ScoutStore) SelectWebReports(ctx context.Context, ids []int) (map[int]
 	defer rows.Close()
 	for rows.Next() {
 		var r ScoutWebReport
-		if err := rows.Scan(&r.ID, &r.Tool, &r.At, &r.Verdict, &r.Label, &r.Summary, &r.Text, &r.URL); err != nil {
+		if err := rows.Scan(&r.ID, &r.Tool, &r.At, &r.Verdict, &r.Label, &r.Summary, &r.Text, &r.URL, &r.Kind); err != nil {
 			return nil, err
 		}
 		out[r.ID] = &r
@@ -2170,6 +2327,10 @@ type PerceptorRecheckRow struct {
 	Recheck2        bool      // a second re-check (details {"recheck":2}) is stored, any status
 	Usable          bool      // the call has a completed Perceptor investigation with a real verdict (any scan kind)
 	Delivered       bool      // the call has a scout_deliveries row (sent, failed or sending: attempted)
+	// ScoreLine: the model score line computed at the call, stored when it was
+	// held (details.score_line of the held investigation; "" without one).
+	// Display text only: the re-check delivery's fallback after a restart.
+	ScoreLine string
 }
 
 // heldForRecheckKey is the details key the listener sets (to true) on the
@@ -2177,11 +2338,20 @@ type PerceptorRecheckRow struct {
 // (recheck.go). Only calls with it are re-checked.
 const heldForRecheckKey = "held_for_recheck"
 
+// recheckScoreLineKey is the details key, on the same investigation, holding
+// the model score line computed at the call (display text for the re-check
+// delivery after a restart; never read by the dataset view or a model).
+const recheckScoreLineKey = "score_line"
+
 // MarkHeldForRecheck sets details.held_for_recheck = true on investigation
-// id, keeping its other keys; nothing else of the row changes. Repeat-safe.
-func (st *ScoutStore) MarkHeldForRecheck(ctx context.Context, id int) error {
+// id and, when scoreLine is not empty, details.score_line = scoreLine,
+// keeping its other keys (an empty scoreLine leaves score_line as it is);
+// nothing else of the row changes. Repeat-safe.
+func (st *ScoutStore) MarkHeldForRecheck(ctx context.Context, id int, scoreLine string) error {
 	tag, err := st.Pool.Exec(ctx, `UPDATE scout_investigations
-		SET details = COALESCE(details, '{}'::jsonb) || jsonb_build_object($2::text, true) WHERE id = $1`, id, heldForRecheckKey)
+		SET details = COALESCE(details, '{}'::jsonb) || jsonb_build_object($2::text, true)
+			|| CASE WHEN $4::text = '' THEN '{}'::jsonb ELSE jsonb_build_object($3::text, $4::text) END
+		WHERE id = $1`, id, heldForRecheckKey, recheckScoreLineKey, scoreLine)
 	if err != nil {
 		return fmt.Errorf("marking investigation %d held for a re-check: %w", id, err)
 	}
@@ -2194,8 +2364,8 @@ func (st *ScoutStore) MarkHeldForRecheck(ctx context.Context, id int) error {
 // SelectPerceptorRechecks returns the calls posted at or after since that the
 // listener held back for a re-check: their first completed live Perceptor
 // investigation marked held_for_recheck (MarkHeldForRecheck; requested at or
-// after since; not a re-check itself) has verdict insufficient or unknown.
-// Oldest call first. A call without the marker (another gate said no, it was
+// after since; not a re-check itself) has verdict insufficient or unknown,
+// with the score line stored on it (ScoreLine). Oldest call first. A call without the marker (another gate said no, it was
 // delivered at the call, -scan / -post, a dry run, or an older binary) is
 // never returned. recheckDecide says what each still needs.
 func (st *ScoutStore) SelectPerceptorRechecks(ctx context.Context, since time.Time) ([]PerceptorRecheckRow, error) {
@@ -2206,8 +2376,10 @@ func (st *ScoutStore) SelectPerceptorRechecks(ctx context.Context, since time.Ti
 			WHERE r.call_id = c.id AND r.details->>'recheck' = '2'),
 		EXISTS (SELECT 1 FROM scout_investigations u JOIN scout_investigation_tools ut ON ut.id = u.tool_id AND ut.code = 'perceptor'
 			WHERE u.call_id = c.id AND u.status = 'completed' AND u.verdict_level IN ('clean', 'caution', 'red_flags')),
-		EXISTS (SELECT 1 FROM scout_deliveries d WHERE d.call_id = c.id)
-		FROM (SELECT DISTINCT ON (i.call_id) i.call_id, i.id, i.verdict_level, i.requested_at
+		EXISTS (SELECT 1 FROM scout_deliveries d WHERE d.call_id = c.id),
+		COALESCE(o.score_line, '')
+		FROM (SELECT DISTINCT ON (i.call_id) i.call_id, i.id, i.verdict_level, i.requested_at,
+				i.details->>'score_line' AS score_line
 			FROM scout_investigations i JOIN scout_investigation_tools t ON t.id = i.tool_id AND t.code = 'perceptor'
 			WHERE i.scan_kind = 'live' AND i.status = 'completed' AND i.call_id IS NOT NULL
 			  AND i.verdict_level IN ('insufficient', 'unknown') AND i.details->>'recheck' IS NULL
@@ -2230,7 +2402,7 @@ func (st *ScoutStore) SelectPerceptorRechecks(ctx context.Context, since time.Ti
 		var r PerceptorRecheckRow
 		if err := rows.Scan(&r.CallID, &r.ContractAddress, &r.MessageID, &r.MessageDate, &r.MessageText,
 			&r.FirstID, &r.FirstLevel, &r.FirstAt, &r.Recheck1, &r.Recheck1ID, &r.Recheck1Status, &r.Recheck1Level,
-			&r.Recheck2, &r.Usable, &r.Delivered); err != nil {
+			&r.Recheck2, &r.Usable, &r.Delivered, &r.ScoreLine); err != nil {
 			return nil, fmt.Errorf("scanning a call to re-check with Perceptor: %w", err)
 		}
 		out = append(out, r)

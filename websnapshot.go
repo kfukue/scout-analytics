@@ -233,6 +233,7 @@ type webReport struct {
 	summary   *string // Perceptor: verdict_summary
 	text      string  // sAlpha: report_text
 	declined  bool    // sAlpha: the text only declines to report (salphaDeclined)
+	reask     bool    // sAlpha: asked again by the re-ask lane, not at the time of the call
 	url       *string
 	truncated bool // a text was longer than webReportMaxBytes and was cut
 }
@@ -272,6 +273,7 @@ func newWebReport(r *ScoutWebReport) *webReport {
 	case webToolSAlpha:
 		w.text, w.truncated = cutText(r.Text, webReportMaxBytes)
 		w.declined = salphaDeclined(w.text)
+		w.reask = r.Kind == ScanKindReask
 	}
 	if r.URL != nil && strings.HasPrefix(*r.URL, "https://") && len(*r.URL) <= webReportMaxURL {
 		u := *r.URL
@@ -451,6 +453,11 @@ func (c webConfig) webCall(r *ScoutWebRow) ScoutWebCall {
 		}
 		return finite(&r.Perf[j])
 	}
+	var reaskAfter *int64
+	if r.salphaReask {
+		v := r.salphaReaskAfterS
+		reaskAfter = &v
+	}
 	return ScoutWebCall{
 		Return1hPct: ret(0), Return1dPct: ret(1), Return3dPct: ret(2), Return7dPct: ret(3), Return30dPct: ret(4),
 		LatestReturnPct: r.LatestReturn, LatestPriceUSD: r.LatestPrice,
@@ -465,6 +472,7 @@ func (c webConfig) webCall(r *ScoutWebRow) ScoutWebCall {
 		CallCount: r.CallCount, LastCallDate: r.LastCallDate,
 		CallMcapUSD: r.callMcap, LatestMcapUSD: r.latestMcap,
 		HasSAlpha: r.SAlphaID != nil && !r.salphaDeclined, PerceptorReportID: r.PerceptorID, SAlphaReportID: r.SAlphaID,
+		SAlphaReaskAfterS:  reaskAfter,
 		PerceptorTodayVerd: r.PerceptorTodayVerd, PerceptorTodayURL: r.PerceptorTodayURL, PerceptorTodayAt: r.PerceptorTodayAt,
 	}
 }
@@ -568,6 +576,12 @@ func newWebSnapshot(rows []ScoutWebRow, updatePosts int, prev *webSnapshot, cfg 
 			if *p != nil && (**p <= 0 || **p > math.MaxInt32) {
 				*p = nil // not an id the snapshot can hold
 			}
+		}
+		// an sAlpha report asked again by the re-ask lane: how long after the call
+		r.salphaReask, r.salphaReaskAfterS = false, 0
+		if r.SAlphaID != nil && r.SAlphaKind != nil && *r.SAlphaKind == ScanKindReask && r.SAlphaAt != nil {
+			r.salphaReask = true
+			r.salphaReaskAfterS = max(0, int64(r.SAlphaAt.Sub(r.MessageDate)/time.Second))
 		}
 		// "Perceptor today" (a rescan): the same link rule; no verdict, no
 		// link or time either; the time in UTC like the others
@@ -794,6 +808,13 @@ func hashWebRows(rows []ScoutWebRow, updatePosts int, gmgn string) string {
 		// sAlpha one declines is in the flags above)
 		optInt(r.PerceptorID)
 		optInt(r.SAlphaID)
+		// and whether the sAlpha one was asked again later, how long after the call
+		if r.salphaReask {
+			buf = append(buf, 1)
+			num(r.salphaReaskAfterS)
+		} else {
+			buf = append(buf, 0)
+		}
 		// the Analytics page's fields (GET /api/analytics): the numbers as
 		// read (with a rugged call's peak), the DEX, price source, quote asset,
 		// no_data windows, verdict at the call and trades in the first 24 hours

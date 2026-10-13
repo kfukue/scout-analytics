@@ -40,26 +40,34 @@ func heldResults(f *recheckFixture) []*toolResult {
 
 // The re-check delivery ends with the model score line computed at the call
 // (as a delivery at the call would), under the re-check line; the model is
-// never asked again. Without a line at the call, or after a restart of the
-// listener (the line is kept in memory only), it is delivered without one. A
-// re-check with red flags delivers nothing and forgets the line.
+// never asked again. After a restart of the listener (a new lane, nothing in
+// memory) the line stored with the held marker is delivered, exactly the
+// first-pass line; the line in memory goes first. Without a line at the call
+// it is delivered without one, after a restart too. A re-check with red flags
+// delivers nothing and forgets the line.
 func TestRecheckScoreLine(t *testing.T) {
 	ca := "0x1616161616161616161616161616161616161616"
 	clean := verdict{Level: levelClean, Label: "No red flags found", Ticker: "$SNIFF"}
+	const kept = "Model v2 · 7d: runner 50%" // a line in memory that differs from the stored one
 	cases := []struct {
 		name      string
 		line      string // the score line computed at the call
 		judged    verdict
 		restart   bool   // the re-check runs in a new lane (a restarted listener)
+		memory    string // replaces the line in memory after the hold ("" = left as kept)
 		want      string // the header's last line ("" = no score line)
 		delivered bool
 	}{
-		{"same process: the line from the call", recheckScoreLine, clean, false, recheckScoreLine, true},
+		{"same process: the line from the call", recheckScoreLine, clean, false, "", recheckScoreLine, true},
 		{"still insufficient: delivered with the line", recheckScoreLine,
-			verdict{Level: levelInsufficient, Label: labelInsufficient, Ticker: "$SNIFF"}, false, recheckScoreLine, true},
-		{"no score at the call: no line", "", clean, false, "", true},
-		{"after a restart: delivered without the line", recheckScoreLine, clean, true, "", true},
-		{"red flags: not delivered", recheckScoreLine, verdict{Level: levelRedFlags, Label: "Red flags", Ticker: "$SNIFF"}, false, "", false},
+			verdict{Level: levelInsufficient, Label: labelInsufficient, Ticker: "$SNIFF"}, false, "", recheckScoreLine, true},
+		{"no score at the call: no line", "", clean, false, "", "", true},
+		{"after a restart: the stored line", recheckScoreLine, clean, true, "", recheckScoreLine, true},
+		{"after a restart, still insufficient: the stored line", recheckScoreLine,
+			verdict{Level: levelInsufficient, Label: labelInsufficient, Ticker: "$SNIFF"}, true, "", recheckScoreLine, true},
+		{"after a restart, no score at the call: no line", "", clean, true, "", "", true},
+		{"the line in memory goes before the stored one", recheckScoreLine, clean, false, kept, kept, true},
+		{"red flags: not delivered", recheckScoreLine, verdict{Level: levelRedFlags, Label: "Red flags", Ticker: "$SNIFF"}, false, "", "", false},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -73,9 +81,15 @@ func TestRecheckScoreLine(t *testing.T) {
 			if !f.s.deferToRecheck(ctx, job{CA: ca, CallID: &call}, heldResults(f), &inv, c.line) {
 				t.Fatal("deferToRecheck = false, want the call held")
 			}
+			if c.memory != "" {
+				held.keepScore(call, c.memory)
+			}
 			l := held
 			if c.restart {
 				l = f.lane(recheckReply, c.judged, &sent)
+				if got := l.scoreLine(call); got != "" {
+					t.Fatalf("restarted lane has score line %q in memory, want none", got)
+				}
 			}
 			if !l.step(ctx, func() int { return 0 }) {
 				t.Fatal("step() = false, want the re-check")
@@ -127,10 +141,49 @@ func checkRecheckHeader(t *testing.T, h, want string) {
 
 // A re-check delivery stopped before anything was sent keeps the score line:
 // the stored re-check delivered on a later step (recheckDeliver, Perceptor not
-// asked again) shows it. A kept line whose delivery can no longer come is
-// given up.
+// asked again) shows it, also when that later step runs in a restarted
+// listener (the stored line). A kept line whose delivery can no longer come
+// is given up.
 func TestRecheckScoreLineKept(t *testing.T) {
 	ca := "0x1717171717171717171717171717171717171717"
+	t.Run("delivery stopped before sending, delivered after a restart", func(t *testing.T) {
+		f := newRecheckFixture(t)
+		asked := noModel(t, f)
+		call, inv := f.unheldCall(t, 111, ca, 13*time.Minute, levelInsufficient)
+		var sent []string
+		judged := verdict{Level: levelClean, Label: "No red flags found", Ticker: "$SNIFF"}
+		l := f.lane(recheckReply, judged, &sent)
+		f.s.recheck = l
+		if !f.s.deferToRecheck(context.Background(), job{CA: ca, CallID: &call}, heldResults(f), &inv, recheckScoreLine) {
+			t.Fatal("deferToRecheck = false, want the call held")
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		t.Cleanup(cancel)
+		l.deliver = func(ctx context.Context, j job, header string, results []*toolResult) (int64, error) {
+			cancel()
+			return 0, &deliveryNotSentError{fmt.Errorf("not sent: %w", ctx.Err())}
+		}
+		if !l.step(ctx, func() int { return 0 }) {
+			t.Fatal("step() = false, want a re-check")
+		}
+		if d := f.deliveries(t, call); len(d) != 0 {
+			t.Fatalf("%d delivery rows after a stop before sending, want none", len(d))
+		}
+		restarted := f.lane(recheckReply, judged, &sent) // nothing in memory
+		if !restarted.step(context.Background(), func() int { return 0 }) {
+			t.Fatal("step() of the restarted lane = false, want the stored re-check delivered")
+		}
+		if len(sent) != 1 || len(f.headers) != 1 {
+			t.Fatalf("sent %q, %d deliveries; want one /scan (before the restart) and one delivery", sent, len(f.headers))
+		}
+		checkRecheckHeader(t, f.headers[0], recheckScoreLine)
+		if d := f.deliveries(t, call); len(d) != 1 || d[0].HeaderText != f.headers[0] {
+			t.Errorf("delivery rows %+v, want one whose header is the one sent", d)
+		}
+		if n := asked.Load(); n != 0 {
+			t.Errorf("the scoring service was asked %d time(s), want 0", n)
+		}
+	})
 	t.Run("delivery stopped before sending, delivered later", func(t *testing.T) {
 		f := newRecheckFixture(t)
 		asked := noModel(t, f)
@@ -144,9 +197,9 @@ func TestRecheckScoreLineKept(t *testing.T) {
 		ok := l.deliver
 		ctx, cancel := context.WithCancel(context.Background())
 		t.Cleanup(cancel)
-		l.deliver = func(ctx context.Context, j job, header string, results []*toolResult) error {
+		l.deliver = func(ctx context.Context, j job, header string, results []*toolResult) (int64, error) {
 			cancel()
-			return &deliveryNotSentError{fmt.Errorf("not sent: %w", ctx.Err())}
+			return 0, &deliveryNotSentError{fmt.Errorf("not sent: %w", ctx.Err())}
 		}
 		if !l.step(ctx, func() int { return 0 }) {
 			t.Fatal("step() = false, want a re-check")

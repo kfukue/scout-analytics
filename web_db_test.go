@@ -220,6 +220,7 @@ type webCallJSON struct {
 	HasSAlpha          bool    `json:"has_salpha_report"`
 	PerceptorReportID  *int    `json:"perceptor_report_id"`
 	SAlphaReportID     *int    `json:"salpha_report_id"`
+	SAlphaReaskAfterS  *int64  `json:"salpha_reask_after_s"`
 	PerceptorTodayVerd *string `json:"perceptor_today_verdict"`
 	PerceptorTodayURL  *string `json:"perceptor_today_url"`
 	PerceptorTodayAt   *string `json:"perceptor_today_at"`

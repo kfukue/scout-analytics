@@ -115,8 +115,8 @@ func TestWebSAlphaDeclinedRow(t *testing.T) {
 		if rec.Code != 200 {
 			t.Fatalf("%s: %d %s", path, rec.Code, rec.Body)
 		}
-		if tag := rec.Header().Get("ETag"); !strings.HasSuffix(tag, "-"+webCallDetailVersion+`"`) || webCallDetailVersion != "2" {
-			t.Errorf("%s: ETag %s, want one ending in -2 (the detail body changed form)", path, tag)
+		if tag := rec.Header().Get("ETag"); !strings.HasSuffix(tag, "-"+webCallDetailVersion+`"`) || webCallDetailVersion != "3" {
+			t.Errorf("%s: ETag %s, want one ending in -3 (the detail body changed form: reask)", path, tag)
 		}
 		d := decodeCallDetail(t, rec.Body.Bytes())
 		if d.SAlpha == nil || d.SAlpha.Declined != tc.declined || (tc.text != "" && d.SAlpha.Text != tc.text) {

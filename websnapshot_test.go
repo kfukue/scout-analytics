@@ -1253,6 +1253,7 @@ type webCallDetailJSON struct {
 		ID        int     `json:"id"`
 		Text      string  `json:"text"`
 		Declined  bool    `json:"declined"`
+		Reask     bool    `json:"reask"`
 		URL       *string `json:"url"`
 		At        string  `json:"at"`
 		Truncated bool    `json:"truncated"`

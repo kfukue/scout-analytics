@@ -977,6 +977,37 @@ CA: 0x…
 Source: https://t.me/scoutrobinhood/1234
 ```
 
+**sAlpha declines are not forwarded.** A reply that only declines ("Not enough public
+signals to generate a report for this token."; the website's rule, see "Website", row
+detail) is no report: the header says `• sAlpha: no report (declined: not enough public
+signals)` (or `too little liquidity or trading`), the reply is not forwarded (nor in the
+Bot API text) and it is not recorded as attached to the delivery
+(`scout_delivery_investigations`). An empty reply says `no report (empty reply)`. With the
+re-ask lane on (`SCOUT_SALPHA_REASK=on`, see "Asking sAlpha again"), the sAlpha line of a
+decline, an empty reply, a timeout or a failure of a call ends with ` — may be asked again
+later` ("may": whether the lane takes it — the token's first call, not asked again yet, no
+report from another call, not rugged or wiped by then — is decided by the lane, not at
+delivery).
+The Perceptor gate decides exactly as before; with no gate tool configured, a decline does
+not count as a report.
+
+The id of the delivery's first message (the header) in the delivery chat is stored in
+`scout_deliveries.notify_message_id` (Bot API: the first chunk's `message_id`), for a live
+delivery and for a Perceptor re-check delivery (written with its outcome, `sent` or
+`failed`); `NULL` for older rows, sends that failed before the header went out, or when
+Telegram's answer does not name it. A late sAlpha report replies to the call's first `sent`
+delivery (a re-check delivery left at `sending` does not count).
+
+**Bot API sends** (`SCOUT_NOTIFY_BOT_TOKEN`): a long text goes out in several messages of at
+most 4,000 bytes, cut after a line break where possible. When Telegram answers `429 Too Many
+Requests`, the same message is sent again after the wait Telegram asks for (`retry_after`),
+at most 3 times per message and at most 60 seconds of waiting per delivery in total (the scan
+worker waits meanwhile, so live calls wait too). A 429 without `retry_after`, or one asking
+for longer, ends the send: the delivery is recorded as `failed` with that error (including
+`retry after …`) and logged, never dropped silently. Bot API errors never contain the bot
+token (the request URL is left out of logs and `scout_deliveries.error`), whichever message
+of a long text failed.
+
 Check it with `./scoutanalytics -test-notify` (sends one test message and exits).
 If Telegram later rejects the chat (`PEER_ID_INVALID`, e.g. the group was upgraded to a
 supergroup), the scanner looks `SCOUT_NOTIFY_PEER` up again and retries once.
@@ -1005,6 +1036,7 @@ SCOUT_CATCHUP_MAX_AGE=24h # missed posts / queued calls older than this are stor
 SCOUT_RESCAN=off         # Perceptor re-scans of first calls without a report; SCOUT_RESCAN_* in "Re-scanning calls without a Perceptor report"
 SCOUT_PERCEPTOR_RECHECK_AFTER=12m   # live call with Perceptor "not enough data yet"/unreadable: re-check this long after the call (5m-60m; 0 = off); see "Re-checking “not enough data yet”"
 SCOUT_PERCEPTOR_RECHECK2_AFTER=2h   # a second re-check for the website only (0 = off; at least the first re-check's window, at most 24h)
+SCOUT_SALPHA_REASK=off   # ask sAlpha again 6-24 h after a call it gave no report for; SCOUT_SALPHA_REASK_* in "Asking sAlpha again"
 ```
 
 ## Investigation tools
@@ -1164,8 +1196,9 @@ overwrite the status and would make today's verdict look like one from the time 
 **No leakage into the model.** A re-scan's verdict is today's, not one known when the call
 was made. `scout_call_dataset_v` (and so `-export-dataset`, the training data and the model's
 scoring row), the requeue's "already investigated" check, the website's `perceptor_verdict`
-/ Perceptor filter / `GET /api/call`, and the sAlpha lookup all read `scan_kind = 'live'` rows
-only. The website shows a re-scan only as `perceptor_today_*`.
+/ Perceptor filter / `GET /api/call` all read `scan_kind = 'live'` rows only (the sAlpha
+lookup reads sAlpha rows only: `live`, and `reask` from the re-ask lane). The website shows a
+re-scan only as `perceptor_today_*`.
 
 **Dry run** (database only: no Telegram login, no node; nothing is scanned, and no call,
 investigation or delivery is written):
@@ -1193,6 +1226,141 @@ out of candidates. Count failures with:
 
 ```sql
 SELECT status, count(*) FROM scout_investigations WHERE scan_kind = 'rescan' GROUP BY 1;
+```
+
+### Asking sAlpha again (re-ask lane)
+
+About half of sAlpha's live replies are no report: a decline ("Not enough public signals…"),
+an empty reply, a timeout or a failure. Often the token simply was too new. The **re-ask
+lane** asks sAlpha once more, 6 to 24 hours after the call, once per token, inside the
+listener (the same Telegram session, never a second process). It is **off by default**.
+
+```
+SCOUT_SALPHA_REASK=off              # on = run the lane in the listener
+SCOUT_SALPHA_REASK_MIN_AGE=6h       # ask again once the call is this old (at least 1h)
+SCOUT_SALPHA_REASK_MAX_AGE=24h      # and not when it is older (longer than MIN_AGE)
+SCOUT_SALPHA_REASK_MAX_PER_DAY=60   # re-asks requested in any rolling 24 hours (1-10000)
+SCOUT_SALPHA_REASK_GAP=10m          # at least this between two re-asks
+```
+
+An invalid value stops every mode at startup, like the rescan settings. The lane needs the
+database and `salpha` in `SCOUT_TOOLS`; otherwise it logs why and stays off.
+
+**Which calls (candidates).** All of these, oldest first (ties: the lower call id):
+
+- the token's **first call** (the website's rule), posted between `MAX_AGE` and `MIN_AGE`
+  ago;
+- the call's **latest live sAlpha investigation** (`scan_kind = 'live'`, of that call) ended
+  `timeout`, `failed` or `rate_limited`, or `completed` with no text (white space only) or
+  with a decline (the website's rule: `salphaDeclinePhrases`, at most 300 characters). A
+  call without any live sAlpha investigation (imported by `-backfill`, stored only by the
+  catch-up) is never a candidate;
+- the token has **no real live sAlpha report** from any call (a real report = completed,
+  text other than white space, not a decline);
+- the token was **never asked again before** (any outcome): once per token;
+- **not rugged**, and `latest_return_pct` is `NULL` or above −99.
+
+Calls missed while the listener was down for longer than `MAX_AGE` are skipped; raise
+`SCOUT_SALPHA_REASK_MAX_AGE` (for example to `168h`) to catch them up, and check first with
+the dry run below.
+
+**How it runs.** Live calls always come first, then the live Perceptor re-check, then the
+rescan lane (each when it is on), then this lane, at most one request per look. It does not
+start while sAlpha's own pacing (`SCOUT_TOOL_SALPHA_MIN_INTERVAL` after its last request)
+still runs. The worker looks only when the live queue is empty, the
+last live call finished at least 5 minutes ago (fixed; a start or reconnect counts as a live
+call), the newest re-ask was requested at least `GAP` ago and fewer than `MAX_PER_DAY`
+re-asks were requested in the last 24 hours (the cap and the gap are read from the database,
+so they hold across restarts). A re-ask uses the same sAlpha runner and rules as live calls
+(`_NEEDS_TEXT`, `_MAX_WAIT` 300 s). It runs synchronously in the worker: a live call that
+arrives meanwhile waits for it, at most about 5 minutes (sAlpha's 300 s `_MAX_WAIT`) plus
+the follow-up. A re-ask is not retried on a rate-limit reply: it is stored as
+`rate_limited` (which uses up the token's one re-ask) and the lane pauses for an hour; a
+Telegram `FLOOD_WAIT` stores nothing and pauses the lane for an hour or the wait Telegram
+asks for, whichever is longer. A stop during a re-ask stores nothing. With no candidate
+left, the lane looks again every 10 minutes.
+
+**Late replies can be misattributed, both ways.** sAlpha replies are matched to the request
+waiting for them, not to the CA they answer. A late sAlpha reply to the previous live call
+that arrives during a re-ask could be taken for the re-ask's (the 5-minute idle time makes
+this unlikely). The other way round, a re-ask that times out can have its late reply picked
+up by the next live call, whose sAlpha result (and delivery) would then show the re-asked
+token's report. Planned mitigation: `details.replies` stores each reply's
+`reply_to_msg_id`; once prod data shows whether sAlpha sets it, replies will be filtered by
+the request they reply to. Until then the lane stays off by default.
+
+**What a re-ask writes.** One `scout_investigations` row (tool `salpha`, `scan_kind =
+'reask'`, `call_id` = the first call, `details` with `"reask": true`, `call_age_s` and
+`call_reply` = why the call's own reply was no report), and, for a real report of a
+delivered call, the follow-up below. Nothing else: no change to `scout_calls.status`,
+`seen_cas.json`, tracking or model scores.
+
+**Follow-up in the delivery chat.** Only when the re-ask brought a real report (completed,
+visible text, not a decline) **and** the call has a delivery with `status = 'sent'`: a text
+**reply** to the delivery's header (`notify_message_id`; sent without the reply when the
+delivery has no stored id, went to another target, or the reply is refused), then the report
+messages forwarded (a text copy when forwarding fails; with the Bot API one text with the
+report, as a reply):
+
+```
+🕐 sAlpha report (asked again 7h after the call) — $DARKCOMP
+CA: 0x…
+Source: https://t.me/scoutrobinhood/1234
+```
+
+It is recorded as another `scout_deliveries` row linking the re-ask investigation (its
+`header_text` starts with 🕐). Calls never delivered (red flags, `-dry-run`) get no
+follow-up; the listener's `-dry-run` sends none. The website shows the report either way.
+The follow-up replies to the call's first `sent` delivery: the live one, or the Perceptor
+re-check's delivery for a call held for the re-check. A follow-up refused with a Telegram
+`FLOOD_WAIT`, or with a Bot API 429 (Too Many Requests) that is still refused after the short
+retries of every Bot API send (see "Bot API sends" above), is recorded as a failed delivery
+and pauses the lane for an hour or the wait Telegram asks for (`retry_after`), whichever is
+longer. Bot API errors never contain the bot token (the request URL is left out of logs and
+`scout_deliveries.error`).
+
+**Website.** A real re-ask report shows like a call's report: the **sA** badge, with the
+title "sAlpha (asked again 7h after the call)", and in the row detail with the note "Later
+report: sAlpha gave none at the time of the call and was asked again." (`salpha_reask_after_s`
+in `/api/calls`, `reask` in `/api/call`). A real report of the call itself always comes first.
+When the re-ask only declined (and the call's own reply was empty or another no-report), the
+detail says "sAlpha did not generate a report" with the note "sAlpha gave none at the time of
+the call; asked again later, it declined." (no "Later report" note).
+
+**Never in the model.** `scout_call_dataset_v` (training data, `-export-dataset`, scoring)
+reads no sAlpha report (its only investigation read is the Perceptor verdict, `scan_kind =
+'live'`, never a re-check), and every other reader of `scout_investigations` compares
+`scan_kind` with `=` (`'live'` or `'rescan'`), so `reask` rows are invisible to the Perceptor
+readers, the live re-check, the requeue, the dataset view and the rescan lane's cap. Only the
+website's sAlpha lookup (`'live'` and `'reask'`) and this lane read them. A future sAlpha
+feature must filter `scan_kind = 'live'`.
+
+**Dry run** (database only; nothing is sent and nothing is written):
+
+```
+go run . -salpha-reask-missing -dry-run
+```
+
+It prints the settings, how many first calls had no sAlpha report, how many of those each rule
+excludes (asked again already, token has a report, rugged, latest return ≤ −99%; each counted
+once, in that order), the rest by the call's reply (any age), how many are too young
+(asked later) and how many are older than `MAX_AGE` (up to 7 days, 7–30 days, older; the size
+of a catch-up with a larger `MAX_AGE`), the candidates now, an estimate of the days needed,
+and every candidate in the order the lane takes them. Like every mode, it applies
+`scoutanalytics.sql` first unless `SCOUT_DB_AUTO_MIGRATE=false` (it adds
+`scout_deliveries.notify_message_id` and the `reask` index), so on prod run it only as part
+of a deploy. `-salpha-reask-missing` without `-dry-run` sends nothing; it prints a pointer to
+this section.
+
+The lane logs one line when it starts (`salpha reask: on — …`) and one per re-ask
+(`salpha reask: call <id> (<CA>, asked 7h after the call; the call's reply: declined): a
+report (3 of 60 today)`, or `declined again`, `an empty reply again`, `timeout — …`), then
+one for the follow-up (`follow-up sent as a reply to message …`, `the call was not delivered
+— no follow-up`, …). Count outcomes with:
+
+```sql
+SELECT status, (report_text ~ '[^[:space:]]') AS has_text, count(*)
+FROM scout_investigations WHERE scan_kind = 'reask' GROUP BY 1, 2;
 ```
 
 ## How it decides "warning / red flag"
@@ -1283,11 +1451,14 @@ The model score line of a re-check delivery (see "Scoring new calls") is the one
 got when it came in, from call-time data: the re-check never asks the scoring service again
 and its result is never a model input. No score at the call (scoring off, the service down
 or too slow, `SCOUT_MODEL_LINE=passed` with no bucket passed) means no line on the re-check
-delivery either. The line is kept in the listener's memory only (the scores themselves are
-in `scout_call_predictions`, but not which buckets passed nor the `SCOUT_MODEL_LINE` mode,
-so the line cannot be rebuilt from them): a reconnect keeps it, but a re-check delivered
-after a **restart** of the listener goes out without the score line. A missing line never
-holds back or delays the delivery.
+delivery either. When the call is held, the line is kept in the listener's memory and also
+stored as `score_line` in the `details` of the held Perceptor investigation (the same
+update that writes the held marker; only when there is a line). The delivery uses the line
+in memory, else the stored one, so a re-check delivered after a **restart** of the listener
+shows exactly the line the call got when it came in (it is never rebuilt from
+`scout_call_predictions`, which does not keep which buckets passed nor the
+`SCOUT_MODEL_LINE` mode). The stored line is display text only: the dataset view and the
+export never read it. A missing line never holds back or delays the delivery.
 
 The re-check's delivery is recorded in `scout_deliveries` with `status = 'sending'` **before**
 it is sent, then updated to `sent` or `failed`. Any delivery row of a call (`sending`
@@ -1364,8 +1535,8 @@ scout_calls ──< scout_investigations >── scout_investigation_tools
 | `scout_call_returns` | call × horizon | `horizon`, `price_usd`, `return_pct`, `max_gain_pct`, `max_drawdown_pct`, `last_trade_at` |
 | `scout_call_dataset_v` (view) | call | features + pivoted outcomes; what `-export-dataset` writes |
 | `scout_calls` | CA found in a @scoutrobinhood post | `message_id`, `message_date`, `message_text`, `urls`, `contract_address`, `chain`, `status` (`queued` → `scanned`/`failed`, or `duplicate`/`dropped`; `backfill` = imported from history; `update` = an update post, recorded only), `post_kind` (`call` / `update`; NULL = stored before the column existed, not classified yet) |
-| `scout_investigations` | (CA, tool) request | `call_id`, `tool_id`, `request_text`, `requested_at`, `completed_at`, `status` (`completed`/`failed`/`timeout`/`rate_limited`), `bot_message_ids`, `report_text`, `report_urls`, `report_url`, `external_id`, `verdict_level`, `verdict_label`, `ticker`, `verdict_summary`, `details` (JSONB: attempts, rate-limit waits, files, photos, buttons), `error`, `scan_kind` (`live` = scanned when the call came in or by `-scan`/`-post`; `rescan` = a late Perceptor re-scan by the rescan lane, today's verdict: never a call-time feature, so the dataset view, the requeue and the website's verdict read `live` rows only) |
-| `scout_deliveries` | bundle sent to you (or failed attempt) | `call_id`, `target`, `status` (`sent`/`failed`), `header_text`, `delivered_at`, `error` |
+| `scout_investigations` | (CA, tool) request | `call_id`, `tool_id`, `request_text`, `requested_at`, `completed_at`, `status` (`completed`/`failed`/`timeout`/`rate_limited`), `bot_message_ids`, `report_text`, `report_urls`, `report_url`, `external_id`, `verdict_level`, `verdict_label`, `ticker`, `verdict_summary`, `details` (JSONB: attempts, rate-limit waits, files, photos, buttons), `error`, `scan_kind` (`live` = scanned when the call came in or by `-scan`/`-post`; `rescan` = a late Perceptor re-scan by the rescan lane, today's verdict: never a call-time feature, so the dataset view, the requeue and the website's verdict read `live` rows only; `reask` = sAlpha asked again 6-24 h after a call by the re-ask lane, never a call-time feature either) |
+| `scout_deliveries` | bundle sent to you (or failed attempt) | `call_id`, `target`, `status` (`sent`/`failed`; `sending` = a Perceptor re-check delivery recorded before its send, counts as not sent), `header_text`, `delivered_at`, `error`, `notify_message_id` (the header's message id in the delivery chat, also for a re-check delivery; NULL when unknown) |
 | `scout_delivery_investigations` | report attached to a delivery | `delivery_id`, `investigation_id` |
 | `scout_investigations_v` (view) | investigation + tool + source post + `delivered` flag | handy for ad-hoc queries |
 
@@ -1459,7 +1630,7 @@ storing a new real call (not an update post, not a post stored again, not a call
 `-backfill`), and
 `{"kind":"report","call_id":812,"tool":"perceptor","id":5120,"scan_kind":"live"}` after storing
 a completed Perceptor or sAlpha report (`"scan_kind":"rescan"` for a re-scan by the rescan
-lane). A failed `NOTIFY` never fails the insert; it is logged (at most
+lane, `"scan_kind":"reask"` for sAlpha asked again by the re-ask lane). A failed `NOTIFY` never fails the insert; it is logged (at most
 one line a minute) and the page then shows the row with the next regular refresh. You can
 watch them with `LISTEN scout_events;` in psql. `-web` opens **one extra database connection**
 for `LISTEN`, outside its pool (so it holds one more connection than before). If that
@@ -1694,7 +1865,10 @@ other sites):
     Only a short reply counts as a decline: its text, with white space trimmed at both ends,
     has at most 300 characters (`salphaDeclineMaxLen`). A longer reply is a real report even
     when a risk line says "too little liquidity to exit". The website query and the Go check
-    use the same phrases, limit and trimming, also for rows stored before this rule.
+    use the same phrases, limit and trimming, also for rows stored before this rule. A report
+    the re-ask lane got later (see "Asking sAlpha again") counts too, after a real report of
+    a call; the panel then says "Later report: sAlpha gave none at the time of the call and
+    was asked again."
   - A text longer than 32 KB is cut there and marked "Cut at 32 KB."; a long one scrolls
     inside the panel. The panel is never wider than the visible part of the table box, also on
     a phone while the table is scrolled sideways.
@@ -1708,7 +1882,8 @@ other sites):
   page."
 - **sA** — a small "sA" badge next to the Perceptor verdict (or its dash) marks a token that
   has an sAlpha report with text (hover for a hint). An empty reply, or one that declines,
-  gives no badge.
+  gives no badge. For a report asked again later the hint is "sAlpha (asked again 7h after
+  the call)".
 - **Rugged** — a call the tracker flagged `rugged` (`scout_call_tracking.rugged`, also while
   it is still tracking) shows a red "rugged" badge in Status instead of the tracking status
   (which is in its tooltip), a dash for **Peak %** in every window (the API sends
@@ -2066,7 +2241,7 @@ Any other value or parameter, or any parameter but `verdict` given twice → HTT
    "latest_at": "2026-11-30T14:31:10.52Z", "latest_trade_at": "2026-11-30T13:02:44Z",
    "latest_age_seconds": 5184070, "call_mcap_usd": 45200, "latest_mcap_usd": 61110.4,
    "has_salpha_report": true, "perceptor_report_id": 5120, "salpha_report_id": 5121,
-   "perceptor_today_verdict": null, "perceptor_today_url": null, "perceptor_today_at": null}]}
+   "salpha_reask_after_s": null, "perceptor_today_verdict": null, "perceptor_today_url": null, "perceptor_today_at": null}]}
 ```
 `call_count` = how many real calls of that token exist in total (1 or more; update posts are
 not counted); `last_call_date` = the date of the most recent one (equal to `message_date` when there is only one). Everything else
@@ -2144,10 +2319,13 @@ a call that say which reports `GET /api/call` returns for it (per token, like th
 verdict comes from; `salpha_report_id` = the id of the token's latest completed sAlpha
 investigation (tool `salpha`, `status = completed`, newest `requested_at`, contract address
 with upper/lower case ignored) **whose `report_text` is not empty and not only white space**,
-a real report always before a reply that declines (see the row detail above);
+a real report always before a reply that declines (see the row detail above), and a call's own
+(`scan_kind = 'live'`) before one the re-ask lane got later (`'reask'`);
 `has_salpha_report` = `salpha_report_id` is not `null` and that reply is not a decline. A new
 report of either tool changes them, and so the `ETag` of `/api/calls`; an empty sAlpha reply
-changes nothing.
+changes nothing. `salpha_reask_after_s` = when that sAlpha report was asked again by the
+re-ask lane, the seconds from the call to that request; `null` for a call's own report and
+without one.
 
 `GET /api/call?id=<call_id>` — the row detail: the Perceptor and sAlpha reports of the token of
 one listed call (`call_id` of a row of `/api/calls`), from memory:
@@ -2157,8 +2335,8 @@ one listed call (`call_id` of a row of `/api/calls`), from memory:
  "perceptor": {"id": 5120, "verdict": "caution", "label": "Caution", "summary": "Top 10 hold 40%",
    "url": "https://www.perceptor.info/r/deb9d3118ec1480e985032f9472c87c0",
    "at": "2026-10-01T14:31:02Z", "truncated": false},
- "salpha": {"id": 5121, "text": "Smart money: 3 wallets bought…", "declined": false, "url": null,
-   "at": "2026-10-01T14:31:40Z", "truncated": false}}
+ "salpha": {"id": 5121, "text": "Smart money: 3 wallets bought…", "declined": false, "reask": false,
+   "url": null, "at": "2026-10-01T14:31:40Z", "truncated": false}}
 ```
 - `perceptor` = the report of `perceptor_report_id` (`null` when there is none): `verdict` is
   `clean`, `caution`, `red_flags`, `insufficient` or `unknown`; `label` and `summary` are the report's
@@ -2166,7 +2344,8 @@ one listed call (`call_id` of a row of `/api/calls`), from memory:
 - `salpha` = the report of `salpha_report_id` (`null` when the token has no sAlpha reply with
   text): `text` is its `report_text`, plain text from a bot (show it as text, never as HTML).
   `declined` = the reply only declines to report (`text` is then its reason); the page shows
-  "sAlpha did not generate a report".
+  "sAlpha did not generate a report". `reask` = the report was not given at the time of the
+  call: the re-ask lane asked sAlpha again later (`at` is then that later time).
 - `url` = the report's link, `null` unless it starts with `https://` (and is at most 2,048
   characters). `at` = `completed_at`, else `requested_at`. `truncated` = a text was longer
   than 32 KB and is cut there (at a character boundary).

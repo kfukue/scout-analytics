@@ -62,7 +62,7 @@ func (f *recheckFixture) lane(reply string, judged verdict, sent *[]string) *rec
 	l := &recheckLane{cfg: recheckConfig{After: 12 * time.Minute, After2: 2 * time.Hour}, s: f.s, db: f.st,
 		runner: f.s.runners[0], toolID: f.perc, now: time.Now, send: send,
 		judge: func(ctx context.Context, spec ToolSpec, res *toolResult) verdict { return judged },
-		deliver: func(ctx context.Context, j job, header string, results []*toolResult) error {
+		deliver: func(ctx context.Context, j job, header string, results []*toolResult) (int64, error) {
 			f.mu.Lock()
 			defer f.mu.Unlock()
 			f.headers = append(f.headers, header)
@@ -71,7 +71,8 @@ func (f *recheckFixture) lane(reply string, judged verdict, sent *[]string) *rec
 				tools = append(tools, r.Spec.Code)
 			}
 			f.tools = append(f.tools, tools)
-			return nil
+			// the header's message id in the delivery chat: 7001, 7002, …
+			return int64(recheckFakeMsgID + len(f.headers)), nil
 		}}
 	l.init()
 	return l
@@ -85,7 +86,7 @@ func (f *recheckFixture) call(t *testing.T, msg int, ca string, age time.Duratio
 	t.Helper()
 	id, inv := f.unheldCall(t, msg, ca, age, level)
 	if !verdictUsable(level) {
-		if err := f.st.MarkHeldForRecheck(context.Background(), inv); err != nil {
+		if err := f.st.MarkHeldForRecheck(context.Background(), inv, ""); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -155,6 +156,10 @@ func (f *recheckFixture) deliveries(t *testing.T, callID int) []ScoutDelivery {
 	}
 	return d
 }
+
+// recheckFakeMsgID + n is the message id the fixture's deliver returns for
+// its n-th delivery.
+const recheckFakeMsgID = 7000
 
 const recheckReply = "$SNIFF on-chain check: report https://www.perceptor.info/r/0fc1598d6fc24311b4437066528e214b"
 
@@ -329,6 +334,98 @@ func TestRecheckDeliveryOutcomes(t *testing.T) {
 			}
 			if n != want {
 				t.Errorf("%d attached reports, want %d", n, want)
+			}
+		})
+	}
+}
+
+// A re-check delivery of a call whose stored live sAlpha result is a decline
+// treats it as the live delivery does: the header says it declined, only the
+// Perceptor re-check is attached, and no sAlpha message goes with it. This
+// holds also when the stored row has no bot message ids (the decline is read
+// from its stored report text).
+func TestRecheckDeliveryStoredSAlphaDecline(t *testing.T) {
+	ca := "0x3333333333333333333333333333333333333333"
+	for _, tc := range []struct {
+		name string
+		ids  []int32
+	}{
+		{"with bot messages", []int32{5, 6}},
+		{"without bot messages", []int32{}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newRecheckFixture(t)
+			ctx := context.Background()
+			call := f.call(t, 10, ca, 13*time.Minute, levelInsufficient)
+			tag, err := f.st.Pool.Exec(ctx, `UPDATE scout_investigations SET report_text = $1, bot_message_ids = $2
+				WHERE call_id = $3 AND tool_id = $4 AND scan_kind = 'live'`, testDecline, tc.ids, call, f.sal)
+			if err != nil || tag.RowsAffected() != 1 {
+				t.Fatalf("seeding the sAlpha decline: %v (%d rows), want 1 row", err, tag.RowsAffected())
+			}
+			var sent []string
+			l := f.lane(recheckReply, verdict{Level: levelClean, Label: "No red flags found", Ticker: "$SNIFF"}, &sent)
+			fake := l.deliver
+			var got []*toolResult
+			l.deliver = func(ctx context.Context, j job, header string, results []*toolResult) (int64, error) {
+				got = results
+				return fake(ctx, j, header, results)
+			}
+			if !l.step(ctx, func() int { return 0 }) {
+				t.Fatal("step() = false, want a re-check")
+			}
+			dels := f.deliveries(t, call)
+			if len(f.headers) != 1 || len(dels) != 1 || dels[0].Status != DeliveryStatusSent {
+				t.Fatalf("deliveries: %d sent, rows %+v; want one sent", len(f.headers), dels)
+			}
+			h := f.headers[0]
+			if want := "• sAlpha: no report (declined: " + salphaDeclineReason(testDecline) + ")"; !strings.Contains(h, want) {
+				t.Errorf("header does not say %q:\n%s", want, h)
+			}
+			// only the Perceptor re-check is attached, not the decline
+			rows := f.percRows(t, call)
+			if len(rows) != 2 {
+				t.Fatalf("%d Perceptor rows, want 2", len(rows))
+			}
+			linked, err := f.st.Pool.Query(ctx, `SELECT investigation_id FROM scout_delivery_investigations WHERE delivery_id = $1 ORDER BY investigation_id`, *dels[0].ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer linked.Close()
+			var ids []int
+			for linked.Next() {
+				var id int
+				if err := linked.Scan(&id); err != nil {
+					t.Fatal(err)
+				}
+				ids = append(ids, id)
+			}
+			if err := linked.Err(); err != nil {
+				t.Fatal(err)
+			}
+			if want := []int{*rows[1].ID}; !slices.Equal(ids, want) {
+				t.Errorf("attached investigations %v, want only the re-check %v", ids, want)
+			}
+			if !slices.Equal(dels[0].InvestigationIDs, []int{*rows[1].ID}) {
+				t.Errorf("delivery's investigation ids %v, want only the re-check %d", dels[0].InvestigationIDs, *rows[1].ID)
+			}
+			// no sAlpha message is forwarded (user account) or copied (Bot API)
+			var sal *toolResult
+			for _, r := range got {
+				if r.Spec.Code == "salpha" {
+					sal = r
+				}
+			}
+			if sal == nil {
+				t.Fatalf("delivered results %v: no sAlpha result", f.tools[0])
+			}
+			if len(sal.Replies) != len(tc.ids) {
+				t.Errorf("sAlpha result has %d replies, want %d (the stored bot message ids)", len(sal.Replies), len(tc.ids))
+			}
+			if !reportDeclined(sal) || forwardable(sal) {
+				t.Errorf("sAlpha result: declined %v, forwardable %v; want declined, not forwardable (text %q)", reportDeclined(sal), forwardable(sal), sal.ReportText())
+			}
+			if txt := f.s.botAPIText(h, job{CA: ca}, got); strings.Contains(txt, "━━ sAlpha ━━") {
+				t.Errorf("Bot API text copies the sAlpha decline:\n%s", txt)
 			}
 		})
 	}
@@ -665,9 +762,9 @@ func TestRecheckDeliveryStopped(t *testing.T) {
 		ok := l.deliver
 		ctx, cancel := context.WithCancel(context.Background())
 		t.Cleanup(cancel)
-		l.deliver = func(ctx context.Context, j job, header string, results []*toolResult) error {
+		l.deliver = func(ctx context.Context, j job, header string, results []*toolResult) (int64, error) {
 			cancel()
-			return &deliveryNotSentError{fmt.Errorf("not sent: %w", ctx.Err())}
+			return 0, &deliveryNotSentError{fmt.Errorf("not sent: %w", ctx.Err())}
 		}
 		if !l.step(ctx, func() int { return 0 }) {
 			t.Fatal("step() = false, want a re-check")
@@ -685,6 +782,10 @@ func TestRecheckDeliveryStopped(t *testing.T) {
 		d := f.deliveries(t, call)
 		if len(sent) != 1 || len(f.headers) != 1 || len(d) != 1 || d[0].Status != DeliveryStatusSent {
 			t.Fatalf("sent %q, %d deliveries, rows %+v; want one /scan and one sent delivery", sent, len(f.headers), d)
+		}
+		// the header's message id is stored, so a sAlpha re-ask can reply to it
+		if d[0].NotifyMessageID == nil || *d[0].NotifyMessageID != recheckFakeMsgID+1 {
+			t.Errorf("notify_message_id of the re-check delivery = %v, want %d", d[0].NotifyMessageID, recheckFakeMsgID+1)
 		}
 		if lines := strings.Split(f.headers[0], "\n"); lines[0] != "✅ $SNIFF No red flags found" || !strings.HasPrefix(lines[1], "🔁 Perceptor re-checked 13m") {
 			t.Errorf("header %q, want the stored clean verdict and the re-check line", f.headers[0])
@@ -705,17 +806,17 @@ func TestRecheckDeliveryStopped(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		t.Cleanup(cancel)
 		calls := 0
-		l.deliver = func(ctx context.Context, j job, header string, results []*toolResult) error {
+		l.deliver = func(ctx context.Context, j job, header string, results []*toolResult) (int64, error) {
 			calls++
 			cancel()
-			return fmt.Errorf("send original call: %w", ctx.Err())
+			return 0, fmt.Errorf("send original call: %w", ctx.Err())
 		}
 		l.keepScore(call, recheckScoreLine)
 		if !l.step(ctx, func() int { return 0 }) {
 			t.Fatal("step() = false, want a re-check")
 		}
-		if d := f.deliveries(t, call); len(d) != 1 || d[0].Status != DeliveryStatusFailed {
-			t.Fatalf("delivery rows %+v, want one failed", d)
+		if d := f.deliveries(t, call); len(d) != 1 || d[0].Status != DeliveryStatusFailed || d[0].NotifyMessageID != nil {
+			t.Fatalf("delivery rows %+v, want one failed without a message id", d)
 		}
 		if got := l.scoreLine(call); got != "" {
 			t.Errorf("score line after a failed send %q, want it forgotten (the delivery is never sent again)", got)
@@ -895,7 +996,7 @@ func TestRecheckHeldMarker(t *testing.T) {
 			}
 		}, true, false},
 		{"marker cannot be written", levelInsufficient, func(f *recheckFixture, res []*toolResult) {
-			f.s.recheck.hold = func(ctx context.Context, invID int) error { return errors.New("database gone") }
+			f.s.recheck.hold = func(ctx context.Context, invID int, scoreLine string) error { return errors.New("database gone") }
 		}, true, false},
 		{"dropped by an older binary before the deploy", levelInsufficient, nil, false, false},
 	}
@@ -938,23 +1039,18 @@ func TestRecheckHeldMarker(t *testing.T) {
 	}
 }
 
-// MarkHeldForRecheck adds the key and keeps the others; running it again
-// changes nothing; an unknown id is an error.
+// MarkHeldForRecheck adds the key, and the score line (score_line) when there
+// is one, and keeps the others; running it again changes nothing; an empty
+// line stores no score_line (nor removes one); an unknown id is an error.
 func TestMarkHeldForRecheck(t *testing.T) {
 	f := newRecheckFixture(t)
 	ctx := context.Background()
-	at := time.Now().Add(-time.Hour)
-	id, err := f.st.InsertScoutInvestigation(ctx, &ScoutInvestigation{ToolID: f.perc, ContractAddress: "0x15",
-		RequestText: "/scan 0x15", RequestedAt: at, CompletedAt: &at, Status: investigationCompleted,
-		VerdictLevel: levelInsufficient, Details: []byte(`{"attempts":1}`)})
-	if err != nil {
-		t.Fatal(err)
-	}
-	read := func() (map[string]any, string) {
+	read := func(id int) (map[string]any, string) {
+		t.Helper()
 		var b []byte
 		var rest string
 		if err := f.st.Pool.QueryRow(ctx, `SELECT details, concat_ws('|', status, verdict_level, updated_at::text, updated_by)
-			FROM scout_investigations WHERE id = $1`, *id).Scan(&b, &rest); err != nil {
+			FROM scout_investigations WHERE id = $1`, id).Scan(&b, &rest); err != nil {
 			t.Fatal(err)
 		}
 		var m map[string]any
@@ -963,17 +1059,56 @@ func TestMarkHeldForRecheck(t *testing.T) {
 		}
 		return m, rest
 	}
-	_, before := read()
-	for i := 1; i <= 2; i++ {
-		if err := f.st.MarkHeldForRecheck(ctx, *id); err != nil {
-			t.Fatalf("mark %d: %v", i, err)
-		}
-		m, rest := read()
-		if m["held_for_recheck"] != true || m["attempts"] != float64(1) || len(m) != 2 || rest != before {
-			t.Errorf("mark %d: details %v, other columns %q (before %q); want attempts kept, held_for_recheck true, nothing else changed", i, m, rest, before)
-		}
+	cases := []struct {
+		name string
+		line string
+		want map[string]any // details after each mark
+	}{
+		{"with a score line", recheckScoreLine,
+			map[string]any{"attempts": float64(1), "held_for_recheck": true, "score_line": recheckScoreLine}},
+		{"no score line: no key", "",
+			map[string]any{"attempts": float64(1), "held_for_recheck": true}},
 	}
-	if err := f.st.MarkHeldForRecheck(ctx, *id+1000); err == nil {
+	for i, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			at := time.Now().Add(-time.Hour)
+			ca := fmt.Sprintf("0x15%d", i)
+			id, err := f.st.InsertScoutInvestigation(ctx, &ScoutInvestigation{ToolID: f.perc, ContractAddress: ca,
+				RequestText: "/scan " + ca, RequestedAt: at, CompletedAt: &at, Status: investigationCompleted,
+				VerdictLevel: levelInsufficient, Details: []byte(`{"attempts":1}`)})
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, before := read(*id)
+			for n := 1; n <= 2; n++ {
+				if err := f.st.MarkHeldForRecheck(ctx, *id, c.line); err != nil {
+					t.Fatalf("mark %d: %v", n, err)
+				}
+				m, rest := read(*id)
+				if !maps.Equal(m, c.want) || rest != before {
+					t.Errorf("mark %d (line %q): details %v, other columns %q (before %q); want details %v, nothing else changed", n, c.line, m, rest, before, c.want)
+				}
+			}
+		})
+	}
+	t.Run("an empty line keeps a stored one", func(t *testing.T) {
+		at := time.Now().Add(-time.Hour)
+		id, err := f.st.InsertScoutInvestigation(ctx, &ScoutInvestigation{ToolID: f.perc, ContractAddress: "0x15e",
+			RequestText: "/scan 0x15e", RequestedAt: at, CompletedAt: &at, Status: investigationCompleted,
+			VerdictLevel: levelInsufficient, Details: []byte(`{}`)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, line := range []string{recheckScoreLine, ""} {
+			if err := f.st.MarkHeldForRecheck(ctx, *id, line); err != nil {
+				t.Fatalf("mark (line %q): %v", line, err)
+			}
+		}
+		if m, _ := read(*id); m["score_line"] != recheckScoreLine || m["held_for_recheck"] != true {
+			t.Errorf("details %v after marks with %q then \"\", want score_line %q kept and held_for_recheck true", m, recheckScoreLine, recheckScoreLine)
+		}
+	})
+	if err := f.st.MarkHeldForRecheck(ctx, 1<<30, recheckScoreLine); err == nil {
 		t.Error("MarkHeldForRecheck of an unknown id = nil, want an error")
 	}
 }
@@ -991,11 +1126,11 @@ func TestRecheckPendingDelivery(t *testing.T) {
 	l := f.lane(recheckReply, verdict{Level: levelClean, Label: "No red flags found", Ticker: "$SNIFF"}, &sent)
 	inner := l.deliver
 	var atSend []ScoutDelivery
-	l.deliver = func(ctx context.Context, j job, header string, results []*toolResult) error {
+	l.deliver = func(ctx context.Context, j job, header string, results []*toolResult) (int64, error) {
 		atSend = f.deliveries(t, call)
 		return inner(ctx, j, header, results)
 	}
-	l.finish = func(ctx context.Context, id int, status string, at *time.Time, errText *string) error {
+	l.finish = func(ctx context.Context, id int, status string, at *time.Time, errText *string, notifyMsgID *int64) error {
 		return errors.New("database gone")
 	}
 	if !l.step(ctx, func() int { return 0 }) {

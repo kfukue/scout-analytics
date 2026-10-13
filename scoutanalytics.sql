@@ -137,12 +137,17 @@ CREATE INDEX IF NOT EXISTS scout_investigations_ca_idx    ON scout_investigation
 CREATE INDEX IF NOT EXISTS scout_investigations_level_idx ON scout_investigations (verdict_level, requested_at DESC);
 -- scan_kind: 'live' = run when the call came in (or by -scan/-post);
 -- 'rescan' = Perceptor re-scan of a first call that had no report, run long
--- after the call by the listener's rescan lane (SCOUT_RESCAN). A rescan's
--- verdict is today's, never a call-time feature: the dataset view and the
--- requeue read 'live' rows only.
-ALTER TABLE scout_investigations ADD COLUMN IF NOT EXISTS scan_kind TEXT NOT NULL DEFAULT 'live';  -- live | rescan
+-- after the call by the listener's rescan lane (SCOUT_RESCAN);
+-- 'reask' = sAlpha asked again 6-24 h after a first call whose live sAlpha
+-- reply declined, was empty or timed out/failed (SCOUT_SALPHA_REASK).
+-- Neither is a call-time feature: the dataset view, the requeue and the
+-- Perceptor readers read 'live' rows only (every reader compares scan_kind
+-- with =, never <>), and the rescan lane's counts read 'rescan' only.
+ALTER TABLE scout_investigations ADD COLUMN IF NOT EXISTS scan_kind TEXT NOT NULL DEFAULT 'live';  -- live | rescan | reask
 -- the rescan lane's daily cap and gap (rows of the last 24 hours, the newest)
 CREATE INDEX IF NOT EXISTS scout_investigations_rescan_idx ON scout_investigations (requested_at DESC) WHERE scan_kind = 'rescan';
+-- the same for the sAlpha re-ask lane
+CREATE INDEX IF NOT EXISTS scout_investigations_reask_idx ON scout_investigations (requested_at DESC) WHERE scan_kind = 'reask';
 
 -- One row per message bundle sent to you (or a failed attempt).
 CREATE TABLE IF NOT EXISTS scout_deliveries (
@@ -160,6 +165,11 @@ CREATE TABLE IF NOT EXISTS scout_deliveries (
     updated_by        TEXT         NOT NULL,
     updated_at        TIMESTAMPTZ  NOT NULL DEFAULT now()
 );
+-- notify_message_id: the id of the delivery's first message (the header) in the
+-- delivery chat, as the sender sees it (user account or Bot API); NULL for
+-- older rows, failed sends, or when Telegram's answer did not name it. A late
+-- sAlpha report (re-ask lane) is sent as a reply to it.
+ALTER TABLE scout_deliveries ADD COLUMN IF NOT EXISTS notify_message_id BIGINT;
 CREATE INDEX IF NOT EXISTS scout_deliveries_call_idx ON scout_deliveries (call_id);
 CREATE INDEX IF NOT EXISTS scout_deliveries_ca_idx   ON scout_deliveries (contract_address);
 
@@ -187,7 +197,7 @@ SELECT i.id, i.call_id, t.code AS tool, t.bot_username, i.contract_address, i.re
        EXISTS (SELECT 1 FROM scout_delivery_investigations di
                JOIN scout_deliveries d ON d.id = di.delivery_id AND d.status = 'sent'
                WHERE di.investigation_id = i.id) AS delivered,
-       i.scan_kind  -- live | rescan (a late Perceptor re-scan, see the column)
+       i.scan_kind  -- live | rescan (a late Perceptor re-scan) | reask (sAlpha asked again), see the column
 FROM scout_investigations i
 JOIN scout_investigation_tools t ON t.id = i.tool_id
 LEFT JOIN scout_calls c ON c.id = i.call_id;
@@ -365,6 +375,9 @@ ALTER TABLE scout_call_tracking ADD COLUMN IF NOT EXISTS latest_checked_at TIMES
 ALTER TABLE scout_call_tracking ADD COLUMN IF NOT EXISTS latest_trade_at   TIMESTAMPTZ;  -- time of the last trade the price comes from
 
 -- Training dataset: one row per call = features known at call time + outcomes.
+-- It reads no sAlpha report today. Any future sAlpha feature must filter
+-- scan_kind = 'live': a 'reask' row is sAlpha asked again hours after the call
+-- (never known at call time), like a Perceptor 'rescan'.
 DROP VIEW IF EXISTS scout_call_predictions_v;
 DROP VIEW IF EXISTS scout_call_dataset_v;
 CREATE VIEW scout_call_dataset_v AS

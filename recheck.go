@@ -52,12 +52,15 @@ package main
 //
 // Model score line: process() scores every call when it comes in (scoreCall,
 // from call-time data) and a held call keeps that line in memory
-// (recheckLane.scores); the re-check delivery shows it last, exactly as a
-// delivery at the call would have. The score is never asked again for the
-// re-check (re-check results are never model inputs). The line is not stored
-// (the scores are, in scout_call_predictions, but not what decides the line:
-// which buckets passed, SCOUT_MODEL_LINE), so a re-check delivered after a
-// restart of the listener (not a reconnect) goes out without it.
+// (recheckLane.scores) and stores it with the held marker (details
+// {"score_line":…} of the same investigation, MarkHeldForRecheck; only when
+// there is a line); the re-check delivery shows it last, exactly as a delivery
+// at the call would have: the line in memory, else the stored one
+// (PerceptorRecheckRow.ScoreLine), so a re-check delivered after a restart of
+// the listener shows the same first-pass line. The score is never asked again
+// for the re-check (re-check results are never model inputs), and the stored
+// line is display text only: the dataset view and the export never read it.
+// A missing line never holds back or delays a delivery.
 
 import (
 	"context"
@@ -249,7 +252,8 @@ func recheckDecide(c recheckConfig, now time.Time, p PerceptorRecheckRow, delive
 // was not stored, or whose marker cannot be written, is not held back (it
 // stays undelivered, as before, and that is logged).
 // scoreLine is the call's model score line computed at the call (scoreCall;
-// "" without one): a held call keeps it for its re-check delivery.
+// "" without one): a held call keeps it for its re-check delivery, in memory
+// and stored with the marker.
 func (s *scanner) deferToRecheck(ctx context.Context, j job, results []*toolResult, invID *int, scoreLine string) bool {
 	if s.recheck == nil || j.CallID == nil {
 		return false
@@ -276,7 +280,7 @@ func (s *scanner) deferToRecheck(ctx context.Context, j job, results []*toolResu
 			j.CA, what, *j.CallID)
 		return false
 	}
-	if err := s.recheck.markHeld(ctx, *invID); err != nil {
+	if err := s.recheck.markHeld(ctx, *invID, scoreLine); err != nil {
 		log.Printf("%s: Perceptor %s — call %d cannot wait for a re-check (%v) — not delivered",
 			j.CA, what, *j.CallID, err)
 		return false
@@ -329,16 +333,18 @@ type recheckLane struct {
 	toolID int
 	now    func() time.Time
 	// send sends text to the runner's bot, judge reads a completed report's
-	// verdict and deliver sends a delivery (the scanner's by default; tests
-	// use fakes).
+	// verdict and deliver sends a delivery and returns the id of its header
+	// message in the delivery chat, 0 when unknown (the scanner's by default;
+	// tests use fakes).
 	send    func(ctx context.Context, r *toolRunner, text string) error
 	judge   func(ctx context.Context, spec ToolSpec, res *toolResult) verdict
-	deliver func(ctx context.Context, j job, header string, results []*toolResult) error
-	// hold marks an investigation held for the re-check and finish sets the
-	// outcome of a recorded delivery (nil: the database's MarkHeldForRecheck
-	// and FinishScoutDelivery; tests use fakes).
-	hold   func(ctx context.Context, invID int) error
-	finish func(ctx context.Context, id int, status string, at *time.Time, errText *string) error
+	deliver func(ctx context.Context, j job, header string, results []*toolResult) (int64, error)
+	// hold marks an investigation held for the re-check (storing the score
+	// line with it) and finish sets the outcome of a recorded delivery, with
+	// its header's message id (nil: the database's MarkHeldForRecheck and
+	// FinishScoutDelivery; tests use fakes).
+	hold   func(ctx context.Context, invID int, scoreLine string) error
+	finish func(ctx context.Context, id int, status string, at *time.Time, errText *string, notifyMsgID *int64) error
 
 	mu          sync.Mutex
 	nextLook    time.Time // the database is not read again before this
@@ -365,7 +371,8 @@ type recheckLane struct {
 	// id -> line, computed at the call), shown last in its re-check delivery.
 	// Removed once that delivery has an outcome (sent or failed) or the
 	// re-check finds red flags; given up after recheckOwedMax past the first
-	// window. Not stored: lost on a restart (see the file comment).
+	// window. Also stored (details.score_line), the fallback after a restart
+	// (see the file comment).
 	scores map[int]heldScore
 	errLog logLimiter
 }
@@ -486,25 +493,27 @@ func (l *recheckLane) dropScore(id int) {
 	delete(l.scores, id)
 }
 
-// markHeld marks investigation invID held for the re-check (a stop of ctx
-// does not cut the write short).
-func (l *recheckLane) markHeld(ctx context.Context, invID int) error {
+// markHeld marks investigation invID held for the re-check, storing the
+// call's score line with it when there is one (a stop of ctx does not cut the
+// write short).
+func (l *recheckLane) markHeld(ctx context.Context, invID int, scoreLine string) error {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
 	defer cancel()
 	if l.hold != nil {
-		return l.hold(ctx, invID)
+		return l.hold(ctx, invID, scoreLine)
 	}
-	return l.db.MarkHeldForRecheck(ctx, invID)
+	return l.db.MarkHeldForRecheck(ctx, invID, scoreLine)
 }
 
-// finishDelivery sets the outcome of delivery id, recorded as sending.
-func (l *recheckLane) finishDelivery(ctx context.Context, id int, status string, at *time.Time, errText *string) error {
+// finishDelivery sets the outcome of delivery id, recorded as sending, and
+// the id of its header message in the delivery chat (nil = unknown).
+func (l *recheckLane) finishDelivery(ctx context.Context, id int, status string, at *time.Time, errText *string, notifyMsgID *int64) error {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
 	defer cancel()
 	if l.finish != nil {
-		return l.finish(ctx, id, status, at, errText)
+		return l.finish(ctx, id, status, at, errText, notifyMsgID)
 	}
-	return l.db.FinishScoutDelivery(ctx, id, status, at, errText)
+	return l.db.FinishScoutDelivery(ctx, id, status, at, errText, notifyMsgID)
 }
 
 // paceWait returns how long r's pacing (MinInterval after its last request:
@@ -803,8 +812,9 @@ func (l *recheckLane) deliverStored(ctx context.Context, p PerceptorRecheckRow) 
 // deliverCall delivers p after its first re-check res (stored as invID; nil
 // when storing failed): the header as for a live call plus a line with the
 // re-check's age (second) and, last, the model score line computed at the
-// call (recheckLane.scores; never asked again, and left out when there is
-// none, e.g. after a restart), the original call post, the re-check's report
+// call (recheckLane.scores, else the one stored when the call was held,
+// p.ScoreLine; never asked again, and left out when there is none), the
+// original call post, the re-check's report
 // and the other tools' reports of the call's live scan, read from the
 // database. n is the lane key's n that ran it (1 or recheckDeliverN).
 //
@@ -824,12 +834,14 @@ func (l *recheckLane) deliverCall(ctx context.Context, p PerceptorRecheckRow, re
 	j := job{CA: p.ContractAddress, SourceMsg: p.MessageID, SourceText: p.MessageText, Meta: metaOf(p.MessageText), CallID: &p.CallID}
 	results, ids := l.callResults(ctx, p.CallID, res, invID)
 	header := withRecheckLine(l.s.deliveryHeader(j, results), fmt.Sprintf("🔁 %s re-checked %s after the call", res.Spec.Name, rescanAgeText(age)))
-	if line := l.scoreLine(p.CallID); line != "" {
+	// the line in memory, else the one stored when the call was held (after a restart)
+	if line := firstNonEmpty(l.scoreLine(p.CallID), p.ScoreLine); line != "" {
 		header += "\n" + line // as process() adds it at the call
 	}
+	// as for a live call: an sAlpha decline is not forwarded, so not attached
 	var attached []int
 	for i, r := range results {
-		if ids[i] != nil && r.Spec.Attach && r.Status == investigationCompleted {
+		if ids[i] != nil && forwardable(r) {
 			attached = append(attached, *ids[i])
 		}
 	}
@@ -848,7 +860,7 @@ func (l *recheckLane) deliverCall(ctx context.Context, p PerceptorRecheckRow, re
 	l.tried[recheckKey(p.CallID, recheckDeliverN)] = true
 	delete(l.owed, p.CallID)
 	l.mu.Unlock()
-	err = l.deliver(ctx, j, header, results)
+	msgID, err := l.deliver(ctx, j, header, results)
 	var notSent *deliveryNotSentError
 	if err != nil && ctx.Err() != nil && errors.As(err, &notSent) {
 		dctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
@@ -874,7 +886,9 @@ func (l *recheckLane) deliverCall(ctx context.Context, p PerceptorRecheckRow, re
 		t := time.Now().UTC()
 		at = &t
 	}
-	if ferr := l.finishDelivery(ctx, *delID, status, at, errText); ferr != nil {
+	// the header's message id, also after a later part failed: a sAlpha
+	// re-ask follow-up replies to it (salpha_reask.go)
+	if ferr := l.finishDelivery(ctx, *delID, status, at, errText, notifyMsgIDPtr(msgID)); ferr != nil {
 		log.Printf("%s: recording the delivery's outcome (%s) failed: %v — it stays recorded as sending (never sent again)", what, status, ferr)
 	}
 	if err != nil {
@@ -916,10 +930,12 @@ func (l *recheckLane) callResults(ctx context.Context, callID int, res *toolResu
 
 // storedToolResult rebuilds a tool's result from its stored investigation, as
 // far as a delivery needs it: the bot's message ids (forwarded), the report
-// text (on the last message: the text copy when forwarding fails) and the
-// verdict.
+// text (on the last message: the text copy when forwarding fails; also kept
+// as StoredText, so a row without message ids still reads as its text, e.g.
+// an sAlpha decline is not forwarded or attached) and the verdict.
 func storedToolResult(spec ToolSpec, row ScoutInvestigation) *toolResult {
-	res := &toolResult{Spec: spec, Command: row.RequestText, RequestedAt: row.RequestedAt, Status: row.Status}
+	res := &toolResult{Spec: spec, Command: row.RequestText, RequestedAt: row.RequestedAt, Status: row.Status,
+		StoredText: row.ReportText}
 	if row.CompletedAt != nil {
 		res.CompletedAt = *row.CompletedAt
 	}

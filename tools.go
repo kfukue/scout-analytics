@@ -233,17 +233,27 @@ type toolResult struct {
 	Verdict     verdict
 	Status      string // completed | failed | timeout | rate_limited
 	Err         error
+	// StoredText: the stored report text of a result rebuilt from the
+	// database (storedToolResult); ReportText falls back to it when the
+	// replies hold no text (a stored row without bot message ids). Empty for
+	// a live result.
+	StoredText string
 
 	Attempts       int   // requests sent (1 + rate-limit retries)
 	RateLimitWaits []int // seconds waited after each rate-limit reply
 }
 
+// ReportText returns the replies' texts joined, or StoredText (trimmed) when
+// they hold none.
 func (r *toolResult) ReportText() string {
 	var parts []string
 	for _, m := range r.Replies {
 		if t := strings.TrimSpace(m.Message); t != "" {
 			parts = append(parts, t)
 		}
+	}
+	if len(parts) == 0 {
+		return strings.TrimSpace(r.StoredText)
 	}
 	return strings.Join(parts, "\n\n")
 }

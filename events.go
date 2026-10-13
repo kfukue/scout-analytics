@@ -57,8 +57,9 @@ type scoutEvent struct {
 	CallID int    `json:"call_id"`
 	Tool   string `json:"tool,omitempty"` // report: perceptor | salpha
 	ID     int    `json:"id,omitempty"`   // report: the investigation id
-	// ScanKind (report only): ScanKindLive, or ScanKindRescan for a re-scan by
-	// the rescan lane (today's verdict, not the call's report).
+	// ScanKind (report only): ScanKindLive, ScanKindRescan for a re-scan by
+	// the rescan lane (today's verdict, not the call's report), or
+	// ScanKindReask for sAlpha asked again later by the re-ask lane.
 	ScanKind string `json:"scan_kind,omitempty"`
 }
 
@@ -142,7 +143,8 @@ type webEventOut struct {
 
 // webSnapshotEvents compares two snapshots and returns the events for what
 // changed: a "call" for each new row, a "report" for each row whose Perceptor
-// verdict or report, or sAlpha report (or decline), changed, and a "report"
+// verdict or report, or sAlpha report (or decline; also a report the re-ask
+// lane got later, which is a new sAlpha id), changed, and a "report"
 // with tool perceptor_today for each row with a new or changed re-scan
 // ("Perceptor today"). Rows that went away send nothing. More than
 // webEventsMaxPerRefresh events become one "reload". Both snapshots are in
