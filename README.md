@@ -2079,7 +2079,10 @@ dependencies; `go test` runs it when `node` is on the PATH). Only the visible ta
   as no value.
 - **Peak vs final tab:** every call's peak against its return at the window (both symmetric
   log, a dashed "return = peak" line) and the share of calls with a peak above 0% that gave back
-  more than half of it (return < peak ÷ 2).
+  more than half of it (return < peak ÷ 2). It also has an exit-rule table: mean and median
+  return when sold at the first touch of 2×, 3× or 5× (else held to the end of the window)
+  against holding, with the share that touched; an upper bound, before tax, rugged calls counted
+  with their pre-rug peak.
 - **Timing tab:** when things happened after the call, within the chosen window (the timing
   columns of "Timing after the call" above; results after the call, never model inputs). It
   counts the **timed** calls: first calls priced in USD with a return for the window **and**

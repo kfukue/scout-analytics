@@ -958,7 +958,14 @@ func TestAnalyticsPageFiles(t *testing.T) {
 	}
 	for _, want := range []string{`<script src="analytics.js" defer></script>`, `href="./"`, "Model insights — coming soon",
 		"First calls only", "late entry", "in USD", "before tax", "rounded to 0.1", `role="tablist"`,
-		`id="panel-overview"`, `id="panel-factor"`, `id="panel-peak"`, "capped at +1,000%"} {
+		`id="panel-overview"`, `id="panel-factor"`, `id="panel-peak"`, "capped at +1,000%",
+		// the exit-rule table on Peak vs final: fillExitTable writes into
+		// #h-exit and #tbl-exit (a missing one would throw and blank the tab)
+		`id="h-exit"`, `id="tbl-exit"`, `id="cap-exit"`,
+		"Sold at the first touch of 2×/3×/5× (a candle or trade high, before tax), else held to the end of the window.",
+		"An upper bound: in thin pools a brief wick can count as a touch.",
+		"Rugged calls count with their peak before the rug: a touch before the rug counts as a sale.",
+		"Not the Timing tab's 'reached 2×' (held 1 h)."} {
 		if !strings.Contains(html, want) {
 			t.Errorf("analytics.html: missing %q", want)
 		}
@@ -1128,6 +1135,26 @@ func TestAnalyticsStatsNode(t *testing.T) {
 	}
 	if !strings.HasPrefix(string(out), "ok: ") {
 		t.Fatalf("node testdata/analytics-stats.test.js: got %q, want \"ok: …\"", out)
+	}
+}
+
+// TestAnalyticsExitNode runs testdata/analytics-exit.test.js with node, when
+// node is on the PATH (skipped otherwise): the Peak vs final tab's exit-rule
+// table (fillExitTable, exitRow, ppCell in frontend/analytics.js) drawn for a
+// normal window, fewer than 20 calls (greyed), no calls and points missing a
+// peak or a return. renderPeak draws it before its early return, so a throw
+// there would blank the whole tab.
+func TestAnalyticsExitNode(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node is not on the PATH")
+	}
+	out, err := exec.Command(node, "testdata/analytics-exit.test.js").CombinedOutput()
+	if err != nil {
+		t.Fatalf("node testdata/analytics-exit.test.js: %v: %s", err, out)
+	}
+	if !strings.HasPrefix(string(out), "ok: ") {
+		t.Fatalf("node testdata/analytics-exit.test.js: got %q, want \"ok: …\"", out)
 	}
 }
 
