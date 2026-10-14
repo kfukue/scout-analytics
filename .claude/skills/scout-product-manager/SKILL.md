@@ -17,7 +17,11 @@ open PRs; the owner reviews and merges them.
 ## The project
 
 Standalone repo `kfukue/scout-analytics` (Go, package `main` at the repo root:
-`go run .`). On the PC it is at `<repo root>`;
+`go run .`). On the PC it is the main checkout, written `<repo root>` in
+this skill (the repo is public: never write the real local path into repo
+files; from any worktree, the parent folder of
+`git rev-parse --path-format=absolute --git-common-dir` is it, as in
+`TESTING.md`);
 production runs from a checkout at `~/Documents/GitHub/scout-analytics` on an
 Ubuntu server. Read `README.md`, `ml/README.md` and `HANDOFF.md` before planning
 anything non-trivial (`DEPLOY.md` and `ml/RUNBOOK.md` for deploy and training).
@@ -574,7 +578,7 @@ Every Go start applies `scoutanalytics.sql` unless `SCOUT_DB_AUTO_MIGRATE=false`
 
 ## Working on the owner's PC from a cloud session
 
-- The repo on the PC is at `<repo root>`;
+- The repo on the PC is the main checkout (`<repo root>`);
   production runs on the separate Ubuntu server that pulls from GitHub.
 - Before overwriting a file on the PC, confirm it still matches the version you
   last wrote or the branch tip. Go files use Windows line endings; compare with

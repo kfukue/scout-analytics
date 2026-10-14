@@ -1,6 +1,29 @@
 # Scout analytics: handoff to Claude Code
 
-## Session state (14 October 2026 UTC, owner's late evening of 13 Oct: main e522918 after PRs #41-#53)
+## Repo moved and history rewritten (14 Oct 2026, afternoon PDT (14–15 Oct UTC))
+
+The repo is public, so on 14 Oct the owner rewrote its history to remove
+local paths and his personal email:
+- git-filter-repo replaced every local path with placeholders
+  (`<repo root>`, `<go-work>`, `<tmp>`, `<postgres dir>`, `Users\<user>`),
+  and a mailmap set every commit author to his GitHub no-reply address.
+- The old repo was renamed `kfukue/scout-analytics-archive` and made
+  private. It keeps the old PR pages (#1-#68). **PR numbers in text
+  written before this section, and in merge commits older than 137b734,
+  refer to that archive; `#1`-`#3` in this section are the new repo.**
+- A new public `kfukue/scout-analytics` was created with the rewritten
+  history, and its `main` protection restored (PR required, applies to
+  admins, no force-push or deletion). Its PR numbers restart at #1. In the
+  new repo, #1 = "no calls_prev" (was #66), #2 = the file-access rule (was
+  #67), #3 = the live-buys export (was #68).
+- The PC main checkout and the server (`$REPO` and `$ML/src`) were reset to
+  the new `main` (6c9287e), keeping untracked `.env`, the session file,
+  data and venvs. The owner's GitHub account now keeps its email private.
+- Rule since then: no absolute local paths in repo files (`scout-rules`).
+- After #1: retrain on the server (without calls_prev) with `--variants`;
+  report pending.
+
+## Session state (14 October 2026 UTC, owner's late evening of 13 Oct: main e522918 after PRs #41-#53, archived numbering)
 
 This section supersedes the states below wherever they differ.
 
