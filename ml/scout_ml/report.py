@@ -148,7 +148,7 @@ def wf_rule_line() -> str:
 
 
 def _seeds_text() -> str:
-    """C.STABILITY_SEEDS as "7 / 11 / 23"."""
+    """C.STABILITY_SEEDS joined by " / " (e.g. "7 / 11 / 23")."""
     return " / ".join(str(s) for s in C.STABILITY_SEEDS)
 
 
@@ -912,7 +912,7 @@ ACROSS_SEEDS_TITLE = "### calls_prev variants across seeds (report only)\n"
 
 
 def _across_lifts(lifts: dict, seeds) -> str:
-    """'2.10 / 1.95 / 2.31' over the seeds, a missing seed as n/a."""
+    """The lifts over the seeds joined by " / " ('2.10 / 1.95 / 2.31'), a missing seed as n/a."""
     return " / ".join(fmt(lifts.get(str(s)), 2) for s in seeds)
 
 

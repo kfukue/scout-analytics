@@ -26,7 +26,7 @@ def test_synthetic_csv_has_exact_view_columns(synthetic_df):
     assert set(synthetic_df["rugged"].dropna().astype(str).str.lower()) == {"true", "false"}
 
 
-def test_end_to_end_training_artifacts(trained):
+def test_end_to_end_training_artifacts(trained, shipped_seeds):
     root, vdir = trained
     assert (root / "LATEST").read_text().strip() == vdir.name
     meta = json.loads((vdir / "meta.json").read_text())
@@ -47,7 +47,7 @@ def test_end_to_end_training_artifacts(trained):
         assert {"pooled_lift_ok", "pooled_lift_lower_ok", "sim_diff_ok", "collapse_ok", "passed",
                 "reasons", "old"} <= set(m["gates"])
         assert {"lift_ok", "collapse_ok", "walk_forward_ok", "passed"} <= set(m["gates"]["old"])
-        assert set(m["gates"]["pooled_lift_seeds"]) == {"7", "11", "23"}   # the shipped seeds
+        assert list(m["gates"]["pooled_lift_seeds"]) == [str(s) for s in shipped_seeds]
         assert len(m["walk_forward"]) >= 5
         for model in ("lightgbm", "logistic"):
             assert {"base_rate", "roc_auc", "pr_auc", "brier"} <= set(m["labels"]["runner"][model])

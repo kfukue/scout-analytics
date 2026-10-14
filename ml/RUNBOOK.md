@@ -278,8 +278,8 @@ cd "$ML/src/ml"
 time "$ML/venv/bin/python" train.py --csv "$ML/data/calls.csv" --out "$ML/models"
 ```
 
-It first trains the normal model, then retrains it with the LightGBM seeds
-11 and 23 and pools the walk-forward weeks: the gates need both (owner
+It first trains the normal model, then retrains it with the other LightGBM
+seeds of `STABILITY_SEEDS` (11, 23, 31, 47, 61 and 89 since 14 Oct 2026) and pools the walk-forward weeks: the gates need both (owner
 decision of 13 Oct 2026, see step 7), and it prints
 `[gates] seed retrains N s, pooled walk-forward N s`. Then one line per bucket
 (`PASS`, `FAIL: <reasons> (see report.md)` or `skipped: ...`) and
@@ -299,7 +299,10 @@ default and print one line at the end, e.g.
 not run twice). The seed retrains cost about two normal runs, with or without
 the diagnostics: on synthetic data a whole run took 26 s before 13 Oct 2026,
 73 s now with the diagnostics off and 102 s with them on (desktop PC). On the
-prod data the extra time is an estimate, not measured yet; the `[gates]` and
+prod data the extra time is an estimate, not measured yet. Since 14 Oct 2026
+there are six seed retrains instead of two (7 seeds, step 7): on the same
+synthetic data `[gates] seed retrains` took 134 s instead of 47 s and a run
+with the diagnostics on about 187 s instead of 102 s. The `[gates]` and
 `[diagnostics]` lines give the real figures (paste them, step 8). The
 diagnostics start only after the model, `meta.json`, `report.md` and `LATEST`
 are written, and the saved model, the gates and the verdict are the same with
@@ -328,8 +331,8 @@ SCOUT_ML_DIAGNOSTICS=0 REPO="$PWD" ML=~/scout-ml bash ~/scout-ml/run_training.sh
 `0`, `off`, `false` and `no` switch them off; any other value prints a
 `WARNING` and keeps the default (on). The script passes the variable through
 to `train.py` as it is; nothing else changes. The report then has no
-"Stability diagnostics" section; the verdict table still shows the three seed
-values and the pooled numbers.
+"Stability diagnostics" section; the verdict table still shows every seed's
+value and the pooled numbers.
 
 Exit code 0 even when gates fail. Random seed: fixed (`LGBM_SEED = 7` in
 `scout_ml/config.py`; the diagnostics use fixed seeds too), so a rerun on the
@@ -397,7 +400,10 @@ and sixth add about one more each, and the calls_prev variant two more
 for its seeds 11 and 23 (its `[variant]` line says "of which other
 seeds and adversarial validation N s"; about 93 s for two such variants on
 that synthetic data, 13 Oct 2026; on the prod data an estimated 40 to 50 s
-for two, not measured). The stability
+for two, not measured). Since 14 Oct 2026 (7 seeds) the calls_prev variant
+is retrained with six other seeds: on the same synthetic data its "of which"
+time was 139 s instead of 48 s and a whole run with `--variants` 453 s
+instead of 280 s. The stability
 diagnostics of step 5 also run (before the variants) unless switched off with
 `SCOUT_ML_DIAGNOSTICS=0`, and add their own time on top. Memory as in step 5.
 The model, `meta.json`, `report.md` and `LATEST` are written before the
@@ -455,9 +461,12 @@ From the top:
    below are still in the walk-forward table, marked "not counted (train <
    1000)" (e.g. the early `medium` weeks from 18 Aug 2026, 530 train rows).
    A bucket PASSes only if all of these hold:
-   - runner lift: the median of the pooled top-10% lift over the three
-     LightGBM seeds 7, 11 and 23 is at least 2 (the cell shows the median and
-     the three values, e.g. "yes: 2.18 (2.18 / 2.26 / 1.94)"), and the lower
+   - runner lift: the median of the pooled top-10% lift over the seven
+     LightGBM seeds 7, 11, 23, 31, 47, 61 and 89 (`STABILITY_SEEDS`; three,
+     7, 11 and 23, before 14 Oct 2026) is at least 2, so at least 4 of the 7
+     seeds must reach 2 (the cell shows the median and every seed's value in
+     the order of the header, e.g. with made-up numbers
+     "yes: 2.18 (2.18 / 2.26 / 1.94 / 2.31 / 2.05 / 2.40 / 1.97)"), and the lower
      end of the 95% interval of the seed-7 pooled lift (whole weeks drawn
      again 2000 times) is above 1.0 (the next column);
    - beats buy-all: the pooled money simulation, top 10% minus all calls
@@ -523,7 +532,8 @@ From the top:
    verdict. It is missing when the run had `SCOUT_ML_DIAGNOSTICS=0`
    (step 5). Its parts:
    - **Seed stability**: the normal model trained again with the LightGBM
-     seeds 11 and 23 next to the saved model's seed 7 (same rows, splits and
+     seeds 11, 23, 31, 47, 61 and 89 next to the saved model's seed 7
+     (`STABILITY_SEEDS`; seeds 11 and 23 only before 14 Oct 2026; same rows, splits and
      weeks; only the seed changes). Per bucket and seed: test top-10% lift
      with its interval, collapses removed, runner ROC AUC, the money
      simulation top 10% vs all, the counted walk-forward weeks beating

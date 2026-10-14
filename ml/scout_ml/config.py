@@ -486,8 +486,14 @@ DIAGNOSTICS = True
 DIAGNOSTICS_ENV = "SCOUT_ML_DIAGNOSTICS"
 # Seed stability (a gate input): the baseline retrained with each of these
 # LightGBM seeds (LGBM_SEED); a seed equal to LGBM_SEED reuses the saved model's
-# results. The runner-lift gate takes the median over exactly these seeds.
-STABILITY_SEEDS = (7, 11, 23)
+# results. The runner-lift gate takes the median over exactly these seeds (the
+# middle value of an odd count). The first one is LGBM_SEED, the saved model.
+# Owner decision of 14 Oct 2026: 7 seeds instead of 3 (7, 11, 23). In reports
+# 20261014-1842 and 20261014-2211, on almost the same data, the median pooled
+# lift over 3 seeds moved by up to +-0.4, so buckets near the threshold of 2
+# flipped PASS / FAIL from run to run; the median of 7 (their 4th value) is
+# steadier. Each extra seed costs about one normal training in every run.
+STABILITY_SEEDS = (7, 11, 23, 31, 47, 61, 89)
 # Pooled walk-forward (the expanding one is a gate input): the test rows of all
 # counted weeks of a bucket pooled, each week ranked by its own model (top 10% /
 # top 30% per week); 95% interval by a week-block bootstrap (weeks resampled
