@@ -1714,7 +1714,7 @@ type ScoutCallPrediction struct {
 	Bucket        string   `json:"bucket"` // short | 3day | medium | long
 	RunnerProb    *float64 `json:"runner_prob"`
 	CollapseProb  *float64 `json:"collapse_prob"`
-	RunnerRankPct *float64 `json:"runner_rank_pct"` // share of recent calls with a lower runner score
+	RunnerRankPct *float64 `json:"runner_rank_pct"` // share of the model's test-period calls (at training) that had a lower runner score
 	// Passed: the bucket's model passed its validation gates (the scoring
 	// service's "passed"); nil = not recorded
 	Passed *bool `json:"passed"`
