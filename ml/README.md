@@ -53,6 +53,15 @@ feature list has raw `dex` (trained before `dex_family`) is still served with it
 `prior_calls` and `secs_since_prev_call` stay in the view but are not features:
 training uses first calls only, where they are always 0 and NULL
 (`UNUSED_VIEW_COLUMNS` in `scout_ml/config.py`).
+`calls_prev_1h` and `calls_prev_24h` stay in the view too, but since 14 Oct
+2026 they are not inputs of new models (`EXCLUDED_INPUTS` in
+`scout_ml/config.py`): they act as a calendar proxy (adversarial AUC 0.99,
+mostly from `calls_prev_24h`), and in report 20261014-1842 the model without
+them had a higher across-seed median pooled lift (3day 2.14 vs 2.10, medium
+2.10 vs 1.86), passed every gate in both buckets and cut the drift to AUC
+0.90. The scoring service builds each model's inputs from that model's own
+`meta.json` `features`, so a model trained with them (up to 20261014-1842)
+is still scored with them until a retrain replaces it.
 
 ## Install
 
@@ -399,8 +408,7 @@ baseline:
 | raw dex + dex_family | `DEX_INPUTS = "both"` |
 | runners must be tradeable | `RUNNER_NEEDS_TRADES = True`: runner also needs `trades_24h >= RUNNER_MIN_TRADES_24H` (100); NULL keeps the label |
 | stronger regularisation | `LGBM_REGULARISATION = "strong"`: `num_leaves` 15 -> 7, `min_child_samples` (min_data_in_leaf) 20 -> 50, `reg_lambda` (lambda_l2) 1 -> 10, `colsample_bytree` (feature_fraction) 0.8 -> 0.6 (`LGBM_REG_SETS`); rounds still from early stopping / the purged k-fold |
-| no calls_prev inputs | `EXCLUDED_INPUTS = ("calls_prev_1h", "calls_prev_24h")`: the model and the logistic baseline without those two inputs (adversarial validation in report 20261013-0702 found `calls_prev_24h` driving the train/test drift: AUC 0.99, gain share 0.42-0.87). `EXCLUDED_INPUTS` can only remove numeric inputs; an outcome, a categorical or an unknown name raises |
-| calls_prev as a burst ratio | `CALLS_PREV_INPUTS = "burst"`: the two raw counts replaced (in place) by `calls_burst_1h = calls_prev_1h * 24 / max(calls_prev_24h, 1)`, the last hour's posting rate relative to the last day's (a missing count gives NaN): it keeps the burst and drops the level that trends with calendar time. Built from the row's own two counts only, so known at the call. Default `"counts"`: the raw counts, as the saved model |
+| with calls_prev counts (default before 14 Oct) | `EXCLUDED_INPUTS = ()`: the model and the logistic baseline with `calls_prev_1h` and `calls_prev_24h` back in, i.e. the inputs of the saved models up to 14 Oct 2026, so every report compares against the old setting. The baseline leaves them out (see the start of this file). `EXCLUDED_INPUTS` can only remove numeric inputs; an outcome, a categorical or an unknown name raises |
 
 Variants are report only: they are never saved or served, and the saved model,
 its `meta.json` (features, levels, rules) and its gates are always the
@@ -422,7 +430,7 @@ the gate), counted weeks beating buy-all, walk-forward mean lift and mean
 collapses removed (counted weeks only), simulation top 10% vs all calls, the
 variant's own pooled walk-forward lift and simulation difference with their
 95% bootstrap intervals (its seed-7 run only; information; the calls_prev
-variants also over every seed, see below), and its
+variant also over every seed, see below), and its
 "single-run (old) gate, information" result. The variants are not judged by
 the pooled gates of the verdict (that would need each variant retrained with
 every seed, three times the cost); the baseline row shows the old single-run
@@ -443,7 +451,13 @@ the adversarial AUC (train vs test) on each one's own inputs with its top
 three drifting inputs. The variants are retrained with seeds 11 and 23; the
 baseline row reuses the gates' and diagnostics' numbers. Report only, never a
 gate; an error there keeps the variant's other numbers. Empty `SEED_VARIANTS`
-to skip it.
+to skip it. Since 14 Oct 2026 `SEED_VARIANTS` is "with calls_prev counts
+(default before 14 Oct)" only; the "no calls_prev inputs" variant became the
+baseline, and the owner rejected "calls_prev as a burst ratio" (worse in
+report 20261014-1842), so it was removed. Its setting
+`CALLS_PREV_INPUTS = "burst"` is still in `config.py` (the two raw counts
+replaced in place by `calls_burst_1h = calls_prev_1h * 24 /
+max(calls_prev_24h, 1)`), but no variant uses it.
 
 A variant that raises an error is recorded as `error: <message>` (in its
 table row and in `meta.json` `"variants"`), a `WARNING` line is printed, the
@@ -457,10 +471,10 @@ the dead score about 2 s of it; a whole run with `--variants` took about
 2 min before the gates of 13 Oct 2026, whose seed retrains add about 47 s to
 every run, see "Stability diagnostics"). The across-seeds table adds two
 retrains plus one adversarial probe per bucket for each `SEED_VARIANTS` entry
-(the baseline row reuses the diagnostics' probe): about 93 s for the two
+(the baseline row reuses the diagnostics' probe): about 93 s for two
 entries on that synthetic data (13 Oct 2026, the sum of their `[variant]`
-lines' "of which" times); on the prod data an estimated 40 to 50 s, not
-measured. Runs without `--variants` are unchanged.
+lines' "of which" times; one entry since 14 Oct 2026); on the prod data an
+estimated 40 to 50 s for two, not measured. Runs without `--variants` are unchanged.
 
 ### Stability diagnostics
 
@@ -535,10 +549,10 @@ gates: 47 s, two retrains of the baseline; pooled walk-forward under 1 s) and
 validation 18 s, evaluation without dead calls under 1 s). So a run with the
 section off now costs about two normal runs more; on the prod data (about 6 s
 per variant in report 20261012-2209, `long` still skipped) expect roughly 20
-to 30 s more per run then. `--variants` adds three more variant rows ("stronger
-regularisation", "no calls_prev inputs", "calls_prev as a burst ratio"),
-about one normal run each, and the across-seeds table (two more runs per
-calls_prev variant; see "Variant comparison").
+to 30 s more per run then. `--variants` adds two more variant rows ("stronger
+regularisation", "with calls_prev counts (default before 14 Oct)"), about one
+normal run each, and the across-seeds table (two more runs for the calls_prev
+variant; see "Variant comparison").
 
 The `model.py`, `validate.py`, `features.py` (`MIN_CATEGORY_COUNT`) and
 `labels.py` (`MAX_OUTCOME_PCT`) settings are read from `config` when a function

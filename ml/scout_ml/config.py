@@ -250,8 +250,9 @@ def categorical_inputs(dex_inputs: str) -> list:
 # time (adversarial validation AUC about 0.99). CALLS_PREV_BURST
 # (features.calls_burst) is the burst ratio of the same row's two counts;
 # build_features always computes it, but it is an input only with
-# CALLS_PREV_INPUTS = "burst" (the two counts replaced by it). "counts" (default):
-# the raw counts, as the saved model.
+# CALLS_PREV_INPUTS = "burst" (the two counts replaced by it; no variant uses it
+# since 14 Oct 2026). "counts" (default): the raw counts, which EXCLUDED_INPUTS
+# below now leaves out.
 CALLS_PREV_RAW = ["calls_prev_1h", "calls_prev_24h"]
 CALLS_PREV_BURST = "calls_burst_1h"
 CALLS_PREV_INPUTS = "counts"
@@ -259,11 +260,18 @@ CALLS_PREV_INPUT_CHOICES = ("counts", "burst")
 # Derived inputs that are model inputs only when a knob selects them.
 OPTIONAL_DERIVED = [CALLS_PREV_BURST]
 
-# Inputs left out of new models (a VARIANT_KNOB; "no calls_prev inputs" sets
-# it). Empty: every input above (the saved model). Only numeric inputs
+# Inputs left out of new models (a VARIANT_KNOB). Only numeric inputs
 # (NUMERIC_RAW + DERIVED + OPTIONAL_DERIVED) can be left out; it can only
-# remove inputs, never add one.
-EXCLUDED_INPUTS = ()
+# remove inputs, never add one. The columns stay in the view and in NUMERIC_RAW.
+# Owner decision 14 Oct 2026: calls_prev_1h / calls_prev_24h are left out by
+# default. They act as a calendar proxy (adversarial AUC 0.99, mostly from
+# calls_prev_24h); in report 20261014-1842 the model without them had a higher
+# across-seed median pooled lift (3day 2.14 vs 2.10, medium 2.10 vs 1.86), passed
+# every gate in both buckets and cut the drift to AUC 0.90. The variant "with
+# calls_prev counts (default before 14 Oct)" keeps the old setting in the report.
+# Serving reads the input list from each model's meta.json, so a model trained
+# with them still scores.
+EXCLUDED_INPUTS = ("calls_prev_1h", "calls_prev_24h")
 # Signed, bounded or already-small columns are standardised as is by the
 # logistic baseline; every other numeric feature is non-negative and skewed.
 NO_LOG = set(["liq_pct", "tax_buy_pct", "tax_sell_pct", "proof_elite", "proof_good",
@@ -447,16 +455,14 @@ VARIANTS = {
     "raw dex + dex_family": {"DEX_INPUTS": "both"},
     "runners must be tradeable": {"RUNNER_NEEDS_TRADES": True},
     "stronger regularisation": {"LGBM_REGULARISATION": "strong"},
-    # report 20261013-0702: adversarial validation found calls_prev_24h driving the
-    # train/test drift (AUC 0.99; gain share 0.42-0.87)
-    "no calls_prev inputs": {"EXCLUDED_INPUTS": ("calls_prev_1h", "calls_prev_24h")},
-    # the two raw counts replaced by calls_burst_1h (see "calls_prev inputs" above)
-    "calls_prev as a burst ratio": {"CALLS_PREV_INPUTS": "burst"},
+    # the default before 14 Oct 2026 (see EXCLUDED_INPUTS): calls_prev_1h /
+    # calls_prev_24h back in, so every report compares against the old setting
+    "with calls_prev counts (default before 14 Oct)": {"EXCLUDED_INPUTS": ()},
 }
 # Variants also retrained with the other STABILITY_SEEDS for the report-only
 # table "calls_prev variants across seeds" (ml/README.md). Never a gate; about
 # one normal training per extra seed and variant; empty it to skip the table.
-SEED_VARIANTS = ("no calls_prev inputs", "calls_prev as a burst ratio")
+SEED_VARIANTS = ("with calls_prev counts (default before 14 Oct)",)
 # Variants that only differ from the baseline through trades_24h: not applicable
 # when the export has no trades_24h column.
 TRADES_VARIANTS = ("dead rule on (collapse OR dead)", "runners must be tradeable")

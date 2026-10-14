@@ -960,8 +960,8 @@ def across_seeds_section(variants: dict, buckets: dict) -> str:
            f"are the seed {C.LGBM_SEED} run's 95% week-block bootstrap, as in the gates. "
            "Adversarial AUC: can a classifier tell the bucket's test part from its train part "
            "on that variant's own inputs (as in \"Adversarial validation\"; 0.5 = no drift; "
-           "calendar inputs left out)? A lower AUC than the baseline's shows the drift the "
-           "removed inputs carried. Report only: never saved, never served, never a gate; "
+           "calendar inputs left out)? The difference from the baseline's AUC shows the drift "
+           "the inputs the variant changes carry. Report only: never saved, never served, never a gate; "
            "to adopt a variant change config.py and train again.\n"]
     rows = [[b, n, *_across_cells(variants[n], b, seeds)] for b in buckets for n in names]
     out.append(table(["bucket", "variant", "counted weeks",

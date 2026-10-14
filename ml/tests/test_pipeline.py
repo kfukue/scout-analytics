@@ -713,6 +713,60 @@ def test_old_flat_meta_still_serves_with_exact_levels(trained, synthetic_df, tmp
             assert b["runner_prob"] == want, (dex, b)
 
 
+def test_model_trained_with_calls_prev_still_scores_after_the_default_dropped_them(
+        trained, synthetic_df, tmp_path, monkeypatch):
+    """A model saved before 14 Oct 2026 (e.g. 20261014-1842) lists calls_prev_1h /
+    calls_prev_24h in meta.json; the config now leaves them out of new models.
+    Serving builds the inputs from meta.json, so /score gives that model the two
+    counts of the row, in its own column order (not C.FEATURES)."""
+    import joblib
+    import pandas as pd
+    from scout_ml.features import build_features
+    from scout_ml.labels import build_labels
+    from scout_ml.model import fit_lgbm, predict
+    calls_prev = ["calls_prev_1h", "calls_prev_24h"]
+    _, vdir = trained
+    assert not set(calls_prev) & set(json.loads((vdir / "meta.json").read_text())["features"])
+    old = tmp_path / "old"
+    shutil.copytree(vdir, old)
+    for p in old.glob("*.joblib"):
+        p.unlink()
+    meta = json.loads((old / "meta.json").read_text())
+    with C.overrides(EXCLUDED_INPUTS=()):                        # the input list before 14 Oct
+        old_cols = list(C.FEATURES)
+    assert set(calls_prev) <= set(old_cols) and not set(calls_prev) & set(C.FEATURES)
+    levels = meta["category_levels"]["short"]
+    df = synthetic_df.copy()
+    df["message_date"] = pd.to_datetime(df["message_date"], utc=True, format="ISO8601")
+    use = build_labels(df)["usable_short"].to_numpy()
+    X = build_features(df[use], levels, old_cols)
+    fitted = fit_lgbm(X, build_labels(df)["runner_short"][use].to_numpy(), n_estimators=20)
+    joblib.dump({"model": fitted["model"], "calibrator": None}, old / "short_runner.joblib")
+    meta.update(features=old_cols, models=["short_runner"])
+    meta["metrics"]["short"]["gates"]["passed"] = True
+    (old / "meta.json").write_text(json.dumps(meta))
+    (tmp_path / "LATEST").write_text("old")
+
+    client = _client(monkeypatch, tmp_path)
+    recs = json.loads(df[use].head(5).assign(message_date="2026-09-01T12:00:00Z")
+                      .to_json(orient="records"))
+    from scout_ml.model import Bundle
+    bundle = Bundle(old)
+    for rec in recs:
+        got = bundle.features(rec, "short")
+        assert list(got.columns) == old_cols
+        for c in calls_prev:
+            assert got[c].iloc[0] == float(rec[c]), c                # the row's own count
+        bumped = bundle.features({**rec, "calls_prev_24h": rec["calls_prev_24h"] + 50}, "short")
+        assert bumped["calls_prev_24h"].iloc[0] == rec["calls_prev_24h"] + 50
+        r = client.post("/score", json={"row": rec})
+        assert r.status_code == 200, r.text
+        body = r.json()
+        _check_shape(body, meta["version"], ["short"])
+        want = round(float(predict(fitted, build_features(rec, levels, old_cols))[0]), 4)
+        assert body["buckets"][0]["runner_prob"] == want
+
+
 def test_report_shows_dead_calls_and_recent_calibration(trained):
     _, vdir = trained
     meta = json.loads((vdir / "meta.json").read_text())

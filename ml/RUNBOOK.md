@@ -372,19 +372,20 @@ time "$ML/venv/bin/python" train.py --csv "$ML/data/calls.csv" --out "$ML/models
 ```
 
 It trains the normal model
-exactly as in step 5 (that is the one saved, served and gated), then seven
+exactly as in step 5 (that is the one saved, served and gated), then six
 variants that each change one setting (dead rule on, i.e. collapse OR dead;
 raw `dex` instead of `dex_family`; raw `dex` + `dex_family`; runners must have
 `trades_24h >= 100`; stronger regularisation, i.e. smaller trees with more
 calls per leaf, a stronger L2 penalty and fewer inputs per tree,
-`LGBM_REGULARISATION = "strong"` in `scout_ml/config.py`; no calls_prev
-inputs, i.e. without `calls_prev_1h` and `calls_prev_24h`, which adversarial
-validation found driving the train/test drift in report 20261013-0702;
-calls_prev as a burst ratio, i.e. those two replaced by
-`calls_burst_1h = calls_prev_1h * 24 / max(calls_prev_24h, 1)`,
-`CALLS_PREV_INPUTS = "burst"`). The "dead rule off" and "dead threshold 100" rows of
+`LGBM_REGULARISATION = "strong"` in `scout_ml/config.py`; with calls_prev
+counts (default before 14 Oct), i.e. with `calls_prev_1h` and
+`calls_prev_24h` back in, `EXCLUDED_INPUTS = ()`). Since 14 Oct 2026 the
+baseline leaves those two out (owner decision after report 20261014-1842:
+they act as a calendar proxy), so this row keeps the old setting in every
+report. The "dead rule off" and "dead threshold 100" rows of
 earlier reports are gone: the rule is now off in the baseline, and the
-threshold only matters with the rule on. The variants are not saved; they only add a section
+threshold only matters with the rule on; so are "no calls_prev inputs" (now
+the baseline) and "calls_prev as a burst ratio" (rejected, 14 Oct 2026). The variants are not saved; they only add a section
 "Variant comparison" at the end of `report.md`, one table per bucket, one row
 per variant (the `baseline` row is the saved model). It prints one
 `[variant] <name>: N s` line per variant. Time: more than the 4 to 5 times
@@ -392,11 +393,11 @@ the step 5 train time measured with four variants (on a desktop PC,
 synthetic data of 6,000 calls, before the gates of 13 Oct 2026: about 30 s
 without, about 2 min with `--variants`; the gates' seed retrains now add
 about 47 s to every run): each variant costs about one normal training run, so the fifth
-to seventh add about one more each, and the two calls_prev variants two more
-each for their seeds 11 and 23 (their `[variant]` line says "of which other
-seeds and adversarial validation N s"; about 93 s for the two on that
-synthetic data, 13 Oct 2026; on the prod data an estimated 40 to 50 s, not
-measured). The stability
+and sixth add about one more each, and the calls_prev variant two more
+for its seeds 11 and 23 (its `[variant]` line says "of which other
+seeds and adversarial validation N s"; about 93 s for two such variants on
+that synthetic data, 13 Oct 2026; on the prod data an estimated 40 to 50 s
+for two, not measured). The stability
 diagnostics of step 5 also run (before the variants) unless switched off with
 `SCOUT_ML_DIAGNOSTICS=0`, and add their own time on top. Memory as in step 5.
 The model, `meta.json`, `report.md` and `LATEST` are written before the
@@ -425,9 +426,10 @@ collapses removed). Paste the whole report as in step 8; the product manager
 decides whether a setting changes.
 
 The last table, "calls_prev variants across seeds" (see `ml/README.md`),
-puts the baseline next to the two calls_prev variants over every seed. A
-variant whose median lift is about the baseline's or better while its
-adversarial AUC is clearly lower carries less drift for the same ranking.
+puts the baseline (without the calls_prev inputs) next to the variant
+with them over every seed. If the variant's median lift is clearly better
+than the baseline's in several reports, tell the product manager; the gap
+between the two adversarial AUCs shows the drift those two inputs carry.
 
 ## 6. Delete the CSV
 

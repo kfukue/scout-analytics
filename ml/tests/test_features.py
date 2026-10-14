@@ -240,7 +240,7 @@ def test_perceptor_insufficient_is_its_own_level_when_frequent_enough():
     assert np.isnan(build_features({"perceptor_verdict": "insufficient"}, rare)["perceptor_verdict"][0])
 
 
-# --- calls_burst_1h (derived; an input only in the "calls_prev as a burst ratio" variant) ---
+# --- calls_burst_1h (derived; an input only with CALLS_PREV_INPUTS = "burst") ---
 
 BURST = C.CALLS_PREV_BURST
 
@@ -251,10 +251,11 @@ def test_calls_burst_is_a_call_time_input_and_not_in_the_saved_model():
     assert_no_leakage([BURST])
     assert BURST in C.OPTIONAL_DERIVED and BURST not in C.DERIVED
     assert all(c in C.VIEW_NUMERIC and not C.is_forbidden(c) for c in C.CALLS_PREV_RAW)
-    # the saved model's inputs are as before: the raw counts, never the burst ratio
+    # the saved model's inputs: neither the burst ratio nor (since 14 Oct 2026) the raw counts
     assert C.CALLS_PREV_INPUTS == "counts"
-    assert C.FEATURES == C.NUMERIC_RAW + C.DERIVED + C.CATEGORICAL
-    assert BURST not in C.FEATURES and set(C.CALLS_PREV_RAW) <= set(C.FEATURES)
+    assert C.FEATURES == [c for c in C.NUMERIC_RAW + C.DERIVED
+                          if c not in C.CALLS_PREV_RAW] + C.CATEGORICAL
+    assert BURST not in C.FEATURES and not set(C.CALLS_PREV_RAW) & set(C.FEATURES)
     assert BURST not in C.NO_LOG
 
 
