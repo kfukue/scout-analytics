@@ -53,3 +53,9 @@ The owner's local time (US Pacific) first, UTC in parentheses, e.g.
   history (days of node time) unless the task explicitly says so.
 - Never run index-writing git in the main checkout (the product manager may
   run `git worktree add` and `git fetch` there); work in `.claude/worktrees/`.
+- Never read or write files outside this repo folder and the owner's
+  personal notes folder (its path is in his user-level `CLAUDE.md`, not in
+  this repo). Scratch files go in the main checkout's
+  `<repo root>\.claude\worktrees\_scratch\`
+  (git-ignored); always give this absolute path, never a relative one
+  (full rule in `scout-rules`, Hard rules).

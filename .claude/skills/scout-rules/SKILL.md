@@ -29,8 +29,30 @@ root).
 - If the task says another agent is working in parallel, stay within the files
   the task names. If `git status` shows unexpected changes in files you need,
   report it instead of editing over them.
+- File access (owner, 14 Oct 2026): read and write files only inside the repo
+  folder `<repo root>` (its worktrees
+  included) and the owner's personal notes folder. Its path comes in your
+  brief when you need it; it is not in this repo and you do not look for it
+  elsewhere. Never run git in the notes folder; the owner commits it.
+  - Where an agent file says `<scratchpad>`, use your `_scratch` subdirectory
+    (below) instead.
+  - Never use the session scratchpad under `AppData\Local\Temp` or any other
+    folder.
+  - Scratch files (throwaway Postgres data, coverage files, logs, LF copies
+    for gofmt, browser profiles) go in your own subdirectory of the MAIN
+    checkout's `_scratch` folder, always given as the absolute path
+    `<repo root>\.claude\worktrees\_scratch\`
+    (never the relative `.claude/worktrees/_scratch` from inside a
+    worktree). It is git-ignored. Delete your subdirectory when you are done.
+  - Installed tools (Go, Postgres binaries, git, `gh`, the repo's
+    `ml/.venv`) may still be run. Files a tool makes for itself (the Go build
+    and module caches, `t.TempDir()` and pytest `tmp_path` folders) are the
+    tool's; you never read or write them directly.
+  - Do not inspect system settings, event logs or other programs' data. If a
+    write is blocked (e.g. Windows Defender's Controlled Folder Access, which
+    protects `Documents`), stop and report it.
 - Processes and test DBs: stop only your own processes, by PID. Throwaway
-  Postgres only, in your own scratchpad subdirectory on your own port (see
+  Postgres only, in your own `_scratch` subdirectory on your own port (see
   `TESTING.md`); never the Windows Postgres service on port 5432.
 - `.env`: the tracker reads `.env` from the folder it is started in, and a
   variable already set in the shell wins over the file.
@@ -172,6 +194,8 @@ Your agent file adds its own report contract on top of these.
   prod".
 - Include any README text you were told not to write yourself.
 - Never include secrets or the contents of `.env` or `scout.session.json`.
+  Never write the owner's personal notes path into any repo file or into a
+  report the PM might paste into one.
 - Dates and times (owner, 14 Oct 2026). In reports, docs, PR text and commit
   messages, use the owner's local time (US Pacific: PDT in summer, PST in
   winter) first, with UTC in parentheses:
