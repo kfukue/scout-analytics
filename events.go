@@ -22,7 +22,8 @@ import (
 //
 //   - The listener sends NOTIFY scout_events with a small JSON payload when it
 //     records a new call or a completed Perceptor / sAlpha report
-//     (ScoutStore.notifyScoutEvent, called from the insert functions).
+//     (ScoutStore.notifyScoutEvent, called from the insert functions), and
+//     when it has stored a model score of a call (scoreCall).
 //   - The website (-web) LISTENs on its own connection; a notification makes it
 //     refresh its snapshot at once, through the one refresh mechanism (so it is
 //     coalesced with the background loop and "Refresh now").
@@ -47,6 +48,7 @@ const scoutEventMaxPayload = 7999
 const (
 	scoutEventCall   = "call"
 	scoutEventReport = "report"
+	scoutEventScore  = "score" // the model's scores of a call were stored
 )
 
 // scoutEvent is the payload of a notification. The website does not need it to

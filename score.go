@@ -27,6 +27,9 @@ type scoreResponse struct {
 		RunnerProb    *float64 `json:"runner_prob"`
 		CollapseProb  *float64 `json:"collapse_prob"`
 		RunnerRankPct *float64 `json:"runner_rank_pct"`
+		// Passed: the bucket's model passed its validation gates; nil when
+		// the service did not say (stored as NULL, "not recorded")
+		Passed *bool `json:"passed"`
 	} `json:"buckets"`
 }
 
@@ -106,13 +109,21 @@ func (s *scanner) scoreCall(ctx context.Context, j job) string {
 		return ""
 	}
 	// The score arrived in time: store it even if the budget runs out now.
+	// All buckets in one transaction (one created_at, the time the website
+	// will show), then one NOTIFY scout_events "score" so an open website
+	// refreshes its snapshot at once.
 	sctx, scancel := context.WithTimeout(context.WithoutCancel(ctx), scoreStoreTimeout)
 	defer scancel()
+	ps := make([]ScoutCallPrediction, 0, len(sr.Buckets))
 	for _, b := range sr.Buckets {
-		p := ScoutCallPrediction{CallID: callID, ModelVersion: sr.ModelVersion, Bucket: b.Bucket,
-			RunnerProb: b.RunnerProb, CollapseProb: b.CollapseProb, RunnerRankPct: b.RunnerRankPct}
-		if err := s.db.UpsertPrediction(sctx, p, row); err != nil {
-			log.Printf("db: prediction for call %d: %v", callID, err)
+		ps = append(ps, ScoutCallPrediction{CallID: callID, ModelVersion: sr.ModelVersion, Bucket: b.Bucket,
+			RunnerProb: b.RunnerProb, CollapseProb: b.CollapseProb, RunnerRankPct: b.RunnerRankPct, Passed: b.Passed})
+	}
+	if len(ps) > 0 {
+		if err := s.db.StorePredictions(sctx, ps, row); err != nil {
+			log.Printf("db: predictions for call %d: %v", callID, err)
+		} else {
+			s.db.notifyScoutEvent(sctx, scoutEvent{Kind: scoutEventScore, CallID: callID})
 		}
 	}
 	if sr.Line == "" {
