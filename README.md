@@ -749,7 +749,11 @@ backfill-timing (dry run): 290 rugged horizon(s) wait for those lookups; 0 rugge
 Off by default. With `SCOUT_MODEL_URL` set (for example `http://127.0.0.1:8601`,
 the service in `ml/serve.py`), the listener sends each new call's dataset row to
 the service, stores the scores in `scout_call_predictions` and adds one line to
-the delivered message. The line lists buckets by horizon. Which ones is set on
+the delivered message. The listener logs one line when it starts
+(`model scoring: on — …` with the URL and `SCOUT_MODEL_TIMEOUT`, or
+`model scoring: off (SCOUT_MODEL_URL not set)`; with `SCOUT_DB=off` it says
+off, because scoring needs the database), so the log shows whether
+`SCOUT_MODEL_URL` was picked up. The delivered line lists buckets by horizon. Which ones is set on
 the scoring service by `SCOUT_MODEL_LINE`:
 
 - `passed` (the default): only the buckets that passed their gates. The line is

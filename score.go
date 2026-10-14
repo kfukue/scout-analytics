@@ -9,6 +9,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"time"
 )
 
@@ -132,6 +133,34 @@ func (s *scanner) scoreCall(ctx context.Context, j job) string {
 	}
 	log.Printf("score %s: %s (precall %s)", j.CA, sr.Line, precall)
 	return sr.Line
+}
+
+// modelScoringStartupLine is the line the listener logs at start-up, so the log
+// shows whether SCOUT_MODEL_URL was picked up. dbOn is whether the listener
+// records to the database: scoreCall needs it, so with SCOUT_DB=off scoring is
+// off. User info, query and fragment in the URL are left out; the path is kept
+// because scoreCall posts to ModelURL+"/score". A value that is not a
+// scheme://host URL is not echoed: its parse error would echo it, and
+// "user:pass@host" parses as scheme "user" with the rest opaque, so clearing
+// User would not hide the password.
+func modelScoringStartupLine(cfg *config, dbOn bool) string {
+	if cfg.ModelURL == "" {
+		return "model scoring: off (SCOUT_MODEL_URL not set)"
+	}
+	if !dbOn {
+		return "model scoring: off (SCOUT_MODEL_URL is set but SCOUT_DB=off; scoring needs the database)"
+	}
+	shown := "(SCOUT_MODEL_URL is not a valid URL)"
+	if u, err := url.Parse(cfg.ModelURL); err == nil && u.Scheme != "" && u.Host != "" {
+		u.User = nil
+		u.RawQuery = ""
+		u.ForceQuery = false
+		u.Fragment = ""
+		u.RawFragment = ""
+		shown = u.String()
+	}
+	return fmt.Sprintf("model scoring: on — live calls are scored by %s/score within %s (shared with the live pre-call stats); scores are stored and shown in the delivery header, never filter deliveries",
+		shown, cfg.ModelTimeout)
 }
 
 // budgetNote explains an error caused by the scoring budget running out.
