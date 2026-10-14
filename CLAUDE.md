@@ -1,7 +1,10 @@
 # Scout analytics: rules for Claude
 
-Read `.claude/skills/scout-rules/SKILL.md` for the shared rules. The product
-manager follows `.claude/skills/scout-product-manager/SKILL.md`.
+## Start here
+
+- Current state: the top section of `HANDOFF.md`.
+- Rules: `.claude/skills/scout-rules/SKILL.md` (every agent);
+  `.claude/skills/scout-product-manager/SKILL.md` (the product manager).
 
 ## Pull requests target `main` (owner, 14 Oct 2026)
 
@@ -24,10 +27,23 @@ manager follows `.claude/skills/scout-product-manager/SKILL.md`.
   `gh pr view <N> --json baseRefName` must say `main` (or the branch the
   owner named). If not, fix it with `gh pr edit <N> --base main` first.
 
-## Never
+## Database changes
+
+Every change to the database structure or data ships with a script to run
+and a rollback script: see "Database changes: run script and rollback" in
+`.claude/skills/scout-rules/SKILL.md`.
+
+## Never (safety net; full rules in scout-rules)
 
 - Never read out, print, commit or copy `.env`, `scout.session.json` or
   anything under `scoutanalytics_data/`.
 - Never connect to the production database. Production data comes only from
   read-only SQL that the owner runs.
 - Never commit or push to `main`.
+- Never use the Windows Postgres on port 5432 for tests; tests use only a
+  throwaway `scout_test` database on another port (`TESTING.md`).
+- Never run the listener, `-backfill` or `-track` against a real database.
+- Never change `onchainStateVersion` or anything that makes the tracker redo
+  history (days of node time) unless the task explicitly says so.
+- Never run index-writing git in the main checkout (the product manager may
+  run `git worktree add` and `git fetch` there); work in `.claude/worktrees/`.
