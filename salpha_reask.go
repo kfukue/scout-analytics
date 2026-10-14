@@ -256,12 +256,19 @@ func (s *scanner) newReaskLane(c reaskConfig) *reaskLane {
 		followUp: s.sendReaskFollowUp,
 		errLog:   logLimiter{every: 10 * time.Minute},
 	}
-	follow := "real reports of delivered calls go to " + l.target + " as a reply to the delivery"
-	if l.noFollowUp {
+	log.Print(reaskStartLine(c.describe(), l.target, l.noFollowUp))
+	return l
+}
+
+// reaskStartLine is the log line saying the re-ask lane is on: its settings
+// (describe) and where follow-ups go (target, an invite link hidden by
+// redactInviteLink), or that none are sent (noFollowUp, -dry-run).
+func reaskStartLine(describe, target string, noFollowUp bool) string {
+	follow := "real reports of delivered calls go to " + redactInviteLink(target) + " as a reply to the delivery"
+	if noFollowUp {
 		follow = "no follow-up is sent (-dry-run)"
 	}
-	log.Printf("salpha reask: on — %s; %s", c.describe(), follow)
-	return l
+	return fmt.Sprintf("salpha reask: on — %s; %s", describe, follow)
 }
 
 // noteLive records that a live call finished (or a worker started) at t.
