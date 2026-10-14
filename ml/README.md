@@ -703,9 +703,18 @@ roll back, write an older version name into `models/LATEST`. Compare the new
     scout_ml/model.py     LightGBM + calibration, logistic baseline, serving bundle
     scout_ml/report.py    report.md
     scout_ml/diagnostics.py  pooled walk-forward + bootstrap (gate inputs), seed spreads, adversarial
+    scout_ml/wallet_rep.py   live-buy wallet reputation (wrep_* columns; not wired in yet)
     train.py  serve.py  make_synthetic.py  tests/
 
-    python -m pytest tests -q        # 236 passed, about 4 minutes
+    python -m pytest tests -q        # 271 passed, about 4 minutes
+
+`scout_ml/wallet_rep.py` (`wrep_frame(df, live_buys)`) scores the wallets in
+each call's live buys (the `-export-live-buys` CSV) by how the earlier first
+calls they bought into turned out at 7 d, counting only outcomes known before
+the call and never the call's own token (settings `WREP_*` in `config.py`).
+It is not wired in yet: train.py, serve.py and the report do not use it, and
+`C.WREP_FEATURES` are not model inputs (a test checks it).
+`make_synthetic.make_live_buys` writes matching invented live buys.
 
 `build_features` raises if an outcome or bookkeeping column (anything starting
 with `ret_`, `max_gain_`, `max_dd_`, `trades_`, `peak_late_after_`, `peak_after_`,

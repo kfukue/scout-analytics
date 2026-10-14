@@ -526,6 +526,28 @@ ADV_PER_WEEK = True
 ADV_MAX_WEEKS = 6
 ADV_WEEK_FOLDS = 3
 
+# --- Live-buy wallet reputation (scout_ml/wallet_rep.py; report-only test) -----
+# For each call C, the wallets in its "Live buys" (the -export-live-buys CSV)
+# are scored by how the earlier FIRST calls they bought into turned out at 7 d
+# (the medium bucket's runner rule; a rug = raw ret_late_7d <= WREP_RUG_PCT),
+# counting only outcomes known before C was posted and never C's own token.
+# Not model inputs yet: these names are deliberately NOT in FEATURES /
+# NUMERIC_FEATURES (a test checks it), so the saved model cannot use them.
+WREP_PREFIX = "wrep_"                  # every wallet-reputation column starts with this
+WREP_FEATURES = ("wrep_n_known", "wrep_known_share",                # how many of C's wallets have history
+                 "wrep_runner_lift_mean", "wrep_runner_lift_max",   # smoothed runner rate / prior
+                 "wrep_rug_lift_mean", "wrep_rug_lift_max",         # smoothed rug rate / prior
+                 "wrep_good_share", "wrep_bad_share")               # share of known wallets judged good / bad
+WREP_KNOWN_LAG_HOURS = 6               # the 7 d outcome counts as known this long after it is due (tracker delay)
+WREP_RUG_PCT = -90.0                   # raw ret_late_7d at or below this is a rug (rugged / rug_at are set later: never read)
+WREP_PRIOR_RUNNER = 0.05               # fixed prior runner rate, not a running rate (a running rate would be a calendar proxy)
+WREP_PRIOR_RUG = 0.15                  # fixed prior rug rate, for the same reason
+WREP_PRIOR_STRENGTH = 20               # pseudo-calls behind each prior: few calls barely move a wallet off it
+WREP_MIN_CALLS = 5                     # a wallet needs this many known calls to count as good or bad
+WREP_GOOD_LIFT = 2.0                   # good wallet: runner lift at least this
+WREP_BAD_LIFT = 1.5                    # bad wallet: rug lift at least this
+WREP_LOOKBACK_DAYS = None              # None = all history; N = only outcomes known in the N days before the call
+
 
 def is_forbidden(col: str) -> bool:
     """True if `col` is an outcome/bookkeeping/identity column."""
