@@ -445,8 +445,7 @@ flaky tests, how to report). Pass it on to `implement`, `simplify` and
   never call the real nodes, Telegram or the production database.
 - Headless browser checks use a throwaway, sync-free, extension-free profile in
   the agent's subdirectory of
-  `<repo root>\.claude\worktrees\_scratch\`,
-  closed by PID and deleted afterwards (the 9 October incident; exact flags in
+  `<repo root>/.claude/worktrees/_scratch/`, closed by PID and deleted afterwards (the 9 October incident; exact flags in
   `TESTING.md`).
 - Every behaviour change gets a test.
 - `TestLatestPriceInterruptedLeavesRowUntouched` was flaky (about 1 run in 10)

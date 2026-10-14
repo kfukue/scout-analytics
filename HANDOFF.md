@@ -1786,8 +1786,8 @@ version:
   `scout_test` (`TestOpenScoutStoreSelection` needs that name), run with
   `-p 1`; without it they are skipped.
 - Throwaway Postgres: `initdb` in the agent's own subdirectory of
-  `<repo root>\.claude\worktrees\_scratch\`
-  (absolute path; see `TESTING.md`; owner, 14 Oct 2026: no files outside the repo
+  `<repo root>/.claude/worktrees/_scratch/` (absolute path; see `TESTING.md`;
+  owner, 14 Oct 2026: no files outside the repo
   and his notes folder), its
   own port on 127.0.0.1, `pg_ctl stop` and delete the directory at the end.
   Never touch the Windows Postgres service on port 5432.

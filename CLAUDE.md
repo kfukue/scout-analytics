@@ -55,7 +55,8 @@ The owner's local time (US Pacific) first, UTC in parentheses, e.g.
   run `git worktree add` and `git fetch` there); work in `.claude/worktrees/`.
 - Never read or write files outside this repo folder and the owner's
   personal notes folder (its path is in his user-level `CLAUDE.md`, not in
-  this repo). Scratch files go in the main checkout's
-  `<repo root>\.claude\worktrees\_scratch\`
-  (git-ignored); always give this absolute path, never a relative one
-  (full rule in `scout-rules`, Hard rules).
+  this repo). Scratch files go in `<repo root>\.claude\worktrees\_scratch\`
+  (git-ignored; `<repo root>` is the main checkout's root folder, and
+  `TESTING.md` shows how to get it from a worktree); always give this
+  absolute path, never a relative one (full rule in `scout-rules`, Hard
+  rules).

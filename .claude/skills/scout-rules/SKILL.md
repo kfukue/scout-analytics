@@ -30,8 +30,8 @@ root).
   the task names. If `git status` shows unexpected changes in files you need,
   report it instead of editing over them.
 - File access (owner, 14 Oct 2026): read and write files only inside the repo
-  folder `<repo root>` (its worktrees
-  included) and the owner's personal notes folder. Its path comes in your
+  folder (`<repo root>`, the main checkout, its worktrees included) and the
+  owner's personal notes folder. Its path comes in your
   brief when you need it; it is not in this repo and you do not look for it
   elsewhere. Never run git in the notes folder; the owner commits it.
   - Where an agent file says `<scratchpad>`, use your `_scratch` subdirectory
@@ -40,10 +40,15 @@ root).
     folder.
   - Scratch files (throwaway Postgres data, coverage files, logs, LF copies
     for gofmt, browser profiles) go in your own subdirectory of the MAIN
-    checkout's `_scratch` folder, always given as the absolute path
-    `<repo root>\.claude\worktrees\_scratch\`
-    (never the relative `.claude/worktrees/_scratch` from inside a
-    worktree). It is git-ignored. Delete your subdirectory when you are done.
+    checkout's `_scratch` folder, always as an absolute path:
+    `<repo root>/.claude/worktrees/_scratch/<task>`, where `<repo root>` is
+    the parent folder of `git rev-parse --path-format=absolute
+    --git-common-dir` (the same from any worktree). Never use the relative
+    `.claude/worktrees/_scratch` from inside a worktree. It is git-ignored.
+    Delete your subdirectory when you are done.
+  - Public repo (owner, 14 Oct 2026): never write absolute local paths
+    (drive letters, user folders) into repo files; write `<repo root>`
+    instead.
   - Installed tools (Go, Postgres binaries, git, `gh`, the repo's
     `ml/.venv`) may still be run. Files a tool makes for itself (the Go build
     and module caches, `t.TempDir()` and pytest `tmp_path` folders) are the

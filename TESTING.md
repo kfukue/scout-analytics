@@ -5,12 +5,23 @@ The single guide to testing this repo, for people and for the agents
 only the essentials and point here.
 
 Scratch files (test databases, coverage, logs, LF copies, browser profiles) go
-in your own `<task>` folder in the main checkout's
-`<repo root>\.claude\worktrees\_scratch\`,
-never in the session scratchpad under `AppData\Local\Temp`, because the owner
-allows files only inside the repo and his notes folder (owner rule, 14 Oct
-2026). Always give this absolute path: a relative `.claude/worktrees/_scratch`
-used from inside a worktree lands in that worktree and is deleted with it.
+in your own `<task>` folder in `<repo root>\.claude\worktrees\_scratch\`,
+where `<repo root>` is the main checkout's root folder, never in the session
+scratchpad under `AppData\Local\Temp`, because the owner allows files only
+inside the repo and his notes folder (owner rule, 14 Oct 2026). Always give
+this absolute path, never a relative one: a relative
+`.claude/worktrees/_scratch` used from inside a worktree lands in that
+worktree and is deleted with it.
+
+Get `<repo root>` as an absolute path from any worktree (or the main
+checkout); the examples below use `$ROOT` (bash) and `$root` (PowerShell):
+
+- bash: `ROOT=$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")`
+- PowerShell:
+  `$root = Split-Path (git rev-parse --path-format=absolute --git-common-dir)`
+
+For example `S="$ROOT/.claude/worktrees/_scratch/<task>"` in bash, or
+`$s = "$root\.claude\worktrees\_scratch\<task>"` in PowerShell.
 
 Files a tool makes for itself (the Go build and module caches, `t.TempDir()`,
 pytest `tmp_path`) are the tool's and are fine; agents never read or write
@@ -96,7 +107,8 @@ own throwaway Postgres and deletes it afterwards.
 Example (Git Bash or Linux; `S`, `D` and `PORT` are yours):
 
 ```bash
-S=<repo root>/.claude/worktrees/_scratch/<task>
+ROOT=$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")
+S="$ROOT/.claude/worktrees/_scratch/<task>"
 D="$S/pg"; PORT=55123
 initdb -D "$D/data" -U postgres -A trust -E UTF8
 pg_ctl -D "$D/data" -l "$D/pg.log" -w \
@@ -129,7 +141,8 @@ worktree's tracked files.
 PowerShell:
 
 ```powershell
-$s = "<repo root>\.claude\worktrees\_scratch\<task>"
+$root = Split-Path (git rev-parse --path-format=absolute --git-common-dir)
+$s = "$root\.claude\worktrees\_scratch\<task>"
 $db = "$s\testdb"
 $env:SCOUT_TEST_DATABASE_URL = (& .\scripts\testdb.ps1 start $db | Select-Object -Last 1)
 go build ./...
@@ -150,7 +163,8 @@ Remove-Item -Recurse -Force $s      # when done with all your scratch files
 bash:
 
 ```bash
-s=<repo root>/.claude/worktrees/_scratch/<task>
+ROOT=$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")
+s="$ROOT/.claude/worktrees/_scratch/<task>"
 db="$s/testdb"
 export SCOUT_TEST_DATABASE_URL="$(scripts/testdb.sh start "$db" | tail -n 1)"
 go build ./...
@@ -183,7 +197,7 @@ steps above. To list skipped tests, add `-v` and look for `--- SKIP`.
 
 - The Go files are CRLF, so plain `gofmt -l` lists almost every file. Check
   gofmt on LF copies in your `_scratch` folder of the main checkout (e.g. with
-  `S=<repo root>/.claude/worktrees/_scratch/<task>`:
+  `S="$ROOT/.claude/worktrees/_scratch/<task>"`:
   `mkdir -p "$S/lf"`, `tr -d '\r' < x.go > "$S/lf/x.go"`, then
   `gofmt -l "$S/lf"`), and keep CRLF line endings in the files you edit.
 - In Git Bash, `grep -c $'\r'` reports 0 even for CRLF files; count CRs with
