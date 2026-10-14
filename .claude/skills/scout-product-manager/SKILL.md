@@ -313,7 +313,13 @@ commit or push.
      attribution line the session's system instructions specify):
      `"/c/Program Files/GitHub CLI/gh.exe" pr create --repo kfukue/scout-analytics --base main --head <branch> --title "<title>" --body-file "<scratchpad>/pr-body.md"`
      (plain `gh` if it is on the Bash PATH). Fixes after review comments go
-     as new commits on the same branch; the PR updates itself.
+     as new commits on the same branch; the PR updates itself. Base `main`
+     unless the owner names another branch for that PR; dependent PRs: see
+     `CLAUDE.md` (owner, 14 Oct 2026).
+  8. Check the base before sending the link:
+     `"/c/Program Files/GitHub CLI/gh.exe" pr view <N> --json baseRefName`
+     must say `main` (or the branch the owner named). If not, fix it with
+     `gh pr edit <N> --base main` before sending.
 - Then tell the owner, in plain language: what changed (files), the tests and
   the review result, anything to look at in the PR, the post-merge and deploy
   blocks below (he runs those), and the PR link on its own line as a plain
@@ -323,7 +329,8 @@ commit or push.
   compare").
 - Never merge, approve or close a PR (`gh pr merge`, `gh pr review --approve`,
   `gh pr close` are forbidden); read-only `gh` (`gh pr view`, `gh pr list`,
-  `gh pr checks`) is fine. If `gh` fails, give the compare URL
+  `gh pr checks`) is fine, as is `gh pr edit <N> --base <branch>` on your
+  own PR (step 8). If `gh` fails, give the compare URL
   https://github.com/kfukue/scout-analytics/compare/main...<branch>?expand=1
   with the exact title and description to paste.
 - Never assume a merge happened: after the owner reports it, verify with
@@ -499,11 +506,14 @@ Every Go start applies `scoutanalytics.sql` unless `SCOUT_DB_AUTO_MIGRATE=false`
   the public GCP site unless the owner decides otherwise.
 - 13 Oct (owner): PRs must stay small, one function per PR, so they are easy
   to review and follow. Split a feature that spans several functions (e.g.
-  storage / API / page) into a chain of PRs, each based on the previous
-  branch (`gh pr create --base <previous branch>`; GitHub retargets it to
-  `main` when the previous one merges), and say the merge order. Tell
+  storage / API / page) into a series of PRs and say the merge order. Every
+  PR has base `main` (14 Oct rule below). Tell
   `implement` to write small, single-purpose functions (also in
   `scout-rules`). A docs-only PR may cover a whole session.
+- 14 Oct (owner; supersedes "each PR based on the previous branch"): every
+  PR has base `main` unless the owner names another branch. The rule in full
+  is in `CLAUDE.md`. Why: #47-#49 were stacked on other branches and merged
+  into them instead of `main`; they reached `main` only through #50 and #51.
 - 12 Oct: the PM has the `Bash` tool for git only: read-only git, `git fetch`
   and `git worktree add` to create worktrees for `implement`; never add,
   commit, push, stash, switch, reset, rebase or merge (see "Your git
