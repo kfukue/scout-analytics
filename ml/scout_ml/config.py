@@ -453,6 +453,10 @@ VARIANTS = {
     # the two raw counts replaced by calls_burst_1h (see "calls_prev inputs" above)
     "calls_prev as a burst ratio": {"CALLS_PREV_INPUTS": "burst"},
 }
+# Variants also retrained with the other STABILITY_SEEDS for the report-only
+# table "calls_prev variants across seeds" (ml/README.md). Never a gate; about
+# one normal training per extra seed and variant; empty it to skip the table.
+SEED_VARIANTS = ("no calls_prev inputs", "calls_prev as a burst ratio")
 # Variants that only differ from the baseline through trades_24h: not applicable
 # when the export has no trades_24h column.
 TRADES_VARIANTS = ("dead rule on (collapse OR dead)", "runners must be tradeable")

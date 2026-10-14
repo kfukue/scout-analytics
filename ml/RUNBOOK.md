@@ -392,7 +392,11 @@ the step 5 train time measured with four variants (on a desktop PC,
 synthetic data of 6,000 calls, before the gates of 13 Oct 2026: about 30 s
 without, about 2 min with `--variants`; the gates' seed retrains now add
 about 47 s to every run): each variant costs about one normal training run, so the fifth
-to seventh add about one more each. The stability
+to seventh add about one more each, and the two calls_prev variants two more
+each for their seeds 11 and 23 (their `[variant]` line says "of which other
+seeds and adversarial validation N s"; about 93 s for the two on that
+synthetic data, 13 Oct 2026; on the prod data an estimated 40 to 50 s, not
+measured). The stability
 diagnostics of step 5 also run (before the variants) unless switched off with
 `SCOUT_ML_DIAGNOSTICS=0`, and add their own time on top. Memory as in step 5.
 The model, `meta.json`, `report.md` and `LATEST` are written before the
@@ -419,6 +423,11 @@ there only may just fit that period: prefer one that is also better in the
 walk-forward columns (weeks beating buy-all, walk-forward mean lift and mean
 collapses removed). Paste the whole report as in step 8; the product manager
 decides whether a setting changes.
+
+The last table, "calls_prev variants across seeds" (see `ml/README.md`),
+puts the baseline next to the two calls_prev variants over every seed. A
+variant whose median lift is about the baseline's or better while its
+adversarial AUC is clearly lower carries less drift for the same ranking.
 
 ## 6. Delete the CSV
 

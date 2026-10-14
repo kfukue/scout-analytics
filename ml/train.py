@@ -395,32 +395,122 @@ def variant_summary(r: dict, pooled: dict | None = None) -> dict:
            for k in ("lift", "lift_lo", "lift_hi", "sim_gain", "sim_gain_lo", "sim_gain_hi")}}
 
 
-def _variant_bucket(b, df, L, has_trades) -> dict:
-    """One bucket of one variant: its summary with its own pooled walk-forward."""
+def _variant_bucket(b, df, L, has_trades, store: dict | None = None) -> dict:
+    """One bucket of one variant: its summary with its own pooled walk-forward.
+    `store` (a dict; the C.SEED_VARIANTS): gets {b: {"r", "keep", "pooled"}}, the
+    input of `variant_across_seeds`; the summary is the same with or without it."""
     keep = {}
     r = _train_bucket(b, df, L, None, has_trades, keep=keep)[0]
     pooled = D.pooled(_wf_weeks(keep)) if keep.get("wf") is not None else None
+    if store is not None:
+        store[b] = {"r": r, "keep": keep, "pooled": pooled}
     return variant_summary(r, pooled)
 
 
+# --- "calls_prev variants across seeds" (report only; config SEED_VARIANTS) ---
+
+def seed_median(seed_lifts: dict) -> dict:
+    """Per seed of C.STABILITY_SEEDS its pooled walk-forward lift (None when there
+    is none; the reason under "why") and their median taken as the runner-lift
+    gate takes it: NaN unless every seed's lift is defined (V.seed_lift_median,
+    shared with V.pooled_gates)."""
+    return V.seed_lift_median(seed_lifts, C.STABILITY_SEEDS)
+
+
+def _top3(adv: dict) -> dict:
+    return {**adv, "top": list(adv.get("top") or [])[:3]}
+
+
+def adversarial_split(keep: dict) -> dict:
+    """D.adversarial on a trained bucket's own feature matrix: its train part vs
+    its test part (as the diagnostics' "split" row; top 3 drifting inputs)."""
+    m = keep["tr"] | keep["te"]
+    return _top3(D.adversarial(keep["X"][m], keep["te"][m]))
+
+
+def across_row(seed_lifts: dict, pooled, adversarial) -> dict:
+    """One bucket of one row of the across-seeds table: `seed_median`, the
+    LGBM_SEED run's pooled walk-forward lift and simulation difference with
+    their 95% intervals (`pooled`, from D.pooled), and `adversarial`
+    (`adversarial_split`, or {"error": ...})."""
+    p = pooled if isinstance(pooled, dict) else {}
+    return {**seed_median(seed_lifts),
+            **{k: p.get(k, np.nan) for k in ("weeks", "lift", "lift_lo", "lift_hi", "sim_gain",
+                                             "sim_gain_lo", "sim_gain_hi")},
+            "adversarial": adversarial}
+
+
+def _adv_or_error(keep: dict) -> dict:
+    try:
+        return adversarial_split(keep)
+    except Exception as exc:  # one probe failing never loses the row
+        return {"error": variant_error(exc)}
+
+
+def across_seeds(buckets: dict, runs: dict, pooled: dict | None, keeps: dict,
+                 adv_known: dict | None = None) -> dict:
+    """One row of the across-seeds table, nothing retrained: per bucket `across_row`
+    from the seed retrains `runs` and pooled walk-forward `pooled`; the
+    adversarial AUC from `adv_known` (bucket -> the diagnostics' "split" result,
+    the same computation) when given, else computed from `keeps`."""
+    t0 = time.time()
+    out = {"seeds": list(C.STABILITY_SEEDS), "buckets": {}}
+    for b, r in buckets.items():
+        if r.get("skipped") or b not in keeps:
+            out["buckets"][b] = {"skipped": r.get("skipped") or "not trained"}
+            continue
+        known = (adv_known or {}).get(b)
+        adv = _top3(known) if isinstance(known, dict) else _adv_or_error(keeps[b])
+        out["buckets"][b] = across_row(_seed_lifts(runs, b), (pooled or {}).get(b), adv)
+    out["seconds"] = round(time.time() - t0, 1)
+    return out
+
+
+def variant_across_seeds(df, L, has_trades: bool, store: dict) -> dict:
+    """For a C.SEED_VARIANTS entry, inside its C.overrides: the variant retrained
+    with the other STABILITY_SEEDS (`seed_runs`; its LGBM_SEED run in `store`,
+    from `_variant_bucket`, is reused), then `across_seeds`. Report only."""
+    t0 = time.time()
+    results = {b: v["r"] for b, v in store.items()}
+    keeps = {b: v["keep"] for b, v in store.items() if v["keep"].get("wf") is not None}
+    runs = seed_runs(df, L, results, keeps, has_trades,
+                     on_fail="the variant's median over the seeds is n/a (report only)")
+    pooled = {b: v["pooled"] for b, v in store.items()}
+    return {**across_seeds(results, runs, pooled, keeps), "seconds": round(time.time() - t0, 1)}
+
+
 def run_variants(df: pd.DataFrame, baseline: dict, has_trades: bool,
-                 baseline_pooled: dict | None = None) -> dict:
+                 baseline_pooled: dict | None = None, baseline_runs: dict | None = None,
+                 baseline_keeps: dict | None = None, baseline_adv: dict | None = None) -> dict:
     """Train every C.VARIANTS entry (one knob changed from the configured
     values) on the same rows and splits; report only, nothing is saved.
     `baseline`: the bucket results of the saved model, reused for "baseline"
     (`baseline_pooled`: its pooled walk-forward per bucket, from the gate inputs).
     `df`: sorted rows as prepared by `train`. `has_trades`: the data has the
     trades_24h column (else the C.TRADES_VARIANTS equal the baseline: n/a).
+    The C.SEED_VARIANTS also get "across_seeds" (`variant_across_seeds`), and
+    then the baseline row too (`across_seeds` from `baseline_runs`, the
+    gates' seed retrains, `baseline_keeps` and `baseline_adv`; left out when
+    `baseline_runs` is None).
     A variant that raises is recorded as {"error": "error: <short message>"} and the
-    others still run: the saved baseline must never be lost to a variant."""
+    others still run: the saved baseline must never be lost to a variant. An
+    error in an across-seeds part only replaces that part by {"error": ...}."""
     out = {}
     attempted = failed = 0
+    seed_variants = [n for n in C.SEED_VARIANTS if n in C.VARIANTS]
     for name, knobs in C.VARIANTS.items():
         entry = {"changes": dict(knobs)}
         out[name] = entry
         if not knobs:
             entry["buckets"] = {b: variant_summary(r, (baseline_pooled or {}).get(b))
                                 for b, r in baseline.items()}
+            if seed_variants and baseline_runs is not None:
+                try:
+                    entry["across_seeds"] = across_seeds(
+                        baseline, baseline_runs, baseline_pooled, baseline_keeps or {},
+                        baseline_adv)
+                except Exception as exc:  # report only: never fails the run
+                    entry["across_seeds"] = {"error": variant_error(exc)}
             continue
         if not has_trades and name in C.TRADES_VARIANTS:
             entry["not_applicable"] = (f"the data has no {C.DEAD_COLUMN} column, so this "
@@ -428,19 +518,33 @@ def run_variants(df: pd.DataFrame, baseline: dict, has_trades: bool,
             continue
         t0 = time.time()
         attempted += 1
+        store = {} if name in seed_variants else None
         try:  # around overrides too; its `finally` restores the config after an error
             with C.overrides(**knobs):
                 policy = dead_policy(df)
                 L = build_labels(df, policy)
-                entry["buckets"] = {b: _variant_bucket(b, df, L, has_trades) for b in C.BUCKETS}
+                entry["buckets"] = {b: _variant_bucket(b, df, L, has_trades, store)
+                                    for b in C.BUCKETS}
+                if store is not None:
+                    try:
+                        entry["across_seeds"] = variant_across_seeds(df, L, has_trades, store)
+                    except Exception as exc:  # the variant's own row is kept
+                        entry["across_seeds"] = {"error": variant_error(exc)}
+                        print(f"WARNING: the across-seeds part of variant {name!r} failed "
+                              f"({entry['across_seeds']['error']}); its other numbers are "
+                              "kept", flush=True)
         except Exception as exc:  # not BaseException: Ctrl-C still stops the run
             failed += 1
             entry.pop("buckets", None)
+            entry.pop("across_seeds", None)
             entry["error"] = variant_error(exc)
             print(f"WARNING: variant {name!r} failed ({entry['error']}); the saved baseline "
                   "model is not affected, the other variants go on", flush=True)
         entry["seconds"] = round(time.time() - t0, 1)
-        print(f"[variant] {name}: {entry['seconds']:.0f} s", flush=True)
+        extra = (entry.get("across_seeds") or {}).get("seconds")
+        print(f"[variant] {name}: {entry['seconds']:.0f} s"
+              + (f" (of which other seeds and adversarial validation {extra:.0f} s)"
+                 if extra is not None else ""), flush=True)
     if attempted and failed == attempted:
         print(f"WARNING: all {attempted} variants failed; report.md has no variant numbers "
               "(the saved baseline model and its gates are complete and valid)", flush=True)
@@ -758,11 +862,18 @@ def train(df: pd.DataFrame, out_root, version: str | None = None, variants: bool
             print(f"WARNING: the stability diagnostics failed ({meta['diagnostics']['error']}); "
                   "the saved models are not affected", flush=True)
             _write_version(out_dir, meta, res)
-    keeps.clear()
     if variants:
-        res["variants"] = run_variants(df, res["buckets"], has_trades, gate_in["pooled"])
+        # the baseline row of "calls_prev variants across seeds" reuses the diagnostics'
+        # adversarial validation when it ran (else it is computed from `keeps`)
+        adv = (res.get("diagnostics") or {}).get("adversarial")
+        adv_known = ({b: v["split"] for b, v in adv.items()
+                      if isinstance(v, dict) and isinstance(v.get("split"), dict)}
+                     if isinstance(adv, dict) else {})
+        res["variants"] = run_variants(df, res["buckets"], has_trades, gate_in["pooled"],
+                                       gate_in["runs"], keeps, adv_known)
         meta["variants"] = _json_safe(res["variants"])
         _write_version(out_dir, meta, res)
+    keeps.clear()
     return out_dir
 
 
@@ -805,12 +916,15 @@ def _run_summary(r: dict, keep: dict | None) -> dict:
             "wf_pooled_lift": pool.get("lift", np.nan)}
 
 
-def seed_runs(df, L, buckets: dict, keeps: dict, has_trades: bool) -> dict:
+def seed_runs(df, L, buckets: dict, keeps: dict, has_trades: bool,
+              on_fail: str = "every trained bucket FAILS its runner-lift gate") -> dict:
     """The baseline retrained with each C.STABILITY_SEEDS LightGBM seed (a seed
     equal to C.LGBM_SEED reuses the saved model's results; nothing is saved):
     {seed: {"buckets": {bucket: _run_summary}, ...} or {"error": ...}}. A gate
     input (the median pooled lift) and the seed-stability table. `buckets`:
-    the saved model's results with their single-run gates."""
+    the saved model's results with their single-run gates. Inside a variant's
+    C.overrides it retrains that variant instead (`variant_across_seeds`;
+    `on_fail`: what a failed seed's WARNING says follows from it)."""
     runs = {}
     for seed in dict.fromkeys(C.STABILITY_SEEDS):
         if seed == C.LGBM_SEED:
@@ -829,7 +943,7 @@ def seed_runs(df, L, buckets: dict, keeps: dict, has_trades: bool) -> dict:
         except Exception as exc:  # one seed failing never stops the others
             runs[seed] = {"error": variant_error(exc)}
             print(f"WARNING: seed {seed} of the seed retrains failed ({runs[seed]['error']}); "
-                  "every trained bucket FAILS its runner-lift gate", flush=True)
+                  f"{on_fail}", flush=True)
         runs[seed]["seconds"] = round(time.time() - t0, 1)
     return runs
 
