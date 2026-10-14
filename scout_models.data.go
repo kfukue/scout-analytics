@@ -1573,6 +1573,25 @@ func (st *ScoutStore) ExportDatasetCSV(ctx context.Context, w io.Writer) (int, e
 	if err != nil {
 		return 0, err
 	}
+	return writeRowsCSV(rows, w)
+}
+
+// ExportLiveBuysCSV writes scout_call_live_buys (one row per live buy, by call
+// and position in the post) as CSV. A NULL amount_usd is an empty field.
+func (st *ScoutStore) ExportLiveBuysCSV(ctx context.Context, w io.Writer) (int, error) {
+	rows, err := st.Pool.Query(ctx, `SELECT call_id, position, tier, amount_usd::float8 AS amount_usd,
+		wallet_display, wallet_prefix, wallet_suffix
+		FROM scout_call_live_buys ORDER BY call_id, position`)
+	if err != nil {
+		return 0, err
+	}
+	return writeRowsCSV(rows, w)
+}
+
+// writeRowsCSV writes rows as CSV: a header with the column names, then one
+// record per row (NULL = empty, times as RFC3339 UTC, floats in the shortest
+// form). It closes rows and returns the number of records written.
+func writeRowsCSV(rows pgx.Rows, w io.Writer) (int, error) {
 	defer rows.Close()
 	cw := csv.NewWriter(w)
 	var header []string
