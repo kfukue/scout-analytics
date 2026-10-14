@@ -19,7 +19,17 @@
   var NO_USD_SPAN = 2 + HORIZONS.length;
   // Columns of the table (index.html), for the detail row when the header
   // cannot be counted.
-  var COLUMNS = 11 + HORIZONS.length;
+  var COLUMNS = 12 + HORIZONS.length;
+  // The model's buckets in the order the row detail lists them, with the
+  // window each one is about; the Model column shows the medium one (7d).
+  var MODEL_BUCKETS = [
+    { bucket: 'short', label: '1d' }, { bucket: '3day', label: '3d' },
+    { bucket: 'medium', label: '7d' }, { bucket: 'long', label: '30d', up: true }
+  ];
+  var MODEL_COLUMN = 'medium';
+  // Whether this website shows model scores (model_scores of api/calls); a
+  // public copy does not: no column, no detail block, no legend entry.
+  var modelScores = true;
   // "Calls from the last …": the choices of the age filter, in days (0 = all).
   var DAY_CHOICES = [1, 7, 30];
   var STATUS_TEXT = {
@@ -429,8 +439,204 @@
     return (typeof c.token_name === 'string' && c.token_name.trim() !== '') ? c.token_name : shortAddress(c.contract_address);
   }
 
+  // ---- Model scores ---------------------------------------------------------
+
+  // The model object of a row (null without a score).
+  function modelOf(c) {
+    var m = c && c.model;
+    return (m && typeof m === 'object' && Array.isArray(m.buckets)) ? m : null;
+  }
+
+  // The bucket called name of a score (null when the score has none).
+  function modelBucket(m, name) {
+    if (!m) { return null; }
+    for (var i = 0; i < m.buckets.length; i++) {
+      var b = m.buckets[i];
+      if (b && typeof b === 'object' && b.bucket === name) { return b; }
+    }
+    return null;
+  }
+
+  // A probability (0 … 1) as a whole percentage, e.g. 0.3123 → "31%".
+  function fmtProb(v) { return isNum(v) ? Math.round(v * 100) + '%' : DASH; }
+
+  // The exact probability, for a title: "31.23%".
+  function exactProb(v) { return isNum(v) ? exactText(v * 100, 2) + '%' : DASH; }
+
+  // "top N%" from runner_rank_pct (the share of recent calls with a lower
+  // runner score): N = 100 − rank, rounded, at least 1; null without a rank.
+  function topText(rank) {
+    if (!isNum(rank)) { return null; }
+    return 'top ' + Math.max(1, Math.min(100, Math.round(100 - rank))) + '%';
+  }
+
+  // How long after the call a score was made, in words: "2 min", "3 h".
+  function afterText(m) {
+    var s = m && m.after_s;
+    if (!isNum(s) || s < 0) { return ''; }
+    if (s < 3600) { return Math.max(1, Math.round(s / 60)) + ' min'; }
+    return Math.round(s / 3600) + ' h';
+  }
+
+  // What a bucket's passed says, for a title.
+  function validationText(b, label) {
+    if (b.passed === false) { return 'not validated: the ' + label + ' model did not pass its gates'; }
+    if (b.passed === true) { return 'validated: the ' + label + ' model passed its gates'; }
+    return 'validation not recorded';
+  }
+
+  // The "n.v." mark of a bucket that did not pass its gates (words, not colour).
+  function notValidatedNode(text) {
+    var n = el('span', 'model-nv', text);
+    n.title = 'Not validated: this model did not pass its validation gates';
+    return n;
+  }
+
+  // s with its first letter in upper case.
+  function capitalized(s) { return s.replace(/^./, function (ch) { return ch.toUpperCase(); }); }
+
+  // The title of a Model 7d cell without a 7d score (m: the row's score, or
+  // null when the call was not scored).
+  function modelMissingTitle(m) {
+    return m ? 'Scored, but with no 7d model' :
+      'Not scored: calls before 13 Oct 2026 are not scored, and a call is also unscored when the scoring service was off or slow';
+  }
+
+  // The title of a Model 7d cell with the 7d bucket b of the score m: the
+  // exact values, the model version, how long after the call it scored and
+  // whether the 7d model passed its gates.
+  function modelCellTitle(m, b) {
+    var tip = ['7d runner chance ' + exactProb(b.runner_prob)];
+    if (isNum(b.collapse_prob)) { tip.push('collapse ' + exactProb(b.collapse_prob)); }
+    if (isNum(b.runner_rank_pct)) { tip.push('higher than ' + exactText(b.runner_rank_pct, 1) + '% of recent calls'); }
+    var after = afterText(m);
+    return tip.join(', ') + '. Model ' + String(m.version || '') + (after ? ', scored ' + after + ' after the call' : '') +
+      '. ' + capitalized(validationText(b, '7d')) + '.';
+  }
+
+  // "Model 7d": the medium bucket's runner probability, under it the call's
+  // rank ("top 8%"); "n.v." when that model did not pass its gates; a dash
+  // without a score. The exact values, the model version and when it scored
+  // are in the title.
+  function modelCell(c) {
+    var td = el('td', 'num model');
+    var m = modelOf(c);
+    var b = modelBucket(m, MODEL_COLUMN);
+    if (!b) {
+      td.textContent = DASH;
+      td.title = modelMissingTitle(m);
+      return td;
+    }
+    td.appendChild(document.createTextNode(fmtProb(b.runner_prob)));
+    if (b.passed === false) { td.appendChild(notValidatedNode('n.v.')); }
+    var top = topText(b.runner_rank_pct);
+    if (top) { td.appendChild(el('span', 'model-rank', top)); }
+    td.title = modelCellTitle(m, b);
+    return td;
+  }
+
+  // The meta line of the detail's model block: the model version and when it
+  // scored (and how long after the call).
+  function modelMeta(m) {
+    var meta = [String(m.version || '')];
+    if (typeof m.scored_at === 'string') {
+      var after = afterText(m);
+      meta.push('scored ' + fmtDate(m.scored_at) + (after ? ' (' + after + ' after the call)' : ''));
+    }
+    return meta;
+  }
+
+  // Adds to li what a bucket's passed says: " (not validated)" or
+  // " (validation not recorded)"; nothing when the model passed its gates.
+  function appendValidation(li, b) {
+    if (b.passed === false) {
+      li.appendChild(document.createTextNode(' '));
+      li.appendChild(notValidatedNode('(not validated)'));
+    } else if (b.passed !== true) {
+      li.appendChild(el('span', 'muted', ' (validation not recorded)'));
+    }
+  }
+
+  // A bucket's numbers in the detail, e.g. ": runner 31%, collapse 44% · top
+  // 8%" ("up" instead of "runner" for the 30d bucket).
+  function modelBucketText(mb, b) {
+    var parts = [(mb.up ? 'up ' : 'runner ') + fmtProb(b.runner_prob)];
+    if (isNum(b.collapse_prob)) { parts.push('collapse ' + fmtProb(b.collapse_prob)); }
+    var text = ': ' + parts.join(', ');
+    var top = topText(b.runner_rank_pct);
+    return top ? text + ' · ' + top : text;
+  }
+
+  // One line of the detail's model list: the bucket mb (of MODEL_BUCKETS) of
+  // the score m; "no model" when the score has none.
+  function modelBucketItem(m, mb) {
+    var b = modelBucket(m, mb.bucket);
+    if (!b) { return el('li', 'muted', mb.label + ': no model'); }
+    var li = el('li');
+    li.appendChild(document.createTextNode(mb.label));
+    appendValidation(li, b);
+    li.appendChild(document.createTextNode(modelBucketText(mb, b)));
+    li.title = validationText(b, mb.label);
+    return li;
+  }
+
+  // The detail's list of the score m: one line per horizon (MODEL_BUCKETS).
+  function modelList(m) {
+    var ul = el('ul', 'model-list');
+    for (var i = 0; i < MODEL_BUCKETS.length; i++) { ul.appendChild(modelBucketItem(m, MODEL_BUCKETS[i])); }
+    return ul;
+  }
+
+  // The "Model (scored at call time)" section for the row c.
+  function modelSection(c) {
+    var sec = el('section', 'report report-model');
+    sec.appendChild(el('h3', 'report-title', 'Model (scored at call time)'));
+    var m = modelOf(c);
+    if (m) {
+      sec.appendChild(reportMeta(modelMeta(m)));
+      sec.appendChild(modelList(m));
+    } else {
+      sec.appendChild(el('p', 'muted', 'Not scored.'));
+    }
+    sec.appendChild(el('p', 'muted small', 'Scores never filter deliveries. Calls before 13 Oct 2026 are not scored.'));
+    return sec;
+  }
+
+  // The "Model (scored at call time)" block of the row detail, from the row
+  // as last drawn. Empty when the website does not show scores.
+  function drawModel(key) {
+    var tr = detailRows[key];
+    if (!tr) { return; }
+    var box = tr.querySelector('.detail-model');
+    box.textContent = '';
+    if (!modelScores || !rowData[key]) { return; }
+    box.appendChild(modelSection(rowData[key]));
+  }
+
+  // Shows or hides everything about model scores (model_scores of api/calls).
+  function setModelScores(on) {
+    on = on !== false;
+    if (on === modelScores) { return; }
+    modelScores = on;
+    var th = document.querySelector('th[data-sort="model"]');
+    if (th) { th.hidden = !on; }
+    var lg = $('legend-model');
+    if (lg) { lg.hidden = !on; }
+    if (!on && state.sort === 'model') {
+      state.sort = 'date';
+      state.dir = 'desc';
+      renderHeaders();
+    }
+    for (var key in detailRows) {
+      if (Object.prototype.hasOwnProperty.call(detailRows, key)) {
+        detailRows[key].firstChild.colSpan = colCount();
+        drawModel(key);
+      }
+    }
+  }
+
   // One row, "now" first: Token (and symbol) · Latest % (and how old that
-  // price is) · Latest MC · Call MC · Date · Perceptor · Status · Calls ·
+  // price is) · Latest MC · Call MC · Date · Perceptor · Model 7d · Status · Calls ·
   // Entry $ · Peak % · Worst drop % · the five windows. The order must match
   // the headers in index.html.
   function buildRow(c) {
@@ -524,6 +730,9 @@
     }
     tr.appendChild(tdPerc);
 
+    // the model's score (any price unit: it does not depend on the USD price)
+    if (modelScores) { tr.appendChild(modelCell(c)); }
+
     // Status: "rugged" replaces the tracking status (which goes in the title).
     var tdStatus = el('td', 'status');
     var st = c.tracking_status;
@@ -579,7 +788,7 @@
   // ---- Row detail ---------------------------------------------------------
 
   function colCount() {
-    var n = document.querySelectorAll('thead th').length;
+    var n = document.querySelectorAll('thead th:not([hidden])').length; // the Model column may be hidden
     return n > 0 ? n : COLUMNS;
   }
 
@@ -607,6 +816,7 @@
     td.colSpan = colCount();
     var box = el('div', 'detail-box');
     box.appendChild(el('div', 'detail-perf'));
+    box.appendChild(el('div', 'detail-model'));
     box.appendChild(el('div', 'detail-today'));
     box.appendChild(el('div', 'detail-reports'));
     td.appendChild(box);
@@ -640,11 +850,12 @@
   }
 
   // The performance block of the row detail, from the row as last drawn, and
-  // the "Perceptor today" block (also from the row).
+  // the model and "Perceptor today" blocks (also from the row).
   function drawPerf(key) {
     var tr = detailRows[key];
     var c = rowData[key];
     if (!tr) { return; }
+    drawModel(key);
     drawToday(key);
     var box = tr.querySelector('.detail-perf');
     box.textContent = '';
@@ -916,6 +1127,7 @@
   }
 
   function renderCalls(data) {
+    setModelScores(data.model_scores);
     var rows = $('rows');
     var frag = document.createDocumentFragment();
     var calls = Array.isArray(data.calls) ? data.calls : [];
@@ -1405,8 +1617,10 @@
   // tool perceptor_today, its Perceptor re-scan, "Perceptor today", or the
   // verdict the Perceptor filter uses, which updates the row without a
   // notice, sound or desktop alert; a row that leaves or enters the Perceptor
-  // filter chosen makes the list load again, quietly) and
-  // "reload" (many changes at once, or events were missed). A new row goes on
+  // filter chosen makes the list load again, quietly), "score" (a row's model
+  // score arrived: the row is updated quietly, or the list loads again when
+  // it is sorted by the model) and "reload" (many changes at once, or events
+  // were missed). A new row goes on
   // top of the table only when the table shows the newest calls first, on page
   // 1, and the row matches the search and the Perceptor filter; otherwise a
   // "N new — refresh" button appears. Only a call posted within the last hour
@@ -1604,6 +1818,16 @@
       return;
     }
     if (!rowMatchesFilters(c)) { loadCalls(true); return; } // no longer in this filter
+    replaceRow(d, tr);
+    if (openRows[key]) { refreshDetail(key); }
+  }
+
+  // Puts the row of an event (d.row) in place of the row shown (tr), keeping
+  // the window numbers shown when the event carries another window's; an open
+  // detail is drawn again from it.
+  function replaceRow(d, tr) {
+    var c = d.row;
+    var key = callKey(c);
     var i = shownIndex(key);
     if (d.horizon !== state.horizon && i >= 0) {
       // the event carries another window's numbers: keep the ones shown
@@ -1622,7 +1846,24 @@
       shown.data.calls[i] = c;
       shown.sig = callsSignature(shown.data);
     }
-    if (openRows[key]) { drawPerf(key); refreshDetail(key); }
+    if (openRows[key]) { drawPerf(key); }
+  }
+
+  // A model score arrived (or changed) for a row: the row and an open detail
+  // are drawn again quietly (no notice, sound or desktop alert). In a list
+  // sorted by the model the row may move: the list loads again instead.
+  function onLiveScore(d) {
+    var c = d.row;
+    var key = callKey(c);
+    if (!key || !modelScores) { return; }
+    if (state.sort === 'model') { scheduleQuietLoad(); return; }
+    var tr = findRow(key);
+    if (!tr) { return; } // not shown: nothing to update (a score never moves a row in or out of a filter)
+    // The score itself filters nothing, but the event's row also carries the
+    // call's latest Perceptor verdict, and the "Calls from the last" filter
+    // goes by time: either may have taken the shown row out of the filter.
+    if (!rowMatchesFilters(c)) { loadCalls(true); return; }
+    replaceRow(d, tr);
   }
 
   function onLiveReload(d) {
@@ -1803,6 +2044,10 @@
     es.addEventListener('report', function (ev) {
       var d = liveData(ev);
       if (d && d.row && typeof d.row === 'object') { onLiveReport(d); }
+    });
+    es.addEventListener('score', function (ev) {
+      var d = liveData(ev);
+      if (d && d.row && typeof d.row === 'object') { onLiveScore(d); }
     });
     es.addEventListener('reload', function (ev) { onLiveReload(liveData(ev)); });
   }

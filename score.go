@@ -110,8 +110,8 @@ func (s *scanner) scoreCall(ctx context.Context, j job) string {
 	}
 	// The score arrived in time: store it even if the budget runs out now.
 	// All buckets in one transaction (one created_at, the time the website
-	// will show), then one NOTIFY scout_events "score" so an open website
-	// refreshes its snapshot at once.
+	// shows), then one NOTIFY scout_events "score" so an open website shows
+	// the score at once.
 	sctx, scancel := context.WithTimeout(context.WithoutCancel(ctx), scoreStoreTimeout)
 	defer scancel()
 	ps := make([]ScoutCallPrediction, 0, len(sr.Buckets))

@@ -226,6 +226,24 @@ type webCallJSON struct {
 	PerceptorTodayAt   *string `json:"perceptor_today_at"`
 	// the verdict the Perceptor filter uses (webLatestPerceptor)
 	PerceptorLatest *string `json:"perceptor_latest_verdict"`
+	// the model's score made at the time of the call (null without one)
+	Model *webCallModelJSON `json:"model"`
+}
+
+type webCallModelJSON struct {
+	Version  string                   `json:"version"`
+	ScoredAt string                   `json:"scored_at"`
+	AfterS   int64                    `json:"after_s"`
+	Buckets  []webCallModelBucketJSON `json:"buckets"`
+}
+
+type webCallModelBucketJSON struct {
+	Bucket        string   `json:"bucket"`
+	Horizon       string   `json:"horizon"`
+	RunnerProb    *float64 `json:"runner_prob"`
+	CollapseProb  *float64 `json:"collapse_prob"`
+	RunnerRankPct *float64 `json:"runner_rank_pct"`
+	Passed        *bool    `json:"passed"`
 }
 
 type webCallsJSON struct {
@@ -240,6 +258,7 @@ type webCallsJSON struct {
 	Verdicts []string      `json:"verdicts"`
 	Days     int           `json:"days"`
 	At       string        `json:"snapshot_at"`
+	Models   bool          `json:"model_scores"`
 	Calls    []webCallJSON `json:"calls"`
 }
 

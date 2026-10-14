@@ -400,6 +400,10 @@ type ScoutWebRow struct {
 	Censored2x uint8
 	RugAfterS  *int
 	RugAtKind  *string
+	// Model: the model's score of this call made at the time of the call
+	// (scout_call_predictions, merged in by attachWebModel); nil without one.
+	// Display only: never an input of the dataset view or of a model.
+	Model *ScoutWebModel
 
 	// worked out by the website when it builds its snapshot (websnapshot.go)
 	usd bool // priced in USD: only then are the numbers shown
@@ -514,6 +518,80 @@ type ScoutWebCall struct {
 	// verdict, perceptor_verdict or perceptor_today_verdict (the rule is
 	// webLatestPerceptor's). nil when the token has no completed report.
 	PerceptorLatestVerd *string `json:"perceptor_latest_verdict"`
+	// Model: the model's score of the call, made at the time of the call (at
+	// most webModelMaxDelay after it; a later back-score is not shown); nil
+	// without one, and when the website does not show scores
+	// (webConfig.ModelScores). Kept last: it must never come between the
+	// three numbers of the window (webRowNumbersJSON).
+	Model *ScoutWebCallModel `json:"model"`
+}
+
+// ScoutWebModelBuckets are the model's holding-period buckets in the order
+// of ScoutWebModel.Buckets, and ScoutWebModelHorizons the window each one is
+// about (ml/scout_ml/config.py BUCKETS horizon_days).
+var (
+	ScoutWebModelBuckets  = [4]string{"short", "3day", "medium", "long"}
+	ScoutWebModelHorizons = [4]string{"1d", "3d", "7d", "30d"}
+)
+
+// ScoutWebModelBucket is one bucket of a stored score: Has says the score has
+// the bucket; the three numbers (nil when missing or not finite) and Passed
+// (whether the bucket's model passed its validation gates; nil = not
+// recorded) are scout_call_predictions' runner_prob, collapse_prob,
+// runner_rank_pct and passed.
+type ScoutWebModelBucket struct {
+	Has      bool
+	Runner   *float64
+	Collapse *float64
+	Rank     *float64
+	Passed   *bool
+}
+
+// ScoutWebModel is the score of a call as the website shows it: one model
+// version, when it was stored (created_at; every bucket of one score is
+// stored in one transaction, so they share it) and its buckets in the order
+// of ScoutWebModelBuckets.
+type ScoutWebModel struct {
+	Version  string
+	ScoredAt time.Time
+	Buckets  [len(ScoutWebModelBuckets)]ScoutWebModelBucket
+}
+
+// ScoutWebPrediction is one bucket row of scout_call_predictions as the
+// website reads it (never its features).
+type ScoutWebPrediction struct {
+	CallID    int
+	Version   string
+	Bucket    string
+	Runner    *float64
+	Collapse  *float64
+	Rank      *float64
+	Passed    *bool
+	CreatedAt time.Time
+}
+
+// ScoutWebCallModel is the "model" object of a row of /api/calls: the model
+// version, when the score was stored and how many seconds after the call,
+// and the buckets the score has, in the order of ScoutWebModelBuckets.
+type ScoutWebCallModel struct {
+	Version  string                    `json:"version"`
+	ScoredAt time.Time                 `json:"scored_at"`
+	AfterS   int64                     `json:"after_s"`
+	Buckets  []ScoutWebCallModelBucket `json:"buckets"`
+}
+
+// ScoutWebCallModelBucket is one bucket of ScoutWebCallModel: its name, the
+// window it is about, the probability of a runner and of a collapse (0 … 1),
+// the share of recent calls with a lower runner score (percent; the call is
+// in the top 100 − rank percent) and whether the bucket's model passed its
+// validation gates (null = not recorded).
+type ScoutWebCallModelBucket struct {
+	Bucket        string   `json:"bucket"`
+	Horizon       string   `json:"horizon"`
+	RunnerProb    *float64 `json:"runner_prob"`
+	CollapseProb  *float64 `json:"collapse_prob"`
+	RunnerRankPct *float64 `json:"runner_rank_pct"`
+	Passed        *bool    `json:"passed"`
 }
 
 // ScoutWebReport is one investigation as the website's row detail shows it
@@ -539,7 +617,7 @@ type ScoutWebReport struct {
 // them; the snapshot rejects anything else).
 type ScoutWebCallsFilter struct {
 	Q       string // substring of token name, symbol or contract address ("" = all)
-	Sort    string // date | return | peak | latest | call_mc | latest_mc | return_1h … return_30d
+	Sort    string // date | return | peak | latest | call_mc | latest_mc | model | return_1h … return_30d
 	Dir     string // desc | asc
 	Horizon string // 1h | 1d | 3d | 7d | 30d
 	USDOnly bool   // only calls priced in USD

@@ -70,7 +70,10 @@ Read side only:
 | `SCOUT_GMGN_URL` | as today | as today |
 
 `SCOUT_WEB_REFRESH` and every database, Telegram and node variable are ignored
-in read mode.
+in read mode. The read side builds its `webConfig` with `ModelScores=false`
+(no environment variable): no row carries a model score, `sort=model` is
+refused with 400, `/api/calls` answers `"model_scores": false` and the page
+hides the Model column, its detail block and its legend entry.
 
 ## 2. Objects and formats
 
@@ -397,7 +400,10 @@ published until it is added to the DTO and to the approved list in the test (7).
 
 **Never published** (not in any DTO, and caught by 4.3 if it leaks through a
 text): the private delivery group's invite link and any link into it; anything
-from `scout_deliveries` / `scout_delivery_investigations`; `SCOUT_NOTIFY_PEER`
+from `scout_deliveries` / `scout_delivery_investigations`; anything from
+`scout_call_predictions` (the model scores, `passed`, the scored `features`
+and the model versions; `ScoutWebRow.Model` is in no export DTO, and the read
+side runs with `ModelScores=false`, section 1); `SCOUT_NOTIFY_PEER`
 and `SCOUT_NOTIFY_CHAT_ID` (in the forms of 4.2.1);
 `request_text`, `bot_message_ids`, `details`, `error`, `external_id`,
 `created_by`/`updated_by`; secrets (the values of `API_HASH`, `TG_PASSWORD`,

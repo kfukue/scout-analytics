@@ -800,9 +800,9 @@ WHERE p.features->>'quote_asset' IS NOT NULL AND t.onchain->>'quote_sym' IS NOT 
 All buckets of one score are stored in one transaction (one `created_at`), each
 with `passed` (whether that bucket's model passed its gates, as the scoring
 service says; NULL = not recorded, e.g. rows stored before this column existed). The
-listener then sends `NOTIFY scout_events` with `{"kind":"score","call_id":…}`; an
-open website refreshes its snapshot on it (it does not show scores yet). Neither
-the dataset view, `-export-dataset` nor `ml/` ever read this table.
+listener then sends `NOTIFY scout_events` with `{"kind":"score","call_id":…}`, so
+an open website shows the score at once (see "Website", Model 7d). Neither the
+dataset view, `-export-dataset` nor `ml/` ever read this table.
 
 ### Latest price (the return as of now)
 
@@ -1815,7 +1815,10 @@ other sites):
     (up to 100 a day) and would push the call-time notices out of the corner. With a
     Perceptor filter on, a row whose latest Perceptor verdict moves it out of the filter
     leaves the list, and one that moves into it appears (the list reloads quietly).
-  - Each of the others also shows a **notice in the bottom-right corner**: token, verdict
+  - **A model score** (a `score` event) updates its row and an open detail quietly, like a
+    re-scan; when the list is sorted by Model 7d it reloads quietly instead.
+  - A new call, a new Perceptor verdict and a new sAlpha report or decline also show a
+    **notice in the bottom-right corner** (a re-scan and a model score do not): token, verdict
     (or "sAlpha: report available" / "did not generate a report") and a GMGN link. At most
     4 are kept (2 on a narrow screen); each goes after a minute or with its × button.
   - **Sound** (a checkbox next to "Updated"): a short beep for each notice, made by the browser
@@ -1862,9 +1865,9 @@ other sites):
   1–3650; anything else is a 400; leave it out for all); the answer carries `"days"` (0 = all),
   and the total counts only the matching calls ("N calls from the last 7 days" under the
   table).
-- **Calls** — 16 columns, in this order:
+- **Calls** — 17 columns, in this order:
   Token (the name links to GMGN; the symbol follows in grey when it differs from the name) |
-  Latest % | Latest MC | Call MC | Date (links to the post) | Perceptor | Status | Calls (`×N`
+  Latest % | Latest MC | Call MC | Date (links to the post) | Perceptor | Model 7d | Status | Calls (`×N`
   when the token was called N > 1 times, empty otherwise; hover for "Called N times, last on
   …") | Entry $ | Peak % | Worst drop % | 1h | 1d | 3d | 7d | 30d.
   - **1h, 1d, 3d, 7d, 30d** are the return over each window (the number the old single
@@ -1873,7 +1876,14 @@ other sites):
   - **Peak % and Worst drop %** are for one window, picked with the small **"Peak / worst drop
     over"** selector (1h … 30d) above the table; their headers name it, e.g. "Peak % (7d)". The
     selector changes only these two columns.
-  - **Sorting:** click Date, Call MC, Latest MC, Latest %, Peak % (for the selected window) or
+  - **Model 7d** is the model's score of the call made at the time of the call (see "Scoring
+    new calls"): the 7-day runner chance in whole percent, under it the call's rank among
+    recent calls ("top 8%" = 100 − `runner_rank_pct`), "n.v." when the 7-day model did not
+    pass its gates, a dash without a score. Calls before 13 Oct 2026 are not scored (they are
+    the training data), and a score stored more than 24 hours after the call is not shown.
+    Hover for the exact values, the model version and how long after the call it scored. It
+    is shown for every price unit, and scores never filter deliveries.
+  - **Sorting:** click Date, Call MC, Latest MC, Latest %, Model 7d, Peak % (for the selected window) or
     any of 1h … 30d; click again to reverse. ▲/▼ shows the column and direction (also as
     `aria-sort`). Rows without a value are always last; ties by call id. Worst drop % is not
     sortable.
@@ -1889,6 +1899,10 @@ other sites):
     latest price, when that price was read (how long ago, "stale"/"quiet" as in the list, and
     how old the call was then), the last trade, Call MC → Latest MC, and Peak % and Worst drop
     % for the window chosen. A call not priced in USD shows only that it has no dollar price.
+  - **Model (scored at call time)**: the model version, when it scored (and how long after
+    the call), and one line per horizon, e.g. "1d (not validated): runner 31%, collapse 44%
+    · top 8%" (30d: "up X%"; "no model" when the score has none). From the row, like the
+    performance block.
   - **Perceptor**: the verdict once (the report's own verdict line, e.g. "No red flags found",
     or the words "no red flags" / "caution" / "red flags" when it has none) and its time, the
     summary, and "Open the Perceptor report" (https links only);
@@ -2284,10 +2298,10 @@ returned and cannot be found by its own name or symbol:
 | Parameter | Values | Default | |
 |---|---|---|---|
 | `q` | text, up to 100 characters | *(none)* | part of the token name, symbol or contract address; case-insensitive (letters of any script, by the Unicode lower-case rule); `%` and `_` are ordinary characters |
-| `sort` | `date`, `return`, `peak`, `latest`, `call_mc`, `latest_mc`, `return_1h`, `return_1d`, `return_3d`, `return_7d`, `return_30d` | `date` | empty values always come last (in both directions); ties by call id, in the direction asked for. `return` / `peak` = by `return_pct` / `peak_pct` of the `horizon` asked for. `return_1h` … `return_30d` = by that window's return (`return_1h_pct` …), whatever the `horizon`. `latest` = by `latest_return_pct`, `call_mc` = by `call_mcap_usd`, `latest_mc` = by `latest_mcap_usd` (these are the same for every `horizon`) |
+| `sort` | `date`, `return`, `peak`, `latest`, `call_mc`, `latest_mc`, `model`, `return_1h`, `return_1d`, `return_3d`, `return_7d`, `return_30d` | `date` | empty values always come last (in both directions); ties by call id, in the direction asked for. `return` / `peak` = by `return_pct` / `peak_pct` of the `horizon` asked for. `return_1h` … `return_30d` = by that window's return (`return_1h_pct` …), whatever the `horizon`. `latest` = by `latest_return_pct`, `call_mc` = by `call_mcap_usd`, `latest_mc` = by `latest_mcap_usd`, `model` = by the `medium` (7d) bucket's `runner_prob` of `model` (these are the same for every `horizon`; `model` is a 400 on a website that does not send scores) |
 | `dir` | `desc`, `asc` | `desc` | |
 | `horizon` | `1h`, `1d`, `3d`, `7d`, `30d` | `1d` | which window `return_pct` / `peak_pct` / `drawdown_pct` (and `sort=return` / `peak`) are for; the page sets it with its Peak / worst drop selector |
-| `usd_only` | `1`, `0` | `1` for every `sort` but `date`, else `0` | `1` = only tokens whose first call has `price_unit = usd` |
+| `usd_only` | `1`, `0` | `1` for every `sort` but `date` and `model`, else `0` | `1` = only tokens whose first call has `price_unit = usd` |
 | `verdict` | `clean`, `caution`, `red_flags`, `not_scanned`, or several separated by commas (`verdict=clean,caution`) | *(none = all)* | the token's **latest** Perceptor verdict, `perceptor_latest_verdict` (see below); with several, a token with any of them. The parameter may also be repeated (`verdict=clean&verdict=caution`); all values add up, repeats and empty items are ignored, so `verdict=` = all, and so do all four. `clean` = no red flags found; `not_scanned` = no completed Perceptor report with a verdict (none, or only ones whose verdict is `unknown` or `insufficient`, "not enough data yet"). The order does not matter: `caution,clean` is the same question, with the same `ETag`, as `clean,caution` |
 | `days` | 1 – 3650 (whole days) | *(none = all)* | only tokens whose first call was posted within the last `days` × 24 hours, counted back from the snapshot time (`snapshot_at`), not the time of the request; `days=0` is a 400 (leave it out for all) |
 | `page` | 1 … | `1` | |
@@ -2297,7 +2311,7 @@ Any other value or parameter, or any parameter but `verdict` given twice → HTT
 
 ```json
 {"total": 3105, "page": 1, "per": 50, "horizon": "1d", "sort": "date", "dir": "desc", "usd_only": false, "verdict": "", "verdicts": [],
- "days": 0, "snapshot_at": "2026-10-02T14:30:00.123Z",
+ "days": 0, "snapshot_at": "2026-10-02T14:30:00.123Z", "model_scores": true,
  "calls": [{"call_id": 812, "message_id": 10002, "message_date": "2026-10-01T14:30:00Z",
    "post_url": "https://t.me/scoutrobinhood/10002",
    "contract_address": "0x…", "token_name": "Malfoid", "token_symbol": "MALFOID",
@@ -2312,7 +2326,10 @@ Any other value or parameter, or any parameter but `verdict` given twice → HTT
    "latest_age_seconds": 5184070, "call_mcap_usd": 45200, "latest_mcap_usd": 61110.4,
    "has_salpha_report": true, "perceptor_report_id": 5120, "salpha_report_id": 5121,
    "salpha_reask_after_s": null, "perceptor_today_verdict": null, "perceptor_today_url": null, "perceptor_today_at": null,
-   "perceptor_latest_verdict": "clean"}]}
+   "perceptor_latest_verdict": "clean",
+   "model": {"version": "20261013-1909", "scored_at": "2026-10-01T14:32:05Z", "after_s": 125,
+     "buckets": [{"bucket": "short", "horizon": "1d", "runner_prob": 0.3123, "collapse_prob": 0.44, "runner_rank_pct": 92.5, "passed": false},
+                 {"bucket": "medium", "horizon": "7d", "runner_prob": 0.12, "collapse_prob": 0.64, "runner_rank_pct": 71.0, "passed": true}]}}]}
 ```
 `call_count` = how many real calls of that token exist in total (1 or more; update posts are
 not counted); `last_call_date` = the date of the most recent one (equal to `message_date` when there is only one). Everything else
@@ -2327,6 +2344,18 @@ five as its 1h … 30d columns; `return_pct` is kept for older clients. `entry_p
 `price_unit` is `usd`. `peak_pct` is also `null` when `rugged` is `true` (the returns and
 `drawdown_pct` stay as stored). `gmgn_url` is `null` for anything that is not a plain `0x…`
 address.
+
+`model` is the model's score of the first call (`scout_call_predictions`, for any
+`price_unit`), `null` without one: only a score stored at most 24 hours after the call counts
+(`after_s` = seconds after the call); with several model versions, the earliest such score's
+version and its buckets. `buckets` lists the buckets that score has, in the order `short`
+(`1d`), `3day` (`3d`), `medium` (`7d`), `long` (`30d`), each with `runner_prob` (0 … 1;
+`null` when missing; for `long`: the chance of being up after 30 days), `collapse_prob`
+(0 … 1; `null` when missing; for `long`: down 90 % or more after 30 days, or rugged), `runner_rank_pct`
+(share of recent calls with a lower runner score) and `passed` (`true`, `false` or `null` =
+not recorded). Any change of it changes the `ETag`. `model_scores` says whether this
+website sends scores; when `false` (a public copy) every `model` is `null` and `sort=model`
+is a 400.
 
 `latest_return_pct` and `latest_price_usd` are the return (from the same entry) and the price
 as of the tracker's most recent reading, `latest_at` when it was read
@@ -2560,7 +2589,10 @@ data: {"call_id":812,"tool":"perceptor","horizon":"1d","row":{…}}
   is the row exactly as `GET /api/calls?horizon=1d` returns it (so `return_pct`, `peak_pct`
   and `drawdown_pct` are those of `horizon`, always `1d`). Rows that leave the list send
   nothing.
-- `reload` = ask for the list again instead: `{"calls":25,"reports":3}` when one read found
+- `score` = a listed token whose model score arrived or changed (a re-score has another
+  `scored_at`): `{"call_id":812,"horizon":"1d","row":{…}}`, the row with its `model`. The page
+  shows it quietly (no notice, sound or desktop alert).
+- `reload` = ask for the list again instead: `{"calls":25,"reports":3,"scores":0}` when one read found
   more than 20 changes, `{"missed":true}` when events after the browser's `Last-Event-ID`
   can no longer be sent (see below).
 - **Ids** are `<process>-<n>`. A browser that reconnects sends the last one it got as
