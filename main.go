@@ -2247,6 +2247,7 @@ func main() {
 		s.rescan.holdBack = cfg.Recheck.horizon()
 	}
 	s.reask = s.newReaskLane(cfg.Reask) // the sAlpha re-ask lane (salpha_reask.go); nil when off
+	log.Print(modelScoringStartupLine(cfg, s.db != nil))
 	backoff := 5 * time.Second
 	for {
 		start := time.Now()
