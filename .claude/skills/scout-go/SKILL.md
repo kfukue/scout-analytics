@@ -12,7 +12,9 @@ description: Rules for Go code in scout analytics (conventions, schema, SCOUT_* 
   `scout_models.data.go`, pgx, no ORM). Run `gofmt` on what you touch.
 - Schema: `scoutanalytics.sql` runs at every startup, so every statement must be
   safe to repeat (`IF NOT EXISTS`, `ADD COLUMN IF NOT EXISTS`). Extend existing
-  tables rather than adding new ones unless the task says otherwise.
+  tables rather than adding new ones unless the task says otherwise. Every
+  schema change also needs a rollback script: see "Database changes: run
+  script and rollback" in `scout-rules`.
 - Configuration is read from environment variables named `SCOUT_*`; document any
   new one in `README.md`.
 
