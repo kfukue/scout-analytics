@@ -100,8 +100,14 @@ Owner decisions, 14 Oct, after the merges:
 - Model 20261014-1842 (`--variants`): 3d PASS (2.10), 7d FAIL (1.86).
   Across seeds, "no calls_prev inputs" gives 3d 2.14 and 7d 2.10, both
   passing every gate, with drift AUC 0.99 → 0.90. The burst ratio is worse.
-  The PM recommends making "no calls_prev" the default; the owner has not
-  decided yet.
+  Owner decision 14 Oct: "no calls_prev" becomes the default
+  (`EXCLUDED_INPUTS`; branch `work/2026-10-14-no-calls-prev`); the report
+  keeps a "with calls_prev counts (default before 14 Oct)" variant, and the
+  burst variant is dropped. After the merge, on the server: pull `$REPO`;
+  refresh the training checkout (`git -C "$ML/src" fetch` then
+  `git -C "$ML/src" checkout --detach origin/main`) and check
+  `grep -n '^EXCLUDED_INPUTS' "$ML/src/ml/scout_ml/config.py"` names both
+  calls_prev inputs; restart `scout-model`; retrain with `--variants`.
 
 **Scoring on prod is working** (owner's read-only queries, 14 Oct UTC).
 Live-handled calls since 13 Oct 12:00 UTC: 10793, 10795, 10796 and 10798
@@ -861,17 +867,16 @@ installed (owner).
     the Timing tab check. The first delivery with the model line on a
     screen. Perceptor filter "Caution" includes tokens with only "today:
     caution". No CSP errors;
-  - retrain with `--variants` and send `report.md` (the `calls_prev`
-    across-seeds table); save each report under
-    `ml-results\models\<version>\report.md`;
+  - save each model report under `ml-results\models\<version>\report.md`;
   - optionally add the two `review.md` lines suggested in #53;
   - invite link (after #55): `scout_deliveries.target` still stores the
     raw invite link (needed for the re-ask match; not on the website), and
     older logs / `scout_deliveries.error` rows may contain it. Read-only
     count in #55. If a DB dump is ever shared, revoke and re-create the
     link in Telegram;
-  - "no calls_prev inputs" as the default model setting (PM recommends;
-    Session state);
+  - after the "no calls_prev" PR merges: the server steps in Session state
+    (pull, refresh `$ML/src`, check, restart `scout-model`, retrain with
+    `--variants`), then send `report.md`;
   - PC clean-up of merged worktrees and branches: the script
     `cleanup-merged.ps1` (dry run first, then `-Apply`) was sent 14 Oct;
   - disk space: ~318 GB free on C: (12 Oct; was ~100 MB before the

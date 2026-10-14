@@ -106,3 +106,16 @@ def test_unused_columns_stay_in_the_view_but_are_no_features():
         assert c not in C.FEATURES and c not in C.NUMERIC_RAW and c not in C.LOG1P_FEATURES, c
         assert not C.is_forbidden(c), c                  # not leaky, just useless
     assert C.NUMERIC_RAW == [c for c in C.VIEW_NUMERIC if c not in C.UNUSED_VIEW_COLUMNS]
+
+
+def test_calls_prev_stay_in_the_view_and_raw_inputs_but_are_left_out_by_default():
+    """Since 14 Oct 2026 calls_prev_1h / calls_prev_24h are no inputs of new models
+    (EXCLUDED_INPUTS), yet the view keeps them and they stay in NUMERIC_RAW: known at
+    the call, not leaky, and an older served model that lists them still reads them."""
+    assert set(C.EXCLUDED_INPUTS) == {"calls_prev_1h", "calls_prev_24h"}
+    assert set(C.EXCLUDED_INPUTS) <= set(C.NUMERIC_RAW)
+    for c in C.EXCLUDED_INPUTS:
+        assert c in C.VIEW_COLUMNS and c in C.VIEW_NUMERIC, c
+        assert not C.is_forbidden(c) and c not in C.UNUSED_VIEW_COLUMNS, c
+        assert c not in C.FEATURES and c not in C.NUMERIC_FEATURES, c
+        assert c not in C.LOG1P_FEATURES, c

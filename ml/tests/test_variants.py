@@ -15,6 +15,8 @@ from scout_ml.labels import build_labels
 from scout_ml.model import Bundle
 
 DEX_VARIANTS = ("raw dex instead of dex_family", "raw dex + dex_family")
+WITH_CALLS_PREV = "with calls_prev counts (default before 14 Oct)"
+CALLS_PREV = {"calls_prev_1h", "calls_prev_24h"}
 
 
 def _row(**kw):
@@ -60,7 +62,7 @@ def test_each_variant_changes_exactly_one_knob():
     assert list(C.VARIANTS) == ["baseline", "dead rule on (collapse OR dead)",
                                 "raw dex instead of dex_family", "raw dex + dex_family",
                                 "runners must be tradeable", "stronger regularisation",
-                                "no calls_prev inputs", "calls_prev as a burst ratio"]
+                                "with calls_prev counts (default before 14 Oct)"]
     for name, knobs in C.VARIANTS.items():
         if name == "baseline":
             continue
@@ -94,7 +96,7 @@ def test_overrides_rebuild_features_never_leak_and_restore():
             assert "trades_24h" not in C.FEATURES
             assert C.FEATURES == C.NUMERIC_FEATURES + C.CATEGORICAL
             assert C.LOG1P_FEATURES == [c for c in C.NUMERIC_FEATURES if c not in C.NO_LOG]
-            dropped = set(knobs.get("EXCLUDED_INPUTS", ()))
+            dropped = set(C.EXCLUDED_INPUTS)                    # the effective value here
             numeric = C.NUMERIC_RAW + C.DERIVED
             if knobs.get("CALLS_PREV_INPUTS") == "burst":   # the raw counts replaced in place
                 numeric = [C.CALLS_PREV_BURST if c == "calls_prev_1h" else c
@@ -204,14 +206,10 @@ def test_variant_table_contents(plain_and_variants):
                 assert k in s, (name, b, k)
             if s["wf_pooled_lift_lo"] is not None:                 # null with < 2 weeks
                 assert s["wf_pooled_lift_lo"] <= s["wf_pooled_lift"] <= s["wf_pooled_lift_hi"]
-        # without the calls_prev inputs the model differs, the rows and simulation do not
-        ncp = v["no calls_prev inputs"]["buckets"][b]
-        assert ncp["sim_all_mean"] == base[b]["sim_all_mean"]
-        assert ncp["runner_auc_logistic"] != base[b]["runner_auc_logistic"]   # fewer inputs
-        burst = v["calls_prev as a burst ratio"]["buckets"][b]
-        assert burst["sim_all_mean"] == base[b]["sim_all_mean"]
-        assert burst["runner_auc_logistic"] not in (base[b]["runner_auc_logistic"],
-                                                    ncp["runner_auc_logistic"])
+        # with the calls_prev inputs back the model differs, the rows and simulation do not
+        wcp = v[WITH_CALLS_PREV]["buckets"][b]
+        assert wcp["sim_all_mean"] == base[b]["sim_all_mean"]
+        assert wcp["runner_auc_logistic"] != base[b]["runner_auc_logistic"]   # more inputs
         # "calls_prev variants across seeds": the baseline and the SEED_VARIANTS only
         seeds = [str(s) for s in C.STABILITY_SEEDS]
         for name in C.VARIANTS:
@@ -235,10 +233,8 @@ def test_variant_table_contents(plain_and_variants):
         assert ab["median"] == m["gates"]["pooled_lift_median"]
         assert ab["sim_gain_lo"] == m["gates"]["sim_diff_lo"]
         # each variant's adversarial probe sees only its own inputs
-        for name, gone in (("no calls_prev inputs", {"calls_prev_1h", "calls_prev_24h",
-                                                     C.CALLS_PREV_BURST}),
-                           ("calls_prev as a burst ratio", {"calls_prev_1h", "calls_prev_24h"}),
-                           ("baseline", {C.CALLS_PREV_BURST})):
+        for name, gone in (("baseline", {"calls_prev_1h", "calls_prev_24h", C.CALLS_PREV_BURST}),
+                           (WITH_CALLS_PREV, {C.CALLS_PREV_BURST})):
             top = {f for f, _ in v[name]["across_seeds"]["buckets"][b]["adversarial"]["top"]}
             assert not top & gone, (name, b, top)
     assert all(v[n].get("seconds") is not None for n in C.VARIANTS if n != "baseline")
@@ -251,8 +247,8 @@ def test_variant_table_contents(plain_and_variants):
         assert f"| {name} |" in report
     assert "| single-run (old) gate, information |" in report
     assert "pooled WF lift [95%]; sim difference [95%] (seed 7 only; information)" in report
-    assert "| no calls_prev inputs | EXCLUDED_INPUTS = ('calls_prev_1h', 'calls_prev_24h') |" in report
-    assert "| calls_prev as a burst ratio | CALLS_PREV_INPUTS = burst |" in report
+    assert f"| {WITH_CALLS_PREV} | EXCLUDED_INPUTS = () |" in report
+    assert "no calls_prev inputs" not in report and "burst ratio" not in report
     across = report[report.index("### calls_prev variants across seeds (report only)"):]
     assert "| median (as the gate) |" in across and "| adversarial AUC (train vs test) |" in across
     for b in meta["metrics"]:
@@ -374,29 +370,32 @@ def test_variant_error_text_is_short_and_table_safe():
     assert long.startswith("error: RuntimeError: xxx") and len(long) <= len("error: ") + 150
 
 
-# --- "no calls_prev inputs" (report-only variant) ---------------------------------
+# --- calls_prev inputs: left out by default since 14 Oct 2026 -----------------------
 
-def test_no_calls_prev_variant_drops_exactly_those_inputs_and_keeps_the_guard(synthetic_df):
+def test_default_leaves_out_calls_prev_and_the_variant_puts_them_back(synthetic_df):
     from scout_ml.features import build_features
     from scout_ml.model import fit_baseline
-    knobs = C.VARIANTS["no calls_prev inputs"]
-    assert knobs == {"EXCLUDED_INPUTS": ("calls_prev_1h", "calls_prev_24h")}
-    assert C.EXCLUDED_INPUTS == ()                              # the saved model: every input
-    assert {"calls_prev_1h", "calls_prev_24h"} <= set(C.FEATURES)
+    assert C.EXCLUDED_INPUTS == ("calls_prev_1h", "calls_prev_24h")   # the saved model
+    assert not CALLS_PREV & set(C.FEATURES) and not CALLS_PREV & set(C.LOG1P_FEATURES)
+    assert CALLS_PREV <= set(C.NUMERIC_RAW)                     # still read from the view
+    knobs = C.VARIANTS[WITH_CALLS_PREV]
+    assert knobs == {"EXCLUDED_INPUTS": ()}
+    assert WITH_CALLS_PREV in C.SEED_VARIANTS
     before = (list(C.FEATURES), list(C.NUMERIC_FEATURES), list(C.LOG1P_FEATURES))
     rows = synthetic_df.head(400)
     with C.overrides(**knobs):
-        gone = {"calls_prev_1h", "calls_prev_24h"}
-        assert not gone & set(C.FEATURES) and not gone & set(C.NUMERIC_FEATURES)
-        assert not gone & set(C.LOG1P_FEATURES)
-        assert set(before[0]) - set(C.FEATURES) == gone           # nothing else removed
-        assert not set(C.FEATURES) - set(before[0])               # and nothing added
+        assert CALLS_PREV <= set(C.NUMERIC_FEATURES) and CALLS_PREV <= set(C.LOG1P_FEATURES)
+        assert set(C.FEATURES) - set(before[0]) == CALLS_PREV      # nothing else added
+        assert not set(before[0]) - set(C.FEATURES)               # and nothing removed
+        assert C.FEATURES == C.NUMERIC_RAW + C.DERIVED + C.CATEGORICAL   # the old input list
         assert_no_leakage(C.FEATURES)
         X = build_features(rows, {})
-        assert list(X.columns) == C.FEATURES and not gone & set(X.columns)
+        assert list(X.columns) == C.FEATURES
         y = (np.arange(len(X)) % 3 == 0).astype(int)
         fit_baseline(X, y)                                       # the logistic baseline follows
     assert (list(C.FEATURES), list(C.NUMERIC_FEATURES), list(C.LOG1P_FEATURES)) == before
+    X = build_features(rows, {})
+    assert list(X.columns) == C.FEATURES and not CALLS_PREV & set(X.columns)
     # it can only remove numeric inputs: an outcome, a categorical or an unknown name raises
     for bad in (("ret_late_1d",), ("dex_family",), ("nonsense",)):
         with pytest.raises(ValueError, match="EXCLUDED_INPUTS"):
@@ -405,21 +404,20 @@ def test_no_calls_prev_variant_drops_exactly_those_inputs_and_keeps_the_guard(sy
         assert list(C.FEATURES) == before[0]
 
 
-# --- "calls_prev as a burst ratio" and "calls_prev variants across seeds" (report only) ---
+# --- the CALLS_PREV_INPUTS = "burst" code path (kept; no variant uses it since 14 Oct) ---
 
-BURST_VARIANT = "calls_prev as a burst ratio"
-
-
-def test_burst_variant_replaces_exactly_the_raw_counts(synthetic_df):
+def test_burst_setting_replaces_exactly_the_raw_counts(synthetic_df):
     from scout_ml.features import build_features
     from scout_ml.model import fit_baseline
-    assert C.VARIANTS[BURST_VARIANT] == {"CALLS_PREV_INPUTS": "burst"}
-    assert C.CALLS_PREV_INPUTS == "counts"                      # the saved model: raw counts
+    assert C.CALLS_PREV_INPUTS == "counts"                      # the saved model: no burst ratio
+    assert not any(k.get("CALLS_PREV_INPUTS") == "burst" for k in C.VARIANTS.values())
     before = (list(C.FEATURES), list(C.NUMERIC_FEATURES), list(C.LOG1P_FEATURES))
+    with C.overrides(EXCLUDED_INPUTS=()):
+        counts = list(C.FEATURES)
     want = [C.CALLS_PREV_BURST if c == "calls_prev_1h" else c
-            for c in before[0] if c != "calls_prev_24h"]
+            for c in counts if c != "calls_prev_24h"]
     rows = synthetic_df.head(400)
-    with C.overrides(**C.VARIANTS[BURST_VARIANT]):
+    with C.overrides(CALLS_PREV_INPUTS="burst", EXCLUDED_INPUTS=()):
         assert C.FEATURES == want                                 # in place, nothing else changed
         assert C.CALLS_PREV_BURST in C.LOG1P_FEATURES             # non-negative, skewed
         assert_no_leakage(C.FEATURES)
@@ -433,8 +431,11 @@ def test_burst_variant_replaces_exactly_the_raw_counts(synthetic_df):
             assert C.FEATURES == want
         assert C.FEATURES == want
     assert (list(C.FEATURES), list(C.NUMERIC_FEATURES), list(C.LOG1P_FEATURES)) == before
+    # with the default exclusion of the raw counts: no error, the ratio in their place
+    with C.overrides(CALLS_PREV_INPUTS="burst"):
+        assert C.FEATURES == want and not CALLS_PREV & set(C.FEATURES)
     with C.overrides(CALLS_PREV_INPUTS="burst", EXCLUDED_INPUTS=(C.CALLS_PREV_BURST,)):
-        assert not {C.CALLS_PREV_BURST, "calls_prev_1h", "calls_prev_24h"} & set(C.FEATURES)
+        assert C.FEATURES == before[0]                             # neither ratio nor counts
     for bad in ("nonsense", "raw", None):
         with pytest.raises(ValueError, match="CALLS_PREV_INPUTS"):
             with C.overrides(CALLS_PREV_INPUTS=bad):
@@ -442,9 +443,17 @@ def test_burst_variant_replaces_exactly_the_raw_counts(synthetic_df):
         assert list(C.FEATURES) == before[0]
 
 
-def test_seed_median_is_taken_as_the_gate_takes_it(monkeypatch):
-    assert set(C.SEED_VARIANTS) == {"no calls_prev inputs", BURST_VARIANT}
+# --- "calls_prev variants across seeds" (report only) --------------------------------
+
+def test_every_variant_applies_without_error_and_seed_variants_are_variants():
+    assert isinstance(C.SEED_VARIANTS, tuple) and C.SEED_VARIANTS == (WITH_CALLS_PREV,)
     assert all(n in C.VARIANTS for n in C.SEED_VARIANTS)
+    for name in C.VARIANTS:
+        with C.overrides(**C.VARIANTS[name]):
+            assert_no_leakage(C.FEATURES)
+
+
+def test_seed_median_is_taken_as_the_gate_takes_it(monkeypatch):
     monkeypatch.setattr(C, "STABILITY_SEEDS", (7, 11, 23))
     s = train_mod.seed_median({7: 2.0, 11: 1.0, 23: 3.5})
     assert s["lifts"] == {"7": 2.0, "11": 1.0, "23": 3.5} and s["median"] == 2.0 and not s["why"]
@@ -481,21 +490,23 @@ def test_calls_prev_variants_are_retrained_with_every_seed(small_df, tmp_path, m
     AUC is the diagnostics' own when they ran."""
     monkeypatch.setattr(C, "BUCKETS", {"short": C.BUCKETS["short"]})
     monkeypatch.setattr(C, "STABILITY_SEEDS", (7, 11))
-    monkeypatch.setattr(C, "VARIANTS", {k: C.VARIANTS[k] for k in ("baseline", BURST_VARIANT)})
+    monkeypatch.setattr(C, "VARIANTS", {k: C.VARIANTS[k] for k in ("baseline", WITH_CALLS_PREV)})
     calls = []
     real = train_mod._train_bucket
     monkeypatch.setattr(train_mod, "_train_bucket", lambda *a, **k: calls.append(
-        (C.LGBM_SEED, C.CALLS_PREV_INPUTS)) or real(*a, **k))
+        (C.LGBM_SEED, C.EXCLUDED_INPUTS)) or real(*a, **k))
     out = train_mod.train(small_df, tmp_path, "v1", variants=True, diagnostics=True)
     # saved model + gate seed 11, then the variant's own run + its seed 11: nothing else
-    assert calls == [(7, "counts"), (11, "counts"), (7, "burst"), (11, "burst")]
+    default = ("calls_prev_1h", "calls_prev_24h")
+    assert calls == [(7, default), (11, default), (7, ()), (11, ())]
     meta = json.loads((out / "meta.json").read_text())
     assert meta["features"] == list(C.FEATURES) and C.CALLS_PREV_BURST not in meta["features"]
+    assert not CALLS_PREV & set(meta["features"])             # the saved model: the default
     g = meta["metrics"]["short"]["gates"]
     base = meta["variants"]["baseline"]["across_seeds"]["buckets"]["short"]
     assert base["lifts"] == g["pooled_lift_seeds"] and set(base["lifts"]) == {"7", "11"}
     assert base["adversarial"]["auc"] == meta["diagnostics"]["adversarial"]["short"]["split"]["auc"]
-    var = meta["variants"][BURST_VARIANT]["across_seeds"]
+    var = meta["variants"][WITH_CALLS_PREV]["across_seeds"]
     a = var["buckets"]["short"]
     assert var["seeds"] == [7, 11] and set(a["lifts"]) == {"7", "11"}
     assert all(isinstance(x, float) for x in a["lifts"].values())
@@ -503,7 +514,7 @@ def test_calls_prev_variants_are_retrained_with_every_seed(small_df, tmp_path, m
     assert 0.0 <= a["adversarial"]["auc"] <= 1.0
     report = (out / "report.md").read_text(encoding="utf-8")
     assert "| pooled WF lift, seed 7 / 11 |" in report
-    assert (f"| short | {BURST_VARIANT} | {a['weeks']} | "
+    assert (f"| short | {WITH_CALLS_PREV} | {a['weeks']} | "
             f"{a['lifts']['7']:.2f} / {a['lifts']['11']:.2f} | {a['median']:.2f} |") in report
     assert "other seeds and adversarial validation" in report
 
@@ -511,12 +522,14 @@ def test_calls_prev_variants_are_retrained_with_every_seed(small_df, tmp_path, m
 def test_a_failing_across_seeds_part_keeps_the_variant_rows(small_df, tmp_path, monkeypatch,
                                                             capsys):
     monkeypatch.setattr(C, "BUCKETS", {"short": C.BUCKETS["short"]})
+    other = "stronger regularisation"                          # a second variant across seeds
     monkeypatch.setattr(C, "VARIANTS", {k: C.VARIANTS[k] for k in
-                                        ("baseline", "no calls_prev inputs", BURST_VARIANT)})
+                                        ("baseline", other, WITH_CALLS_PREV)})
+    monkeypatch.setattr(C, "SEED_VARIANTS", (other, WITH_CALLS_PREV))
     real = train_mod.variant_across_seeds
 
     def across(*a, **k):
-        if C.CALLS_PREV_INPUTS == "burst":
+        if C.EXCLUDED_INPUTS == ():
             raise RuntimeError("boom | x")
         return real(*a, **k)
 
@@ -526,14 +539,14 @@ def test_a_failing_across_seeds_part_keeps_the_variant_rows(small_df, tmp_path, 
     monkeypatch.setattr(train_mod, "variant_across_seeds", across)
     monkeypatch.setattr(train_mod, "adversarial_split", no_probe)
     out = train_mod.train(small_df, tmp_path, "v1", variants=True)
-    assert "across-seeds part of variant 'calls_prev as a burst ratio' failed" in capsys.readouterr().out
+    assert f"across-seeds part of variant '{WITH_CALLS_PREV}' failed" in capsys.readouterr().out
     v = json.loads((out / "meta.json").read_text())["variants"]
-    assert "top_lift" in v[BURST_VARIANT]["buckets"]["short"] and "error" not in v[BURST_VARIANT]
-    assert v[BURST_VARIANT]["across_seeds"] == {"error": "error: RuntimeError: boom / x"}
-    for name in ("baseline", "no calls_prev inputs"):          # the probe failing loses no row
+    assert "top_lift" in v[WITH_CALLS_PREV]["buckets"]["short"] and "error" not in v[WITH_CALLS_PREV]
+    assert v[WITH_CALLS_PREV]["across_seeds"] == {"error": "error: RuntimeError: boom / x"}
+    for name in ("baseline", other):                           # the probe failing loses no row
         a = v[name]["across_seeds"]["buckets"]["short"]
         assert a["adversarial"] == {"error": "error: ValueError: probe down"}
         assert "lifts" in a and "sim_gain_lo" in a
     report = (out / "report.md").read_text(encoding="utf-8")
-    assert f"| short | {BURST_VARIANT} | error: RuntimeError: boom / x |" in report
+    assert f"| short | {WITH_CALLS_PREV} | error: RuntimeError: boom / x |" in report
     assert "error: ValueError: probe down" in report
