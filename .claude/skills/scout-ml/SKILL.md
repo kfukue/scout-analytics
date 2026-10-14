@@ -31,9 +31,9 @@ description: Rules for the scout analytics Python model package (ml/) and the da
   the gate values from `models/<version>/report.md` in your report.
 - Project rule: scores never filter deliveries; they are only appended to the
   message. Which buckets appear is `SCOUT_MODEL_LINE` on the scoring service:
-  default `passed` (only gate-passing buckets); prod is to run `all` once the
-  scoring service is installed (failing buckets marked "(not validated)"),
-  decided 12 Oct 2026 because only he reads the group. Keep `passed` as the code default.
+  default `passed` (only gate-passing buckets); prod runs `all` since 13 Oct
+  2026 (failing buckets marked "(not validated)"), decided 12 Oct 2026
+  because only he reads the group. Keep `passed` as the code default.
 
 ## Practices
 

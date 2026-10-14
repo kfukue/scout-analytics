@@ -772,10 +772,9 @@ the scoring service by `SCOUT_MODEL_LINE`:
   ```
 
 Any other value counts as `passed`. Changing it needs a restart of the scoring
-service only (not the listener). Prod is to run `all` once the scoring
-service is installed (the owner's decision of 12 October 2026: he is the
-only reader of the delivery group). See
-`ml/README.md`.
+service only (not the listener). Prod runs `all` since 13 Oct 2026 (the
+owner's decision of 12 October 2026: he is the only reader of the delivery
+group). See `ml/README.md`.
 
 Scores never filter deliveries. Reading the call's pre-call trades from the node,
 its feature row and the scoring request share one budget, `SCOUT_MODEL_TIMEOUT`

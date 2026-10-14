@@ -1755,10 +1755,12 @@ Later:
   `POST /api/refresh`). Keep p95 under 10 ms; rerun
   `go test -run xxx -bench BenchmarkWebSnapshot -benchmem` after touching it.
 - Only real calls are scanned, delivered and tracked; one row per token.
-- Agents never commit or push (`git commit`, `git add`, `git push` and
-  `git stash` are denied in `.claude/settings.json`); the PM gives exact
-  commands and the owner commits on `work/...` branches, never on `main`,
-  then pushes and merges.
+- Agents other than the PM never commit or push. Since 12 Oct the PM adds,
+  commits and pushes its own `work/...` branches after `review` passes and
+  opens the PR; the owner merges. Never on `main`, never `git stash`.
+- Files only inside the repo and the owner's personal notes folder (owner,
+  14 Oct 2026; rule in `scout-rules`; the path is in his user-level
+  `CLAUDE.md`).
 - Wait for all checks (tests, `review`) before committing; separate clean
   commits per change.
 - Say "tested locally" unless it ran on the prod server. Flag anything that
@@ -1788,7 +1790,10 @@ version:
   `SCOUT_TEST_DATABASE_URL` pointing at a throwaway Postgres named
   `scout_test` (`TestOpenScoutStoreSelection` needs that name), run with
   `-p 1`; without it they are skipped.
-- Throwaway Postgres: `initdb` in the agent's own scratchpad subdirectory, its
+- Throwaway Postgres: `initdb` in the agent's own subdirectory of
+  `<repo root>/.claude/worktrees/_scratch/` (absolute path; see `TESTING.md`;
+  owner, 14 Oct 2026: no files outside the repo
+  and his notes folder), its
   own port on 127.0.0.1, `pg_ctl stop` and delete the directory at the end.
   Never touch the Windows Postgres service on port 5432.
 - `TestLatestPriceInterruptedLeavesRowUntouched` was flaky (about 1 run in 10)
@@ -1802,8 +1807,9 @@ version:
 - Page changes: check at 1280px and 390px, light and dark. DOM with
   `textContent` only, and keep the Content-Security-Policy (no inline script or
   style).
-- Headless browser checks: use a throwaway `--user-data-dir` in the session
-  scratchpad and start Edge/Chrome with `--disable-sync --disable-extensions
+- Headless browser checks: use a throwaway `--user-data-dir` in the agent's
+  subdirectory of the main checkout's `_scratch` folder (absolute path; see
+  `TESTING.md`) and start Edge/Chrome with `--disable-sync --disable-extensions
   --no-first-run --no-default-browser-check` (plus Edge `--inprivate` if it
   works headless), so the test profile is never signed into the owner's
   Microsoft account and never loads his extensions (on 9 October a test
@@ -1902,8 +1908,9 @@ Checks after deploying `work/2026-10-08-ml-pool-web` (deployed 8 October in
     got mixed before).
   - Usage limits cut agents off mid-task, so a restarted agent must first check
     `git status` and the files for partial work.
-  - Each throwaway Postgres gets its own scratchpad directory and port and is
-    deleted afterwards.
+  - Each throwaway Postgres gets its own subdirectory of the main checkout's
+    `_scratch` folder (absolute path; see `TESTING.md`)
+    directory and port and is deleted afterwards.
   - On this PC git needs `safe.directory` (the owner added it globally for
     this repo); agents use `git -c safe.directory=* …`.
   - `git add -p` instructions must say exactly which hunks to take (the owner

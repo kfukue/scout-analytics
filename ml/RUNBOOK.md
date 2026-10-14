@@ -7,8 +7,8 @@ exact; replace only the two paths in step 0.
 What it does NOT do: it does not start the scoring service and does not wire
 scores into deliveries. The scoring service may run and the listener may use
 it (`SCOUT_MODEL_URL`); which buckets the delivery line shows is set by
-`SCOUT_MODEL_LINE` on the scoring service (prod is to run `all` once the
-scoring service is installed, the owner's decision of 12 Oct 2026; step 9). Scores never filter deliveries in any case.
+`SCOUT_MODEL_LINE` on the scoring service (prod runs `all` since 13 Oct 2026,
+the owner's decision of 12 Oct 2026; step 9). Scores never filter deliveries in any case.
 
 ## Quick way: one script
 

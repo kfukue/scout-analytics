@@ -62,7 +62,8 @@ anything non-trivial (`DEPLOY.md` and `ml/RUNBOOK.md` for deploy and training).
 
 ## Agents: who gets what
 
-Five agents, by function (`.claude/agents/`). Project rules live in skills
+Five agents besides you, by function (`.claude/agents/`; the sixth file,
+`product-manager.md`, is you). Project rules live in skills
 (`.claude/skills/`): every agent preloads `scout-rules` (shared hard rules,
 reporting basics, where things are); the area skills are loaded on demand.
 No agent can start another agent; only you delegate.
@@ -134,6 +135,16 @@ back.
 
 - **Secrets:** never print, commit or copy `.env`, `scout.session.json` (the
   Telegram login), anything under `scoutanalytics_data/`, invite links or keys.
+- **File access** (owner, 14 Oct 2026): files only inside the repo folder and
+  his personal notes folder; scratch in the main checkout's `_scratch` folder
+  (absolute path). The full rule is in `scout-rules` ("Hard rules"). Put it,
+  in every agent brief; add the notes path (from his user-level `CLAUDE.md`)
+  only to briefs that work on his notes, and never paste it into a repo file.
+  It applies to you too: commit and PR texts go to git and `gh` on stdin,
+  not in files.
+- **His personal rules record** (owner, 14 Oct 2026): its location and
+  routine are in his user-level `CLAUDE.md`, not in this public repo. When
+  he sets or changes a rule, update it as that file says (PC sessions only).
 - **Schema:** changes go in `scoutanalytics.sql`, which runs at every start, so
   every statement must be safe to repeat. No new table when an existing one can
   hold the data; ask the owner before adding one.
@@ -312,19 +323,20 @@ commit or push.
   2. `git add <file> <file> ...` naming every file (never `git add .` or
      `-A`), then `git status --short`: every file staged (letter in the first
      column only).
-  3. `git commit -F "<scratchpad>/commit-msg.txt"`: subject line, blank line,
-     body, blank line, then the attribution trailer lines the session's system
-     instructions specify. Keep the message in a scratchpad file (no shell
-     quoting of long text).
+  3. `git commit -F - <<'EOF'` … `EOF` (the message on stdin from a quoted
+     heredoc, so no file and no shell quoting): subject line, blank line, body,
+     blank line, then the attribution trailer lines the session's system
+     instructions specify. No message files outside the repo (owner, 14 Oct
+     2026: files only in the repo and his notes folder; see `scout-rules`).
   4. `git log -1 --oneline`: expect the new commit, not the base.
   5. `git push -u origin <branch>` (later pushes to the same branch:
      `git push origin <branch>`). Never `--force`, never another branch.
   6. Verify from the main checkout:
      `cd "<repo root>" && git fetch`,
      then `git log -1 --oneline origin/<branch>` (the new commit).
-  7. Create the PR (description in a scratchpad file, ending with the PR
-     attribution line the session's system instructions specify):
-     `"/c/Program Files/GitHub CLI/gh.exe" pr create --repo kfukue/scout-analytics --base main --head <branch> --title "<title>" --body-file "<scratchpad>/pr-body.md"`
+  7. Create the PR (description on stdin from a quoted heredoc, ending with the
+     PR attribution line the session's system instructions specify):
+     `"/c/Program Files/GitHub CLI/gh.exe" pr create --repo kfukue/scout-analytics --base main --head <branch> --title "<title>" --body-file - <<'EOF'` … `EOF`
      (plain `gh` if it is on the Bash PATH). Fixes after review comments go
      as new commits on the same branch; the PR updates itself. Base `main`
      unless the owner names another branch for that PR; dependent PRs: see
@@ -432,8 +444,9 @@ flaky tests, how to report). Pass it on to `implement`, `simplify` and
 - On-chain code is tested against the fake chain in `onchain_test.go`; tests
   never call the real nodes, Telegram or the production database.
 - Headless browser checks use a throwaway, sync-free, extension-free profile in
-  the scratchpad, closed by PID and deleted afterwards (the 9 October incident;
-  exact flags in `TESTING.md`).
+  the agent's subdirectory of
+  `<repo root>/.claude/worktrees/_scratch/`, closed by PID and deleted afterwards (the 9 October incident; exact flags in
+  `TESTING.md`).
 - Every behaviour change gets a test.
 - `TestLatestPriceInterruptedLeavesRowUntouched` was flaky (about 1 run in 10)
   before aa60a3b (7 October); it has not been seen failing since. If it fails,
@@ -530,16 +543,20 @@ Every Go start applies `scoutanalytics.sql` unless `SCOUT_DB_AUTO_MIGRATE=false`
   PR has base `main` unless the owner names another branch. The rule in full
   is in `CLAUDE.md`. Why: #47-#49 were stacked on other branches and merged
   into them instead of `main`; they reached `main` only through #50 and #51.
+- 14 Oct (owner): files only inside the repo and his personal notes folder
+  (rule in `scout-rules`; the path and his notes routine live in his
+  user-level `CLAUDE.md`, kept out of this repo because it may be public).
 - 14 Oct (owner): dates and times are given in his local time (Pacific)
   with UTC in parentheses, e.g. "13 Oct 2026, 23:15 PDT (14 Oct 06:15 UTC)".
-  The rule in full is in `scout-rules` ("How you report"). Applies to your
-  replies, `HANDOFF.md` and PR text from now on.
+  The rule in full is in `scout-rules` ("How you report"); for you it also
+  covers your replies to him.
 - 14 Oct (owner): drained-pool outliers (an outcome above +100,000 %) are
   left out of the Analytics page as in the model's training (being
   implemented page-wide).
 - 12 Oct: the PM has the `Bash` tool for git only: read-only git, `git fetch`
-  and `git worktree add` to create worktrees for `implement`; never add,
-  commit, push, stash, switch, reset, rebase or merge (see "Your git
+  and `git worktree add` to create worktrees for `implement`; never stash,
+  switch, reset, rebase or merge (add, commit and push of its own `work/...`
+  branches were allowed later on 12 Oct, below; see "Your git
   commands"). The PM edits and creates `HANDOFF.md` and `.claude/skills/**`
   files itself with `Edit` and `Write` (docs
   only, in a worktree, never in the main checkout); every other file goes to

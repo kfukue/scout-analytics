@@ -4,6 +4,29 @@ The single guide to testing this repo, for people and for the agents
 (`implement`, `simplify`, `verify`, `review`). The agent files and skills keep
 only the essentials and point here.
 
+Scratch files (test databases, coverage, logs, LF copies, browser profiles) go
+in your own `<task>` folder in `<repo root>\.claude\worktrees\_scratch\`,
+where `<repo root>` is the main checkout's root folder, never in the session
+scratchpad under `AppData\Local\Temp`, because the owner allows files only
+inside the repo and his notes folder (owner rule, 14 Oct 2026). Always give
+this absolute path, never a relative one: a relative
+`.claude/worktrees/_scratch` used from inside a worktree lands in that
+worktree and is deleted with it.
+
+Get `<repo root>` as an absolute path from any worktree (or the main
+checkout); the examples below use `$ROOT` (bash) and `$root` (PowerShell):
+
+- bash: `ROOT=$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")`
+- PowerShell:
+  `$root = Split-Path (git rev-parse --path-format=absolute --git-common-dir)`
+
+For example `S="$ROOT/.claude/worktrees/_scratch/<task>"` in bash, or
+`$s = "$root\.claude\worktrees\_scratch\<task>"` in PowerShell.
+
+Files a tool makes for itself (the Go build and module caches, `t.TempDir()`,
+pytest `tmp_path`) are the tool's and are fine; agents never read or write
+them directly.
+
 ## Layers
 
 - **Unit (Go):** `*_test.go` files that need no database. They always run with
@@ -63,25 +86,30 @@ own throwaway Postgres and deletes it afterwards.
   creates the database `scout_test` and prints the DSN on its last line.
 - `run` runs a command with `SCOUT_TEST_DATABASE_URL` set to that database
   (check the exact behaviour against the scripts once that branch merges).
-- `<dir>` is a new subdirectory of your session scratchpad, never inside the
-  repo.
+- `<dir>` is a new subdirectory of your `_scratch` folder, e.g.
+  `<repo root>\.claude\worktrees\_scratch\<task>\testdb`;
+  never inside a worktree's tracked files.
 - After `stop`, check that `<dir>` is gone (delete it if it is not) and say so
   in your report.
 
 ### Manual steps
 
-- Run `initdb` in your own subdirectory of the session scratchpad. Listen on
-  127.0.0.1 only, on a port no other agent uses (pick one in 55000-55999).
-  Name the database `scout_test`.
+- Run `initdb` in your own subdirectory of
+  `<repo root>\.claude\worktrees\_scratch\<task>`
+  in the main checkout (the data directory must be new and empty;
+  `.claude/worktrees/` is git-ignored, so nothing there gets committed). Listen on 127.0.0.1 only, on a port no other agent uses (pick
+  one in 55000-55999). Name the database `scout_test`.
 - Set `SCOUT_TEST_DATABASE_URL` to it, and run the tests with `-p 1`.
 - At the end, stop it (`pg_ctl stop`) and delete its directory. Confirm both in
   your report.
 - Never touch the Windows Postgres service on port 5432.
 
-Example (Git Bash or Linux; `D` and `PORT` are yours):
+Example (Git Bash or Linux; `S`, `D` and `PORT` are yours):
 
 ```bash
-D="<scratchpad>/pg-<task>"; PORT=55123
+ROOT=$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")
+S="$ROOT/.claude/worktrees/_scratch/<task>"
+D="$S/pg"; PORT=55123
 initdb -D "$D/data" -U postgres -A trust -E UTF8
 pg_ctl -D "$D/data" -l "$D/pg.log" -w \
   -o "-p $PORT -c listen_addresses=127.0.0.1" start
@@ -91,6 +119,7 @@ export SCOUT_TEST_DATABASE_URL="postgres://postgres@127.0.0.1:$PORT/scout_test?s
 # ... run the tests ...
 pg_ctl -D "$D/data" -m fast -w stop
 rm -rf "$D"
+rm -rf "$S"   # when you are done with all your scratch files
 ```
 
 ## CI
@@ -104,19 +133,23 @@ changes. It fails if any database test was skipped for a missing
 
 ## A complete local run
 
-From the repo root. Put coverage files and logs in your scratchpad, not in the
-repo.
+From the repo root. Put coverage files and logs in your
+`<repo root>\.claude\worktrees\_scratch\<task>`
+folder of the main checkout (git-ignored; `$s` / `s` below), not in the
+worktree's tracked files.
 
 PowerShell:
 
 ```powershell
-$db = "<scratchpad>\testdb-<task>"
+$root = Split-Path (git rev-parse --path-format=absolute --git-common-dir)
+$s = "$root\.claude\worktrees\_scratch\<task>"
+$db = "$s\testdb"
 $env:SCOUT_TEST_DATABASE_URL = (& .\scripts\testdb.ps1 start $db | Select-Object -Last 1)
 go build ./...
 go vet ./...
 go test -race -p 1 ./...
-go test -p 1 -coverprofile "<scratchpad>\cover.out" .
-go tool cover -func "<scratchpad>\cover.out"
+go test -p 1 -coverprofile "$s\cover.out" .
+go tool cover -func "$s\cover.out"
 node --check frontend\app.js        # each changed JS file
 node testdata\analytics-stats.test.js
 go test -run xxx -bench BenchmarkWebSnapshot -benchmem .
@@ -124,18 +157,21 @@ Push-Location ml; .\.venv\Scripts\python.exe -m pytest tests -q; Pop-Location
 & .\scripts\testdb.ps1 stop $db
 Remove-Item Env:SCOUT_TEST_DATABASE_URL
 Test-Path $db                       # must print False
+Remove-Item -Recurse -Force $s      # when done with all your scratch files
 ```
 
 bash:
 
 ```bash
-db="<scratchpad>/testdb-<task>"
+ROOT=$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")
+s="$ROOT/.claude/worktrees/_scratch/<task>"
+db="$s/testdb"
 export SCOUT_TEST_DATABASE_URL="$(scripts/testdb.sh start "$db" | tail -n 1)"
 go build ./...
 go vet ./...
 go test -race -p 1 ./...
-go test -p 1 -coverprofile "<scratchpad>/cover.out" .
-go tool cover -func "<scratchpad>/cover.out"
+go test -p 1 -coverprofile "$s/cover.out" .
+go tool cover -func "$s/cover.out"
 node --check frontend/app.js        # each changed JS file
 node testdata/analytics-stats.test.js
 go test -run xxx -bench BenchmarkWebSnapshot -benchmem .
@@ -143,6 +179,7 @@ go test -run xxx -bench BenchmarkWebSnapshot -benchmem .
 scripts/testdb.sh stop "$db"
 unset SCOUT_TEST_DATABASE_URL
 test ! -e "$db" && echo deleted
+rm -rf "$s"                         # when done with all your scratch files
 ```
 
 Until the scripts are merged, replace the `start`/`stop` lines with the manual
@@ -159,9 +196,10 @@ steps above. To list skipped tests, add `-v` and look for `--- SKIP`.
 ## Line endings and gofmt
 
 - The Go files are CRLF, so plain `gofmt -l` lists almost every file. Check
-  gofmt on LF copies (e.g. `tr -d '\r' < x.go > <scratchpad>/lf/x.go`, then
-  `gofmt -l <scratchpad>/lf`), and keep CRLF line endings in the files you
-  edit.
+  gofmt on LF copies in your `_scratch` folder of the main checkout (e.g. with
+  `S="$ROOT/.claude/worktrees/_scratch/<task>"`:
+  `mkdir -p "$S/lf"`, `tr -d '\r' < x.go > "$S/lf/x.go"`, then
+  `gofmt -l "$S/lf"`), and keep CRLF line endings in the files you edit.
 - In Git Bash, `grep -c $'\r'` reports 0 even for CRLF files; count CRs with
   `tr -cd '\r' < file | wc -c` and compare with `wc -l < file`.
 
@@ -176,7 +214,9 @@ steps above. To list skipped tests, add `-v` and look for `--- SKIP`.
 - No sleeps for synchronisation where a channel or clock can be injected; fixed
   random seeds; no real network.
 - Headless browser checks (only when the task asks for them): a throwaway
-  `--user-data-dir` in the session scratchpad, and Edge/Chrome started with
+  `--user-data-dir` in your `_scratch` folder of the main checkout (e.g.
+  `<repo root>\.claude\worktrees\_scratch\<task>\browser`),
+  and Edge/Chrome started with
   `--disable-sync --disable-extensions --no-first-run
   --no-default-browser-check` (plus Edge `--inprivate` if it works headless),
   so the test profile is never signed into the owner's Microsoft account and
