@@ -5,9 +5,9 @@
 // with), over a tiny stand-in for document and the page's data, col and state
 // (as testdata/analytics-health.test.js does). A normal case, no outcomes yet,
 // the 404 (hidden) and error states, MIN_N greying, a true, false and null
-// "passed", the page filters (they apply here), extreme outcomes (above
-// +100,000% in any bucket's column: an outcome in no bucket) and the +1,000%
-// cap on the mean returns; and that load() asks for
+// "passed", the page filters (they apply here), extreme calls (an outcome
+// above +100,000%: left out before the join by pageRows, as everywhere on
+// the page) and the +1,000% cap on the mean returns; and that load() asks for
 // model-live and render() draws the section on every tab. render() calls
 // renderLive, so a throw here would blank the page. Run:
 // node testdata/analytics-live.test.js [analytics.js] [analytics-stats.js]
@@ -110,33 +110,33 @@ check('join: by the column names (other order)', S.joinModelLive({
 check('join: none', S.joinModelLive(jb, [[1]], 0), []);
 
 // liveBucketStats
-function rec(t, rank, x, ret, known, version, passed, extreme) {
+function rec(t, rank, x, ret, known, version, passed) {
   return {
     t: t, rank: rank, passed: passed === undefined ? true : passed, version: version || 'v1', known: known !== false,
-    extreme: !!extreme, x: x, ret: ret
+    x: x, ret: ret
   };
 }
 var st = S.liveBucketStats([
   rec(30, 95, 150, 40), rec(20, 90, 100, 20), rec(25, 89.9, 200, 60), rec(40, null, 100, 0), rec(10, 50, 10, -20),
   rec(5, 99, 500, 300, false)
 ], S.LIVE_RULES.short);
-check('stats: counts', [st.scored, st.known, st.extreme, st.top.n, st.top.k, st.all.n, st.all.k], [6, 5, 0, 2, 2, 5, 4]);
+check('stats: counts', [st.scored, st.known, st.top.n, st.top.k, st.all.n, st.all.k], [6, 5, 2, 2, 5, 4]);
 check('stats: means over the known calls', [st.top.mean, st.all.mean], [30, 20]);
 check('stats: lift = top rate ÷ all rate', st.lift, 1 / 0.8);
 check('stats: first call (known or not)', st.firstT, 5);
 var empty = S.liveBucketStats([], S.LIVE_RULES.short);
 check('stats: empty', [empty.scored, empty.known, empty.top, empty.all, isNaN(empty.lift), isNaN(empty.firstT), empty.version,
   empty.versionN, empty.passed], [0, 0, { n: 0, k: 0, mean: null }, { n: 0, k: 0, mean: null }, true, true, null, 0, null]);
-// Extreme outcomes and the cap (ml/scout_ml/config.py MAX_OUTCOME_PCT,
-// SIM_MAX_RET_PCT): an extreme call is never an outcome, even if marked
-// known; each mean return is capped at cap (the page passes PL_CAP), the
-// runner rule reads the uncapped value
-check('max outcome', S.LIVE_MAX_OUTCOME_PCT, 1e5);
-var capRecs = [rec(1, 95, 5000, 5000), rec(2, 50, 0, 0), rec(3, 95, 3.9e47, 3.9e47, true, 'v1', true, true)];
+// The cap (ml/scout_ml/config.py SIM_MAX_RET_PCT): each mean return is
+// capped at cap (the page passes PL_CAP), the runner rule reads the uncapped
+// value. Extreme calls (MAX_OUTCOME_PCT) are the page's (pageRows, below):
+// one shared cap, no second constant here
+check('one outcome cap: no LIVE_MAX_OUTCOME_PCT', [typeof S.LIVE_MAX_OUTCOME_PCT, S.MAX_OUTCOME_PCT], ['undefined', 1e5]);
+var capRecs = [rec(1, 95, 5000, 5000), rec(2, 50, 0, 0)];
 var capped = S.liveBucketStats(capRecs, S.LIVE_RULES['3day'], 1000);
-check('stats: extreme left out, +5000% capped at +1000%',
-  [capped.scored, capped.known, capped.extreme, capped.top.n, capped.top.k, capped.all.n, capped.all.k, capped.top.mean, capped.all.mean],
-  [3, 2, 1, 1, 1, 2, 1, 1000, 500]);
+check('stats: +5000% capped at +1000%',
+  [capped.scored, capped.known, capped.top.n, capped.top.k, capped.all.n, capped.all.k, capped.top.mean, capped.all.mean],
+  [2, 2, 1, 1, 2, 1, 1000, 500]);
 var uncapped = S.liveBucketStats(capRecs, S.LIVE_RULES['3day']);
 check('stats: no cap given: not capped', [uncapped.top.mean, uncapped.all.mean], [5000, 2500]);
 var noRunner = S.liveBucketStats([rec(1, 95, 10, 0), rec(2, 50, 10, 0)], S.LIVE_RULES.short);
@@ -211,14 +211,14 @@ var col = {};
 COLUMNS.forEach(function (c, i) { col[c] = i; });
 var box = {
   document: document, A: S, col: col, data: null, state: null, snapshotMs: NaN,
-  live: null, liveEtag: '', liveLoading: false, fetch: null, Promise: Promise
+  live: null, liveEtag: '', liveLoading: false, fetch: null, Promise: Promise, kept: [], keptOf: null
 };
 vm.createContext(box);
 vm.runInContext([takeVar('DASH'), takeVar('MIN_N'), takeVar('PL_CAP'), takeVar('LIVE_FORMAT'), takeVar('FLAG_USD'),
   takeVar('MONTHS'), takeVar('SUPERSCRIPT'), takeVar('isNum'), takeVar('LIVE_HEADS')].concat(['$', 'el', 'fmtInt', 'fmtDay',
   'sciText', 'fmtPct', 'exactPct', 'headRow', 'pctCell', 'rateCell', 'fewRateCell', 'verdictKey', 'familyKey', 'isUSD',
   'isRugged', 'metricAt', 'now', 'isQuiet', 'passQuiet', 'passVerdict', 'passFamily', 'liveRuleText', 'liveError',
-  'applyLive', 'loadLive', 'liveExtreme', 'liveRecs', 'liveCoverText', 'liveMeanCell', 'liveLiftCell', 'liveValidCell', 'liveRow',
+  'applyLive', 'loadLive', 'pageRows', 'liveRecs', 'liveCoverText', 'liveMeanCell', 'liveLiftCell', 'liveValidCell', 'liveRow',
   'renderLive'].map(take)).join('\n'), box);
 
 var VERDICTS = ['clean', 'caution', 'red_flags', 'unknown', 'none'];
@@ -417,9 +417,10 @@ if (draw('19 top', MIX, MIX_LIVE)) {
     ['tok', 'num', 'num', 'num', 'num ana-few', 'num', 'num ana-few', 'num pos ana-few', 'num pos', 'num']);
 }
 
-// ---- Extreme outcomes and the +1,000% cap ------------------------------------------
+// ---- Extreme calls and the +1,000% cap ---------------------------------------------
 // 1: a drained pool: +3.9e47% in its 30d return only (every other value
-//    normal): an outcome in no bucket, the short one (1d) included
+//    normal): left out of the whole page (pageRows), so neither scored nor
+//    counted among the first calls here, in every bucket (1d included)
 // 2: +5000% everywhere (peak 150): a runner in every bucket, its return
 //    capped at +1,000% in the means
 // 3: nothing (peak 10, return 0); 4: a 1d peak of exactly +100,000% (not above
@@ -429,20 +430,21 @@ WILD[0][col.ret_30d] = 3.9e47;
 var WILD_LIVE = [liveRow(1, 0, 95, [true, true, true, true]), liveRow(2, 0, 95, [true, true, true, true]),
   liveRow(3, 0, 50, [true, true, true, true]), liveRow(4, 0, 50, [true, true, true, true])];
 if (draw('extreme', WILD, WILD_LIVE)) {
-  check('extreme: coverage counts it', page['ml-cover'].textContent,
-    '4 of 4 first calls (after the page filters) scored at call time (first score 2 Sep 2026). ' +
-    '1 left out of every bucket as in training: an outcome above +100,000% (bad pool data).');
-  check('extreme: scored, never an outcome; +5000% capped', rowTexts(), [
-    ['short (1d)', '4', '3', '1', '100.0%1 / 1', '66.7%2 / 3', '1.5×', '+1,000%', '+333.3%', 'yes'],
-    ['3day (3d)', '4', '3', '1', '100.0%1 / 1', '33.3%1 / 3', '3.0×', '+1,000%', '+333.3%', 'yes'],
-    ['medium (7d)', '4', '3', '1', '100.0%1 / 1', '33.3%1 / 3', '3.0×', '+1,000%', '+333.3%', 'yes'],
-    ['long (30d)', '4', '3', '1', '100.0%1 / 1', '33.3%1 / 3', '3.0×', '+1,000%', '+333.3%', 'yes']
+  check('extreme: not among the calls, no clause (the page-wide note has it)', page['ml-cover'].textContent,
+    '3 of 3 first calls (after the page filters) scored at call time (first score 2 Sep 2026).');
+  check('extreme: not scored, never an outcome; +5000% capped', rowTexts(), [
+    ['short (1d)', '3', '3', '1', '100.0%1 / 1', '66.7%2 / 3', '1.5×', '+1,000%', '+333.3%', 'yes'],
+    ['3day (3d)', '3', '3', '1', '100.0%1 / 1', '33.3%1 / 3', '3.0×', '+1,000%', '+333.3%', 'yes'],
+    ['medium (7d)', '3', '3', '1', '100.0%1 / 1', '33.3%1 / 3', '3.0×', '+1,000%', '+333.3%', 'yes'],
+    ['long (30d)', '3', '3', '1', '100.0%1 / 1', '33.3%1 / 3', '3.0×', '+1,000%', '+333.3%', 'yes']
   ]);
+  var wildRows = rowTexts();
 }
-// none extreme: no clause in the coverage line
+// without the drained call at all: exactly the same section
 if (draw('not extreme', WILD.slice(1), WILD_LIVE.slice(1))) {
   check('not extreme: coverage', page['ml-cover'].textContent,
     '3 of 3 first calls (after the page filters) scored at call time (first score 2 Sep 2026).');
+  check('not extreme: same rows as with it', rowTexts(), wildRows);
 }
 
 // ---- No outcomes yet: called 2 days before now ----------------------------------
@@ -518,7 +520,7 @@ check('no analytics yet: no table', [page['model-insights'].hidden, page['ml-bod
 
 // ---- The hooks: load() asks for model-live with /api/analytics, and render()
 // draws the section on every tab (so the page filters apply at once) ---------------
-var hooks = { loadLive: 0, renderLive: 0, fetched: [] };
+var hooks = { loadLive: 0, renderLive: 0, note: 0, fetched: [] };
 var hookFake = {
   hidden: true, textContent: '',
   querySelectorAll: function () { return []; }, setAttribute: function () {}
@@ -532,7 +534,8 @@ var hookBox = {
   fetch: function (url) { hooks.fetched.push(url); return new Promise(function () {}); }, // never answers
   passQuiet: function () { return true; }, passVerdict: function () { return true; }, passFamily: function () { return true; },
   renderOverview: function () { return 1; }, drawPL: function () {}, renderFactor: function () {}, renderTiming: function () {},
-  renderPeak: function () {}
+  renderPeak: function () {},
+  pageRows: function () { return hookBox.data.rows; }, renderExtremeNote: function () { hooks.note++; }
 };
 vm.createContext(hookBox);
 vm.runInContext([take('load'), take('render')].join('\n'), hookBox);
@@ -545,6 +548,7 @@ hookBox.data = { horizons: ['1h', '1d'], rows: [[1]] };
   hookBox.state = { horizon: '1d', k: '4', tab: tab };
   hookBox.render();
   check('render ' + tab + ': draws the model section', hooks.renderLive, i + 1);
+  check('render ' + tab + ': writes the page-wide note', hooks.note, i + 1);
 });
 
 // ---- loadLive: the request, its ETag, and what each answer does -------------------
