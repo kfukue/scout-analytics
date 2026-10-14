@@ -293,18 +293,32 @@
     return peak >= at ? at : ret;
   }
 
+  // The exit-rule table leaves out a pair whose peak or return is above this
+  // (in %): drained pools have given absurd outcomes (e.g. +3.9×10⁴⁷ %), and
+  // one of them makes the "hold to the end" mean meaningless. The same cap
+  // and the same strict ">" as the model's training: MAX_OUTCOME_PCT in
+  // ml/scout_ml/config.py, applied by extreme_outcome in ml/scout_ml/labels.py
+  // (exactly 1e5 is kept; a missing value is not extreme).
+  // Only the selected window's pair is checked, unlike labels.py, which checks every horizon.
+  var EXIT_MAX_OUTCOME_PCT = 1e5;
+
   // The exit rule m (exitReturn) over the pairs { peak, ret }: n = pairs with
   // both, hit = those that touched m× (0 for hold, m = Infinity), and the
-  // mean and median return under the rule.
+  // mean and median return under the rule. out = pairs left out of every
+  // rule because their peak or return is above EXIT_MAX_OUTCOME_PCT (counted
+  // before the missing check, as labels.py: such a pair is out even when the
+  // other value is missing); the same for every m, so every row of the table
+  // is over the same calls.
   function exitRuleStats(pairs, m) {
-    var rets = [], hit = 0;
+    var rets = [], hit = 0, out = 0;
     for (var i = 0; i < pairs.length; i++) {
+      if (pairs[i].peak > EXIT_MAX_OUTCOME_PCT || pairs[i].ret > EXIT_MAX_OUTCOME_PCT) { out++; continue; }
       var v = exitReturn(pairs[i].peak, pairs[i].ret, m);
       if (!isNum(v)) { continue; }
       rets.push(v);
       if (pairs[i].peak >= (m - 1) * 100) { hit++; }
     }
-    return { n: rets.length, hit: hit, mean: mean(rets), median: median(rets) };
+    return { n: rets.length, hit: hit, mean: mean(rets), median: median(rets), out: out };
   }
 
   // Data health per period (the Overview's "Data health" tables). recs: one
@@ -842,7 +856,8 @@
     symlog: symlog, symlogInv: symlogInv, log1p10: log1p10, log1p10Inv: log1p10Inv,
     symlogTicks: symlogTicks, log1pTicks: log1pTicks,
     weekStart: weekStart, monthStart: monthStart, hourWeekday: hourWeekday, DAY_MS: DAY_MS,
-    cumulativePL: cumulativePL, gaveBack: gaveBack, exitReturn: exitReturn, exitRuleStats: exitRuleStats, jitter: jitter,
+    cumulativePL: cumulativePL, gaveBack: gaveBack, exitReturn: exitReturn, exitRuleStats: exitRuleStats,
+    EXIT_MAX_OUTCOME_PCT: EXIT_MAX_OUTCOME_PCT, jitter: jitter,
     weekHealth: weekHealth, quietByWeekFamily: quietByWeekFamily,
     LIVE_RULES: LIVE_RULES, LIVE_TOP_RANK: LIVE_TOP_RANK, LIVE_MAX_OUTCOME_PCT: LIVE_MAX_OUTCOME_PCT, liveRunner: liveRunner, joinModelLive: joinModelLive,
     liveBucketStats: liveBucketStats,
