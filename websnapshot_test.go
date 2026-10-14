@@ -1203,6 +1203,16 @@ func BenchmarkWebSnapshot(b *testing.B) {
 		req.Header.Set("If-None-Match", snap.analytics.etag)
 		serve(b, req, 304)
 	})
+	b.Run("http/model_live_gzip", func(b *testing.B) {
+		req := httptest.NewRequest("GET", "/api/model-live", nil)
+		req.Header.Set("Accept-Encoding", "gzip")
+		serve(b, req, 200)
+	})
+	b.Run("http/model_live_not_modified", func(b *testing.B) {
+		req := httptest.NewRequest("GET", "/api/model-live", nil)
+		req.Header.Set("If-None-Match", snap.modelLive.etag)
+		serve(b, req, 304)
+	})
 	b.Run("http/not_modified", func(b *testing.B) {
 		rec := httptest.NewRecorder()
 		ws.ServeHTTP(rec, httptest.NewRequest("GET", "/api/calls?q=pe&verdict=clean&sort=peak", nil))

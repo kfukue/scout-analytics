@@ -240,6 +240,12 @@ func webModelRunner(r *ScoutWebRow) *float64 {
 	return r.Model.Buckets[webModelColumn].Runner
 }
 
+// webModelAfterS: how many whole seconds after the call at the score m was
+// stored (never below 0); /api/calls' "model" object and /api/model-live send it.
+func webModelAfterS(m *ScoutWebModel, at time.Time) int64 {
+	return max(0, int64(m.ScoredAt.Sub(at)/time.Second))
+}
+
 // webCallModel is the "model" object of a row as sent (nil without a score).
 func webCallModel(r *ScoutWebRow) *ScoutWebCallModel {
 	m := r.Model
@@ -247,7 +253,7 @@ func webCallModel(r *ScoutWebRow) *ScoutWebCallModel {
 		return nil
 	}
 	out := &ScoutWebCallModel{Version: m.Version, ScoredAt: m.ScoredAt,
-		AfterS: max(0, int64(m.ScoredAt.Sub(r.MessageDate)/time.Second)), Buckets: []ScoutWebCallModelBucket{}}
+		AfterS: webModelAfterS(m, r.MessageDate), Buckets: []ScoutWebCallModelBucket{}}
 	for b, v := range m.Buckets {
 		if !v.Has {
 			continue
@@ -372,6 +378,10 @@ type webSnapshot struct {
 	// analytics: the body of GET /api/analytics, encoded (and compressed)
 	// once when the snapshot is built (webanalytics.go)
 	analytics *webAnalytics
+	// modelLive: the body of GET /api/model-live, built the same way
+	// (webmodellive.go); nil when the website does not show model scores
+	// (webConfig.ModelScores)
+	modelLive *webModelLive
 }
 
 // webTodayVerdict codes a "Perceptor today" verdict for webSnapshot.todayVerd:
@@ -801,6 +811,9 @@ func newWebSnapshot(rows []ScoutWebRow, updatePosts int, prev *webSnapshot, cfg 
 		// Same content: keep prev's blocks (and let the rows just read go).
 		same := *prev
 		same.summary, same.summaryTag, same.answers = s.summary, s.summaryTag, nil
+		if !cfg.ModelScores {
+			same.modelLive = nil // nothing model-related is held without scores
+		}
 		return &same, nil
 	}
 
@@ -900,7 +913,24 @@ func newWebSnapshot(rows []ScoutWebRow, updatePosts int, prev *webSnapshot, cfg 
 		return nil, fmt.Errorf("analytics: %w", err)
 	}
 	s.analytics = ana
+	if s.modelLive, err = snapshotModelLive(rows, prev, cfg); err != nil {
+		return nil, fmt.Errorf("model scores: %w", err)
+	}
 	return s, nil
+}
+
+// snapshotModelLive builds the body of GET /api/model-live for a new
+// snapshot (the one of prev again when the bytes are the same); nil when the
+// website does not show model scores.
+func snapshotModelLive(rows []ScoutWebRow, prev *webSnapshot, cfg webConfig) (*webModelLive, error) {
+	if !cfg.ModelScores {
+		return nil, nil
+	}
+	var old *webModelLive
+	if prev != nil {
+		old = prev.modelLive
+	}
+	return buildWebModelLive(rows, old)
 }
 
 // trimBlock returns b without spare room: as it is when little is spare, else a copy.

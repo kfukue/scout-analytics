@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -103,10 +104,38 @@ func TestWebModelScores(t *testing.T) {
 	}
 	fx.wantOrder(t, "sort=model&dir=asc&per=2", "alpha", "virt")
 
-	// a website that does not show scores: no row has one, and sort=model is refused
+	// GET /api/model-live: the same two scores, one row each, read from the
+	// same snapshot; beta (no bucket), gamma (back-scored) and the repeat
+	// call's score are not there, nor the stored features
+	code, _, body := fx.get(t, "/api/model-live")
+	if code != 200 || strings.Contains(string(body), "secret") {
+		t.Fatalf("/api/model-live: %d %s", code, body)
+	}
+	live := decodeModelLive(t, body)
+	wantRows := []string{
+		fmt.Sprintf("[%d,0,120,0.1,0.05,90,false,0.2,0.1,90,false,0.3,0.15,90,true,0.4,0.2,90,null]", fx.ids["alpha"]),
+		fmt.Sprintf("[%d,0,60,null,null,null,null,null,null,null,null,0.3,0.15,90,null,null,null,null,null]", fx.ids["virt"]),
+	}
+	if live.FirstCalls != 9 || live.Scored != 2 || fmt.Sprint(live.Versions) != "[20261013-1909]" || len(live.Rows) != len(wantRows) {
+		t.Fatalf("/api/model-live: first_calls %d scored %d versions %v rows %s", live.FirstCalls, live.Scored, live.Versions, live.Rows)
+	}
+	for i, row := range live.Rows {
+		if string(row) != wantRows[i] {
+			t.Errorf("/api/model-live row %d: got %s, want %s", i, row, wantRows[i])
+		}
+	}
+
+	// a website that does not show scores: no row has one, sort=model is
+	// refused and /api/model-live does not exist
 	off := mustWebServer(t, fx.st, webConfig{GMGNTemplate: defaultGMGNTemplate}, fx.web.static)
 	if rec := getWeb(off, "/api/calls?sort=model"); rec.Code != 400 {
 		t.Fatalf("ModelScores off, sort=model: %d %s", rec.Code, rec.Body)
+	}
+	if rec := getWeb(off, "/api/model-live"); rec.Code != 404 {
+		t.Fatalf("ModelScores off, /api/model-live: %d %s, want 404", rec.Code, rec.Body)
+	}
+	if snap := off.snap.Load(); snap == nil || snap.modelLive != nil {
+		t.Fatalf("ModelScores off: snapshot %v holds a model-live body", snap != nil)
 	}
 	for _, c := range decodeCalls(t, getWeb(off, "/api/calls")).Calls {
 		if c.Model != nil {

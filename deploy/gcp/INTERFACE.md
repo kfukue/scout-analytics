@@ -74,6 +74,8 @@ in read mode. The read side builds its `webConfig` with `ModelScores=false`
 (no environment variable): no row carries a model score, `sort=model` is
 refused with 400, `/api/calls` answers `"model_scores": false` and the page
 hides the Model column, its detail block and its legend entry.
+`GET /api/model-live` never exists on the public site: it is registered only
+with `ModelScores=true`, so the read side answers 404 like any unknown `/api/` path.
 
 ## 2. Objects and formats
 
