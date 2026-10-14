@@ -64,21 +64,32 @@ since then: every PR has base `main` unless he names another branch (PR
   suggests two lines for `.claude/agents/review.md` (the owner's file;
   not known whether added).
 
-**In progress (PM worktrees, uncommitted unless noted; each becomes its
-own PR with base `main`):**
+**Open PRs from the overnight session (all reviewed PASS, all base `main`;
+tested locally only; nothing deployed):**
 
 | Worktree | Branch | From | Work |
 |---|---|---|---|
 | model-startup-line-20261014 | `work/2026-10-14-model-startup-line` | 694e9e5 | **PR #56** (465caae, reviewed PASS): listener start-up line: model scoring on/off (also off with SCOUT_DB=off), URL without user info/query/fragment, budget. Deploy: listener restart |
 | log-invite-link-20261014 | `work/2026-10-14-log-invite-link` | 694e9e5 | **PR #55** (a18cbe6, reviewed PASS): invite link redacted as `<invite>` in start-up lines and errors; `scout_deliveries.target` keeps the real link (re-ask matches on it). Deploy: listener restart |
-| exit-rule-20261014 | `work/2026-10-14-exit-rule` | cc0bc2c | Analytics idea 1 (owner approved): "Exit rule" table on Peak vs final; page-only; built, test of the drawing code being added, then review |
-| model-live-api-20261014 | `work/2026-10-14-model-live-api` | cc0bc2c | Analytics idea 3a (owner approved): `GET /api/model-live` from the snapshot, 404 when `ModelScores=false`; Go only, page section later |
+| exit-rule-20261014 | `work/2026-10-14-exit-rule` | cc0bc2c | **PR #58** (3aae8fc): Analytics idea 1, "Exit rule" table on Peak vs final (sell at first touch of 2×/3×/5× vs hold; before tax; upper bound). Page-only |
+| data-health-20261014 | `work/2026-10-14-data-health` | #58 branch | **PR #59** (4c4046a), merge after #58: idea 2, "Data health by week" + quiet share by week × pool family on Overview; all calls, filters ignored. Page-only |
+| model-live-api-20261014 | `work/2026-10-14-model-live-api` | cc0bc2c | **PR #60** (398289b): idea 3a, `GET /api/model-live` (scores stored at call time, from the snapshot; 404 and nothing built when `ModelScores=false`). Go only |
+| model-insights-page-20261014 | `work/2026-10-14-model-insights-page` | #59 branch | **PR #61** (4250e24), merge after #58-#60: idea 3b, the Model insights section (coverage, per bucket: scored, outcome known, top 10% by at-call rank, runner rate and live lift, capped mean return, validated; extreme outcomes left out as in training). Page-only |
+| exit-extremes-20261014 | `work/2026-10-14-exit-extremes` | #61 branch | **PR #63** (f23e8f7), merge last: exit table leaves out a window peak/return above +100,000 % (drained pools). Page-only |
+| rank-wording-20261014 | `work/2026-10-14-rank-wording` | e522918 | **PR #62** (f0178a1): "top N%" described correctly (vs the calls the model was tested on at training, not "recent calls"); text only, SQL comment only |
 | claude-md-safety-20261014 | `work/2026-10-14-claude-md-safety` | e522918 | **PR #54** (e58be2b, reviewed PASS): `CLAUDE.md`: "Start here", DB-rule pointer, safety-net "Never" list (port 5432, no listener/backfill/track on a real DB, `onchainStateVersion`, no git writes in the main checkout) |
 | handoff-20261014 | `work/2026-10-14-handoff` | 694e9e5 | this update |
 
-Order after those: Analytics idea 2 (data health) once the exit-rule PR
-is merged (both edit `analytics.js`/`analytics.html`); then 3b (the
-Model insights page section) once 3a is merged.
+Merge order: #54, #55, #56, #57, #62 in any order. The analytics chain
+goes #58 → #59 → #60 → #61 → #63. #59, #61 and #63 were stacked on the
+previous branch because they edit the same page files and the owner was
+away; each has base `main` and states its order. Deploy: one listener
+restart (#55, #56) and one `-web` restart (#58-#63). Then the browser
+checks listed in each PR.
+
+Not done (owner decision): the Peak vs final scatter and the Overview
+mean still include drained-pool outcomes (pre-existing); the same
++100,000 % rule could be applied page-wide.
 
 **Owner question open:** dates in docs. The owner's local date (Pacific)
 or UTC? This file, branch names and skill entries currently mix "13 Oct"
@@ -117,8 +128,8 @@ uniswap_v4 waves (late Sep). No variant tables: the training checkout did
 not yet have #46/#47, and the run was without `--variants`. Next: retrain with `--variants` and send `report.md`.
 
 **Analytics page ideas (investigate report 14 Oct). Owner decision: go
-with the PM's order. 1 (exit rule) and 3a (feed) are being built; then 2;
-then 3b; 4 any time:**
+with the PM's order. 1, 2, 3a and 3b are built as PRs #58-#61 (see the
+table above); 4 (copy table) is not started:**
 1. **Exit rule** (on "Peak vs final"): return if sold at the first
    touch of 2×/3×/5×, else held to the horizon. `(m−1)·100` when
    `peak_h ≥ (m−1)·100`, else `ret_h`. Page-only, 1 PR, uses data
