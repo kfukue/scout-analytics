@@ -1,10 +1,11 @@
 // Tests of frontend/analytics-stats.js. Run: node testdata/analytics-stats.test.js
-// (no dependencies; exit code 1 on any failure). TestAnalyticsStatsNode runs
+// [path to analytics-stats.js] (no dependencies; exit code 1 on any failure). TestAnalyticsStatsNode runs
 // it from `go test` when node is on the PATH. It lives outside frontend/ so
 // the website (which serves every file of frontend/) does not serve it.
 'use strict';
 
-var S = require('../frontend/analytics-stats.js');
+var path = require('path');
+var S = require(process.argv[2] ? path.resolve(process.argv[2]) : '../frontend/analytics-stats.js');
 
 var failures = 0;
 var count = 0;
@@ -220,41 +221,63 @@ near('exitReturn: missing return, NaN', S.exitReturn(50, NaN, 2), NaN);
   ];
   // 2×: 100, 100, 100, −50, −100; 3×: 200, 20, 200, −50, −100;
   // 5×: 400, 20, 250, −50, −100; hold: −100, 20, 250, −50, −100
-  check('exitRuleStats 2×', S.exitRuleStats(pairs, 2), { n: 5, hit: 3, mean: 30, median: 100, out: 0 });
-  check('exitRuleStats 3×', S.exitRuleStats(pairs, 3), { n: 5, hit: 2, mean: 54, median: 20, out: 0 });
-  check('exitRuleStats 5×', S.exitRuleStats(pairs, 5), { n: 5, hit: 1, mean: 104, median: 20, out: 0 });
-  check('exitRuleStats hold', S.exitRuleStats(pairs, Infinity), { n: 5, hit: 0, mean: 4, median: -50, out: 0 });
+  check('exitRuleStats 2×', S.exitRuleStats(pairs, 2), { n: 5, hit: 3, mean: 30, median: 100 });
+  check('exitRuleStats 3×', S.exitRuleStats(pairs, 3), { n: 5, hit: 2, mean: 54, median: 20 });
+  check('exitRuleStats 5×', S.exitRuleStats(pairs, 5), { n: 5, hit: 1, mean: 104, median: 20 });
+  check('exitRuleStats hold', S.exitRuleStats(pairs, Infinity), { n: 5, hit: 0, mean: 4, median: -50 });
   var e = S.exitRuleStats([], 2);
   check('exitRuleStats: no pairs', [e.n, e.hit, isNaN(e.mean), isNaN(e.median)], [0, 0, true, true]);
 })();
 
-// exit rule: a pair with a peak or a return above EXIT_MAX_OUTCOME_PCT (1e5 %,
-// ml/scout_ml/config.py MAX_OUTCOME_PCT, strict ">" as labels.py) is left out
-// of every rule and counted in out; exactly 1e5 is kept
-check('EXIT_MAX_OUTCOME_PCT', S.EXIT_MAX_OUTCOME_PCT, 1e5);
+// exitRuleStats has no cap of its own: calls with an outcome above
+// MAX_OUTCOME_PCT never reach it (the page leaves them out, isExtremeCall
+// below), so a huge pair is counted like any other
+check('exitRuleStats: no cap of its own', S.exitRuleStats([{ peak: 3.9e47, ret: 3.9e47 }], Infinity),
+  { n: 1, hit: 0, mean: 3.9e47, median: 3.9e47 });
+
+// isExtremeCall: the page-wide rule: a call is extreme when the return or
+// the peak of any window the page shows (1h, 1d, 3d, 7d, 30d; the columns
+// of /api/analytics) is above MAX_OUTCOME_PCT (1e5 %, as
+// ml/scout_ml/config.py MAX_OUTCOME_PCT; strict ">" as labels.py
+// extreme_outcome); missing is not extreme, +Infinity is; no other column
+// counts. The ten columns are listed here, not read from the module, so a
+// column dropped from EXTREME_COLUMNS fails below.
+check('MAX_OUTCOME_PCT', S.MAX_OUTCOME_PCT, 1e5);
+var WINDOW_COLS = ['ret_1h', 'peak_1h', 'ret_1d', 'peak_1d', 'ret_3d', 'peak_3d', 'ret_7d', 'peak_7d', 'ret_30d', 'peak_30d'];
+check('EXTREME_COLUMNS', S.EXTREME_COLUMNS, WINDOW_COLS);
 (function () {
-  var pairs = [
-    { peak: 1e5, ret: 1e5 },        // exactly at the cap: kept
-    { peak: 100000.01, ret: 0 },    // peak just above: out
-    { peak: 50, ret: 100000.5 },    // return just above (peak ordinary): out
-    { peak: 3.9e47, ret: 3.9e47 },  // the prod drained pool: out
-    { peak: 3.9e47, ret: -100 },    // peak above, return ordinary: out
-    { peak: Infinity, ret: 10 },    // +inf is extreme (labels.py), not missing: out
-    { peak: 1e48, ret: null },      // extreme with the return missing: out
-    { peak: null, ret: 1e6 },       // return above with the peak missing: out
-    { peak: 0, ret: -50 }
-  ];
-  // kept: (1e5, 1e5) and (0, −50). 2× and 5×: 100 or 400, −50; hold: 1e5, −50
-  check('exitRuleStats cap 2×', S.exitRuleStats(pairs, 2), { n: 2, hit: 1, mean: 25, median: 25, out: 7 });
-  check('exitRuleStats cap 5×', S.exitRuleStats(pairs, 5), { n: 2, hit: 1, mean: 175, median: 175, out: 7 });
-  check('exitRuleStats cap hold', S.exitRuleStats(pairs, Infinity), { n: 2, hit: 0, mean: 49975, median: 49975, out: 7 });
-  check('exitRuleStats cap: out the same for every rule',
-    [2, 3, 5, Infinity].map(function (m) { return S.exitRuleStats(pairs, m).out; }), [7, 7, 7, 7]);
-  check('exitRuleStats cap: peak and return exactly 1e5 kept',
-    S.exitRuleStats([{ peak: 1e5, ret: 1e5 }], Infinity), { n: 1, hit: 0, mean: 1e5, median: 1e5, out: 0 });
-  check('exitRuleStats cap: return exactly 1e5 kept', S.exitRuleStats([{ peak: 20, ret: 1e5 }], Infinity), { n: 1, hit: 0, mean: 1e5, median: 1e5, out: 0 });
-  check('exitRuleStats cap: peak just above dropped', S.exitRuleStats([{ peak: 100000.01, ret: 0 }], 2), { n: 0, hit: 0, mean: NaN, median: NaN, out: 1 });
-  check('exitRuleStats cap: return just above dropped', S.exitRuleStats([{ peak: 50, ret: 100000.5 }], Infinity), { n: 0, hit: 0, mean: NaN, median: NaN, out: 1 });
+  var cols = ['call_id', 'ret_1h', 'peak_1h', 'dd_1h', 'ret_1d', 'peak_1d', 'dd_1d', 'ret_3d', 'peak_3d', 'dd_3d',
+    'ret_7d', 'peak_7d', 'dd_7d', 'ret_30d', 'peak_30d', 'dd_30d', 'mcap'];
+  var col = {};
+  cols.forEach(function (c, i) { col[c] = i; });
+  // a row with every value v, then name set to x
+  function row(v, name, x) {
+    var r = cols.map(function () { return v; });
+    if (name) { r[col[name]] = x; }
+    return r;
+  }
+  check('isExtremeCall: ordinary', S.isExtremeCall(row(50), col), false);
+  check('isExtremeCall: all exactly 1e5 kept', S.isExtremeCall(row(1e5), col), false);
+  check('isExtremeCall: all missing (null) kept', S.isExtremeCall(row(null), col), false);
+  check('isExtremeCall: all undefined kept', S.isExtremeCall(row(undefined), col), false);
+  check('isExtremeCall: all NaN kept', S.isExtremeCall(row(NaN), col), false);
+  check('isExtremeCall: an empty row kept', S.isExtremeCall([], col), false);
+  check('isExtremeCall: no outcome columns kept', S.isExtremeCall([1e48], { call_id: 0 }), false);
+  WINDOW_COLS.forEach(function (name) {
+    check('isExtremeCall: ' + name + ' exactly 1e5 kept', S.isExtremeCall(row(0, name, 1e5), col), false);
+    check('isExtremeCall: ' + name + ' just above dropped', S.isExtremeCall(row(0, name, 100000.01), col), true);
+    check('isExtremeCall: ' + name + ' +3.9e47 dropped', S.isExtremeCall(row(0, name, 3.9e47), col), true);
+    check('isExtremeCall: ' + name + ' +Infinity dropped', S.isExtremeCall(row(0, name, Infinity), col), true);
+    check('isExtremeCall: ' + name + ' alone, others missing', S.isExtremeCall(row(null, name, 2e5), col), true);
+    check('isExtremeCall: ' + name + ' missing, others ordinary', S.isExtremeCall(row(10, name, null), col), false);
+  });
+  // −100 % (total loss) and a huge drop are real outcomes; columns outside
+  // the rule (the drops at every window, factors, the id) never count
+  check('isExtremeCall: −Infinity and −100 kept', [S.isExtremeCall(row(-100), col), S.isExtremeCall(row(0, 'ret_1d', -Infinity), col)],
+    [false, false]);
+  ['dd_1h', 'dd_1d', 'dd_3d', 'dd_7d', 'dd_30d', 'mcap', 'call_id'].forEach(function (name) {
+    check('isExtremeCall: ' + name + ' above the cap does not count', S.isExtremeCall(row(0, name, 3.9e47), col), false);
+  });
 })();
 
 // jitter: fixed per id, in range

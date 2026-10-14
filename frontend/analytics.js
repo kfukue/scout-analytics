@@ -76,6 +76,8 @@
   var live = null;        // the last body of GET /api/model-live (null: none, or an error)
   var liveEtag = '';
   var liveLoading = false;
+  var kept = [];          // pageRows(): data.rows less the extreme calls
+  var keptOf = null;      // the body kept was worked out from
 
   function $(id) { return document.getElementById(id); }
 
@@ -168,6 +170,31 @@
       parts.push(VERDICT_LABEL[state.verdict] || state.verdict);
     }
     return parts.join(' · ');
+  }
+
+  // The rows every tab and table uses: data.rows less the extreme calls
+  // (A.isExtremeCall: a return or peak at any window above +100,000%, bad
+  // pool data; the model's training cap). Only "Data health" reads data.rows
+  // itself.
+  // Worked out once per body read.
+  function pageRows() {
+    if (keptOf !== data) {
+      keptOf = data;
+      kept = data.rows.filter(function (r) { return !A.isExtremeCall(r, col); });
+    }
+    return kept;
+  }
+
+  // The page-wide note on the n calls pageRows leaves out ("" when none).
+  function extremeNoteText(n) {
+    if (!n) { return ''; }
+    return fmtInt(n) + (n === 1 ? ' call' : ' calls') + ' left out everywhere except Data health: an outcome above +' +
+      fmtInt(A.MAX_OUTCOME_PCT) + '% (bad pool data), with the same cap as the model\'s training.';
+  }
+  function renderExtremeNote() {
+    var n = data.rows.length - pageRows().length;
+    $('ana-extreme').textContent = extremeNoteText(n);
+    $('ana-extreme').hidden = !n;
   }
 
   // ---- grouping -----------------------------------------------------------
@@ -1331,16 +1358,14 @@
   // The exit-rule table: sell at the first touch of 2×, 3× or 5×, else hold
   // to the end of the window (A.exitReturn), against holding every call.
   // Over the same points as the chart (a peak and a return for the window),
-  // so rugged calls keep their peak before the rug and their final return,
-  // except the pairs whose peak or return for the window is above
-  // A.EXIT_MAX_OUTCOME_PCT (bad pool data), which every row leaves out and
-  // the caption counts.
+  // so rugged calls keep their peak before the rug and their final return.
+  // Calls with an outcome above +100,000% are not among the rows (pageRows).
   var EXIT_RULES = [
     { m: 2, label: 'Sell at 2×' }, { m: 3, label: 'Sell at 3×' }, { m: 5, label: 'Sell at 5×' },
     { m: Infinity, label: 'Hold to the end' }
   ];
   var EXIT_HEADS = [
-    ['n', 'Calls with a peak and a return for the window (calls with a peak or return for the window above +100,000% left out): the n of every number in the row'],
+    ['n', 'Calls with a peak and a return for the window: the n of every number in the row'],
     ['Touched', 'Share of the calls whose peak within the window reached the exit multiple'],
     ['Mean return', 'Average return under the rule'],
     ['Median return', 'Middle return under the rule'],
@@ -1392,15 +1417,6 @@
     }
     frag.appendChild(tbody);
     $('tbl-exit').replaceChildren(frag);
-    // the calls left out of every row (A.exitRuleStats: the window's peak or
-    // return above A.EXIT_MAX_OUTCOME_PCT), after the static caption; empty
-    // when none. The span is cosmetic: a page without it still gets the table.
-    var capOut = $('cap-exit-out');
-    if (capOut) {
-      capOut.textContent = hold.out ? ' ' + fmtInt(hold.out) + (hold.out === 1 ? ' call' : ' calls') + ' left out: ' +
-        (hold.out === 1 ? 'a peak or return' : 'peaks or returns') + ' for the window above +' +
-        fmtInt(A.EXIT_MAX_OUTCOME_PCT) + '% (bad pool data).' : '';
-    }
   }
 
   // ---- Timing -----------------------------------------------------------------
@@ -2079,9 +2095,7 @@
 
   var LIVE_HEADS = [
     ['Scored', 'Calls with a score for this bucket'],
-    ['Outcome known', 'Scored calls whose window is over and that have the return (and for short the peak) for it. ' +
-      'As in training, a call with any 1d peak or 1d/3d/7d/30d return above +100,000% (bad pool data) is an outcome in no bucket ' +
-      '(the count is in the line above the table)'],
+    ['Outcome known', 'Scored calls whose window is over and that have the return (and for short the peak) for it'],
     ['Top 10%', 'Calls with an outcome in the top 10%. Top 10% = scored above 90% of the calls the model was tested on ' +
       'when it was trained (so the share can drift from 10%).'],
     ['Runner rate, top 10%', 'Share of the top 10% with an outcome that were runners (before tax)'],
@@ -2139,21 +2153,10 @@
     });
   }
 
-  // Whether page row r has an outcome some bucket reads (its rule's value or
-  // its return, at its window) above A.LIVE_MAX_OUTCOME_PCT: bogus pool data,
-  // an outcome in no bucket (ml/scout_ml/labels.py extreme_outcome; a
-  // missing value is not extreme).
-  function liveExtreme(r) {
-    return live.buckets.some(function (b, i) {
-      var rule = A.LIVE_RULES[b], h = live.horizons[i];
-      return !!rule && (metricAt(r, rule.col, h) > A.LIVE_MAX_OUTCOME_PCT || metricAt(r, 'ret', h) > A.LIVE_MAX_OUTCOME_PCT);
-    });
-  }
-
   // One record per call scored for bucket b (A.liveBucketStats): known = its
-  // window (h, of hs seconds) is over, both the rule's value and the return
-  // are there (as the training labels need both) and the call is not extreme
-  // (j.extreme, set by renderLive).
+  // window (h, of hs seconds) is over and both the rule's value and the
+  // return are there (as the training labels need both). Extreme calls are
+  // not among the rows (pageRows).
   function liveRecs(joined, b, rule, h, hs) {
     var out = [];
     joined.forEach(function (j) {
@@ -2163,8 +2166,8 @@
       var x = metricAt(r, rule.col, h), ret = metricAt(r, 'ret', h);
       var due = (r[col.t] + hs) * 1000 <= now();
       out.push({
-        t: r[col.t], rank: s.rank, passed: s.passed, version: j.version, extreme: j.extreme,
-        known: due && !j.extreme && isNum(x) && isNum(ret), x: x, ret: ret
+        t: r[col.t], rank: s.rank, passed: s.passed, version: j.version,
+        known: due && isNum(x) && isNum(ret), x: x, ret: ret
       });
     });
     return out;
@@ -2172,19 +2175,15 @@
 
   // "N of M first calls scored at call time (first score <date>)": M = the
   // first calls that pass the page filters, N = those with a score; the
-  // date is that of the earliest score (the call's time + after_s); then,
-  // when any, how many scored calls are extreme (j.extreme).
+  // date is that of the earliest score (the call's time + after_s).
   function liveCoverText(joined, m) {
-    var first = Infinity, extreme = 0;
+    var first = Infinity;
     joined.forEach(function (j) {
       var at = j.row[col.t] + (isNum(j.after) ? j.after : 0);
       if (at < first) { first = at; }
-      if (j.extreme) { extreme++; }
     });
     return fmtInt(joined.length) + ' of ' + fmtInt(m) + ' first calls (after the page filters) scored at call time' +
-      (joined.length ? ' (first score ' + fmtDay(first * 1000) + ').' : '.') +
-      (extreme ? ' ' + fmtInt(extreme) + ' left out of every bucket as in training: an outcome above ' +
-        fmtPct(A.LIVE_MAX_OUTCOME_PCT) + ' (bad pool data).' : '');
+      (joined.length ? ' (first score ' + fmtDay(first * 1000) + ').' : '.');
   }
 
   // A mean return, greyed when n is under MIN_N.
@@ -2256,9 +2255,8 @@
     var ok = !!(live && data);
     $('ml-body').hidden = !ok;
     if (!ok) { return; }
-    var rows = data.rows.filter(function (r) { return passVerdict(r) && passFamily(r) && passQuiet(r); });
+    var rows = pageRows().filter(function (r) { return passVerdict(r) && passFamily(r) && passQuiet(r); });
     var joined = A.joinModelLive(live, rows, col.call_id);
-    joined.forEach(function (j) { j.extreme = liveExtreme(j.row); });
     $('ml-cover').textContent = liveCoverText(joined, rows.length);
     var frag = document.createDocumentFragment();
     frag.appendChild(headRow('Bucket', LIVE_HEADS));
@@ -2288,9 +2286,11 @@
         b.setAttribute('aria-pressed', b.getAttribute('data-k') === state.k ? 'true' : 'false');
       });
     });
+    // extreme calls left out of every view (pageRows), the note says how many
+    renderExtremeNote();
     // filters: family and verdict for everything; quiet inside each view
     var base = [], quietOnly = [];
-    data.rows.forEach(function (r) {
+    pageRows().forEach(function (r) {
       if (passQuiet(r)) { quietOnly.push(r); }
       if (passVerdict(r) && passFamily(r)) { base.push(r); }
     });

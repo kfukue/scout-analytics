@@ -2033,6 +2033,12 @@ final**, **Timing**); section 2, **Model insights**, joins the scores the model 
 each call (`GET /api/model-live`; hidden on a website that answers `404` there) to the same rows and
 filters, and shows per bucket how the calls it ranked in the top 10% did against all scored calls with an
 outcome (runner rate by the training labels' rule but before tax, live lift, mean return, validated).
+A call with an outcome above **+100,000%** (its peak or its return at any window the page shows:
+1h, 1d, 3d, 7d or 30d; bad pool data from drained pools) is left out of every tab, table and chart
+and of Model insights, with the same cap and the same strict "above" as the model's training
+(`MAX_OUTCOME_PCT` and `extreme_outcome` in `ml/scout_ml/`, which checks only the outcomes its
+labels use: the 1d peak and the 1d, 3d, 7d and 30d returns); only the Data health tables still
+count it, and a note above the tabs says how many calls were left out.
 Everything on it is **first
 calls only, late entry (60 s after the post), in USD, before tax; values rounded to 0.1**,
 worked out in the browser from one compact feed (`GET /api/analytics`, below), so every choice
@@ -2062,7 +2068,8 @@ dependencies; `go test` runs it when `node` is on the PATH). Only the visible ta
   family or verdict choice), and, when a pool family or verdict is chosen, a line for that
   choice); and the **hour × weekday** heat map (UTC; cell = mean or median, call count on
   hover; cells under 20 calls grey). After the By week table, **Data health by week** (or
-  month) always counts every call (the pool family, verdict and quiet choices do not apply):
+  month) always counts every call (the pool family, verdict and quiet choices do not apply, and
+  calls with an outcome above +100,000% are counted too):
   per week the calls and the shares with a Perceptor verdict at the call, with a known 24 h
   trade count, quiet (of those with a known count; rugged calls are never quiet) and rugged,
   plus the quiet share by week × pool family (shares of fewer than 20 calls grey).
@@ -2096,8 +2103,8 @@ dependencies; `go test` runs it when `node` is on the PATH). Only the visible ta
   more than half of it (return < peak ÷ 2). It also has an exit-rule table: mean and median
   return when sold at the first touch of 2×, 3× or 5× (else held to the end of the window)
   against holding, with the share that touched; an upper bound, before tax, rugged calls counted
-  with their pre-rug peak; calls with a peak or return for the window above +100,000% (bad pool
-  data) are left out and counted in the caption.
+  with their pre-rug peak (calls with an outcome above +100,000% are already left out of the
+  whole page, above).
 - **Timing tab:** when things happened after the call, within the chosen window (the timing
   columns of "Timing after the call" above; results after the call, never model inputs). It
   counts the **timed** calls: first calls priced in USD with a return for the window **and**

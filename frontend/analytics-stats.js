@@ -293,32 +293,47 @@
     return peak >= at ? at : ret;
   }
 
-  // The exit-rule table leaves out a pair whose peak or return is above this
-  // (in %): drained pools have given absurd outcomes (e.g. +3.9×10⁴⁷ %), and
-  // one of them makes the "hold to the end" mean meaningless. The same cap
-  // and the same strict ">" as the model's training: MAX_OUTCOME_PCT in
-  // ml/scout_ml/config.py, applied by extreme_outcome in ml/scout_ml/labels.py
-  // (exactly 1e5 is kept; a missing value is not extreme).
-  // Only the selected window's pair is checked, unlike labels.py, which checks every horizon.
-  var EXIT_MAX_OUTCOME_PCT = 1e5;
+  // An outcome above this (in %) is bad pool data: drained pools have given
+  // absurd outcomes (e.g. +3.9×10⁴⁷ %), and one of them makes any mean
+  // meaningless. The same cap and the same strict ">" as the model's
+  // training: MAX_OUTCOME_PCT in ml/scout_ml/config.py, applied by
+  // extreme_outcome in ml/scout_ml/labels.py (exactly 1e5 is kept; a missing
+  // value is not extreme; +Infinity is).
+  var MAX_OUTCOME_PCT = 1e5;
+  // The /api/analytics columns the page checks: the return and the peak of
+  // every window the page shows (1h, 1d, 3d, 7d, 30d), so no chart, table or
+  // mean on it ever reads an outcome above the cap. Training checks only the
+  // columns its labels use (labels.py outcome_columns: max_gain_late_1d and
+  // ret_late_1d/3d/7d/30d), so the page leaves out a few calls training keeps
+  // (e.g. one with only its 7d peak above the cap).
+  var EXTREME_COLUMNS = ['ret_1h', 'peak_1h', 'ret_1d', 'peak_1d', 'ret_3d', 'peak_3d',
+    'ret_7d', 'peak_7d', 'ret_30d', 'peak_30d'];
+
+  // Whether a call is extreme: any of its EXTREME_COLUMNS values
+  // (row[col[name]]) above MAX_OUTCOME_PCT (the cap and the strict ">" of
+  // labels.py extreme_outcome). A missing value (null, undefined, NaN)
+  // compares false: not extreme.
+  function isExtremeCall(row, col) {
+    for (var i = 0; i < EXTREME_COLUMNS.length; i++) {
+      if (row[col[EXTREME_COLUMNS[i]]] > MAX_OUTCOME_PCT) { return true; }
+    }
+    return false;
+  }
 
   // The exit rule m (exitReturn) over the pairs { peak, ret }: n = pairs with
   // both, hit = those that touched m× (0 for hold, m = Infinity), and the
-  // mean and median return under the rule. out = pairs left out of every
-  // rule because their peak or return is above EXIT_MAX_OUTCOME_PCT (counted
-  // before the missing check, as labels.py: such a pair is out even when the
-  // other value is missing); the same for every m, so every row of the table
-  // is over the same calls.
+  // mean and median return under the rule. Calls with an outcome above
+  // MAX_OUTCOME_PCT never get here: the page leaves them out (isExtremeCall
+  // checks the peak and the return of every window).
   function exitRuleStats(pairs, m) {
-    var rets = [], hit = 0, out = 0;
+    var rets = [], hit = 0;
     for (var i = 0; i < pairs.length; i++) {
-      if (pairs[i].peak > EXIT_MAX_OUTCOME_PCT || pairs[i].ret > EXIT_MAX_OUTCOME_PCT) { out++; continue; }
       var v = exitReturn(pairs[i].peak, pairs[i].ret, m);
       if (!isNum(v)) { continue; }
       rets.push(v);
       if (pairs[i].peak >= (m - 1) * 100) { hit++; }
     }
-    return { n: rets.length, hit: hit, mean: mean(rets), median: median(rets), out: out };
+    return { n: rets.length, hit: hit, mean: mean(rets), median: median(rets) };
   }
 
   // Data health per period (the Overview's "Data health" tables). recs: one
@@ -378,10 +393,6 @@
   };
   // "Top 10%": a runner_rank_pct (known when the call was scored) of at least this.
   var LIVE_TOP_RANK = 90;
-  // A call with any outcome some bucket's rule or return reads (the 1d peak,
-  // the 1d/3d/7d/30d return) above this is bogus pool data: an outcome in no
-  // bucket (ml/scout_ml/config.py MAX_OUTCOME_PCT, labels.py extreme_outcome).
-  var LIVE_MAX_OUTCOME_PCT = 1e5;
 
   // Whether value v is a runner by rule.
   function liveRunner(v, rule) {
@@ -413,10 +424,10 @@
   }
 
   // The live numbers of one bucket. recs: one per call scored for it,
-  // { t, rank, passed, version, known, extreme, x, ret } (known: its window is
-  // over, x, the rule's value, and ret, the return, are both there, and it is
-  // not extreme: an outcome above LIVE_MAX_OUTCOME_PCT). Returns scored,
-  // known, extreme (the count left out for that), top / all = { n, k:
+  // { t, rank, passed, version, known, x, ret } (known: its window is over
+  // and x, the rule's value, and ret, the return, are both there; extreme
+  // calls never get here: the page leaves them out, isExtremeCall). Returns
+  // scored, known, top / all = { n, k:
   // runners, mean: mean return, each call's capped at cap when given, as
   // ml/scout_ml/config.py SIM_MAX_RET_PCT } over the known calls (top: rank ≥
   // LIVE_TOP_RANK), lift = top rate ÷ all rate (NaN when either is missing or
@@ -426,13 +437,12 @@
   // record).
   function liveBucketStats(recs, rule, cap) {
     var top = { n: 0, k: 0, rets: [] }, all = { n: 0, k: 0, rets: [] };
-    var firstT = Infinity, votes = {}, best = null, extreme = 0;
+    var firstT = Infinity, votes = {}, best = null;
     recs.forEach(function (r) {
       if (r.t < firstT) { firstT = r.t; }
       var v = votes[r.version] || (votes[r.version] = { n: 0, version: r.version, passed: r.passed });
       v.n++;
       if (!best || v.n > best.n) { best = v; }
-      if (r.extreme) { extreme++; return; }
       if (!r.known) { return; }
       var hit = liveRunner(r.x, rule);
       var ret = isNum(cap) ? Math.min(r.ret, cap) : r.ret;
@@ -445,7 +455,7 @@
     function done(g) { return { n: g.n, k: g.k, mean: mean(g.rets) }; }
     var lift = top.n && all.k ? (top.k / top.n) / (all.k / all.n) : NaN;
     return {
-      scored: recs.length, known: all.n, extreme: extreme, top: done(top), all: done(all), lift: lift,
+      scored: recs.length, known: all.n, top: done(top), all: done(all), lift: lift,
       firstT: recs.length ? firstT : NaN, version: best ? best.version : null, versionN: best ? best.n : 0,
       passed: best ? best.passed : null
     };
@@ -857,9 +867,9 @@
     symlogTicks: symlogTicks, log1pTicks: log1pTicks,
     weekStart: weekStart, monthStart: monthStart, hourWeekday: hourWeekday, DAY_MS: DAY_MS,
     cumulativePL: cumulativePL, gaveBack: gaveBack, exitReturn: exitReturn, exitRuleStats: exitRuleStats,
-    EXIT_MAX_OUTCOME_PCT: EXIT_MAX_OUTCOME_PCT, jitter: jitter,
+    MAX_OUTCOME_PCT: MAX_OUTCOME_PCT, EXTREME_COLUMNS: EXTREME_COLUMNS, isExtremeCall: isExtremeCall, jitter: jitter,
     weekHealth: weekHealth, quietByWeekFamily: quietByWeekFamily,
-    LIVE_RULES: LIVE_RULES, LIVE_TOP_RANK: LIVE_TOP_RANK, LIVE_MAX_OUTCOME_PCT: LIVE_MAX_OUTCOME_PCT, liveRunner: liveRunner, joinModelLive: joinModelLive,
+    LIVE_RULES: LIVE_RULES, LIVE_TOP_RANK: LIVE_TOP_RANK, liveRunner: liveRunner, joinModelLive: joinModelLive,
     liveBucketStats: liveBucketStats,
     shortNum: shortNum, shortUSD: shortUSD, signedPct: signedPct, rangeLabel: rangeLabel,
     rangeLabels: rangeLabels

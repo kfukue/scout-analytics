@@ -961,7 +961,7 @@ func TestAnalyticsPageFiles(t *testing.T) {
 		`id="panel-overview"`, `id="panel-factor"`, `id="panel-peak"`, "capped at +1,000%",
 		// the exit-rule table on Peak vs final: fillExitTable writes into
 		// #h-exit and #tbl-exit (a missing one would throw and blank the tab)
-		`id="h-exit"`, `id="tbl-exit"`, `id="cap-exit"`, `id="cap-exit-out"`,
+		`id="h-exit"`, `id="tbl-exit"`, `id="cap-exit"`,
 		"Sold at the first touch of 2×/3×/5× (a candle or trade high, before tax), else held to the end of the window.",
 		"An upper bound: in thin pools a brief wick can count as a touch.",
 		"Rugged calls count with their peak before the rug: a touch before the rug counts as a sale.",
@@ -983,9 +983,17 @@ func TestAnalyticsPageFiles(t *testing.T) {
 	if i, j, k := strings.Index(html, `id="tbl-period"`), strings.Index(html, `id="t-health"`), strings.Index(html, `id="t-matrix"`); i < 0 || j < i || k < j {
 		t.Error("analytics.html: the data health tables must come right after the By week table")
 	}
-	// the data health section uses every row (no page filter), and the
-	// caption's "20" is MIN_N; the quiet, rugged and verdict rules and the
-	// caption's threshold fill are covered by TestAnalyticsHealthNode
+	// the page-wide note on the calls left out for an outcome above
+	// +100,000% (renderExtremeNote writes into it from render(); a missing one
+	// would throw and blank the page); what it says and which rows every tab
+	// gets are covered by TestAnalyticsOutliersNode
+	if want := `<p id="ana-extreme" class="muted small note" hidden></p>`; !strings.Contains(html, want) {
+		t.Errorf("analytics.html: missing %q (the page-wide note on extreme calls)", want)
+	}
+	// the data health section uses every row (no page filter, extreme calls
+	// included), and the caption's "20" is MIN_N; the quiet, rugged and
+	// verdict rules and the caption's threshold fill are covered by
+	// TestAnalyticsHealthNode
 	for _, want := range []string{"renderHealth(data.rows);", "var MIN_N = 20;"} {
 		if !strings.Contains(js, want) {
 			t.Errorf("analytics.js: missing %q (data health by week)", want)
@@ -1234,10 +1242,9 @@ func TestAnalyticsHealthNode(t *testing.T) {
 // frontend/analytics-stats.js) and drawing (applyLive, loadLive, renderLive
 // in frontend/analytics.js) for a normal case, no outcomes yet, the 404
 // (hidden) and error states, MIN_N greying, a true, false and null "passed",
-// the page filters, extreme outcomes (above +100,000% in any bucket's column:
-// an outcome in no bucket) and the +1,000% cap on the mean returns. render
-// calls renderLive, so a throw there would
-// blank the page.
+// the page filters, extreme calls (an outcome above +100,000%: left out
+// before the join, as on the whole page) and the +1,000% cap on the mean
+// returns. render calls renderLive, so a throw there would blank the page.
 func TestAnalyticsLiveNode(t *testing.T) {
 	node, err := exec.LookPath("node")
 	if err != nil {
@@ -1249,6 +1256,28 @@ func TestAnalyticsLiveNode(t *testing.T) {
 	}
 	if !strings.HasPrefix(string(out), "ok: ") {
 		t.Fatalf("node testdata/analytics-live.test.js: got %q, want \"ok: …\"", out)
+	}
+}
+
+// TestAnalyticsOutliersNode runs testdata/analytics-outliers.test.js with
+// node, when node is on the PATH (skipped otherwise): the page-wide rule on
+// extreme calls (a return or peak at any window above +100,000%, the cap of
+// the model's training): a +3.9e47% call, or one with only its 7d peak or
+// any other one of the ten columns above the cap, is gone from the Overview
+// numbers, the Peak vs final scatter, its caption and the exit table, and the
+// rows of every other tab, still counted in Data health, and the page-wide
+// note shows only while some call is left out.
+func TestAnalyticsOutliersNode(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node is not on the PATH")
+	}
+	out, err := exec.Command(node, "testdata/analytics-outliers.test.js").CombinedOutput()
+	if err != nil {
+		t.Fatalf("node testdata/analytics-outliers.test.js: %v: %s", err, out)
+	}
+	if !strings.HasPrefix(string(out), "ok: ") {
+		t.Fatalf("node testdata/analytics-outliers.test.js: got %q, want \"ok: …\"", out)
 	}
 }
 
