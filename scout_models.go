@@ -582,9 +582,10 @@ type ScoutWebCallModel struct {
 
 // ScoutWebCallModelBucket is one bucket of ScoutWebCallModel: its name, the
 // window it is about, the probability of a runner and of a collapse (0 … 1),
-// the share of recent calls with a lower runner score (percent; the call is
-// in the top 100 − rank percent) and whether the bucket's model passed its
-// validation gates (null = not recorded).
+// the share of the calls the model was tested on when it was trained that had
+// a lower runner score (percent; the call is in the top 100 − rank percent)
+// and whether the bucket's model passed its validation gates (null = not
+// recorded).
 type ScoutWebCallModelBucket struct {
 	Bucket        string   `json:"bucket"`
 	Horizon       string   `json:"horizon"`

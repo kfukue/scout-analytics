@@ -341,7 +341,7 @@ CREATE TABLE IF NOT EXISTS scout_call_predictions (
 ALTER TABLE scout_call_predictions ADD COLUMN IF NOT EXISTS bucket          TEXT;     -- short | 3day | medium | long (NULL = first experiment's rows)
 ALTER TABLE scout_call_predictions ADD COLUMN IF NOT EXISTS runner_prob     NUMERIC;  -- 0..1
 ALTER TABLE scout_call_predictions ADD COLUMN IF NOT EXISTS collapse_prob   NUMERIC;  -- 0..1
-ALTER TABLE scout_call_predictions ADD COLUMN IF NOT EXISTS runner_rank_pct NUMERIC;  -- % of recent calls with a lower runner score
+ALTER TABLE scout_call_predictions ADD COLUMN IF NOT EXISTS runner_rank_pct NUMERIC;  -- % of the calls the model was tested on at training that had a lower runner score
 ALTER TABLE scout_call_predictions ADD COLUMN IF NOT EXISTS features        JSONB;    -- the feature row that was scored
 -- whether the bucket's model passed its validation gates (the scoring service's
 -- "passed"; NULL = not recorded: rows stored before this column, or a service

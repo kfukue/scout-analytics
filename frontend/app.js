@@ -463,8 +463,9 @@
   // The exact probability, for a title: "31.23%".
   function exactProb(v) { return isNum(v) ? exactText(v * 100, 2) + '%' : DASH; }
 
-  // "top N%" from runner_rank_pct (the share of recent calls with a lower
-  // runner score): N = 100 − rank, rounded, at least 1; null without a rank.
+  // "top N%" from runner_rank_pct (the share of the calls the model was tested
+  // on when it was trained that had a lower runner score; fixed at training):
+  // N = 100 − rank, rounded, at least 1; null without a rank.
   function topText(rank) {
     if (!isNum(rank)) { return null; }
     return 'top ' + Math.max(1, Math.min(100, Math.round(100 - rank))) + '%';
@@ -508,7 +509,7 @@
   function modelCellTitle(m, b) {
     var tip = ['7d runner chance ' + exactProb(b.runner_prob)];
     if (isNum(b.collapse_prob)) { tip.push('collapse ' + exactProb(b.collapse_prob)); }
-    if (isNum(b.runner_rank_pct)) { tip.push('higher than ' + exactText(b.runner_rank_pct, 1) + '% of recent calls'); }
+    if (isNum(b.runner_rank_pct)) { tip.push('scored higher than ' + exactText(b.runner_rank_pct, 1) + '% of the calls the model was tested on when it was trained'); }
     var after = afterText(m);
     return tip.join(', ') + '. Model ' + String(m.version || '') + (after ? ', scored ' + after + ' after the call' : '') +
       '. ' + capitalized(validationText(b, '7d')) + '.';

@@ -84,7 +84,7 @@ function cell(c) {
 
 var cases = [
   // name, row, text, n.v., rank line, words the title must contain
-  ['validated', row([medium(0.3123, 92.5, true)]), '31%top 8%', false, 'top 8%', ['31.23%', 'collapse 44%', '92.5%', 'Model 20261013-1909', '2 min after the call', 'Validated: the 7d model passed its gates']],
+  ['validated', row([medium(0.3123, 92.5, true)]), '31%top 8%', false, 'top 8%', ['31.23%', 'collapse 44%', 'scored higher than 92.5% of the calls the model was tested on when it was trained', 'Model 20261013-1909', '2 min after the call', 'Validated: the 7d model passed its gates']],
   ['not validated', row([medium(0.3123, 92.5, false)]), '31%n.v.top 8%', true, 'top 8%', ['Not validated: the 7d model did not pass its gates']],
   ['validation not recorded', row([medium(0.05, 10, null)]), '5%top 90%', false, 'top 90%', ['Validation not recorded']],
   ['passed missing', row([medium(0.05, 10)]), '5%top 90%', false, 'top 90%', ['Validation not recorded']],

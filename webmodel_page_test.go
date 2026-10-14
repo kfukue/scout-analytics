@@ -28,7 +28,9 @@ func TestAppModelNode(t *testing.T) {
 
 // TestIndexModelColumn: the page has the Model 7d header right after
 // Perceptor, sortable, and its legend entry (both hidden by app.js when the
-// website does not show scores).
+// website does not show scores). The rank is described against the calls the
+// model was tested on when it was trained (runner_rank_pct uses the reference
+// quantiles stored at training), not "recent calls".
 func TestIndexModelColumn(t *testing.T) {
 	b, err := fs.ReadFile(frontendFS, "frontend/index.html")
 	if err != nil {
@@ -43,5 +45,21 @@ func TestIndexModelColumn(t *testing.T) {
 	}
 	if !strings.Contains(html, `id="legend-model"`) {
 		t.Fatal("no legend entry for the Model column")
+	}
+	const rankWords = "the calls the model was tested on when it was trained"
+	if n := strings.Count(html, rankWords); n != 2 {
+		t.Errorf("index.html: %q appears %d times, want 2 (Model 7d header title and legend)", rankWords, n)
+	}
+	if strings.Contains(html, "recent calls") {
+		t.Error(`index.html still describes the model rank as against "recent calls"`)
+	}
+	// The legend says the reference is fixed at training (a call's rank does
+	// not change over time), not that "the share can drift".
+	const fixedRef = "the reference is fixed when the model is trained, so the share of today's calls shown as 'top 8%' need not be 8%"
+	if !strings.Contains(html, fixedRef) {
+		t.Errorf("index.html legend: missing %q", fixedRef)
+	}
+	if strings.Contains(html, "drift as calls change") {
+		t.Error(`index.html legend still says the share "can drift as calls change"`)
 	}
 }

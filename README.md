@@ -1878,7 +1878,9 @@ other sites):
     selector changes only these two columns.
   - **Model 7d** is the model's score of the call made at the time of the call (see "Scoring
     new calls"): the 7-day runner chance in whole percent, under it the call's rank among
-    recent calls ("top 8%" = 100 − `runner_rank_pct`), "n.v." when the 7-day model did not
+    the calls the model was tested on when it was trained ("top 8%" = 100 − `runner_rank_pct`;
+    the reference is fixed when the model is trained, so the share of today's calls shown as
+    'top 8%' need not be 8%), "n.v." when the 7-day model did not
     pass its gates, a dash without a score. Calls before 13 Oct 2026 are not scored (they are
     the training data), and a score stored more than 24 hours after the call is not shown.
     Hover for the exact values, the model version and how long after the call it scored. It
@@ -2352,10 +2354,10 @@ version and its buckets. `buckets` lists the buckets that score has, in the orde
 (`1d`), `3day` (`3d`), `medium` (`7d`), `long` (`30d`), each with `runner_prob` (0 … 1;
 `null` when missing; for `long`: the chance of being up after 30 days), `collapse_prob`
 (0 … 1; `null` when missing; for `long`: down 90 % or more after 30 days, or rugged), `runner_rank_pct`
-(share of recent calls with a lower runner score) and `passed` (`true`, `false` or `null` =
-not recorded). Any change of it changes the `ETag`. `model_scores` says whether this
-website sends scores; when `false` (a public copy) every `model` is `null` and `sort=model`
-is a 400.
+(share of the calls the model was tested on when it was trained that had a lower runner
+score) and `passed` (`true`, `false` or `null` = not recorded). Any change of it changes
+the `ETag`. `model_scores` says whether this website sends scores; when `false` (a public
+copy) every `model` is `null` and `sort=model` is a 400.
 
 `latest_return_pct` and `latest_price_usd` are the return (from the same entry) and the price
 as of the tracker's most recent reading, `latest_at` when it was read
