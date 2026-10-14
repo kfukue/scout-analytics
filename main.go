@@ -1690,13 +1690,31 @@ func (s *scanner) resolveNotify(ctx context.Context) (tg.InputPeerClass, string,
 		// not a username after all: fall through to a title match
 	}
 	want := strings.ToLower(p)
-	return s.findDialog(ctx, func(d dialogInfo) bool { return strings.ToLower(strings.TrimSpace(d.Title)) == want }, p)
+	// redacted: the text is only for errors, and a link inviteLinkRe does not
+	// recognise ends up here
+	return s.findDialog(ctx, func(d dialogInfo) bool { return strings.ToLower(strings.TrimSpace(d.Title)) == want }, redactInviteLink(p))
 }
 
 var usernameRe = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9_]{3,31}$`)
 
 // inviteLinkRe matches private invite links: https://t.me/+HASH, t.me/joinchat/HASH, tg://join?invite=HASH, +HASH.
 var inviteLinkRe = regexp.MustCompile(`(?:t\.me/\+|t\.me/joinchat/|join\?invite=|^\+)([A-Za-z0-9_-]{8,})`)
+
+// inviteRedactRe finds invite links to hide in logs and errors. It catches
+// everything inviteLinkRe resolves and more (any case, telegram.me, a hash of
+// any length after t.me/+), since a link the resolver does not recognise is
+// still a secret. Group 1 or 2 is the part kept; the hash after it is hidden.
+var inviteRedactRe = regexp.MustCompile(`(?i)((?:t|telegram)\.me/(?:\+|joinchat/)|join\?invite=)[A-Za-z0-9_-]+|^(\+)[A-Za-z0-9_-]{8,}`)
+
+// redactInviteLink returns s with the hash of every private invite link in it
+// replaced by "<invite>" ("https://t.me/+<invite>"), like botAPIRedact does
+// for the bot token: the delivery target goes into log lines and errors that
+// the owner pastes into chats. Anything else (a public @username, "me", a
+// chat id or title) is returned unchanged. Only for display: what is sent to
+// Telegram and stored as scout_deliveries.target keeps the real value.
+func redactInviteLink(s string) string {
+	return inviteRedactRe.ReplaceAllString(s, "${1}${2}<invite>")
+}
 
 // chatPeer converts a chat from an API result into an input peer + description.
 func chatPeer(c tg.ChatClass) (tg.InputPeerClass, string, bool) {
@@ -1776,7 +1794,7 @@ func (s *scanner) sendNotify(ctx context.Context, text string, replyTo int) (int
 	}
 	upd, err := send()
 	if err != nil && isPeerError(err) {
-		log.Printf("delivery chat rejected (%v) — looking up SCOUT_NOTIFY_PEER=%q again", err, s.cfg.NotifyPeer)
+		log.Printf("delivery chat rejected (%v) — looking up SCOUT_NOTIFY_PEER=%q again", err, redactInviteLink(s.cfg.NotifyPeer))
 		peer, label, rerr := s.resolveNotify(ctx)
 		if rerr != nil {
 			return 0, fmt.Errorf("%w (re-resolve failed: %v)", err, rerr)
@@ -2151,7 +2169,7 @@ func main() {
 				return err
 			}
 			if _, err := s.sendNotify(ctx, "✅ scoutanalytics test message — reports will arrive here", 0); err != nil {
-				return fmt.Errorf("test message to %q failed: %w", cfg.NotifyPeer, err)
+				return fmt.Errorf("test message to %q failed: %w", redactInviteLink(cfg.NotifyPeer), err)
 			}
 			fmt.Println("test message sent — check the chat")
 			return nil
@@ -2266,16 +2284,7 @@ func main() {
 			} else {
 				go s.trackLoop(ctx)
 			}
-			var names []string
-			for _, t := range cfg.Tools {
-				g := ""
-				if t.Gate {
-					g = " [gate]"
-				}
-				names = append(names, fmt.Sprintf("@%s %q%s", t.Bot, t.Command, g))
-			}
-			log.Printf("listening to @%s → %s → deliver to %s (dry-run=%v)",
-				cfg.SourceChannel, strings.Join(names, ", "), deliveryLabel(cfg), cfg.DryRun)
+			log.Print(listeningLine(cfg))
 			<-ctx.Done()
 			return ctx.Err()
 		})
@@ -2562,6 +2571,24 @@ func printResults(s *scanner, results []*toolResult, noDeliver bool) {
 	}
 }
 
+// listeningLine is the start-up log line naming the source channel, the tools
+// and the delivery target (an invite link hidden by redactInviteLink).
+func listeningLine(cfg *config) string {
+	var names []string
+	for _, t := range cfg.Tools {
+		g := ""
+		if t.Gate {
+			g = " [gate]"
+		}
+		names = append(names, fmt.Sprintf("@%s %q%s", t.Bot, t.Command, g))
+	}
+	return fmt.Sprintf("listening to @%s → %s → deliver to %s (dry-run=%v)",
+		cfg.SourceChannel, strings.Join(names, ", "), redactInviteLink(deliveryLabel(cfg)), cfg.DryRun)
+}
+
+// deliveryLabel names the delivery target. It is stored as
+// scout_deliveries.target (and compared with it), so it keeps an invite link
+// as is: log it through redactInviteLink.
 func deliveryLabel(c *config) string {
 	if c.NotifyBotToken != "" {
 		return "bot API chat " + c.NotifyChatID
@@ -2665,7 +2692,7 @@ func run(ctx context.Context, s *scanner, body func(ctx context.Context) error) 
 		if cfg.NotifyBotToken == "" && !s.listOnly {
 			var label string
 			if s.notifyPeer, label, err = s.resolveNotify(ctx); err != nil {
-				return fmt.Errorf("resolve SCOUT_NOTIFY_PEER=%q: %w", cfg.NotifyPeer, err)
+				return fmt.Errorf("resolve SCOUT_NOTIFY_PEER=%q: %w", redactInviteLink(cfg.NotifyPeer), err)
 			}
 			log.Printf("reports will be delivered to %s", label)
 		}
