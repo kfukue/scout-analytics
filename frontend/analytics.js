@@ -390,6 +390,95 @@
     $('tbl-matrix').replaceChildren(frag);
   }
 
+  // ---- data health by week (every row: the page filters do not apply) ------
+
+  var HEALTH_HEADS = [
+    ['Calls', 'First calls in the period, whatever the page filters'],
+    ['Verdict at the call', 'Share with a Perceptor verdict at the time of the call (readable or not)'],
+    ['Trade count known', 'Share whose number of trades in the first 24 hours is known'],
+    ['Quiet', 'Share of the calls with a known trade count that are quiet (fewer than the threshold, not rugged)'],
+    ['Rugged', 'Share of all calls in the period flagged rugged by the tracker (as of now)']
+  ];
+
+  // The records A.weekHealth and A.quietByWeekFamily count: the page's own
+  // period, verdict, quiet, rugged and family rules for every row.
+  function healthRecords(rows) {
+    return rows.map(function (r) {
+      var fi = r[col.family];
+      return {
+        start: periodStart(r[col.t]), verdict: verdictKey(r) !== 'none', known: isNum(r[col.trades_24h]),
+        quiet: isQuiet(r), rugged: isRugged(r), family: familyKey(r), order: fi < 0 ? 1e6 : fi
+      };
+    });
+  }
+
+  // rateCell, greyed when n is under MIN_N.
+  function fewRateCell(k, n, what) {
+    var td = rateCell(k, n, what);
+    if (n > 0 && n < MIN_N) {
+      td.classList.add('ana-few');
+      td.title += ' (fewer than ' + MIN_N + ')';
+    }
+    return td;
+  }
+
+  // weeks: A.weekHealth's periods, each with its label.
+  function fillHealthTable(weeks, first) {
+    var frag = document.createDocumentFragment();
+    frag.appendChild(headRow(first, HEALTH_HEADS));
+    var tbody = el('tbody');
+    weeks.forEach(function (w) {
+      var tr = el('tr');
+      var th = el('th', 'tok', w.label);
+      th.scope = 'row';
+      tr.appendChild(th);
+      tr.appendChild(el('td', 'num', fmtInt(w.calls)));
+      tr.appendChild(fewRateCell(w.verdict, w.calls, 'calls had a Perceptor verdict at the call'));
+      tr.appendChild(fewRateCell(w.known, w.calls, 'calls have a known trade count'));
+      tr.appendChild(fewRateCell(w.quiet, w.known, 'calls with a known trade count are quiet'));
+      tr.appendChild(fewRateCell(w.rugged, w.calls, 'calls are flagged rugged'));
+      tbody.appendChild(tr);
+    });
+    if (!weeks.length) { emptyRow(tbody, HEALTH_HEADS.length + 1, 'No calls.'); }
+    frag.appendChild(tbody);
+    $('tbl-health').replaceChildren(frag);
+  }
+
+  // qf: A.quietByWeekFamily's result, each period with its label.
+  function fillHealthFamily(qf, first) {
+    var heads = qf.families.map(function (f) { return [FAMILY_LABEL[f] || f, 'Quiet share; under it: quiet / calls with a known trade count']; });
+    var frag = document.createDocumentFragment();
+    frag.appendChild(headRow(first, heads));
+    var tbody = el('tbody');
+    if (!qf.families.length) { emptyRow(tbody, 1, 'No calls with a known trade count.'); }
+    (qf.families.length ? qf.weeks : []).forEach(function (w) {
+      var tr = el('tr');
+      var th = el('th', 'tok', w.label);
+      th.scope = 'row';
+      tr.appendChild(th);
+      qf.families.forEach(function (f) {
+        var c = w.cells[f] || { k: 0, n: 0 };
+        tr.appendChild(fewRateCell(c.k, c.n, (FAMILY_LABEL[f] || f) + ' calls with a known trade count are quiet, ' + w.label));
+      });
+      tbody.appendChild(tr);
+    });
+    frag.appendChild(tbody);
+    $('tbl-health-fam').replaceChildren(frag);
+  }
+
+  function renderHealth(rows) {
+    var word = state.period === 'month' ? 'month' : 'week';
+    var recs = healthRecords(rows);
+    var weeks = A.weekHealth(recs);
+    var qf = A.quietByWeekFamily(recs);
+    weeks.concat(qf.weeks).forEach(function (w) { w.label = periodLabel(w.start); });
+    $('t-health').textContent = 'Data health by ' + word;
+    $('t-health-fam').textContent = 'Quiet share by ' + word + ' and pool family';
+    $('lg-health-quiet').textContent = fmtInt(data.quiet_below);
+    fillHealthTable(weeks, cap(word));
+    fillHealthFamily(qf, cap(word));
+  }
+
   function stat(dl, label, value, title) {
     var d = el('div');
     d.appendChild(el('dt', null, label));
@@ -855,6 +944,7 @@
     $('t-period').textContent = 'By ' + word + ' (UTC' + (word === 'week' ? ', Monday to Sunday' : '') + ')';
     $('t-matrix').textContent = 'Median (and mean) return by ' + word + ' and Perceptor verdict at the call';
     fillTable('tbl-period', word === 'week' ? 'Week' : 'Month', periods);
+    renderHealth(data.rows);
     var vkeys = data.verdicts.filter(function (v) { return usedVerdicts[v]; });
     fillMatrix(periods, vkeys);
     return rows.length;

@@ -2057,7 +2057,11 @@ dependencies; `go test` runs it when `node` is on the PATH). Only the visible ta
   calls and "no red flags" at the call, both following only the quiet choice (not the pool
   family or verdict choice), and, when a pool family or verdict is chosen, a line for that
   choice); and the **hour × weekday** heat map (UTC; cell = mean or median, call count on
-  hover; cells under 20 calls grey).
+  hover; cells under 20 calls grey). After the By week table, **Data health by week** (or
+  month) always counts every call (the pool family, verdict and quiet choices do not apply):
+  per week the calls and the shares with a Perceptor verdict at the call, with a known 24 h
+  trade count, quiet (of those with a known count; rugged calls are never quiet) and rugged,
+  plus the quiet share by week × pool family (shares of fewer than 20 calls grey).
 - **By factor tab:** a factor known at the call: the Perceptor verdict at the call, the
   **market cap at the call, price × supply, fully diluted** (the price at the post × the
   token's total supply read from the chain, see "Token supply" below; not the post's "called

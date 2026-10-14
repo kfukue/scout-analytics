@@ -965,10 +965,34 @@ func TestAnalyticsPageFiles(t *testing.T) {
 		"Sold at the first touch of 2×/3×/5× (a candle or trade high, before tax), else held to the end of the window.",
 		"An upper bound: in thin pools a brief wick can count as a touch.",
 		"Rugged calls count with their peak before the rug: a touch before the rug counts as a sale.",
-		"Not the Timing tab's 'reached 2×' (held 1 h)."} {
+		"Not the Timing tab's 'reached 2×' (held 1 h).",
+		// the data health tables on Overview: renderHealth writes into
+		// these ids (a missing one would throw and blank the rest of the
+		// tab), right after the By week table; the threshold in the caption
+		// is filled from the body's quiet_below
+		`id="t-health"`, `id="tbl-health"`, `id="t-health-fam"`, `id="tbl-health-fam"`, `id="cap-health"`, `id="lg-health-quiet"`,
+		"All calls, page filters not applied.",
+		"Verdict = a Perceptor verdict at the time of the call, readable or not (history imported from before live handling has none).",
+		`Quiet = fewer than <span id="lg-health-quiet">50</span> trades in the first 24 h after the call and not flagged rugged, among calls whose trade count is known (on-chain pools only); Uniswap v2 counts Sync events, so its quiet share reads low.`,
+		"Calls under a day old have no trade count yet, so the newest period's 'known' share reads low.",
+		"Rugged = flagged rugged by the tracker (as of now).", "Grey: a share of fewer than 20 calls."} {
 		if !strings.Contains(html, want) {
 			t.Errorf("analytics.html: missing %q", want)
 		}
+	}
+	if i, j, k := strings.Index(html, `id="tbl-period"`), strings.Index(html, `id="t-health"`), strings.Index(html, `id="t-matrix"`); i < 0 || j < i || k < j {
+		t.Error("analytics.html: the data health tables must come right after the By week table")
+	}
+	// the data health section uses every row (no page filter), and the
+	// caption's "20" is MIN_N; the quiet, rugged and verdict rules and the
+	// caption's threshold fill are covered by TestAnalyticsHealthNode
+	for _, want := range []string{"renderHealth(data.rows);", "var MIN_N = 20;"} {
+		if !strings.Contains(js, want) {
+			t.Errorf("analytics.js: missing %q (data health by week)", want)
+		}
+	}
+	if webQuietTrades != 50 {
+		t.Errorf("webQuietTrades = %d, want 50 (the data health caption's placeholder)", webQuietTrades)
 	}
 	if !strings.Contains(index, `href="analytics.html"`) {
 		t.Error("index.html does not link to the Analytics page")
@@ -1155,6 +1179,27 @@ func TestAnalyticsExitNode(t *testing.T) {
 	}
 	if !strings.HasPrefix(string(out), "ok: ") {
 		t.Fatalf("node testdata/analytics-exit.test.js: got %q, want \"ok: …\"", out)
+	}
+}
+
+// TestAnalyticsHealthNode runs testdata/analytics-health.test.js with node,
+// when node is on the PATH (skipped otherwise): the Overview tab's data
+// health tables (renderHealth, healthRecords, fillHealthTable,
+// fillHealthFamily, fewRateCell in frontend/analytics.js) drawn for a normal
+// week, a week with no known trade count, the MIN_N greying, no calls, the
+// Month period and the page filters set (ignored). renderOverview draws
+// them, so a throw there would blank the rest of the tab.
+func TestAnalyticsHealthNode(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node is not on the PATH")
+	}
+	out, err := exec.Command(node, "testdata/analytics-health.test.js").CombinedOutput()
+	if err != nil {
+		t.Fatalf("node testdata/analytics-health.test.js: %v: %s", err, out)
+	}
+	if !strings.HasPrefix(string(out), "ok: ") {
+		t.Fatalf("node testdata/analytics-health.test.js: got %q, want \"ok: …\"", out)
 	}
 }
 

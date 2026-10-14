@@ -151,6 +151,12 @@
       <h3 class="ana-h" id="t-period">By week</h3>
       <div class="ana-wrap" tabindex="0" role="region" aria-labelledby="t-period"><table id="tbl-period" aria-labelledby="t-period"></table></div>
 
+      <h3 class="ana-h" id="t-health">Data health by week</h3>
+      <div class="ana-wrap" tabindex="0" role="region" aria-labelledby="t-health"><table id="tbl-health" aria-labelledby="t-health"></table></div>
+      <h3 class="ana-h" id="t-health-fam">Quiet share by week and pool family</h3>
+      <div class="ana-wrap" tabindex="0" role="region" aria-labelledby="t-health-fam"><table id="tbl-health-fam" aria-labelledby="t-health-fam"></table></div>
+      <p id="cap-health" class="muted small note">All calls, page filters not applied. Verdict = a Perceptor verdict at the time of the call, readable or not (history imported from before live handling has none). Quiet = fewer than <span id="lg-health-quiet">50</span> trades in the first 24 h after the call and not flagged rugged, among calls whose trade count is known (on-chain pools only); Uniswap v2 counts Sync events, so its quiet share reads low. Calls under a day old have no trade count yet, so the newest period's 'known' share reads low. Rugged = flagged rugged by the tracker (as of now). Grey: a share of fewer than 20 calls.</p>
+
       <h3 class="ana-h" id="t-matrix">Median (and mean) return by week and Perceptor verdict</h3>
       <div class="ana-wrap" tabindex="0" role="region" aria-labelledby="t-matrix"><table id="tbl-matrix" aria-labelledby="t-matrix"></table></div>
       </div>

@@ -579,6 +579,45 @@ near('timeAxisInv(timeAxis(86400))', S.timeAxisInv(S.timeAxis(86400)), 86400, 1e
 check('fmtDur', [S.fmtDur(0), S.fmtDur(29), S.fmtDur(300), S.fmtDur(3599), S.fmtDur(5400), S.fmtDur(86399), S.fmtDur(86400),
   S.fmtDur(2592000), S.fmtDur(-120), S.fmtDur(NaN)], ['0m', '0m', '5m', '1h', '1.5h', '1d', '1d', '30d', '−2m', '–']);
 
+// data health per week (weekHealth, quietByWeekFamily), over records as the
+// page builds them (healthRecords in analytics.js decides verdict, known,
+// quiet and rugged). Three weeks, given out of order: W2 a normal week, W1 a
+// week with no known trade count, W3 one call.
+(function () {
+  var W1 = Date.UTC(2026, 8, 21), W2 = Date.UTC(2026, 8, 28), W3 = Date.UTC(2026, 9, 5);
+  var ORDER = { v4: 0, v2: 1, gecko: 2, v3: 3 };
+  function recs(n, start, f, o) {
+    var out = [];
+    for (var i = 0; i < n; i++) {
+      out.push({ start: start, verdict: !!o.v, known: !!o.k, quiet: !!o.q, rugged: !!o.r, family: f, order: ORDER[f] });
+    }
+    return out;
+  }
+  var all = [].concat(
+    recs(3, W2, 'v2', { v: 1, k: 1 }), recs(1, W2, 'v2', { v: 1, k: 1, q: 1 }),
+    recs(4, W2, 'v4', { v: 1, k: 1, q: 1 }), recs(2, W2, 'v4', { v: 1, k: 1 }),
+    recs(1, W2, 'v4', { k: 1, r: 1 }), // rugged: known, never quiet (the page's rule)
+    recs(2, W2, 'gecko', {}),
+    recs(1, W2, 'v3', { q: 1 }), // quiet without a known count: not counted
+    recs(2, W1, 'gecko', { v: 1 }), recs(1, W1, 'gecko', { r: 1 }),
+    recs(1, W3, 'v2', { v: 1, k: 1, q: 1 }));
+  check('weekHealth: newest first, per week', S.weekHealth(all), [
+    { start: W3, calls: 1, verdict: 1, known: 1, quiet: 1, rugged: 0 },
+    { start: W2, calls: 14, verdict: 10, known: 11, quiet: 5, rugged: 1 },
+    { start: W1, calls: 3, verdict: 2, known: 0, quiet: 0, rugged: 1 }
+  ]);
+  check('weekHealth: none', S.weekHealth([]), []);
+  var qf = S.quietByWeekFamily(all);
+  check('quietByWeekFamily: families with a known count, by order', qf.families, ['v4', 'v2']);
+  check('quietByWeekFamily: weeks newest first', qf.weeks.map(function (w) { return w.start; }), [W3, W2, W1]);
+  check('quietByWeekFamily: normal week', qf.weeks[1].cells, { v2: { k: 1, n: 4 }, v4: { k: 4, n: 7 } });
+  check('quietByWeekFamily: week with no known count', qf.weeks[2].cells, {});
+  check('quietByWeekFamily: one call', qf.weeks[0].cells, { v2: { k: 1, n: 1 } });
+  check('quietByWeekFamily: none', S.quietByWeekFamily([]), { families: [], weeks: [] });
+  check('quietByWeekFamily: no known count anywhere', S.quietByWeekFamily(recs(2, W1, 'gecko', { v: 1 })),
+    { families: [], weeks: [{ start: W1, cells: {} }] });
+}());
+
 if (failures) {
   console.error(failures + ' of ' + count + ' checks failed');
   process.exit(1);

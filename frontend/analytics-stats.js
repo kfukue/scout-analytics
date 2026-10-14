@@ -2,7 +2,8 @@
 // state): mean and median, equal-count groups, the fixed return bands, the
 // outcome classes, the symmetric-log and log scales, UTC weeks and hours,
 // "$100 on every call", "gave back more than half" and the exit rule (sell at
-// the first touch of m×); and for the Timing tab
+// the first touch of m×); the data health per week (weekHealth,
+// quietByWeekFamily); and for the Timing tab
 // the time bands, the "reached 2×" rule (at least MIN_HELD_2X_S at 2×) and
 // the windows too short for it (can2xReach), the time held at 2× (the real
 // one; 0 for a call that never touched 2×) and its histogram, Kaplan–Meier and the
@@ -303,6 +304,48 @@
       if (pairs[i].peak >= (m - 1) * 100) { hit++; }
     }
     return { n: rets.length, hit: hit, mean: mean(rets), median: median(rets) };
+  }
+
+  // Data health per period (the Overview's "Data health" tables). recs: one
+  // record per call, { start, verdict, known, quiet, rugged, family, order }
+  // (start = the period start in ms; verdict, known, quiet, rugged: booleans
+  // decided by the page's own rules; family and order: the pool family key
+  // and its sort order). Periods are those with calls, newest first.
+
+  // Per period: calls, with a verdict, with a known trade count, quiet (of
+  // the known ones) and rugged.
+  function weekHealth(recs) {
+    var by = {}, out = [];
+    for (var i = 0; i < recs.length; i++) {
+      var r = recs[i], w = by[r.start];
+      if (!w) { w = by[r.start] = { start: r.start, calls: 0, verdict: 0, known: 0, quiet: 0, rugged: 0 }; out.push(w); }
+      w.calls++;
+      if (r.verdict) { w.verdict++; }
+      if (r.known) { w.known++; }
+      if (r.known && r.quiet) { w.quiet++; }
+      if (r.rugged) { w.rugged++; }
+    }
+    return out.sort(function (a, b) { return b.start - a.start; });
+  }
+
+  // The quiet share per period and pool family: families = the keys with at
+  // least one known trade count, by order; weeks = every period with calls
+  // (newest first), cells[family] = { k: quiet, n: known } (missing: none).
+  function quietByWeekFamily(recs) {
+    var by = {}, weeks = [], fams = {};
+    for (var i = 0; i < recs.length; i++) {
+      var r = recs[i], w = by[r.start];
+      if (!w) { w = by[r.start] = { start: r.start, cells: {} }; weeks.push(w); }
+      if (!r.known) { continue; }
+      if (!fams[r.family]) { fams[r.family] = { key: r.family, order: r.order }; }
+      var c = w.cells[r.family] || (w.cells[r.family] = { k: 0, n: 0 });
+      c.n++;
+      if (r.quiet) { c.k++; }
+    }
+    var families = Object.keys(fams).map(function (k) { return fams[k]; });
+    families.sort(function (a, b) { return a.order - b.order; });
+    weeks.sort(function (a, b) { return b.start - a.start; });
+    return { families: families.map(function (f) { return f.key; }), weeks: weeks };
   }
 
   // A fixed offset in [−0.5, 0.5) for a call id: the jitter of a point, the
@@ -711,6 +754,7 @@
     symlogTicks: symlogTicks, log1pTicks: log1pTicks,
     weekStart: weekStart, monthStart: monthStart, hourWeekday: hourWeekday, DAY_MS: DAY_MS,
     cumulativePL: cumulativePL, gaveBack: gaveBack, exitReturn: exitReturn, exitRuleStats: exitRuleStats, jitter: jitter,
+    weekHealth: weekHealth, quietByWeekFamily: quietByWeekFamily,
     shortNum: shortNum, shortUSD: shortUSD, signedPct: signedPct, rangeLabel: rangeLabel,
     rangeLabels: rangeLabels
   };
