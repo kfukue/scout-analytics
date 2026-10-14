@@ -800,10 +800,9 @@ WHERE p.features->>'quote_asset' IS NOT NULL AND t.onchain->>'quote_sym' IS NOT 
 All buckets of one score are stored in one transaction (one `created_at`), each
 with `passed` (whether that bucket's model passed its gates, as the scoring
 service says; NULL = not recorded, e.g. rows stored before this column existed). The
-listener then sends `NOTIFY scout_events` with `{"kind":"score","call_id":…}`; an
-open website refreshes its snapshot on it (the API includes the scores; the page does
-not show them yet). Neither
-the dataset view, `-export-dataset` nor `ml/` ever read this table.
+listener then sends `NOTIFY scout_events` with `{"kind":"score","call_id":…}`, so
+an open website shows the score at once (see "Website", Model 7d). Neither the
+dataset view, `-export-dataset` nor `ml/` ever read this table.
 
 ### Latest price (the return as of now)
 
@@ -1816,7 +1815,10 @@ other sites):
     (up to 100 a day) and would push the call-time notices out of the corner. With a
     Perceptor filter on, a row whose latest Perceptor verdict moves it out of the filter
     leaves the list, and one that moves into it appears (the list reloads quietly).
-  - Each of the others also shows a **notice in the bottom-right corner**: token, verdict
+  - **A model score** (a `score` event) updates its row and an open detail quietly, like a
+    re-scan; when the list is sorted by Model 7d it reloads quietly instead.
+  - A new call, a new Perceptor verdict and a new sAlpha report or decline also show a
+    **notice in the bottom-right corner** (a re-scan and a model score do not): token, verdict
     (or "sAlpha: report available" / "did not generate a report") and a GMGN link. At most
     4 are kept (2 on a narrow screen); each goes after a minute or with its × button.
   - **Sound** (a checkbox next to "Updated"): a short beep for each notice, made by the browser
@@ -1863,9 +1865,9 @@ other sites):
   1–3650; anything else is a 400; leave it out for all); the answer carries `"days"` (0 = all),
   and the total counts only the matching calls ("N calls from the last 7 days" under the
   table).
-- **Calls** — 16 columns, in this order:
+- **Calls** — 17 columns, in this order:
   Token (the name links to GMGN; the symbol follows in grey when it differs from the name) |
-  Latest % | Latest MC | Call MC | Date (links to the post) | Perceptor | Status | Calls (`×N`
+  Latest % | Latest MC | Call MC | Date (links to the post) | Perceptor | Model 7d | Status | Calls (`×N`
   when the token was called N > 1 times, empty otherwise; hover for "Called N times, last on
   …") | Entry $ | Peak % | Worst drop % | 1h | 1d | 3d | 7d | 30d.
   - **1h, 1d, 3d, 7d, 30d** are the return over each window (the number the old single
@@ -1874,7 +1876,14 @@ other sites):
   - **Peak % and Worst drop %** are for one window, picked with the small **"Peak / worst drop
     over"** selector (1h … 30d) above the table; their headers name it, e.g. "Peak % (7d)". The
     selector changes only these two columns.
-  - **Sorting:** click Date, Call MC, Latest MC, Latest %, Peak % (for the selected window) or
+  - **Model 7d** is the model's score of the call made at the time of the call (see "Scoring
+    new calls"): the 7-day runner chance in whole percent, under it the call's rank among
+    recent calls ("top 8%" = 100 − `runner_rank_pct`), "n.v." when the 7-day model did not
+    pass its gates, a dash without a score. Calls before 13 Oct 2026 are not scored (they are
+    the training data), and a score stored more than 24 hours after the call is not shown.
+    Hover for the exact values, the model version and how long after the call it scored. It
+    is shown for every price unit, and scores never filter deliveries.
+  - **Sorting:** click Date, Call MC, Latest MC, Latest %, Model 7d, Peak % (for the selected window) or
     any of 1h … 30d; click again to reverse. ▲/▼ shows the column and direction (also as
     `aria-sort`). Rows without a value are always last; ties by call id. Worst drop % is not
     sortable.
@@ -1890,6 +1899,10 @@ other sites):
     latest price, when that price was read (how long ago, "stale"/"quiet" as in the list, and
     how old the call was then), the last trade, Call MC → Latest MC, and Peak % and Worst drop
     % for the window chosen. A call not priced in USD shows only that it has no dollar price.
+  - **Model (scored at call time)**: the model version, when it scored (and how long after
+    the call), and one line per horizon, e.g. "1d (not validated): runner 31%, collapse 44%
+    · top 8%" (30d: "up X%"; "no model" when the score has none). From the row, like the
+    performance block.
   - **Perceptor**: the verdict once (the report's own verdict line, e.g. "No red flags found",
     or the words "no red flags" / "caution" / "red flags" when it has none) and its time, the
     summary, and "Open the Perceptor report" (https links only);
@@ -2577,7 +2590,7 @@ data: {"call_id":812,"tool":"perceptor","horizon":"1d","row":{…}}
   nothing.
 - `score` = a listed token whose model score arrived or changed (a re-score has another
   `scored_at`): `{"call_id":812,"horizon":"1d","row":{…}}`, the row with its `model`. The page
-  does not use it yet.
+  shows it quietly (no notice, sound or desktop alert).
 - `reload` = ask for the list again instead: `{"calls":25,"reports":3,"scores":0}` when one read found
   more than 20 changes, `{"missed":true}` when events after the browser's `Last-Event-ID`
   can no longer be sent (see below).

@@ -153,8 +153,8 @@ type webEventOut struct {
 // with a verdict) changed otherwise. Every row an event carries has its
 // perceptor_latest_verdict, so the page can tell whether it now enters or
 // leaves its Perceptor filter. A "score" goes for each row whose model score
-// arrived or changed (webSnapshot.modelAt). Rows that went away
-// send nothing. More than
+// arrived or changed (webSnapshot.modelAt; the page shows it quietly). Rows
+// that went away send nothing. More than
 // webEventsMaxPerRefresh events become one "reload". Both snapshots are in
 // place already and are only read.
 func webSnapshotEvents(prev, next *webSnapshot) []webEventOut {

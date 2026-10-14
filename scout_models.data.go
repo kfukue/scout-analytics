@@ -1735,7 +1735,7 @@ func (st *ScoutStore) UpsertPrediction(ctx context.Context, p ScoutCallPredictio
 
 // StorePredictions stores every bucket of one score in one transaction: all or
 // none. Its rows share one created_at (now() is the time the transaction
-// started), which the website will show as the time of the score.
+// started), which the website shows as the time of the score.
 func (st *ScoutStore) StorePredictions(ctx context.Context, ps []ScoutCallPrediction, features []byte) error {
 	tx, err := st.Pool.Begin(ctx)
 	if err != nil {
