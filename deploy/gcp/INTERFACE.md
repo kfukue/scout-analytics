@@ -72,7 +72,8 @@ Read side only:
 `SCOUT_WEB_REFRESH` and every database, Telegram and node variable are ignored
 in read mode. The read side builds its `webConfig` with `ModelScores=false`
 (no environment variable): no row carries a model score, `sort=model` is
-refused with 400 and `/api/calls` answers `"model_scores": false`.
+refused with 400, `/api/calls` answers `"model_scores": false` and the page
+hides the Model column, its detail block and its legend entry.
 
 ## 2. Objects and formats
 

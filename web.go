@@ -69,10 +69,10 @@ type webConfig struct {
 	// SCOUT_WEB_REFRESH: how often the list is read again from the database
 	// (0 = the default)
 	Refresh time.Duration
-	// ModelScores: send the model's scores (each row's model in
-	// /api/calls, sort=model). Always on for this website
+	// ModelScores: show the model's scores (the Model column, the row
+	// detail's model block, sort=model). Always on for this website
 	// (loadWebConfig); a public copy (deploy/gcp) runs with it off: no row
-	// carries a score and sort=model is refused.
+	// carries a score, sort=model is refused and the page hides the column.
 	ModelScores bool
 }
 
@@ -284,8 +284,9 @@ type webCallsResponse struct {
 	Verdicts   []string  `json:"verdicts"`    // the same list as an array; [] = all
 	Days       int       `json:"days"`        // the age filter: calls from the last Days days (of SnapshotAt); 0 = all
 	SnapshotAt time.Time `json:"snapshot_at"` // when the list was last read from the database
-	// ModelScores: whether this website sends model scores
-	// (webConfig.ModelScores); when false every row's model is null
+	// ModelScores: whether this website shows model scores
+	// (webConfig.ModelScores); when false every row's model is null and the
+	// page hides the Model column
 	ModelScores bool           `json:"model_scores"`
 	Calls       []ScoutWebCall `json:"calls"`
 }
