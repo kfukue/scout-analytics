@@ -2023,7 +2023,11 @@ other sites):
 
 **Analytics page** (`/analytics.html`; "Analytics" in the top bar of the list, "Calls" back).
 Section 1, **Call performance**, is built, in four tabs (**Overview**, **By factor**, **Peak vs
-final**, **Timing**); section 2, "Model insights", is an empty heading for now. Everything on it is **first
+final**, **Timing**); section 2, **Model insights**, joins the scores the model gave at the time of
+each call (`GET /api/model-live`; hidden on a website that answers `404` there) to the same rows and
+filters, and shows per bucket how the calls it ranked in the top 10% did against all scored calls with an
+outcome (runner rate by the training labels' rule but before tax, live lift, mean return, validated).
+Everything on it is **first
 calls only, late entry (60 s after the post), in USD, before tax; values rounded to 0.1**,
 worked out in the browser from one compact feed (`GET /api/analytics`, below), so every choice
 is instant and no request reads the database. The charts of the first three tabs are SVG drawn

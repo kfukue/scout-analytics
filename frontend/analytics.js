@@ -17,12 +17,14 @@
   var A = window.AnaStats;
   var DASH = '–';
   var FORMAT = 4;          // the body's "format" this page understands
+  var LIVE_FORMAT = 1;     // the same for GET /api/model-live
   var MIN_N = 20;          // fewer calls with data than this: the group is greyed out
   var REFRESH_MS = 60000;  // ask again (cheap: 304 while nothing changed)
   var REDRAW_MS = 600000;  // on a 304, draw again only this often ("not due yet" moves slowly)
   var TOP_DEX = 12;        // posted DEX names shown on their own; the rest are "Other"
   var TOP_QUOTE = 8;
-  var PL_CAP = 1000;       // "$100 on every call": each return capped at +1,000%
+  var PL_CAP = 1000;       // "$100 on every call" and the Model insights mean returns: each return capped at
+                           // +1,000% (the same as ml/scout_ml/config.py SIM_MAX_RET_PCT)
   var FLAG_USD = 1, FLAG_RUGGED = 2, FLAG_TRACKED = 4; // the "flags" column
   var SVGNS = 'http://www.w3.org/2000/svg';
 
@@ -71,6 +73,9 @@
   var timer = null;
   var lastLoad = 0;
   var lastDraw = 0;
+  var live = null;        // the last body of GET /api/model-live (null: none, or an error)
+  var liveEtag = '';
+  var liveLoading = false;
 
   function $(id) { return document.getElementById(id); }
 
@@ -2054,6 +2059,208 @@
     drawTmRug(all, gr, H, hz);
   }
 
+  // ---- Model insights (GET /api/model-live) -----------------------------------
+  // The model's scores made at the call (within 24 h, as the server picks
+  // them) joined to the rows that pass the page filters: per bucket, how the
+  // calls it ranked in the top 10% did against all scored calls with an
+  // outcome, by the training labels' runner rule before tax (A.LIVE_RULES).
+
+  var LIVE_HEADS = [
+    ['Scored', 'Calls with a score for this bucket'],
+    ['Outcome known', 'Scored calls whose window is over and that have the return (and for short the peak) for it. ' +
+      'As in training, a call with any 1d peak or 1d/3d/7d/30d return above +100,000% (bad pool data) is an outcome in no bucket ' +
+      '(the count is in the line above the table)'],
+    ['Top 10%', 'Calls with an outcome in the top 10%. Top 10% = scored above 90% of the calls the model was tested on ' +
+      'when it was trained (so the share can drift from 10%).'],
+    ['Runner rate, top 10%', 'Share of the top 10% with an outcome that were runners (before tax)'],
+    ['Runner rate, all', 'Share of all scored calls with an outcome that were runners (before tax)'],
+    ['Live lift', 'Runner rate of the top 10% ÷ runner rate of all'],
+    ['Mean return, top 10%', 'Average return over the window of the top 10% with an outcome, each call capped at +1,000% ' +
+      '(as on "$100 on every call" and in the model\'s money simulation)'],
+    ['Mean return, all', 'Average return over the window of all scored calls with an outcome, each call capped at +1,000% ' +
+      '(as on "$100 on every call" and in the model\'s money simulation)'],
+    ['Validated', 'Whether the model version that scored most of these calls passed its validation gates']
+  ];
+
+  // The runner rule of a bucket in words, for the title of its row.
+  function liveRuleText(rule, h) {
+    return 'Runner = ' + (rule.col === 'peak' ? 'peak within ' : 'return at ') + h + ' ' + (rule.op === '>' ? 'above ' : 'of ') +
+      fmtPct(rule.at) + (rule.op === '>' ? '' : ' or more') + ', before tax';
+  }
+
+  // The muted line of the section ("" hides it).
+  function liveError(msg) {
+    $('ml-error').textContent = msg;
+    $('ml-error').hidden = !msg;
+  }
+
+  // What GET /api/model-live answered: 200 with a body, 304 (unchanged), 404
+  // (this website does not publish scores: the whole section stays hidden,
+  // no error), anything else or 0 (no answer) an error: one muted line, no
+  // table. Returns whether the section must be drawn again.
+  function applyLive(status, body, tag) {
+    $('model-insights').hidden = status === 404;
+    if (status === 304 && live) { return false; }
+    var bad = status === 404 ? '' : status === 0 ? 'no answer' : status !== 200 ? 'HTTP ' + status :
+      !body || body.format !== LIVE_FORMAT || !['rows', 'columns', 'buckets', 'horizons', 'versions'].every(function (k) {
+        return Array.isArray(body[k]);
+      }) ? 'unexpected format' : '';
+    live = status === 200 && !bad ? body : null;
+    liveEtag = live ? tag || '' : '';
+    liveError(bad ? 'Model scores could not be loaded (' + bad + ').' : '');
+    return true;
+  }
+
+  // Reads GET /api/model-live (with its ETag; load() calls it with every read
+  // of /api/analytics) and draws the section again when the answer changed it.
+  function loadLive() {
+    if (liveLoading) { return Promise.resolve(); }
+    liveLoading = true;
+    var headers = { 'Accept': 'application/json' };
+    if (liveEtag && live) { headers['If-None-Match'] = liveEtag; }
+    return fetch('api/model-live', { headers: headers, cache: 'no-store' }).then(function (r) {
+      if (r.status !== 200) { return r.text().then(function () { return { status: r.status }; }); }
+      return r.json().then(function (body) { return { status: 200, body: body, etag: r.headers.get('ETag') || '' }; });
+    }).catch(function () { return { status: 0 }; }).then(function (res) {
+      liveLoading = false;
+      if (applyLive(res.status, res.body, res.etag)) { renderLive(); }
+    });
+  }
+
+  // Whether page row r has an outcome some bucket reads (its rule's value or
+  // its return, at its window) above A.LIVE_MAX_OUTCOME_PCT: bogus pool data,
+  // an outcome in no bucket (ml/scout_ml/labels.py extreme_outcome; a
+  // missing value is not extreme).
+  function liveExtreme(r) {
+    return live.buckets.some(function (b, i) {
+      var rule = A.LIVE_RULES[b], h = live.horizons[i];
+      return !!rule && (metricAt(r, rule.col, h) > A.LIVE_MAX_OUTCOME_PCT || metricAt(r, 'ret', h) > A.LIVE_MAX_OUTCOME_PCT);
+    });
+  }
+
+  // One record per call scored for bucket b (A.liveBucketStats): known = its
+  // window (h, of hs seconds) is over, both the rule's value and the return
+  // are there (as the training labels need both) and the call is not extreme
+  // (j.extreme, set by renderLive).
+  function liveRecs(joined, b, rule, h, hs) {
+    var out = [];
+    joined.forEach(function (j) {
+      var s = j.b[b];
+      if (!s) { return; }
+      var r = j.row;
+      var x = metricAt(r, rule.col, h), ret = metricAt(r, 'ret', h);
+      var due = (r[col.t] + hs) * 1000 <= now();
+      out.push({
+        t: r[col.t], rank: s.rank, passed: s.passed, version: j.version, extreme: j.extreme,
+        known: due && !j.extreme && isNum(x) && isNum(ret), x: x, ret: ret
+      });
+    });
+    return out;
+  }
+
+  // "N of M first calls scored at call time (first score <date>)": M = the
+  // first calls that pass the page filters, N = those with a score; the
+  // date is that of the earliest score (the call's time + after_s); then,
+  // when any, how many scored calls are extreme (j.extreme).
+  function liveCoverText(joined, m) {
+    var first = Infinity, extreme = 0;
+    joined.forEach(function (j) {
+      var at = j.row[col.t] + (isNum(j.after) ? j.after : 0);
+      if (at < first) { first = at; }
+      if (j.extreme) { extreme++; }
+    });
+    return fmtInt(joined.length) + ' of ' + fmtInt(m) + ' first calls (after the page filters) scored at call time' +
+      (joined.length ? ' (first score ' + fmtDay(first * 1000) + ').' : '.') +
+      (extreme ? ' ' + fmtInt(extreme) + ' left out of every bucket as in training: an outcome above ' +
+        fmtPct(A.LIVE_MAX_OUTCOME_PCT) + ' (bad pool data).' : '');
+  }
+
+  // A mean return, greyed when n is under MIN_N.
+  function liveMeanCell(v, n) {
+    var td = pctCell(v);
+    if (isNum(v)) {
+      td.title = 'Mean over ' + fmtInt(n) + ' calls' + (n < MIN_N ? ' (fewer than ' + MIN_N + ')' : '');
+      if (n < MIN_N) { td.classList.add('ana-few'); }
+    }
+    return td;
+  }
+
+  // Live lift (top rate ÷ all rate), greyed when the top 10% has fewer than
+  // MIN_N calls (all has at least as many).
+  function liveLiftCell(st) {
+    var td = el('td', 'num', isNum(st.lift) ? st.lift.toFixed(1) + '×' : DASH);
+    if (!isNum(st.lift)) { return td; }
+    var few = st.top.n < MIN_N;
+    td.title = 'Runner rate of the top 10% ÷ runner rate of all' + (few ? ' (fewer than ' + MIN_N + ' calls)' : '');
+    if (few) { td.classList.add('ana-few'); }
+    return td;
+  }
+
+  // Validated, in the call list's words (app.js): "yes", "n.v." or a dash.
+  function liveValidCell(st, b) {
+    var td = el('td', 'num');
+    var model = st.version ? ' (model ' + st.version + ', ' + fmtInt(st.versionN) + ' of ' + fmtInt(st.scored) + ' calls)' : '';
+    if (st.passed === true) {
+      td.textContent = 'yes';
+      td.title = 'Validated: the ' + b + ' model passed its gates' + model;
+    } else if (st.passed === false) {
+      td.appendChild(el('span', 'model-nv', 'n.v.'));
+      td.title = 'Not validated: this model did not pass its validation gates' + model;
+    } else {
+      td.textContent = DASH;
+      td.title = 'Validation not recorded' + model;
+    }
+    return td;
+  }
+
+  // The row of bucket b (window h, of hs seconds); st = A.liveBucketStats.
+  function liveRow(b, h, hs, rule, st) {
+    var tr = el('tr');
+    var th = el('th', 'tok', b + ' (' + h + ')');
+    th.scope = 'row';
+    th.title = liveRuleText(rule, h);
+    tr.appendChild(th);
+    tr.appendChild(el('td', 'num', fmtInt(st.scored)));
+    if (st.scored && !st.known) {
+      var td = el('td', 'muted', '0 with an outcome yet; first ' + h + ' outcomes from ' + fmtDay((st.firstT + hs) * 1000));
+      td.colSpan = LIVE_HEADS.length - 2;
+      tr.appendChild(td);
+    } else {
+      tr.appendChild(el('td', 'num', fmtInt(st.known)));
+      tr.appendChild(el('td', 'num', fmtInt(st.top.n)));
+      tr.appendChild(fewRateCell(st.top.k, st.top.n, 'top 10% calls with an outcome were runners'));
+      tr.appendChild(fewRateCell(st.all.k, st.all.n, 'scored calls with an outcome were runners'));
+      tr.appendChild(liveLiftCell(st));
+      tr.appendChild(liveMeanCell(st.top.mean, st.top.n));
+      tr.appendChild(liveMeanCell(st.all.mean, st.all.n));
+    }
+    tr.appendChild(liveValidCell(st, b));
+    return tr;
+  }
+
+  // The section: nothing until both bodies are read (an error or a website
+  // without scores is applyLive's).
+  function renderLive() {
+    var ok = !!(live && data);
+    $('ml-body').hidden = !ok;
+    if (!ok) { return; }
+    var rows = data.rows.filter(function (r) { return passVerdict(r) && passFamily(r) && passQuiet(r); });
+    var joined = A.joinModelLive(live, rows, col.call_id);
+    joined.forEach(function (j) { j.extreme = liveExtreme(j.row); });
+    $('ml-cover').textContent = liveCoverText(joined, rows.length);
+    var frag = document.createDocumentFragment();
+    frag.appendChild(headRow('Bucket', LIVE_HEADS));
+    var tbody = el('tbody');
+    live.buckets.forEach(function (b, i) {
+      var rule = A.LIVE_RULES[b], h = live.horizons[i], hi = data.horizons.indexOf(h);
+      if (!rule || hi < 0) { return; }
+      var hs = data.horizon_seconds[hi];
+      tbody.appendChild(liveRow(b, h, hs, rule, A.liveBucketStats(liveRecs(joined, b, rule, h, hs), rule, PL_CAP)));
+    });
+    frag.appendChild(tbody);
+    $('tbl-ml').replaceChildren(frag);
+  }
+
   // ---- render -----------------------------------------------------------------
 
   function render() {
@@ -2092,6 +2299,7 @@
     }
     $('ana-msg').hidden = shown > 0;
     if (shown === 0) { $('ana-msg').textContent = 'No calls match this choice.'; }
+    renderLive();
     lastDraw = Date.now();
     // for measuring (headless browser checks): the time of the last drawing
     $('ana-body').setAttribute('data-render-ms', String(Math.round(performance.now() - t0)));
@@ -2125,6 +2333,7 @@
     if (loading) { return; }
     loading = true;
     lastLoad = Date.now();
+    loadLive();
     var headers = { 'Accept': 'application/json' };
     if (etag && data) { headers['If-None-Match'] = etag; }
     fetch('api/analytics', { headers: headers, cache: 'no-store' }).then(function (r) {

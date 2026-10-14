@@ -323,8 +323,15 @@
     </details>
   </section>
 
-  <section class="panel" aria-labelledby="model-title">
-    <h2 id="model-title">Model insights — coming soon</h2>
+  <section class="panel" id="model-insights" aria-labelledby="model-title" hidden>
+    <h2 id="model-title">Model insights</h2>
+    <p id="ml-error" class="muted small note" hidden></p>
+    <div id="ml-body" hidden>
+      <p id="ml-cover" class="muted small note"></p>
+      <h3 class="ana-h" id="t-ml">Did the calls the model ranked highest do better?</h3>
+      <div class="ana-wrap" tabindex="0" role="region" aria-labelledby="t-ml"><table id="tbl-ml" aria-labelledby="t-ml"></table></div>
+      <p id="cap-ml" class="muted small note">Scores the model gave at the time of each call (only scores made within 24 h of the call). Top 10% = scored above 90% of the calls the model was tested on when it was trained (so the share can drift from 10%). Runner rates and returns are before tax (training labels are after tax). Page filters apply. Few calls are scored so far; treat small numbers as noise. Grey: fewer than 20 calls.</p>
+    </div>
   </section>
   <noscript><p class="notice">This page needs JavaScript.</p></noscript>
 </main>
