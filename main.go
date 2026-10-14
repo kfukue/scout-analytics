@@ -1962,6 +1962,21 @@ func (s *scanner) findDialog(ctx context.Context, match func(dialogInfo) bool, w
 	}
 }
 
+// exportCSVFile creates (or truncates) the file at path with os.Create (mode
+// 0666 before umask), lets export write to it and closes it. It returns the
+// number of rows export wrote, and export's error, else the close error.
+func exportCSVFile(path string, export func(io.Writer) (int, error)) (int, error) {
+	f, err := os.Create(path)
+	if err != nil {
+		return 0, err
+	}
+	n, err := export(f)
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	return n, err
+}
+
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
@@ -1981,6 +1996,7 @@ func main() {
 	priceCheck := flag.String("price-check", "", "on-chain diagnostic for a CA: find its pool and print entry/current price (no Telegram; reads the asset database's Chainlink feeds when a database is configured, SCOUT_DB=off to skip), then exit")
 	priceAt := flag.String("price-at", "", "with -price-check: the call time, RFC3339 (e.g. 2026-10-01T14:30:00Z) or a duration ago (e.g. 6h); default 1h ago")
 	exportPath := flag.String("export-dataset", "", "write the training dataset (one row per call: features + 1h/1d/3d/7d/30d outcomes) to this CSV file, then exit")
+	exportLiveBuysPath := flag.String("export-live-buys", "", "write the live buys of every call (scout_call_live_buys: one row per buy, by call and position) to this CSV file, then exit")
 	testNotify := flag.Bool("test-notify", false, "send one test message to SCOUT_NOTIFY_PEER and exit")
 	postFlag := flag.String("post", "", "process specific @scoutrobinhood post id(s), e.g. 10002 or 10002,10005: show what was found, investigate and deliver, then exit")
 	listenOnly := flag.Bool("listen-only", false, "listener without the performance tracker: new calls are still scanned, delivered and queued for tracking; run -track in another terminal to compute performance")
@@ -2057,7 +2073,7 @@ func main() {
 	}
 
 	// Modes that need only the database (no Telegram login).
-	if *exportPath != "" || *trackOnly || *trackOnce || *webOnly || *retryNoPool || *rescanMissing || *reaskMissing {
+	if *exportPath != "" || *exportLiveBuysPath != "" || *trackOnly || *trackOnce || *webOnly || *retryNoPool || *rescanMissing || *reaskMissing {
 		if s.db == nil {
 			log.Fatal("these modes need the database (SCOUT_DB=off is set)")
 		}
@@ -2079,18 +2095,17 @@ func main() {
 				log.Fatalf("retry: %v", err)
 			}
 		case *exportPath != "":
-			f, err := os.Create(*exportPath)
-			if err != nil {
-				log.Fatal(err)
-			}
-			n, err := s.db.ExportDatasetCSV(ctx, f)
-			if cerr := f.Close(); err == nil {
-				err = cerr
-			}
+			n, err := exportCSVFile(*exportPath, func(w io.Writer) (int, error) { return s.db.ExportDatasetCSV(ctx, w) })
 			if err != nil {
 				log.Fatal(err)
 			}
 			fmt.Printf("wrote %d calls to %s\n", n, *exportPath)
+		case *exportLiveBuysPath != "":
+			n, err := exportCSVFile(*exportLiveBuysPath, func(w io.Writer) (int, error) { return s.db.ExportLiveBuysCSV(ctx, w) })
+			if err != nil {
+				log.Fatal(err)
+			}
+			fmt.Printf("wrote %d live buys to %s\n", n, *exportLiveBuysPath)
 		case *trackOnce:
 			if !s.pc.Enabled {
 				log.Fatal("SCOUT_TRACK_PERFORMANCE=false")

@@ -494,6 +494,7 @@ One row per call (`scout_call_dataset_v`): **features known at call time** (MCap
 Tax, Age, Holders, Proof elite/good, live-buy counts/$ per tier, Perceptor verdict, DEX,
 launchpad) + **outcomes** (`ret_*`, `max_gain_*`, `max_dd_*` for 1h/1d/3d/7d/30d, `rugged`).
 Only use the feature columns as model inputs; everything about the future is an outcome.
+`./scoutanalytics -export-live-buys live_buys.csv` writes `scout_call_live_buys` the same way, one row per live buy ordered by `call_id, position` (`call_id,position,tier,amount_usd,wallet_display,wallet_prefix,wallet_suffix`; no amount = empty field).
 
 | Setting | Default | |
 |---|---|---|
