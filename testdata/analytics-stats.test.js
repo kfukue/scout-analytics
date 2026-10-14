@@ -220,12 +220,41 @@ near('exitReturn: missing return, NaN', S.exitReturn(50, NaN, 2), NaN);
   ];
   // 2×: 100, 100, 100, −50, −100; 3×: 200, 20, 200, −50, −100;
   // 5×: 400, 20, 250, −50, −100; hold: −100, 20, 250, −50, −100
-  check('exitRuleStats 2×', S.exitRuleStats(pairs, 2), { n: 5, hit: 3, mean: 30, median: 100 });
-  check('exitRuleStats 3×', S.exitRuleStats(pairs, 3), { n: 5, hit: 2, mean: 54, median: 20 });
-  check('exitRuleStats 5×', S.exitRuleStats(pairs, 5), { n: 5, hit: 1, mean: 104, median: 20 });
-  check('exitRuleStats hold', S.exitRuleStats(pairs, Infinity), { n: 5, hit: 0, mean: 4, median: -50 });
+  check('exitRuleStats 2×', S.exitRuleStats(pairs, 2), { n: 5, hit: 3, mean: 30, median: 100, out: 0 });
+  check('exitRuleStats 3×', S.exitRuleStats(pairs, 3), { n: 5, hit: 2, mean: 54, median: 20, out: 0 });
+  check('exitRuleStats 5×', S.exitRuleStats(pairs, 5), { n: 5, hit: 1, mean: 104, median: 20, out: 0 });
+  check('exitRuleStats hold', S.exitRuleStats(pairs, Infinity), { n: 5, hit: 0, mean: 4, median: -50, out: 0 });
   var e = S.exitRuleStats([], 2);
   check('exitRuleStats: no pairs', [e.n, e.hit, isNaN(e.mean), isNaN(e.median)], [0, 0, true, true]);
+})();
+
+// exit rule: a pair with a peak or a return above EXIT_MAX_OUTCOME_PCT (1e5 %,
+// ml/scout_ml/config.py MAX_OUTCOME_PCT, strict ">" as labels.py) is left out
+// of every rule and counted in out; exactly 1e5 is kept
+check('EXIT_MAX_OUTCOME_PCT', S.EXIT_MAX_OUTCOME_PCT, 1e5);
+(function () {
+  var pairs = [
+    { peak: 1e5, ret: 1e5 },        // exactly at the cap: kept
+    { peak: 100000.01, ret: 0 },    // peak just above: out
+    { peak: 50, ret: 100000.5 },    // return just above (peak ordinary): out
+    { peak: 3.9e47, ret: 3.9e47 },  // the prod drained pool: out
+    { peak: 3.9e47, ret: -100 },    // peak above, return ordinary: out
+    { peak: Infinity, ret: 10 },    // +inf is extreme (labels.py), not missing: out
+    { peak: 1e48, ret: null },      // extreme with the return missing: out
+    { peak: null, ret: 1e6 },       // return above with the peak missing: out
+    { peak: 0, ret: -50 }
+  ];
+  // kept: (1e5, 1e5) and (0, −50). 2× and 5×: 100 or 400, −50; hold: 1e5, −50
+  check('exitRuleStats cap 2×', S.exitRuleStats(pairs, 2), { n: 2, hit: 1, mean: 25, median: 25, out: 7 });
+  check('exitRuleStats cap 5×', S.exitRuleStats(pairs, 5), { n: 2, hit: 1, mean: 175, median: 175, out: 7 });
+  check('exitRuleStats cap hold', S.exitRuleStats(pairs, Infinity), { n: 2, hit: 0, mean: 49975, median: 49975, out: 7 });
+  check('exitRuleStats cap: out the same for every rule',
+    [2, 3, 5, Infinity].map(function (m) { return S.exitRuleStats(pairs, m).out; }), [7, 7, 7, 7]);
+  check('exitRuleStats cap: peak and return exactly 1e5 kept',
+    S.exitRuleStats([{ peak: 1e5, ret: 1e5 }], Infinity), { n: 1, hit: 0, mean: 1e5, median: 1e5, out: 0 });
+  check('exitRuleStats cap: return exactly 1e5 kept', S.exitRuleStats([{ peak: 20, ret: 1e5 }], Infinity), { n: 1, hit: 0, mean: 1e5, median: 1e5, out: 0 });
+  check('exitRuleStats cap: peak just above dropped', S.exitRuleStats([{ peak: 100000.01, ret: 0 }], 2), { n: 0, hit: 0, mean: NaN, median: NaN, out: 1 });
+  check('exitRuleStats cap: return just above dropped', S.exitRuleStats([{ peak: 50, ret: 100000.5 }], Infinity), { n: 0, hit: 0, mean: NaN, median: NaN, out: 1 });
 })();
 
 // jitter: fixed per id, in range

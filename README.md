@@ -2090,7 +2090,8 @@ dependencies; `go test` runs it when `node` is on the PATH). Only the visible ta
   more than half of it (return < peak ÷ 2). It also has an exit-rule table: mean and median
   return when sold at the first touch of 2×, 3× or 5× (else held to the end of the window)
   against holding, with the share that touched; an upper bound, before tax, rugged calls counted
-  with their pre-rug peak.
+  with their pre-rug peak; calls with a peak or return for the window above +100,000% (bad pool
+  data) are left out and counted in the caption.
 - **Timing tab:** when things happened after the call, within the chosen window (the timing
   columns of "Timing after the call" above; results after the call, never model inputs). It
   counts the **timed** calls: first calls priced in USD with a return for the window **and**

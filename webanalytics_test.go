@@ -961,7 +961,7 @@ func TestAnalyticsPageFiles(t *testing.T) {
 		`id="panel-overview"`, `id="panel-factor"`, `id="panel-peak"`, "capped at +1,000%",
 		// the exit-rule table on Peak vs final: fillExitTable writes into
 		// #h-exit and #tbl-exit (a missing one would throw and blank the tab)
-		`id="h-exit"`, `id="tbl-exit"`, `id="cap-exit"`,
+		`id="h-exit"`, `id="tbl-exit"`, `id="cap-exit"`, `id="cap-exit-out"`,
 		"Sold at the first touch of 2×/3×/5× (a candle or trade high, before tax), else held to the end of the window.",
 		"An upper bound: in thin pools a brief wick can count as a touch.",
 		"Rugged calls count with their peak before the rug: a touch before the rug counts as a sale.",

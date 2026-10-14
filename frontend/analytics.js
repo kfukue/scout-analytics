@@ -1331,13 +1331,16 @@
   // The exit-rule table: sell at the first touch of 2×, 3× or 5×, else hold
   // to the end of the window (A.exitReturn), against holding every call.
   // Over the same points as the chart (a peak and a return for the window),
-  // so rugged calls keep their peak before the rug and their final return.
+  // so rugged calls keep their peak before the rug and their final return,
+  // except the pairs whose peak or return for the window is above
+  // A.EXIT_MAX_OUTCOME_PCT (bad pool data), which every row leaves out and
+  // the caption counts.
   var EXIT_RULES = [
     { m: 2, label: 'Sell at 2×' }, { m: 3, label: 'Sell at 3×' }, { m: 5, label: 'Sell at 5×' },
     { m: Infinity, label: 'Hold to the end' }
   ];
   var EXIT_HEADS = [
-    ['n', 'Calls with a peak and a return for the window: the n of every number in the row'],
+    ['n', 'Calls with a peak and a return for the window (calls with a peak or return for the window above +100,000% left out): the n of every number in the row'],
     ['Touched', 'Share of the calls whose peak within the window reached the exit multiple'],
     ['Mean return', 'Average return under the rule'],
     ['Median return', 'Middle return under the rule'],
@@ -1389,6 +1392,15 @@
     }
     frag.appendChild(tbody);
     $('tbl-exit').replaceChildren(frag);
+    // the calls left out of every row (A.exitRuleStats: the window's peak or
+    // return above A.EXIT_MAX_OUTCOME_PCT), after the static caption; empty
+    // when none. The span is cosmetic: a page without it still gets the table.
+    var capOut = $('cap-exit-out');
+    if (capOut) {
+      capOut.textContent = hold.out ? ' ' + fmtInt(hold.out) + (hold.out === 1 ? ' call' : ' calls') + ' left out: ' +
+        (hold.out === 1 ? 'a peak or return' : 'peaks or returns') + ' for the window above +' +
+        fmtInt(A.EXIT_MAX_OUTCOME_PCT) + '% (bad pool data).' : '';
+    }
   }
 
   // ---- Timing -----------------------------------------------------------------

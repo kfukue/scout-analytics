@@ -3,7 +3,9 @@
 // pctCell, headRow, emptyRow), over the real calculations of
 // analytics-stats.js. A normal window, a window with fewer than MIN_N calls
 // (every row greyed), an empty window (the one empty row), and points with a
-// missing peak or return (not counted by any rule). renderPeak calls
+// missing peak or return (not counted by any rule), peaks or returns above
+// +100,000% (left out of every row, counted in #cap-exit-out), and a page
+// without #cap-exit-out (the table still draws). renderPeak calls
 // fillExitTable before its own early return, so a throw here would blank the
 // whole tab. Run: node testdata/analytics-exit.test.js [path to analytics.js]
 // (no dependencies; exit code 1 on any failure). TestAnalyticsExitNode runs
@@ -83,7 +85,7 @@ Node.prototype.replaceChildren = function () {
 };
 
 var page = {};
-function resetPage() { page = { 'h-exit': new Node('h3'), 'tbl-exit': new Node('table') }; }
+function resetPage() { page = { 'h-exit': new Node('h3'), 'tbl-exit': new Node('table'), 'cap-exit-out': new Node('span') }; }
 var document = {
   createElement: function (tag) { return new Node(tag); },
   createTextNode: function (text) { var n = new Node('#text'); n._text = String(text); return n; },
@@ -159,6 +161,8 @@ if (draw('normal', normal, '7d')) {
   check('normal: table parts', table().children.map(function (c) { return c.tagName; }), ['thead', 'tbody']);
   check('normal: head', texts(head()), HEADS);
   check('normal: head scopes', head().children.map(function (c) { return c.scope; }), HEADS.map(function () { return 'col'; }));
+  check('normal: n head title', head().children[1].title,
+    'Calls with a peak and a return for the window (calls with a peak or return for the window above +100,000% left out): the n of every number in the row');
   check('normal: row count', tbody().children.length, 4);
   check('normal: rows', rowTexts(), NORMAL_ROWS);
   check('normal: not greyed', tbody().children.map(function (tr) { return tr.className; }), ['', '', '', '']);
@@ -170,6 +174,7 @@ if (draw('normal', normal, '7d')) {
   check('normal: 2× vs hold classes', [two[5].className, two[6].className], ['num pos', 'num pos']);
   check('normal: 5× vs hold class (zero)', cellAt(2, 5).className, 'num zero');
   check('normal: hold mean class', cellAt(3, 3).className, 'num neg');
+  check('normal: no left-out clause', page['cap-exit-out'].textContent, '');
   // drawn again: the table is replaced, not appended to
   box.fillExitTable(normal, '1d');
   check('redrawn: table parts', table().children.map(function (c) { return c.tagName; }), ['thead', 'tbody']);
@@ -226,6 +231,62 @@ if (draw('21 + missing', pts([[10, 300, -100], [5, 100, 50], [6, 20, -50]]).conc
 if (draw('only missing', missing, '7d')) {
   check('only missing: row count', tbody().children.length, 1);
   check('only missing: text', tbody().children[0].textContent, 'No calls with a peak and a return for this window.');
+}
+
+// ---- Outcomes above +100,000% (bad pool data): left out of every row -------
+// The prod drained pool (+3.9×10⁴⁷%) would make the hold mean ~+1.5×10⁴⁶%;
+// left out, the rows are exactly the normal window's and the caption counts it.
+var CLAUSE_1 = ' 1 call left out: a peak or return for the window above +100,000% (bad pool data).';
+var drained = { r: { id: 990 }, peak: 3.9e47, ret: 3.9e47 };
+if (draw('normal + drained', normal.concat([drained]), '7d')) {
+  check('normal + drained: n', tbody().children.map(function (tr, r) { return cellAt(r, 1).textContent; }), ['25', '25', '25', '25']);
+  check('normal + drained: hold mean', cellAt(3, 3).textContent, '−46.0%');
+  check('normal + drained: 2× mean vs hold', cellAt(0, 5).textContent, '+90.0 pp');
+  check('normal + drained: same rows as without it', rowTexts(), NORMAL_ROWS);
+  check('normal + drained: caption clause', page['cap-exit-out'].textContent, CLAUSE_1);
+  // drawn again without it: the clause is cleared
+  box.fillExitTable(normal, '7d');
+  check('normal after drained: clause cleared', page['cap-exit-out'].textContent, '');
+}
+// exactly +100,000% is kept (strict ">", as ml/scout_ml/labels.py)
+if (draw('normal + at the cap', normal.concat([{ r: { id: 991 }, peak: 1e5, ret: 1e5 }]), '7d')) {
+  check('at the cap: n', cellAt(3, 1).textContent, '26');
+  check('at the cap: no clause', page['cap-exit-out'].textContent, '');
+}
+// an extreme peak with an ordinary return, and an ordinary peak with an
+// extreme return: both left out, the plural clause
+if (draw('normal + two extreme', normal.concat([{ r: { id: 992 }, peak: 3.9e47, ret: -100 }, { r: { id: 993 }, peak: 50, ret: 100000.5 }]), '7d')) {
+  check('two extreme: same rows as without them', rowTexts(), NORMAL_ROWS);
+  check('two extreme: caption clause', page['cap-exit-out'].textContent, ' 2 calls left out: peaks or returns for the window above +100,000% (bad pool data).');
+}
+// only extreme ones: the empty row, and the clause still says why
+if (draw('only drained', [drained], '7d')) {
+  check('only drained: row count', tbody().children.length, 1);
+  check('only drained: text', tbody().children[0].textContent, 'No calls with a peak and a return for this window.');
+  check('only drained: caption clause', page['cap-exit-out'].textContent, CLAUSE_1);
+}
+
+// A page without #cap-exit-out (the span is cosmetic): no throw, and the
+// table still draws, with and without calls left out.
+function drawNoSpan(name, p, hz) {
+  resetPage();
+  delete page['cap-exit-out'];
+  try {
+    box.fillExitTable(p, hz);
+  } catch (e) {
+    check(name + ': does not throw', String(e && e.stack || e), null);
+    return false;
+  }
+  check(name + ': does not throw', null, null);
+  return true;
+}
+if (drawNoSpan('no span', normal, '7d')) {
+  check('no span: table parts', table().children.map(function (c) { return c.tagName; }), ['thead', 'tbody']);
+  check('no span: rows', rowTexts(), NORMAL_ROWS);
+}
+if (drawNoSpan('no span + drained', normal.concat([drained]), '7d')) {
+  check('no span + drained: heading', page['h-exit'].textContent, 'Exit rule: sell at 2×, 3× or 5× (7d window)');
+  check('no span + drained: rows', rowTexts(), NORMAL_ROWS);
 }
 
 // ppCell on its own: the sign, the unit and the dash
