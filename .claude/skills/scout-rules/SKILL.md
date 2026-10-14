@@ -16,8 +16,11 @@ root).
 - Do not commit, push, or switch branches unless the task explicitly says to.
 - Do not run the listener, `-backfill` or `-track` against a real database.
 - Never reset, re-track or bulk-update calls in any database the owner uses.
-  When existing rows need repair, give the exact read-only SQL to find them and
-  the exact UPDATE in your report; the owner decides and runs it.
+  When existing rows need repair, write the read-only SQL that finds them and
+  the change itself as an `ops/` folder with its rollback (see "Database
+  changes: run script and rollback" below); the owner decides and runs it.
+- Every database change ships with a script to run AND a rollback script
+  (owner, 13 Oct 2026). See "Database changes: run script and rollback" below.
 - Never change `onchainStateVersion` or anything else that makes the tracker
   redo history without the task explicitly saying so. Flag it instead.
 - Don't edit `HANDOFF.md` unless the task is about it. Edit `README.md` only
@@ -37,6 +40,123 @@ root).
   split instead of growing one large diff. Write new code as small,
   single-purpose, testable functions; split a function that grows long
   rather than adding to it.
+
+## Database changes: run script and rollback
+
+Owner rule (13 Oct 2026): every change to the database, its structure or its
+data, comes with a script to run and a rollback script, in case the script
+fails or its result is wrong. Agents write the scripts as files in the repo,
+not only as text in a report or PR body. Only the product manager may give
+the owner a small one-off write in a message, and only with its backup step
+and its rollback in the same message. This rule is for new work. Do not add
+rollbacks to the old `ops/` folders that are already DONE, or to the writes
+already in `scoutanalytics.sql` (the UPDATEs run at start and the seed
+INSERTs). `DEPLOY.md` 3.4 ("rollback is forward-only") and 3.5 ("a
+committed B is not undone") were written before this rule. For new changes,
+R supersedes them.
+
+Data changes (UPDATE, INSERT or DELETE the owner runs in pgAdmin; `ops/`
+folder, A = read-only count, B = the write, C = check, D/E = follow-ups,
+R = rollback):
+
+- B runs as one transaction (`BEGIN; ... COMMIT;`). If B stops with an
+  error, the owner runs `ROLLBACK;` and nothing has changed. R is for undoing
+  a B that finished.
+- Before changing anything, B saves what it is about to change, inside the
+  same transaction, in a backup table for each table it touches:
+  `CREATE TABLE <table>_bak_<topic>_<YYYYMMDD> AS SELECT ... FROM <table> WHERE ...`
+  (the folder's topic in the name, so two folders on one day never clash).
+  Keep the table's primary key in it (all its columns, e.g. `call_id`, or
+  `call_id, horizon`). B then changes exactly the rows in the backup table,
+  joining on that key.
+  - UPDATE: the backup holds the key and the old values of the changed
+    columns; R sets them back.
+  - DELETE: the backup holds the whole rows (`SELECT *`); R inserts them
+    again. Do not delete from a table that other tables point to (such as
+    `scout_calls`) without asking the product manager first. If such a
+    delete is needed, the backup covers every table that points to it:
+    - `ON DELETE CASCADE` children, whose rows are deleted too (for
+      `scout_calls`: tracking, returns, candles, live buys, predictions and
+      more). Back up their whole rows.
+    - `ON DELETE SET NULL` children, whose link is cleared (for
+      `scout_calls`: `scout_investigations`, `scout_deliveries`). Back up
+      their key and the old link.
+
+    R puts the parent rows back first, then the child rows, then the links.
+  - INSERT: the keys exist only after the insert. B creates the backup
+    table empty first, then runs
+    `WITH ins AS (INSERT ... RETURNING <key>) INSERT INTO <backup> SELECT * FROM ins`.
+    R deletes those rows.
+- The backup table is a real table, not `CREATE TEMP TABLE`: a TEMP table
+  is lost when the pgAdmin tab closes. It is not a schema table: it is never
+  in `scoutanalytics.sql`, the program never reads it, and the owner drops it
+  afterwards. So the "no new tables" rule does not apply to it.
+- R is `R_rollback.sql` in the same folder: one transaction that restores
+  every table B touched from its backup table. It never works out the rows
+  again from B's WHERE clause, because that would also hit rows the program
+  wrote after B ran. The folder `README.md` says how long R is safe to run
+  (for example "before the tracker is restarted", when the tracker rewrites
+  those rows).
+- The folder `README.md` ends with the `DROP TABLE` for the backup tables.
+  The owner runs it in either case: once he is happy with B, or after R.
+- Same pgAdmin rules as every other script: no psql meta-commands, and
+  `<<< EDIT` on each line with a value the owner must change. C shows the
+  state after B and after R; the README says what to expect in each case.
+  The folder's row in `ops/README.md` says, in its "What it does" column,
+  that R exists.
+
+Structure changes (`scoutanalytics.sql`, which the program runs at every
+start):
+
+- The run script is the new statements in `scoutanalytics.sql`. Write them so
+  they are safe to repeat (`IF NOT EXISTS`) and quote them in your report.
+  New data writes (UPDATE, INSERT or DELETE) go in an `ops/` folder, not in
+  `scoutanalytics.sql`. If one really must run at every start, ask the
+  product manager first.
+- Also write a folder `ops/<YYYY-MM-DD>-<topic>/` with `R_rollback.sql`, a
+  `C_check.sql` and a `README.md`. C is read-only and shows whether the
+  change is there (it queries `information_schema.tables`,
+  `information_schema.columns`, `pg_indexes` and `pg_views` for what the
+  change added). The folder's row in `ops/README.md` says, in its "Status"
+  column, "rollback only, for branch `work/...`; not run". The README gives
+  the rollback order:
+  0. Only if the change adds a view built on a view that already exists:
+     `DROP VIEW IF EXISTS <new view>;` after the services are stopped and
+     before the previous commit starts in step 1. Otherwise the previous
+     commit's `DROP VIEW` of the existing view fails at start.
+  1. Restart the services on the previous commit, as in the rollback part
+     of `DEPLOY.md` section 3.0: `go run` on the previous commit, or the
+     previous binary. `scoutanalytics.sql` is built into the binary, so
+     the binary that starts decides which schema runs, and `git pull`
+     alone changes nothing. The old `scoutanalytics.sql` then runs at
+     start, with `SCOUT_DB_AUTO_MIGRATE` on (the default). When it is
+     off, the owner runs the old file by hand first.
+  2. Then run R.
+
+  If R ran first, the code still running would fail on the missing column
+  or table, and a restart on the new commit would put the change back.
+- R is safe to repeat too, and removes with `IF EXISTS` everything the
+  change added: columns, indexes, tables and views (`DROP COLUMN IF EXISTS`,
+  `DROP INDEX IF EXISTS`, `DROP TABLE IF EXISTS`, `DROP VIEW IF EXISTS`). New
+  views go first, and a view built on another new view goes before that
+  view. It never drops or recreates a view that exists on the previous
+  commit, and never uses `CASCADE`. After step 1 the old views no
+  longer use the new column. If `DROP COLUMN` fails with "view ... depends
+  on column", either R missed a view the change added, or step 1 has not
+  happened yet. R says plainly what data is lost, for example "the values in
+  column X are deleted".
+
+Test both directions on your throwaway Postgres and report the commands and
+results:
+
+- Data change: B, then C, then R, then C, then B again.
+- Structure change: apply the new `scoutanalytics.sql`, then C, then apply
+  the previous commit's file (`git show <base>:scoutanalytics.sql`, as step 1
+  does), then R, then C, then apply the new file again.
+
+The first new folder that has an R also updates the `ops/README.md` header
+and legend in a targeted edit: add R to the legend, and make "never run
+again" cover B only.
 
 ## How you report (basics)
 

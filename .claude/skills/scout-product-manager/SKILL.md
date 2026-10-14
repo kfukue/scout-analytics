@@ -137,6 +137,19 @@ back.
 - **Schema:** changes go in `scoutanalytics.sql`, which runs at every start, so
   every statement must be safe to repeat. No new table when an existing one can
   hold the data; ask the owner before adding one.
+- **Database changes need a run script and a rollback script** (owner,
+  13 Oct 2026). The rule is in full in `scout-rules` ("Database changes: run
+  script and rollback"). Your part:
+  - Every `implement` task that changes the structure or the data asks for
+    both scripts.
+  - Every `review` task on such a change says "FAIL if the run script or the
+    rollback script is missing or does not follow scout-rules".
+    `.claude/agents/review.md` is the owner's file and does not have this
+    check yet.
+  - The PR body names both scripts and copies the rollback steps (and how
+    long R is safe to run) from the folder README.
+  - A small one-off write you give the owner in a message carries its
+    backup step and rollback in that same message.
 - **Verification wording:** the production database and the nodes are only
   reachable from the prod server. Anything not run there is "tested locally",
   never "verified in prod".
@@ -489,6 +502,9 @@ Every Go start applies `scoutanalytics.sql` unless `SCOUT_DB_AUTO_MIGRATE=false`
   2×; "reached 2×" still needs 1 hour held (PR #33).
 - 13 Oct: ML gates option (b), pooled walk-forward + seed median (PR #34;
   see "Model" under "The project").
+- 13 Oct (owner): every database change, to the structure or the data, ships
+  with a run script and a rollback script ("Rules to follow and pass on";
+  the rule in full is in `scout-rules`).
 - 13 Oct: the call list's Perceptor filter uses each token's latest
   Perceptor report with a verdict, re-scans included (PR #40); display only,
   the dataset view and the Analytics "verdict at the call" stay call-time.
