@@ -10,7 +10,7 @@ import argparse
 import numpy as np
 import pandas as pd
 
-from scout_ml.config import HORIZONS, LATEST_VIEW, VIEW_COLUMNS
+from scout_ml.config import BUCKETS, HORIZONS, LATEST_VIEW, UPDATE_KIND, VIEW_COLUMNS
 
 HORIZON_DAYS = {"1h": 1 / 24, "1d": 1, "3d": 3, "7d": 7, "30d": 30}
 STEP_SIGMA = {"1h": 0.30, "1d": 0.75, "3d": 0.55, "7d": 0.55, "30d": 0.80}  # log-price steps
@@ -195,6 +195,51 @@ def make(n: int = 6000, days: float = 70, seed: int = 7, end: str = "2026-10-01T
     elif dex_names != "plain":
         raise ValueError(f"dex_names must be 'plain' or 'drifting', not {dex_names!r}")
     return d[VIEW_COLUMNS]
+
+
+LIVE_BUY_COLUMNS = ["call_id", "position", "tier", "amount_usd", "wallet_display",
+                    "wallet_prefix", "wallet_suffix"]   # the -export-live-buys header
+
+
+def wallet_digits(n_wallets: int, seed: int = 7) -> list:
+    """8 lower-case hex digits per synthetic wallet (prefix "0x" + the first 4,
+    suffix the last 4); wallets 0 .. n_skilled-1 are make_live_buys' skilled
+    ones. An odd multiplier mod 2^32 keeps them distinct."""
+    return [f"{(w * 2654435761 + seed) % 2 ** 32:08x}" for w in range(n_wallets)]
+
+
+def make_live_buys(d: pd.DataFrame, n_wallets: int = 2000, skilled_share: float = 0.02,
+                   seed: int = 7) -> pd.DataFrame:
+    """Invented live buys (the -export-live-buys layout) for the calls of `d`
+    (make()'s output): about 3 per call post, none on update posts. A share
+    `skilled_share` of the `n_wallets` wallets is "skilled": a buy on a medium
+    runner call (raw ret_late_7d at or above the medium runner threshold) is
+    by a skilled wallet 60% of the time, any other buy 2%. The prefix / suffix
+    case varies between posts of the same wallet, as in real posts."""
+    rng = np.random.default_rng([seed, 31])
+    col, _, threshold = BUCKETS["medium"]["runner"]
+    runner = (pd.to_numeric(d[col], errors="coerce") >= threshold).to_numpy()
+    per_call = np.where(d["post_kind"].astype(str).to_numpy() == UPDATE_KIND, 0,
+                        rng.poisson(3.0, len(d)))
+    row = np.repeat(np.arange(len(d)), per_call)
+    n = len(row)
+    n_skilled = max(1, int(round(n_wallets * skilled_share)))
+    skilled = rng.random(n) < np.where(runner[row], 0.60, 0.02)
+    wallet = np.where(skilled, rng.integers(0, n_skilled, n),
+                      n_skilled + rng.integers(0, max(1, n_wallets - n_skilled), n))
+    digits = pd.Series(wallet_digits(n_wallets, seed)).iloc[wallet].reset_index(drop=True)
+    upper = pd.Series(rng.random(n) < 0.5)
+    head, suffix = digits.str[:4], digits.str[-4:]
+    prefix = "0x" + head.where(~upper, head.str.upper())
+    suffix = suffix.where(~upper, suffix.str.upper())
+    out = pd.DataFrame({
+        "call_id": d["call_id"].to_numpy()[row],
+        "position": pd.Series(row).groupby(row).cumcount().to_numpy() + 1,
+        "tier": rng.choice(["elite", "good", "other"], n, p=[0.3, 0.5, 0.2]),
+        "amount_usd": np.where(rng.random(n) < 0.1, np.nan, rng.lognormal(np.log(400), 1.0, n).round(2)),
+        "wallet_display": prefix + "…" + suffix,
+        "wallet_prefix": prefix, "wallet_suffix": suffix})
+    return out[LIVE_BUY_COLUMNS]
 
 
 def write_csv(d: pd.DataFrame, path) -> None:
