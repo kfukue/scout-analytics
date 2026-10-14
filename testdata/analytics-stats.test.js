@@ -193,6 +193,41 @@ check('gaveBack', S.gaveBack([
   { peak: null, ret: 3 }    // missing: not counted
 ]), { k: 2, n: 3 });
 
+// exit rule: sell at the first touch of m×, else hold to the end
+check('exitReturn: exactly at 2× sells', S.exitReturn(100, 20, 2), 100);
+check('exitReturn: just under 2× holds', S.exitReturn(99.9, 20, 2), 20);
+check('exitReturn: exactly at 3× sells', S.exitReturn(200, -40, 3), 200);
+check('exitReturn: exactly at 5× sells', S.exitReturn(400, 900, 5), 400);
+check('exitReturn: above m× sells at m×, not the peak', S.exitReturn(1000, 500, 2), 100);
+check('exitReturn: under m× holds to the return', S.exitReturn(150, 120, 3), 120);
+check('exitReturn: negative peak and return hold', S.exitReturn(-20, -60, 2), -60);
+check('exitReturn: touched 2× then rugged sells at 2×', S.exitReturn(150, -100, 2), 100);
+check('exitReturn: rugged without touching 3× keeps the loss', S.exitReturn(150, -100, 3), -100);
+check('exitReturn: hold (Infinity) is the return', S.exitReturn(5000, 12.5, Infinity), 12.5);
+near('exitReturn: missing peak', S.exitReturn(null, 30, 2), NaN);
+near('exitReturn: missing peak (undefined)', S.exitReturn(undefined, 30, 2), NaN);
+near('exitReturn: missing return, peak above m×', S.exitReturn(150, null, 2), NaN);
+near('exitReturn: missing return, NaN', S.exitReturn(50, NaN, 2), NaN);
+(function () {
+  var pairs = [
+    { peak: 400, ret: -100 }, // touched 2×, 3× and 5× (exactly), then rugged
+    { peak: 100, ret: 20 },   // touched 2× exactly
+    { peak: 250, ret: 250 },  // touched 2× and 3×, ended at its peak
+    { peak: 0, ret: -50 },
+    { peak: -10, ret: -100 },
+    { peak: null, ret: 30 },  // missing peak: not counted by any rule
+    { peak: 120, ret: NaN }   // missing return: not counted by any rule
+  ];
+  // 2×: 100, 100, 100, −50, −100; 3×: 200, 20, 200, −50, −100;
+  // 5×: 400, 20, 250, −50, −100; hold: −100, 20, 250, −50, −100
+  check('exitRuleStats 2×', S.exitRuleStats(pairs, 2), { n: 5, hit: 3, mean: 30, median: 100 });
+  check('exitRuleStats 3×', S.exitRuleStats(pairs, 3), { n: 5, hit: 2, mean: 54, median: 20 });
+  check('exitRuleStats 5×', S.exitRuleStats(pairs, 5), { n: 5, hit: 1, mean: 104, median: 20 });
+  check('exitRuleStats hold', S.exitRuleStats(pairs, Infinity), { n: 5, hit: 0, mean: 4, median: -50 });
+  var e = S.exitRuleStats([], 2);
+  check('exitRuleStats: no pairs', [e.n, e.hit, isNaN(e.mean), isNaN(e.median)], [0, 0, true, true]);
+})();
+
 // jitter: fixed per id, in range
 check('jitter is fixed', S.jitter(812) === S.jitter(812), true);
 check('jitter differs between ids', S.jitter(812) !== S.jitter(813), true);

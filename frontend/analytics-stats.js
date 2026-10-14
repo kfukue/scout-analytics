@@ -1,7 +1,8 @@
 // Scout analytics: the pure calculations of the Analytics page (no DOM, no
 // state): mean and median, equal-count groups, the fixed return bands, the
 // outcome classes, the symmetric-log and log scales, UTC weeks and hours,
-// "$100 on every call" and "gave back more than half"; and for the Timing tab
+// "$100 on every call", "gave back more than half" and the exit rule (sell at
+// the first touch of m×); and for the Timing tab
 // the time bands, the "reached 2×" rule (at least MIN_HELD_2X_S at 2×) and
 // the windows too short for it (can2xReach), the time held at 2× (the real
 // one; 0 for a call that never touched 2×) and its histogram, Kaplan–Meier and the
@@ -276,6 +277,32 @@
       if (p.ret < p.peak / 2) { k++; }
     }
     return { k: k, n: n };
+  }
+
+  // The exit rule "sell at the first touch of m×, else hold to the end of the
+  // window": the return of a call with this peak and final return (in %).
+  // Touched m× = a peak of (m − 1) × 100% or more (exactly at it counts), as
+  // the "≥ +100% peak" share. m = Infinity: hold to the end. NaN when the
+  // peak or the return is missing (whether it touched m× is unknown), so
+  // every rule is counted over the same calls.
+  function exitReturn(peak, ret, m) {
+    if (!isNum(peak) || !isNum(ret)) { return NaN; }
+    var at = (m - 1) * 100;
+    return peak >= at ? at : ret;
+  }
+
+  // The exit rule m (exitReturn) over the pairs { peak, ret }: n = pairs with
+  // both, hit = those that touched m× (0 for hold, m = Infinity), and the
+  // mean and median return under the rule.
+  function exitRuleStats(pairs, m) {
+    var rets = [], hit = 0;
+    for (var i = 0; i < pairs.length; i++) {
+      var v = exitReturn(pairs[i].peak, pairs[i].ret, m);
+      if (!isNum(v)) { continue; }
+      rets.push(v);
+      if (pairs[i].peak >= (m - 1) * 100) { hit++; }
+    }
+    return { n: rets.length, hit: hit, mean: mean(rets), median: median(rets) };
   }
 
   // A fixed offset in [−0.5, 0.5) for a call id: the jitter of a point, the
@@ -683,7 +710,7 @@
     symlog: symlog, symlogInv: symlogInv, log1p10: log1p10, log1p10Inv: log1p10Inv,
     symlogTicks: symlogTicks, log1pTicks: log1pTicks,
     weekStart: weekStart, monthStart: monthStart, hourWeekday: hourWeekday, DAY_MS: DAY_MS,
-    cumulativePL: cumulativePL, gaveBack: gaveBack, jitter: jitter,
+    cumulativePL: cumulativePL, gaveBack: gaveBack, exitReturn: exitReturn, exitRuleStats: exitRuleStats, jitter: jitter,
     shortNum: shortNum, shortUSD: shortUSD, signedPct: signedPct, rangeLabel: rangeLabel,
     rangeLabels: rangeLabels
   };

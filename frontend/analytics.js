@@ -1187,6 +1187,7 @@
       pts.push({ r: r, peak: p, ret: v });
       all.push(p, v);
     });
+    fillExitTable(pts, hz);
     var gb = A.gaveBack(pts);
     var big = $('peak-big');
     big.replaceChildren();
@@ -1230,6 +1231,69 @@
     mount(c);
     $('cap-peak').textContent = fmtInt(pts.length) + ' calls with a peak and a return for ' + hz + ', both on a symmetric log scale. ' +
       'Points on the dashed line ended at their peak; below it, they gave some back. Rugged calls keep their peak before the rug.';
+  }
+
+  // The exit-rule table: sell at the first touch of 2×, 3× or 5×, else hold
+  // to the end of the window (A.exitReturn), against holding every call.
+  // Over the same points as the chart (a peak and a return for the window),
+  // so rugged calls keep their peak before the rug and their final return.
+  var EXIT_RULES = [
+    { m: 2, label: 'Sell at 2×' }, { m: 3, label: 'Sell at 3×' }, { m: 5, label: 'Sell at 5×' },
+    { m: Infinity, label: 'Hold to the end' }
+  ];
+  var EXIT_HEADS = [
+    ['n', 'Calls with a peak and a return for the window: the n of every number in the row'],
+    ['Touched', 'Share of the calls whose peak within the window reached the exit multiple'],
+    ['Mean return', 'Average return under the rule'],
+    ['Median return', 'Middle return under the rule'],
+    ['Mean vs hold', 'Mean return under the rule minus the mean when held to the end, in percentage points'],
+    ['Median vs hold', 'Median return under the rule minus the median when held to the end, in percentage points']
+  ];
+
+  // A difference of two percentages, in percentage points ("+26.0 pp").
+  function ppCell(v) {
+    var td = pctCell(v);
+    if (isNum(v)) {
+      td.textContent = fmtPct(v).replace(/%$/, ' pp');
+      td.title = exactPct(v).replace(/%$/, ' percentage points');
+    }
+    return td;
+  }
+
+  // One row of the exit-rule table: rule x, its stats s, and hold = the
+  // stats of "hold to the end" (the baseline of the differences).
+  function exitRow(x, s, hold) {
+    var tr = el('tr');
+    var th = el('th', 'tok', x.label);
+    th.scope = 'row';
+    tr.appendChild(th);
+    if (s.n < MIN_N) {
+      tr.className = 'ana-few';
+      th.title = 'Fewer than ' + MIN_N + ' calls with data';
+    }
+    var base = x.m === Infinity;
+    tr.appendChild(el('td', 'num', fmtInt(s.n)));
+    tr.appendChild(base ? el('td', 'num', DASH) : rateCell(s.hit, s.n, 'calls touched ' + x.m + '× within the window'));
+    tr.appendChild(pctCell(s.mean));
+    tr.appendChild(pctCell(s.median));
+    tr.appendChild(base ? el('td', 'num', DASH) : ppCell(s.mean - hold.mean));
+    tr.appendChild(base ? el('td', 'num', DASH) : ppCell(s.median - hold.median));
+    return tr;
+  }
+
+  function fillExitTable(pts, hz) {
+    $('h-exit').textContent = 'Exit rule: sell at 2×, 3× or 5× (' + hz + ' window)';
+    var frag = document.createDocumentFragment();
+    frag.appendChild(headRow('Exit rule', EXIT_HEADS));
+    var tbody = el('tbody');
+    var hold = A.exitRuleStats(pts, Infinity);
+    if (hold.n) {
+      EXIT_RULES.forEach(function (x) { tbody.appendChild(exitRow(x, A.exitRuleStats(pts, x.m), hold)); });
+    } else {
+      emptyRow(tbody, EXIT_HEADS.length + 1, 'No calls with a peak and a return for this window.');
+    }
+    frag.appendChild(tbody);
+    $('tbl-exit').replaceChildren(frag);
   }
 
   // ---- Timing -----------------------------------------------------------------
