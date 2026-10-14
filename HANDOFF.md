@@ -1,9 +1,163 @@
 # Scout analytics: handoff to Claude Code
 
-## Session state (13 October 2026, evening: main 29b5c2e after PRs #36-#40; prod 29b5c2e)
+## Session state (14 October 2026 UTC, owner's late evening of 13 Oct: main e522918 after PRs #41-#53)
 
-This section supersedes the earlier 13 October and the 12 October states
-below wherever they differ.
+This section supersedes the states below wherever they differ.
+
+**Main and prod:** main is at **e522918** (PR #53). #52 (cc0bc2c) and
+#53 (e522918) are docs/skills only, so nothing to deploy: e522918 runs
+the same code as 694e9e5 (PR #51). Prod: the owner
+restarted the listener at 23:15:58 (his local time, 13 Oct) after merging
+#45-#51. He was asked to confirm `git log -1` = 694e9e5 or later and to restart
+`-web` for the Model 7d column; neither is confirmed yet. Earlier on 13 Oct
+the owner said he had pulled and restarted the listener, `-track` and
+`-web` after #42/#43, so the tracker should have #42. He was asked to
+confirm 37deb10 then; not confirmed. If unsure, restart `-track` once.
+The scoring service needs no restart for the models served today: #46
+touches `build_features` (an extra `calls_burst_1h` column, unused with the
+default `CALLS_PREV_INPUTS = "counts"`). Restart it before serving any
+model that lists `calls_burst_1h` as an input.
+
+**Merged since 29b5c2e** (merge commit; PRs #47-#49 have no first-parent
+merge on `main`, see the incident below):
+
+- #41 (7191526): this file and the PM skill. #43 (0dc52fa): the PM skill
+  and `scout-rules`, adding the owner's small-PR rule (one function per
+  PR, small functions).
+- #42 (ebae905): the tracker's ETH/USD `slot0` and Pons bisection set
+  `noState` only on a real no-state error.
+- #44 (37deb10): Timing tab Kaplan-Meier captions match the computation;
+  unused tooltip classes dropped.
+- #45 (f9b1e70): web scores 1/3, storage. `passed` column on
+  `scout_call_predictions` (repeat-safe), every bucket of a score stored in
+  one transaction, NOTIFY `score`, leakage guards. Closes "Persist the ML
+  `passed` flag".
+- #48 + #49, merged to `main` as #50 (0326bef): web scores 2/3 and 3/3.
+  Scores in the snapshot, `/api/calls` (`model`, `model_scores`,
+  `sort=model`) and SSE `score`; only scores made within 24 h of the call;
+  the public GCP side runs with `ModelScores=false`. The call list has a
+  sortable "Model 7d" column after Perceptor, a "Model (scored at call
+  time)" block in the row detail, and a legend entry. The call list now
+  has 17 columns.
+- #46 (26a26f2, its own merge) and #47 (reached `main` through #51,
+  694e9e5): report-only ML
+  variants "calls_prev as a burst ratio" and the table "calls_prev variants
+  across seeds"; shared helper `validate.seed_lift_median` (gate behaviour
+  unchanged).
+
+**Incident (stacked PRs):** #48, #49 and #47 were opened with their base
+set to the previous work branch. The owner merged each one while its base
+branch still existed, so GitHub merged them into those branches, not into
+`main`. Re-sent as #50 and #51 (same commits, base `main`). Owner rule
+since then: every PR has base `main` unless he names another branch (PR
+#52, `CLAUDE.md`).
+
+**Merged rules (14 Oct UTC):**
+- #52 (cc0bc2c): new root `CLAUDE.md`. Every PR has base `main` unless
+  the owner names another branch. Dependent PRs wait for the previous
+  merge by default. Check the base with `gh pr view <N> --json
+  baseRefName` before sending a link. PM skill steps 7/8.
+- #53 (e522918): every database change, structure or data, ships with a
+  run script and a rollback script. Full rule in `scout-rules`, "Database
+  changes: run script and rollback" (backup tables, `R_rollback.sql`,
+  rollback order for schema changes, test run → R → run). The PR body
+  suggests two lines for `.claude/agents/review.md` (the owner's file;
+  not known whether added).
+
+**Open PRs from the overnight session (all reviewed PASS, all base `main`;
+tested locally only; nothing deployed):**
+
+| Worktree | Branch | From | Work |
+|---|---|---|---|
+| model-startup-line-20261014 | `work/2026-10-14-model-startup-line` | 694e9e5 | **PR #56** (465caae, reviewed PASS): listener start-up line: model scoring on/off (also off with SCOUT_DB=off), URL without user info/query/fragment, budget. Deploy: listener restart |
+| log-invite-link-20261014 | `work/2026-10-14-log-invite-link` | 694e9e5 | **PR #55** (a18cbe6, reviewed PASS): invite link redacted as `<invite>` in start-up lines and errors; `scout_deliveries.target` keeps the real link (re-ask matches on it). Deploy: listener restart |
+| exit-rule-20261014 | `work/2026-10-14-exit-rule` | cc0bc2c | **PR #58** (3aae8fc): Analytics idea 1, "Exit rule" table on Peak vs final (sell at first touch of 2×/3×/5× vs hold; before tax; upper bound). Page-only |
+| data-health-20261014 | `work/2026-10-14-data-health` | #58 branch | **PR #59** (4c4046a), merge after #58: idea 2, "Data health by week" + quiet share by week × pool family on Overview; all calls, filters ignored. Page-only |
+| model-live-api-20261014 | `work/2026-10-14-model-live-api` | cc0bc2c | **PR #60** (398289b): idea 3a, `GET /api/model-live` (scores stored at call time, from the snapshot; 404 and nothing built when `ModelScores=false`). Go only |
+| model-insights-page-20261014 | `work/2026-10-14-model-insights-page` | #59 branch | **PR #61** (4250e24), merge after #58-#60: idea 3b, the Model insights section (coverage, per bucket: scored, outcome known, top 10% by at-call rank, runner rate and live lift, capped mean return, validated; extreme outcomes left out as in training). Page-only |
+| exit-extremes-20261014 | `work/2026-10-14-exit-extremes` | #61 branch | **PR #63** (f23e8f7), merge last: exit table leaves out a window peak/return above +100,000 % (drained pools). Page-only |
+| rank-wording-20261014 | `work/2026-10-14-rank-wording` | e522918 | **PR #62** (f0178a1): "top N%" described correctly (vs the calls the model was tested on at training, not "recent calls"); text only, SQL comment only |
+| claude-md-safety-20261014 | `work/2026-10-14-claude-md-safety` | e522918 | **PR #54** (e58be2b, reviewed PASS): `CLAUDE.md`: "Start here", DB-rule pointer, safety-net "Never" list (port 5432, no listener/backfill/track on a real DB, `onchainStateVersion`, no git writes in the main checkout) |
+| handoff-20261014 | `work/2026-10-14-handoff` | 694e9e5 | this update |
+
+Merge order: #54, #55, #56, #57, #62 in any order. The analytics chain
+goes #58 → #59 → #60 → #61 → #63. #59, #61 and #63 were stacked on the
+previous branch because they edit the same page files and the owner was
+away; each has base `main` and states its order. Deploy: one listener
+restart (#55, #56) and one `-web` restart (#58-#63). Then the browser
+checks listed in each PR.
+
+Not done (owner decision): the Peak vs final scatter and the Overview
+mean still include drained-pool outcomes (pre-existing); the same
++100,000 % rule could be applied page-wide.
+
+**Owner question open:** dates in docs. The owner's local date (Pacific)
+or UTC? This file, branch names and skill entries currently mix "13 Oct"
+(local) and "14 Oct" (UTC) for the same evening.
+
+**Scoring on prod is working** (owner's read-only queries, 14 Oct UTC).
+Live-handled calls since 13 Oct 12:00 UTC: 10793, 10795, 10796 and 10798
+are unscored (by timing they appear to predate the scoring service); 10804
+(19:25 UTC) and 10812 (14 Oct 00:36 UTC) are scored. Only 9 calls were handled live on
+13–14 Oct, so the website column and any live-accuracy view fill slowly.
+Both scored calls (6 rows, `20261013-1909`) have `passed` NULL, because
+the listener then ran pre-#45 code. The PM gave an optional backfill with
+a backup table and a rollback (`scout_call_predictions_bak_passed_20261014`);
+not known whether it was run.
+
+Watch item (investigate, 14 Oct): `scoreCall` shares one
+`SCOUT_MODEL_TIMEOUT` (10 s) between the live pre-call stats on the Nitro
+node and the `/score` request. If pre-call uses the whole budget, the call
+gets no score at all (the feature-row read fails on the expired context).
+Not seen so far (2 of 2 scored). Signs in the listener log: `score <CA>:
+feature row: context deadline exceeded (precall 10s; …)`. Quick remedy:
+`SCOUT_MODEL_TIMEOUT=25s` plus a listener restart, at the cost of up to
+~30 s more delivery delay.
+
+**Latest model (20261014-0559, served automatically via `LATEST`):**
+short FAIL (median pooled lift 1.11), 3day FAIL (1.88), **medium PASS**
+(2.02 of 2.02/2.02/1.61, saved-seed lower end 1.39, sim difference +38.9
+[+27.4, +46.1], collapses 0.489), long skipped (3108 rows over 48 days).
+Weaker than 1909 (medium 2.26). The top 10% at 7 d still averages −12.9 %
+(vs −51.7 % for all calls). Adversarial AUC 0.99; `calls_prev_24h` is
+40–45 % of it and is the 2nd input of the medium runner model (0.074).
+3day: the 4-week rolling model beats expanding (2.15 vs 1.88); medium
+the reverse (1.37 vs 2.02). Dead-call score: LightGBM would pass the
+proposed gate (3.75×, 3/3 weeks), but 65 % of dead calls came in two
+uniswap_v4 waves (late Sep). No variant tables: the training checkout did
+not yet have #46/#47, and the run was without `--variants`. Next: retrain with `--variants` and send `report.md`.
+
+**Analytics page ideas (investigate report 14 Oct). Owner decision: go
+with the PM's order. 1, 2, 3a and 3b are built as PRs #58-#61 (see the
+table above); 4 (copy table) is not started:**
+1. **Exit rule** (on "Peak vs final"): return if sold at the first
+   touch of 2×/3×/5×, else held to the horizon. `(m−1)·100` when
+   `peak_h ≥ (m−1)·100`, else `ret_h`. Page-only, 1 PR, uses data
+   `/api/analytics` already sends. Label it "touched" (not the Timing
+   tab's "held 1 h") and before tax. It's an upper bound in thin pools.
+   Times to 3×/5× would need new columns plus a history backfill: not
+   proposed.
+2. **Data health by week:** calls, share with a Perceptor verdict at the
+   call, quiet/dead share by pool family. Page-only, 1 PR. Pick one
+   "dead" definition: the page's quiet excludes rugged calls, ML's dead
+   includes them. Denominator: calls with a known trade count. v2 counts
+   Sync events, so its share is biased low.
+3. **Model insights** (the "coming soon" slot): live lift and calibration
+   of the scores stored at the call. Data is already in the snapshot
+   (`attachWebModel`); proposed as a separate `GET /api/model-live`
+   gated on `ModelScores`, so `/api/analytics` stays identical to the
+   public copy. Go PR + page PR. Top 10% = `runner_rank_pct ≥ 90`; rates
+   gross of tax; show coverage and n. At today's volume (9 live calls on
+   13–14 Oct) matured 7 d outcomes are weeks away, so build the Go part
+   first and show "n matured" states.
+4. **CSV export:** page-only, from the accumulators, not the DOM. Either a
+   `blob:` download (CSP likely fine, but the scout-web href rule needs a
+   documented exception; check in a browser) or "Copy as TSV" through the
+   clipboard (no CSP surface). Guard against formula injection.
+
+## Earlier session state (13 October 2026, evening: main 29b5c2e after PRs #36-#40; prod 29b5c2e; history)
+
+Superseded by 14 October above where they differ.
 
 **Main and prod:** main is at **29b5c2e** (PR #40). Prod: the owner
 pulled 29b5c2e on the server (`git log -1` read back by him) and
@@ -591,7 +745,7 @@ Never touch the owner's own Postgres server.
   chooses it (open decision above: `details` JSONB `score_line` in
   `MarkHeldForRecheck`, or a column).
 - Persist the ML `passed` flag in `scout_call_predictions` (schema change;
-  unblocked now that #1-#3 are on main).
+  unblocked now that #1-#3 are on main). Done: PR #45, 14 Oct.
 - ML timing outcome columns in the dataset view (the `timing_`/rug leakage
   guard is on main since PR #19).
 - GCP Go export per `deploy/gcp/INTERFACE.md` (after the publish decision).
@@ -638,10 +792,15 @@ matter are in section 5. Package `main` is at the repo root: `go run .`.
 ## Deferred / open
 
 Kept current by the PM whenever an item is deferred or an owner check is
-pending (13 October 2026, evening). Everything through PR #40 is on
-`main` (29b5c2e) and deployed on prod (owner, 13 Oct). The scoring service
-is installed and the listener connected; sAlpha re-ask is on. Resolved
-13 Oct: sAlpha re-ask, bot-token redaction, re-check score-line
+pending (14 October 2026 UTC). Everything through PR #53 is on `main`
+(e522918). The listener was restarted at 23:15 local on 13 Oct, after the
+merges; its code level is not confirmed, and neither is `-web` having
+#50. Scoring works on prod: the owner's query shows calls 10804 and 10812
+scored. By timing, the 4 earlier unscored calls predate the service.
+Resolved 14 Oct UTC: web model scores (#45, #50), `calls_prev` report-only
+variants (#46, #51), persisted `passed` flag (#45), PR base rule (#52), DB
+rollback rule (#53). Resolved 13 Oct: tracker `noState` paths (#42),
+Timing captions (#44), sAlpha re-ask, bot-token redaction, re-check score-line
 persistence (PR #35); ML gates option (b) (PR #34); Timing real time held
 (PR #33); test-DB guard (PR #37); `reply_to_msg_id` filtering (PR #38);
 `paceWait`, `isNoSuchValue`, "0 red flags" parser, score budget test
@@ -652,12 +811,12 @@ installed (owner).
   commit not yet pushed, in an agent worktree under `.claude/worktrees/` —
   see the Session state at the top):
   - Throwaway-Postgres scripts `scripts/testdb.ps1` / `scripts/testdb.sh`
-    (agent-afcf62469a29564cf) (paused, see Session state).
+    (agent-afcf62469a29564cf) (paused, see the earlier session states).
   - CI draft `.github/workflows/test.yml` (agent-aa31691b57e3bc7ff; owner
-    approval) (paused, see Session state).
-  - In progress (table "In progress" at the top): model scores on the
-    website, `calls_prev` report-only variants, tracker no-state paths
-    (`slot0`, Pons), Timing tab caption and `ech-tip-box`.
+    approval) (paused, see the earlier session states).
+  - In progress (table at the top): the model-scoring start-up line,
+    invite-link redaction in the logs, the exit-rule table, the
+    `/api/model-live` feed and the `CLAUDE.md` safety net.
   - The old worktree `agent-ae167c3d46439a04d` was checked (nothing
     missing from main) and removed by the owner 13 Oct.
 - **Owner setting:** `SCOUT_SALPHA_REASK=on` since 13 Oct; the 7-day
@@ -671,7 +830,15 @@ installed (owner).
     `-post`/`-ca` can back-score; the website hides such scores);
   - `scout_models.data.go`: `pgxpool.ParseConfig`'s error can contain the
     raw DB URL (password) for an unparseable `SCOUT_DATABASE_URL`
-    (startup log only; pre-existing).
+    (startup log only; pre-existing);
+  - `chainlink()` still flips `noState` after a revert;
+    `ponsCurveFor`/`ponsCurveOfToken` read a busy error at `latest` as
+    "not a Pons token"; stored node errors may include the node URL;
+  - Timing chart title still says "half had fallen back by";
+  - Perceptor: if the follow-up reply query shows it always replies to our
+    request, propose requiring the reply link for Perceptor (PR #38);
+  - the 196 empty sAlpha replies (dry run, 13 Oct) are worth a look;
+  - ML research variants (4)-(8) from the earlier plan.
 - **Owner checks:**
   - GCP publish: the merged draft publishes sAlpha report text (scrubbed)
     and Perceptor report links; confirm (b) publish, or ask for (a) labels
@@ -680,9 +847,23 @@ installed (owner).
   - ML: the `calls_prev` read-only SQL Q1/Q2 (13 Oct session state);
     `GATE_MIN_POOLED_WEEKS = 2` is an implementer default the owner may
     change;
-  - after the 29b5c2e deploy: the first delivery with the model line;
-    Perceptor filter "Caution" includes tokens with only "today: caution";
-    no CSP errors;
+  - prod at e522918 (or later) with `-web` restarted, and `-track` once if
+    unsure it has #42. Then the browser check of the
+    Model 7d column at 1280/390 px, light and dark (checklist in #49), and
+    the Timing tab check. The first delivery with the model line on a
+    screen. Perceptor filter "Caution" includes tokens with only "today:
+    caution". No CSP errors;
+  - retrain with `--variants` and send `report.md` (the `calls_prev`
+    across-seeds table); save each report under
+    `ml-results\models\<version>\report.md`;
+  - optionally add the two `review.md` lines suggested in #53;
+  - invite link (after #55): `scout_deliveries.target` still stores the
+    raw invite link (needed for the re-ask match; not on the website), and
+    older logs / `scout_deliveries.error` rows may contain it. Read-only
+    count in #55. If a DB dump is ever shared, revoke and re-create the
+    link in Telegram;
+  - dates in docs: local (Pacific) or UTC (Session state);
+  - PC clean-up of merged worktrees and branches (block sent 13 Oct);
   - disk space: ~318 GB free on C: (12 Oct; was ~100 MB before the
     owner's 10 Oct clean-up, which blocked Go builds); old agent
     scratchpads under `...\AppData\Local\Temp\claude\...` (~5.5 GB) may be
@@ -730,7 +911,7 @@ tracker and `-web` restarted by the owner 12 Oct after the pull; section 3).
   keeps a current return per token. Rolling worker queue.
 - Website (`-web`, no login, read-only): one row per token from an in-memory
   snapshot refreshed every 15 seconds, live updates over Server-Sent Events, a
-  "Refresh now" button, 16 columns (17 before 2c), search, sorts, Perceptor
+  "Refresh now" button, 17 columns (incl. Model 7d since PR #50), search, sorts, Perceptor
   filter, legend and a per-row report detail pane. Plain JavaScript in
   `frontend/` (no framework, no build step).
 - Model (`ml/`): labels for four holding periods, logistic baseline and
