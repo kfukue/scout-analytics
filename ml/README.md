@@ -400,6 +400,7 @@ baseline:
 | runners must be tradeable | `RUNNER_NEEDS_TRADES = True`: runner also needs `trades_24h >= RUNNER_MIN_TRADES_24H` (100); NULL keeps the label |
 | stronger regularisation | `LGBM_REGULARISATION = "strong"`: `num_leaves` 15 -> 7, `min_child_samples` (min_data_in_leaf) 20 -> 50, `reg_lambda` (lambda_l2) 1 -> 10, `colsample_bytree` (feature_fraction) 0.8 -> 0.6 (`LGBM_REG_SETS`); rounds still from early stopping / the purged k-fold |
 | no calls_prev inputs | `EXCLUDED_INPUTS = ("calls_prev_1h", "calls_prev_24h")`: the model and the logistic baseline without those two inputs (adversarial validation in report 20261013-0702 found `calls_prev_24h` driving the train/test drift: AUC 0.99, gain share 0.42-0.87). `EXCLUDED_INPUTS` can only remove numeric inputs; an outcome, a categorical or an unknown name raises |
+| calls_prev as a burst ratio | `CALLS_PREV_INPUTS = "burst"`: the two raw counts replaced (in place) by `calls_burst_1h = calls_prev_1h * 24 / max(calls_prev_24h, 1)`, the last hour's posting rate relative to the last day's (a missing count gives NaN): it keeps the burst and drops the level that trends with calendar time. Built from the row's own two counts only, so known at the call. Default `"counts"`: the raw counts, as the saved model |
 
 Variants are report only: they are never saved or served, and the saved model,
 its `meta.json` (features, levels, rules) and its gates are always the
@@ -517,8 +518,9 @@ gates: 47 s, two retrains of the baseline; pooled walk-forward under 1 s) and
 validation 18 s, evaluation without dead calls under 1 s). So a run with the
 section off now costs about two normal runs more; on the prod data (about 6 s
 per variant in report 20261012-2209, `long` still skipped) expect roughly 20
-to 30 s more per run then. `--variants` adds two more variant rows ("stronger
-regularisation", "no calls_prev inputs"), about one normal run each.
+to 30 s more per run then. `--variants` adds three more variant rows ("stronger
+regularisation", "no calls_prev inputs", "calls_prev as a burst ratio"),
+about one normal run each.
 
 The `model.py`, `validate.py`, `features.py` (`MIN_CATEGORY_COUNT`) and
 `labels.py` (`MAX_OUTCOME_PCT`) settings are read from `config` when a function

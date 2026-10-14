@@ -59,7 +59,7 @@ def test_each_variant_changes_exactly_one_knob():
     assert list(C.VARIANTS) == ["baseline", "dead rule on (collapse OR dead)",
                                 "raw dex instead of dex_family", "raw dex + dex_family",
                                 "runners must be tradeable", "stronger regularisation",
-                                "no calls_prev inputs"]
+                                "no calls_prev inputs", "calls_prev as a burst ratio"]
     for name, knobs in C.VARIANTS.items():
         if name == "baseline":
             continue
@@ -94,7 +94,11 @@ def test_overrides_rebuild_features_never_leak_and_restore():
             assert C.FEATURES == C.NUMERIC_FEATURES + C.CATEGORICAL
             assert C.LOG1P_FEATURES == [c for c in C.NUMERIC_FEATURES if c not in C.NO_LOG]
             dropped = set(knobs.get("EXCLUDED_INPUTS", ()))
-            assert C.NUMERIC_FEATURES == [c for c in C.NUMERIC_RAW + C.DERIVED if c not in dropped]
+            numeric = C.NUMERIC_RAW + C.DERIVED
+            if knobs.get("CALLS_PREV_INPUTS") == "burst":   # the raw counts replaced in place
+                numeric = [C.CALLS_PREV_BURST if c == "calls_prev_1h" else c
+                           for c in numeric if c != "calls_prev_24h"]
+            assert C.NUMERIC_FEATURES == [c for c in numeric if c not in dropped]
             has, lacks = want.get(name, want["baseline"])
             assert has <= set(C.CATEGORICAL) and not lacks & set(C.CATEGORICAL), name
     with pytest.raises(RuntimeError):
@@ -203,6 +207,10 @@ def test_variant_table_contents(plain_and_variants):
         ncp = v["no calls_prev inputs"]["buckets"][b]
         assert ncp["sim_all_mean"] == base[b]["sim_all_mean"]
         assert ncp["runner_auc_logistic"] != base[b]["runner_auc_logistic"]   # fewer inputs
+        burst = v["calls_prev as a burst ratio"]["buckets"][b]
+        assert burst["sim_all_mean"] == base[b]["sim_all_mean"]
+        assert burst["runner_auc_logistic"] not in (base[b]["runner_auc_logistic"],
+                                                    ncp["runner_auc_logistic"])
     assert all(v[n].get("seconds") is not None for n in C.VARIANTS if n != "baseline")
     report = (var / "report.md").read_text(encoding="utf-8")
     assert "## Variant comparison (report only; not saved, not served)" in report
@@ -212,6 +220,7 @@ def test_variant_table_contents(plain_and_variants):
     assert "| single-run (old) gate, information |" in report
     assert "pooled WF lift [95%]; sim difference [95%] (seed 7 only; information)" in report
     assert "| no calls_prev inputs | EXCLUDED_INPUTS = ('calls_prev_1h', 'calls_prev_24h') |" in report
+    assert "| calls_prev as a burst ratio | CALLS_PREV_INPUTS = burst |" in report
     plain_report = (plain_and_variants[0] / "report.md").read_text(encoding="utf-8")
     assert "Variant comparison" not in plain_report
 
@@ -354,5 +363,42 @@ def test_no_calls_prev_variant_drops_exactly_those_inputs_and_keeps_the_guard(sy
     for bad in (("ret_late_1d",), ("dex_family",), ("nonsense",)):
         with pytest.raises(ValueError, match="EXCLUDED_INPUTS"):
             with C.overrides(EXCLUDED_INPUTS=bad):
+                pass
+        assert list(C.FEATURES) == before[0]
+
+
+# --- "calls_prev as a burst ratio" (report only) ---
+
+BURST_VARIANT = "calls_prev as a burst ratio"
+
+
+def test_burst_variant_replaces_exactly_the_raw_counts(synthetic_df):
+    from scout_ml.features import build_features
+    from scout_ml.model import fit_baseline
+    assert C.VARIANTS[BURST_VARIANT] == {"CALLS_PREV_INPUTS": "burst"}
+    assert C.CALLS_PREV_INPUTS == "counts"                      # the saved model: raw counts
+    before = (list(C.FEATURES), list(C.NUMERIC_FEATURES), list(C.LOG1P_FEATURES))
+    want = [C.CALLS_PREV_BURST if c == "calls_prev_1h" else c
+            for c in before[0] if c != "calls_prev_24h"]
+    rows = synthetic_df.head(400)
+    with C.overrides(**C.VARIANTS[BURST_VARIANT]):
+        assert C.FEATURES == want                                 # in place, nothing else changed
+        assert C.CALLS_PREV_BURST in C.LOG1P_FEATURES             # non-negative, skewed
+        assert_no_leakage(C.FEATURES)
+        X = build_features(rows, {})
+        assert list(X.columns) == want
+        np.testing.assert_allclose(
+            X[C.CALLS_PREV_BURST].to_numpy(),
+            (rows["calls_prev_1h"] * 24 / np.maximum(rows["calls_prev_24h"], 1)).to_numpy(float))
+        fit_baseline(X, (np.arange(len(X)) % 3 == 0).astype(int))   # the logistic follows
+        with C.overrides(LGBM_SEED=11):                            # nested (the seed retrains)
+            assert C.FEATURES == want
+        assert C.FEATURES == want
+    assert (list(C.FEATURES), list(C.NUMERIC_FEATURES), list(C.LOG1P_FEATURES)) == before
+    with C.overrides(CALLS_PREV_INPUTS="burst", EXCLUDED_INPUTS=(C.CALLS_PREV_BURST,)):
+        assert not {C.CALLS_PREV_BURST, "calls_prev_1h", "calls_prev_24h"} & set(C.FEATURES)
+    for bad in ("nonsense", "raw", None):
+        with pytest.raises(ValueError, match="CALLS_PREV_INPUTS"):
+            with C.overrides(CALLS_PREV_INPUTS=bad):
                 pass
         assert list(C.FEATURES) == before[0]

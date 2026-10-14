@@ -238,3 +238,67 @@ def test_perceptor_insufficient_is_its_own_level_when_frequent_enough():
     rare = learn_cat_levels(df.iloc[:59])                     # 19 'insufficient' rows
     assert rare["perceptor_verdict"] == ["clean", "unknown"]
     assert np.isnan(build_features({"perceptor_verdict": "insufficient"}, rare)["perceptor_verdict"][0])
+
+
+# --- calls_burst_1h (derived; an input only in the "calls_prev as a burst ratio" variant) ---
+
+BURST = C.CALLS_PREV_BURST
+
+
+def test_calls_burst_is_a_call_time_input_and_not_in_the_saved_model():
+    assert BURST == "calls_burst_1h"
+    assert not C.is_forbidden(BURST)                            # no outcome prefix / column
+    assert_no_leakage([BURST])
+    assert BURST in C.OPTIONAL_DERIVED and BURST not in C.DERIVED
+    assert all(c in C.VIEW_NUMERIC and not C.is_forbidden(c) for c in C.CALLS_PREV_RAW)
+    # the saved model's inputs are as before: the raw counts, never the burst ratio
+    assert C.CALLS_PREV_INPUTS == "counts"
+    assert C.FEATURES == C.NUMERIC_RAW + C.DERIVED + C.CATEGORICAL
+    assert BURST not in C.FEATURES and set(C.CALLS_PREV_RAW) <= set(C.FEATURES)
+    assert BURST not in C.NO_LOG
+
+
+def test_calls_burst_formula_and_edge_cases():
+    rows = pd.DataFrame({"calls_prev_1h": [3, 0, 2, None, 5, 4, 1],
+                         "calls_prev_24h": [48, 0, 0, 10, None, 1, 24]})
+    got = build_features(rows, {}, columns=[BURST])[BURST].tolist()
+    want = [3 * 24 / 48, 0.0, 2 * 24 / 1, np.nan, np.nan, 4 * 24 / 1, 1.0]
+    np.testing.assert_allclose(got, want, equal_nan=True)
+    # absent columns: missing, never an error
+    assert np.isnan(build_features({"liq_usd": 1}, {}, columns=[BURST])[BURST].iloc[0])
+
+
+def test_calls_burst_reads_only_the_same_rows_calls_prev_counts(synthetic_df):
+    """Leakage: calls_burst_1h depends on calls_prev_1h / calls_prev_24h of its own
+    row and nothing else (no outcome, no date, no other row)."""
+    rows = synthetic_df.head(300).reset_index(drop=True)
+    cols = [BURST]
+    want = (rows["calls_prev_1h"] * 24 / np.maximum(rows["calls_prev_24h"], 1)).to_numpy(float)
+    base = build_features(rows, {}, columns=cols)[BURST].to_numpy()
+    np.testing.assert_allclose(base, want, equal_nan=True)
+    # every other column replaced by junk (outcomes, trades_24h, message_date, all other inputs)
+    junk = rows.copy()
+    rng = np.random.default_rng(3)
+    for c in junk.columns:
+        if c not in C.CALLS_PREV_RAW:
+            junk[c] = rng.normal(size=len(junk)) * 1e6
+    junk["message_date"] = "2031-01-01T00:00:00Z"
+    np.testing.assert_array_equal(build_features(junk, {}, columns=cols)[BURST].to_numpy(), base)
+    # and with ONLY the two counts present
+    only = rows[C.CALLS_PREV_RAW]
+    np.testing.assert_array_equal(build_features(only, {}, columns=cols)[BURST].to_numpy(), base)
+    # rows shuffled: each value moves with its own row (no window over other rows)
+    perm = rng.permutation(len(rows))
+    shuffled = build_features(rows.iloc[perm], {}, columns=cols)[BURST].to_numpy()
+    np.testing.assert_array_equal(shuffled, base[perm])
+    # changing a count changes only that row's value
+    bumped = rows.copy()
+    bumped.loc[5, "calls_prev_1h"] = float(bumped.loc[5, "calls_prev_1h"]) + 7
+    diff = build_features(bumped, {}, columns=cols)[BURST].to_numpy() != base
+    assert diff.tolist() == [i == 5 for i in range(len(rows))]
+    # serving: one JSON row gives the batch value
+    for i in (0, 17, 250):
+        as_json = {k: (None if pd.isna(v) else v.item() if hasattr(v, "item") else v)
+                   for k, v in rows.iloc[i].items()}
+        one = build_features(as_json, {}, columns=cols)[BURST].iloc[0]
+        np.testing.assert_allclose(one, base[i], equal_nan=True)
