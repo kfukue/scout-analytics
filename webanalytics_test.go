@@ -956,7 +956,7 @@ func TestAnalyticsPageFiles(t *testing.T) {
 	if i, j := strings.Index(html, `<script src="analytics-stats.js" defer></script>`), strings.Index(html, `<script src="analytics.js" defer></script>`); i < 0 || j < 0 || i > j {
 		t.Error("analytics.html must load analytics-stats.js (deferred) before analytics.js")
 	}
-	for _, want := range []string{`<script src="analytics.js" defer></script>`, `href="./"`, "Model insights — coming soon",
+	for _, want := range []string{`<script src="analytics.js" defer></script>`, `href="./"`,
 		"First calls only", "late entry", "in USD", "before tax", "rounded to 0.1", `role="tablist"`,
 		`id="panel-overview"`, `id="panel-factor"`, `id="panel-peak"`, "capped at +1,000%",
 		// the exit-rule table on Peak vs final: fillExitTable writes into
@@ -994,6 +994,31 @@ func TestAnalyticsPageFiles(t *testing.T) {
 	if webQuietTrades != 50 {
 		t.Errorf("webQuietTrades = %d, want 50 (the data health caption's placeholder)", webQuietTrades)
 	}
+	// Model insights (GET /api/model-live): the section is hidden until the
+	// endpoint answers (a website without scores answers 404 and it stays
+	// hidden); renderLive and applyLive write into these ids (a missing one
+	// would throw inside render and blank the page). What it draws is covered
+	// by TestAnalyticsLiveNode.
+	if strings.Contains(html, "coming soon") {
+		t.Error("analytics.html: the Model insights heading still says coming soon")
+	}
+	for _, want := range []string{
+		`<section class="panel" id="model-insights" aria-labelledby="model-title" hidden>`,
+		`<h2 id="model-title">Model insights</h2>`, `<p id="ml-error" class="muted small note" hidden></p>`,
+		`<div id="ml-body" hidden>`, `id="ml-cover"`, `id="t-ml"`, `id="tbl-ml"`, `id="cap-ml"`,
+		"Scores the model gave at the time of each call (only scores made within 24 h of the call).",
+		"Top 10% = scored above 90% of the calls the model was tested on when it was trained (so the share can drift from 10%).",
+		"Runner rates and returns are before tax (training labels are after tax).",
+		"Page filters apply.", "Few calls are scored so far; treat small numbers as noise.",
+		"Grey: fewer than 20 calls."} {
+		if !strings.Contains(html, want) {
+			t.Errorf("analytics.html: missing %q (model insights)", want)
+		}
+	}
+	// The fetch (ETag, 304, 404, errors), the runner rules, the page
+	// filters and the hooks into load() and render() are checked by
+	// behaviour in testdata/analytics-live.test.js (TestAnalyticsLiveNode),
+	// not by the source text here.
 	if !strings.Contains(index, `href="analytics.html"`) {
 		t.Error("index.html does not link to the Analytics page")
 	}
@@ -1200,6 +1225,30 @@ func TestAnalyticsHealthNode(t *testing.T) {
 	}
 	if !strings.HasPrefix(string(out), "ok: ") {
 		t.Fatalf("node testdata/analytics-health.test.js: got %q, want \"ok: …\"", out)
+	}
+}
+
+// TestAnalyticsLiveNode runs testdata/analytics-live.test.js with node, when
+// node is on the PATH (skipped otherwise): the Model insights section's
+// calculations (LIVE_RULES, joinModelLive, liveBucketStats in
+// frontend/analytics-stats.js) and drawing (applyLive, loadLive, renderLive
+// in frontend/analytics.js) for a normal case, no outcomes yet, the 404
+// (hidden) and error states, MIN_N greying, a true, false and null "passed",
+// the page filters, extreme outcomes (above +100,000% in any bucket's column:
+// an outcome in no bucket) and the +1,000% cap on the mean returns. render
+// calls renderLive, so a throw there would
+// blank the page.
+func TestAnalyticsLiveNode(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node is not on the PATH")
+	}
+	out, err := exec.Command(node, "testdata/analytics-live.test.js").CombinedOutput()
+	if err != nil {
+		t.Fatalf("node testdata/analytics-live.test.js: %v: %s", err, out)
+	}
+	if !strings.HasPrefix(string(out), "ok: ") {
+		t.Fatalf("node testdata/analytics-live.test.js: got %q, want \"ok: …\"", out)
 	}
 }
 

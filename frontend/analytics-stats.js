@@ -3,7 +3,8 @@
 // outcome classes, the symmetric-log and log scales, UTC weeks and hours,
 // "$100 on every call", "gave back more than half" and the exit rule (sell at
 // the first touch of m×); the data health per week (weekHealth,
-// quietByWeekFamily); and for the Timing tab
+// quietByWeekFamily); the model's scores at the call against the outcomes
+// (LIVE_RULES, joinModelLive, liveBucketStats); and for the Timing tab
 // the time bands, the "reached 2×" rule (at least MIN_HELD_2X_S at 2×) and
 // the windows too short for it (can2xReach), the time held at 2× (the real
 // one; 0 for a call that never touched 2×) and its histogram, Kaplan–Meier and the
@@ -346,6 +347,94 @@
     families.sort(function (a, b) { return a.order - b.order; });
     weeks.sort(function (a, b) { return b.start - a.start; });
     return { families: families.map(function (f) { return f.key; }), weeks: weeks };
+  }
+
+  // ---- Model insights (scores made at the call, GET /api/model-live) --------
+
+  // The runner rule of each model bucket, as the training labels define it
+  // (ml/scout_ml/config.py BUCKETS: short max_gain_late_1d >= 100, 3day
+  // ret_late_3d >= 50, medium ret_late_7d >= 50, long ret_late_30d > 0), but
+  // before tax (the page has no tax; the labels are net of it). col: the
+  // /api/analytics value at the bucket's window ('peak' or 'ret', late entry).
+  var LIVE_RULES = {
+    short: { col: 'peak', op: '>=', at: 100 },
+    '3day': { col: 'ret', op: '>=', at: 50 },
+    medium: { col: 'ret', op: '>=', at: 50 },
+    long: { col: 'ret', op: '>', at: 0 }
+  };
+  // "Top 10%": a runner_rank_pct (known when the call was scored) of at least this.
+  var LIVE_TOP_RANK = 90;
+  // A call with any outcome some bucket's rule or return reads (the 1d peak,
+  // the 1d/3d/7d/30d return) above this is bogus pool data: an outcome in no
+  // bucket (ml/scout_ml/config.py MAX_OUTCOME_PCT, labels.py extreme_outcome).
+  var LIVE_MAX_OUTCOME_PCT = 1e5;
+
+  // Whether value v is a runner by rule.
+  function liveRunner(v, rule) {
+    return isNum(v) && (rule.op === '>' ? v > rule.at : v >= rule.at);
+  }
+
+  // Joins the rows of GET /api/model-live (body) to the page's rows by call
+  // id (idCol: the call id's index in a page row). Returns one record per
+  // page row with a score, in the page rows' order: { row, version, after
+  // (seconds from the call to the score), b }, b =
+  // per bucket of body.buckets { prob, rank, passed } (null when the score has
+  // no runner probability for it). Scored calls that are not among the rows
+  // (filtered out, or another snapshot's) are left out.
+  function joinModelLive(body, rows, idCol) {
+    var c = {}, byId = {}, out = [];
+    body.columns.forEach(function (name, i) { c[name] = i; });
+    body.rows.forEach(function (s) { byId[s[c.call_id]] = s; });
+    rows.forEach(function (r) {
+      var s = byId[r[idCol]];
+      if (!s) { return; }
+      var b = {};
+      body.buckets.forEach(function (k) {
+        var p = s[c['runner_' + k]];
+        b[k] = isNum(p) ? { prob: p, rank: s[c['rank_' + k]], passed: s[c['passed_' + k]] } : null;
+      });
+      out.push({ row: r, version: body.versions[s[c.version]], after: s[c.after_s], b: b });
+    });
+    return out;
+  }
+
+  // The live numbers of one bucket. recs: one per call scored for it,
+  // { t, rank, passed, version, known, extreme, x, ret } (known: its window is
+  // over, x, the rule's value, and ret, the return, are both there, and it is
+  // not extreme: an outcome above LIVE_MAX_OUTCOME_PCT). Returns scored,
+  // known, extreme (the count left out for that), top / all = { n, k:
+  // runners, mean: mean return, each call's capped at cap when given, as
+  // ml/scout_ml/config.py SIM_MAX_RET_PCT } over the known calls (top: rank ≥
+  // LIVE_TOP_RANK), lift = top rate ÷ all rate (NaN when either is missing or
+  // the all rate is 0), firstT = the earliest call, version = the version
+  // that scored most of the calls (a tie goes to the one counted first),
+  // versionN = how many it scored and passed = its value (that of its first
+  // record).
+  function liveBucketStats(recs, rule, cap) {
+    var top = { n: 0, k: 0, rets: [] }, all = { n: 0, k: 0, rets: [] };
+    var firstT = Infinity, votes = {}, best = null, extreme = 0;
+    recs.forEach(function (r) {
+      if (r.t < firstT) { firstT = r.t; }
+      var v = votes[r.version] || (votes[r.version] = { n: 0, version: r.version, passed: r.passed });
+      v.n++;
+      if (!best || v.n > best.n) { best = v; }
+      if (r.extreme) { extreme++; return; }
+      if (!r.known) { return; }
+      var hit = liveRunner(r.x, rule);
+      var ret = isNum(cap) ? Math.min(r.ret, cap) : r.ret;
+      [all].concat(isNum(r.rank) && r.rank >= LIVE_TOP_RANK ? [top] : []).forEach(function (g) {
+        g.n++;
+        g.rets.push(ret);
+        if (hit) { g.k++; }
+      });
+    });
+    function done(g) { return { n: g.n, k: g.k, mean: mean(g.rets) }; }
+    var lift = top.n && all.k ? (top.k / top.n) / (all.k / all.n) : NaN;
+    return {
+      scored: recs.length, known: all.n, extreme: extreme, top: done(top), all: done(all), lift: lift,
+      firstT: recs.length ? firstT : NaN, version: best ? best.version : null, versionN: best ? best.n : 0,
+      passed: best ? best.passed : null
+    };
   }
 
   // A fixed offset in [−0.5, 0.5) for a call id: the jitter of a point, the
@@ -755,6 +844,8 @@
     weekStart: weekStart, monthStart: monthStart, hourWeekday: hourWeekday, DAY_MS: DAY_MS,
     cumulativePL: cumulativePL, gaveBack: gaveBack, exitReturn: exitReturn, exitRuleStats: exitRuleStats, jitter: jitter,
     weekHealth: weekHealth, quietByWeekFamily: quietByWeekFamily,
+    LIVE_RULES: LIVE_RULES, LIVE_TOP_RANK: LIVE_TOP_RANK, LIVE_MAX_OUTCOME_PCT: LIVE_MAX_OUTCOME_PCT, liveRunner: liveRunner, joinModelLive: joinModelLive,
+    liveBucketStats: liveBucketStats,
     shortNum: shortNum, shortUSD: shortUSD, signedPct: signedPct, rangeLabel: rangeLabel,
     rangeLabels: rangeLabels
   };
