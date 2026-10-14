@@ -172,6 +172,19 @@ Your agent file adds its own report contract on top of these.
   prod".
 - Include any README text you were told not to write yourself.
 - Never include secrets or the contents of `.env` or `scout.session.json`.
+- Dates and times (owner, 14 Oct 2026). In reports, docs, PR text and commit
+  messages, use the owner's local time (US Pacific: PDT in summer, PST in
+  winter) first, with UTC in parentheses:
+  - a time: "13 Oct 2026, 23:15 PDT (14 Oct 06:15 UTC)";
+  - a date alone: "13 Oct (14 Oct UTC)" when the UTC date differs, otherwise
+    just "13 Oct".
+
+  Some formats keep their own convention:
+  - Branch names use the owner's local date.
+  - Model versions stay UTC stamps (e.g. `20261014-0559` = 13 Oct 22:59 PDT).
+  - Log lines are quoted as printed.
+
+  Older text is not rewritten.
 
 ## Where things are (on `main`)
 

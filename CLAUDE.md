@@ -33,6 +33,12 @@ Every change to the database structure or data ships with a script to run
 and a rollback script: see "Database changes: run script and rollback" in
 `.claude/skills/scout-rules/SKILL.md`.
 
+## Dates and times
+
+The owner's local time (US Pacific) first, UTC in parentheses, e.g.
+"13 Oct 2026, 23:15 PDT (14 Oct 06:15 UTC)". Full rule in
+`.claude/skills/scout-rules/SKILL.md` ("How you report").
+
 ## Never (safety net; full rules in scout-rules)
 
 - Never read out, print, commit or copy `.env`, `scout.session.json` or

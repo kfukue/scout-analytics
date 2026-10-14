@@ -87,13 +87,21 @@ away; each has base `main` and states its order. Deploy: one listener
 restart (#55, #56) and one `-web` restart (#58-#63). Then the browser
 checks listed in each PR.
 
-Not done (owner decision): the Peak vs final scatter and the Overview
-mean still include drained-pool outcomes (pre-existing); the same
-+100,000 % rule could be applied page-wide.
+All of #54-#63 were merged by the owner on 14 Oct, 11:26-11:37 PDT
+(18:26-18:37 UTC); main is 2c8af02.
 
-**Owner question open:** dates in docs. The owner's local date (Pacific)
-or UTC? This file, branch names and skill entries currently mix "13 Oct"
-(local) and "14 Oct" (UTC) for the same evening.
+Owner decisions, 14 Oct, after the merges:
+- Dates in docs: local Pacific time first, UTC in parentheses. The full rule
+  is in `scout-rules` "How you report".
+- Drained-pool outcomes above +100,000 % are left out page-wide on
+  Analytics, as in training. In progress on branch
+  `work/2026-10-14-outliers-pagewide`.
+- The stored invite link in `scout_deliveries.target` stays as it is.
+- Model 20261014-1842 (`--variants`): 3d PASS (2.10), 7d FAIL (1.86).
+  Across seeds, "no calls_prev inputs" gives 3d 2.14 and 7d 2.10, both
+  passing every gate, with drift AUC 0.99 → 0.90. The burst ratio is worse.
+  The PM recommends making "no calls_prev" the default; the owner has not
+  decided yet.
 
 **Scoring on prod is working** (owner's read-only queries, 14 Oct UTC).
 Live-handled calls since 13 Oct 12:00 UTC: 10793, 10795, 10796 and 10798
@@ -862,8 +870,10 @@ installed (owner).
     older logs / `scout_deliveries.error` rows may contain it. Read-only
     count in #55. If a DB dump is ever shared, revoke and re-create the
     link in Telegram;
-  - dates in docs: local (Pacific) or UTC (Session state);
-  - PC clean-up of merged worktrees and branches (block sent 13 Oct);
+  - "no calls_prev inputs" as the default model setting (PM recommends;
+    Session state);
+  - PC clean-up of merged worktrees and branches: the script
+    `cleanup-merged.ps1` (dry run first, then `-Apply`) was sent 14 Oct;
   - disk space: ~318 GB free on C: (12 Oct; was ~100 MB before the
     owner's 10 Oct clean-up, which blocked Go builds); old agent
     scratchpads under `...\AppData\Local\Temp\claude\...` (~5.5 GB) may be
