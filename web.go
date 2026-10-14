@@ -70,9 +70,10 @@ type webConfig struct {
 	// (0 = the default)
 	Refresh time.Duration
 	// ModelScores: show the model's scores (the Model column, the row
-	// detail's model block, sort=model). Always on for this website
-	// (loadWebConfig); a public copy (deploy/gcp) runs with it off: no row
-	// carries a score, sort=model is refused and the page hides the column.
+	// detail's model block, sort=model, GET /api/model-live). Always on for
+	// this website (loadWebConfig); a public copy (deploy/gcp) runs with it
+	// off: no row carries a score, sort=model is refused, /api/model-live is
+	// not registered (404) and the page hides the column.
 	ModelScores bool
 }
 
@@ -759,9 +760,9 @@ type webRefreshCall struct {
 }
 
 // newWebServer builds the site: GET /api/summary, GET /api/calls, GET
-// /api/call, GET /api/analytics, GET /api/events, POST /api/refresh and the
-// pages. The API answers
-// 503 until refresh has succeeded once.
+// /api/call, GET /api/analytics, GET /api/model-live (only with
+// cfg.ModelScores), GET /api/events, POST /api/refresh and the pages. The API
+// answers 503 until refresh has succeeded once.
 func newWebServer(st *ScoutStore, cfg webConfig, static fs.FS) (*webServer, error) {
 	s := &webServer{st: st, cfg: cfg, static: static, mux: http.NewServeMux(), lastRows: -1,
 		errLog: logLimiter{every: webErrorLogEvery}, tradesErrLog: logLimiter{every: webErrorLogEvery},
@@ -783,6 +784,9 @@ func newWebServer(st *ScoutStore, cfg webConfig, static fs.FS) (*webServer, erro
 	s.mux.HandleFunc("/api/calls", s.handleCalls)
 	s.mux.HandleFunc("/api/call", s.handleCall)
 	s.mux.HandleFunc("/api/analytics", s.handleAnalytics)
+	if cfg.ModelScores {
+		s.mux.HandleFunc("/api/model-live", s.handleModelLive)
+	}
 	s.mux.HandleFunc("/api/events", s.handleEvents)
 	s.mux.HandleFunc(webRefreshPath, s.handleRefresh)
 	s.mux.HandleFunc("/api/", func(w http.ResponseWriter, r *http.Request) {

@@ -2557,6 +2557,42 @@ clients that take it; `503` before the first snapshot.
 - The fields behind it are part of the list's snapshot version, so a change to any of them also
   changes the `ETag` of `/api/calls`.
 
+`GET /api/model-live` — the model's scores stored at the time of each first call (for the
+Analytics page's "Model insights"): one compact row per scored first call, built once with each
+snapshot from the scores the list's rows already carry (the call's own score stored at most 24
+hours after the call, of the earliest such model version; see the Model column), from memory.
+No parameters (any → `400`); weak `ETag` (a hash of the body), `If-None-Match` → `304`,
+`Cache-Control: no-cache`, `X-Snapshot-At`, gzip for clients that take it; `503` before the
+first snapshot. Only a website that shows model scores has it: on one without (the public
+copy, `ModelScores` off) the path answers `404`. No outcomes: join the rows to those of
+`GET /api/analytics` by `call_id`. The stored `features` are never sent.
+
+```json
+{"format": 1, "buckets": ["short","3day","medium","long"], "horizons": ["1d","3d","7d","30d"],
+ "first_calls": 6012, "scored": 1840, "versions": ["20261013-1909","20261020-0800"],
+ "columns": ["call_id","version","after_s",
+             "runner_short","collapse_short","rank_short","passed_short",
+             "runner_3day","collapse_3day","rank_3day","passed_3day",
+             "runner_medium","collapse_medium","rank_medium","passed_medium",
+             "runner_long","collapse_long","rank_long","passed_long"],
+ "rows": [[812, 0, 120, 0.31, 0.155, 90, false, 0.2, 0.1, 90, false, 0.12, 0.06, 90, true, 0.06, 0.03, 90, null],
+          [830, 1, 60, null, null, null, null, null, null, null, null, null, null, 92.5, true, null, null, null, null]]}
+```
+
+- `first_calls` = the first calls in the snapshot (one per token, the rows of
+  `/api/analytics`); `scored` = the rows here, so the page can show coverage.
+- `version` is an index into `versions` (most frequent first); `after_s` = whole seconds from
+  the call to the score (`created_at` − the call's time, never below 0).
+- Per bucket: `runner_<b>` = `runner_prob`, `collapse_<b>` = `collapse_prob` (0 … 1),
+  `rank_<b>` = `runner_rank_pct` (percent), as stored (full precision); `null` when missing or
+  not a finite number. `passed_<b>` = whether that bucket's model passed its validation gates:
+  `true`, `false`, or `null` = not recorded. All four are `null` when the score has no such
+  bucket.
+- Size: about 91 bytes a scored row, 24 gzipped (12,000 synthetic rows with 2,445 scored:
+  223 KB, 59 KB gzipped); stored probabilities have more digits, so expect more on real data.
+- The fields behind it are part of the list's snapshot version, so a change to a score also
+  changes the `ETag` of `/api/calls`.
+
 `GET /api/events` — live updates as a stream of
 [Server-Sent Events](https://html.spec.whatwg.org/multipage/server-sent-events.html)
 (`Content-Type: text/event-stream`, `Cache-Control: no-store`, never gzip-compressed, no

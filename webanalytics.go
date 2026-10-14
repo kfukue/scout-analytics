@@ -465,20 +465,39 @@ func buildWebAnalytics(rows []ScoutWebRow, prev *webAnalytics) (*webAnalytics, e
 		Families: fams.names, Dexes: dexes.names, Quotes: quotes.names,
 		Columns: webAnalyticsColumns, Rows: out,
 	}
-	var buf bytes.Buffer
-	buf.Grow(len(out) + 4096)
-	if err := json.NewEncoder(&buf).Encode(&body); err != nil {
-		return nil, fmt.Errorf("encode: %w", err)
+	plain, etag, err := encodeWebBody(&body, len(out)+4096, `-a`+strconv.Itoa(webAnalyticsFormat))
+	if err != nil {
+		return nil, err
 	}
-	plain := buf.Bytes()
-	sum := sha256.Sum256(plain)
-	etag := `W/"` + hex.EncodeToString(sum[:12]) + `-a` + strconv.Itoa(webAnalyticsFormat) + `"`
 	if prev != nil && prev.etag == etag && bytes.Equal(prev.plain, plain) {
 		return prev, nil
 	}
-	a := &webAnalytics{plain: plain, etag: etag, rows: len(rows)}
+	gz, err := gzipIfSmaller(plain)
+	if err != nil {
+		return nil, err
+	}
+	return &webAnalytics{plain: plain, gz: gz, etag: etag, rows: len(rows)}, nil
+}
+
+// encodeWebBody encodes the body of an endpoint built with a snapshot (body,
+// a pointer; size, the room to reserve) and its weak ETag: a hash of the
+// bytes, then tag (the endpoint's letter and format).
+func encodeWebBody(body any, size int, tag string) (plain []byte, etag string, err error) {
+	var buf bytes.Buffer
+	buf.Grow(size)
+	if err := json.NewEncoder(&buf).Encode(body); err != nil {
+		return nil, "", fmt.Errorf("encode: %w", err)
+	}
+	plain = buf.Bytes()
+	sum := sha256.Sum256(plain)
+	return plain, `W/"` + hex.EncodeToString(sum[:12]) + tag + `"`, nil
+}
+
+// gzipIfSmaller compresses a body built with a snapshot (once per change of
+// its content, so at the default level); nil when that is not smaller.
+func gzipIfSmaller(plain []byte) ([]byte, error) {
 	var zb bytes.Buffer
-	zw, err := gzip.NewWriterLevel(&zb, gzip.DefaultCompression) // once per change of the content
+	zw, err := gzip.NewWriterLevel(&zb, gzip.DefaultCompression)
 	if err != nil {
 		return nil, fmt.Errorf("gzip: %w", err)
 	}
@@ -488,10 +507,10 @@ func buildWebAnalytics(rows []ScoutWebRow, prev *webAnalytics) (*webAnalytics, e
 	if err := zw.Close(); err != nil {
 		return nil, fmt.Errorf("gzip: %w", err)
 	}
-	if zb.Len() < len(plain) {
-		a.gz = zb.Bytes()
+	if zb.Len() >= len(plain) {
+		return nil, nil
 	}
-	return a, nil
+	return zb.Bytes(), nil
 }
 
 // handleAnalytics is GET /api/analytics: the rows of the Analytics page, as
@@ -512,16 +531,23 @@ func (s *webServer) handleAnalytics(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusServiceUnavailable, "starting: the data is not loaded yet")
 		return
 	}
-	s.snapshotHeaders(w, snap, a.etag)
-	if s.notModified(w, r, a.etag) {
+	s.serveBuiltBody(w, r, snap, a.plain, a.gz, a.etag)
+}
+
+// serveBuiltBody sends a JSON body built with the snapshot (plain, and gz
+// when compressing made it smaller): ETag (weak, a hash of the body) and
+// If-None-Match → 304 like the other answers, gzip for clients that take it.
+func (s *webServer) serveBuiltBody(w http.ResponseWriter, r *http.Request, snap *webSnapshot, plain, gz []byte, etag string) {
+	s.snapshotHeaders(w, snap, etag)
+	if s.notModified(w, r, etag) {
 		return
 	}
 	h := w.Header()
 	h.Set("Content-Type", "application/json; charset=utf-8")
 	h.Add("Vary", "Accept-Encoding")
-	body := a.plain
-	if a.gz != nil && acceptsGzip(r) {
-		body = a.gz
+	body := plain
+	if gz != nil && acceptsGzip(r) {
+		body = gz
 		h.Set("Content-Encoding", "gzip")
 	}
 	h.Set("Content-Length", strconv.Itoa(len(body)))
