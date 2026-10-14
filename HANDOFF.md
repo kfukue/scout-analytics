@@ -440,7 +440,7 @@ below). Merged 12 Oct after 41a27b0 (PR, merge commit, branch head):
 **Owner to-do: deploy 228b3e0** (no tracker restart, no schema change,
 `onchainStateVersion` unchanged), on the server:
 
-1. `cd ~/Documents/GitHub/scout-analytics && git checkout main && git pull`;
+1. `cd "$REPO" && git checkout main && git pull`;
    `git log -1 --oneline` shows `228b3e0 Merge pull request #30 …`.
 2. Restart `-web` (`go run . -web`) for #27 and the listener
    (`go run . -listen-only`) for #28. The tracker keeps running.

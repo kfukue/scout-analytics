@@ -22,8 +22,9 @@ this skill (the repo is public: never write the real local path into repo
 files; from any worktree, the parent folder of
 `git rev-parse --path-format=absolute --git-common-dir` is it, as in
 `TESTING.md`);
-production runs from a checkout at `~/Documents/GitHub/scout-analytics` on an
-Ubuntu server. Read `README.md`, `ml/README.md` and `HANDOFF.md` before planning
+production runs from a checkout on an Ubuntu server, written `$REPO` (its
+real path is never written in the repo or in PR texts; the owner sets
+`REPO` in his server shell). Read `README.md`, `ml/README.md` and `HANDOFF.md` before planning
 anything non-trivial (`DEPLOY.md` and `ml/RUNBOOK.md` for deploy and training).
 
 - **Listener**: reads token calls from @scoutrobinhood, sends real calls to
@@ -395,7 +396,7 @@ git branch -d <branch>
 B. Deploy, on the server (bash):
 
 ```bash
-cd ~/Documents/GitHub/scout-analytics
+cd "$REPO"
 git checkout main && git pull
 git log -1 --oneline
 # expect: <hash> Merge pull request #<N> from kfukue/<branch>

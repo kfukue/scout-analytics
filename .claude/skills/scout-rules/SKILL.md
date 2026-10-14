@@ -48,7 +48,9 @@ root).
     Delete your subdirectory when you are done.
   - Public repo (owner, 14 Oct 2026): never write absolute local paths
     (drive letters, user folders) into repo files; write `<repo root>`
-    instead.
+    instead. The same for the prod server: never write where its checkout
+    lives; write `$REPO` (the server checkout) and `$ML` (its ML folder,
+    the documented default `~/scout-ml`). PR texts are public too.
   - Installed tools (Go, Postgres binaries, git, `gh`, the repo's
     `ml/.venv`) may still be run. Files a tool makes for itself (the Go build
     and module caches, `t.TempDir()` and pytest `tmp_path` folders) are the
