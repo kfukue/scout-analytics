@@ -466,7 +466,7 @@ From the repo root on the server:
 
 Every Go start applies `scoutanalytics.sql` unless `SCOUT_DB_AUTO_MIGRATE=false`.
 
-## Owner decisions in force (8-13 October 2026)
+## Owner decisions in force (8-14 October 2026)
 
 - The `long` model waits for data (about 25 December) rather than loosening the
   threshold.
@@ -530,6 +530,13 @@ Every Go start applies `scoutanalytics.sql` unless `SCOUT_DB_AUTO_MIGRATE=false`
   PR has base `main` unless the owner names another branch. The rule in full
   is in `CLAUDE.md`. Why: #47-#49 were stacked on other branches and merged
   into them instead of `main`; they reached `main` only through #50 and #51.
+- 14 Oct (owner): dates and times are given in his local time (Pacific)
+  with UTC in parentheses, e.g. "13 Oct 2026, 23:15 PDT (14 Oct 06:15 UTC)".
+  The rule in full is in `scout-rules` ("How you report"). Applies to your
+  replies, `HANDOFF.md` and PR text from now on.
+- 14 Oct (owner): drained-pool outliers (an outcome above +100,000 %) are
+  left out of the Analytics page as in the model's training (being
+  implemented page-wide).
 - 12 Oct: the PM has the `Bash` tool for git only: read-only git, `git fetch`
   and `git worktree add` to create worktrees for `implement`; never add,
   commit, push, stash, switch, reset, rebase or merge (see "Your git
