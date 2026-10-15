@@ -268,9 +268,9 @@ OPTIONAL_DERIVED = [CALLS_PREV_BURST]
 # Not inputs of the saved model: with WALLET_REP = False (the default, which
 # train.py enforces) these names are NOT in FEATURES / NUMERIC_FEATURES, so the
 # saved model cannot use them (serving cannot compute them yet). They are
-# inputs only in the report-only WALLET_REP_VARIANTS "wallet reputation (wrep_*)"
-# and "wallet reputation, quality only" (WALLET_REP = True), which train.py runs
-# with --variants --live-buys PATH.
+# inputs only in the report-only WALLET_REP_VARIANTS "wallet reputation (wrep_*)",
+# "wallet reputation, quality only" and "wallet reputation, last 14 days"
+# (WALLET_REP = True), which train.py runs with --variants --live-buys PATH.
 # The three shares are in NO_LOG; the count and the lifts are log1p-scaled by
 # the logistic baseline.
 WALLET_REP = False                     # a VARIANT_KNOB: True appends WREP_FEATURES to the numeric inputs
@@ -306,7 +306,16 @@ WREP_PRIOR_STRENGTH = 20               # pseudo-calls behind each prior: few cal
 WREP_MIN_CALLS = 5
 WREP_GOOD_LIFT = 2.0                   # good wallet: runner lift at least this
 WREP_BAD_LIFT = 1.5                    # bad wallet: rug lift at least this
-WREP_LOOKBACK_DAYS = None              # None = all history; N = only outcomes known in the N days before the call
+WREP_LOOKBACK_DAYS = None              # a VARIANT_KNOB. None = all history; N = only outcomes known in the N days before the call
+# The lookback of the variant "wallet reputation, last 14 days" (owner decision
+# 15 Oct 2026, fixed before any result; one value, no sweep). Report
+# 20261015-1944: the full wallet variant held adoption rules 1-4 at 3day and
+# failed only rule 5 (drift), whose pre-registered next step is a lookback
+# variant: a wallet's all-time history grows with calendar time (a time proxy),
+# a fixed window does not. 14 days = CALIB_RECENT_DAYS and keeps the coverage
+# ramp-up short.
+WREP_LOOKBACK_VARIANT_DAYS = 14
+WREP_LOOKBACK_VARIANT = f"wallet reputation, last {WREP_LOOKBACK_VARIANT_DAYS} days"   # its VARIANTS name
 WREP_SHARES = ("wrep_known_share", "wrep_good_share", "wrep_bad_share")   # bounded 0..1: in NO_LOG
 # The two coverage inputs (how many of C's wallets have history). They grow with
 # calendar time as the history builds up from August 2026, so they act as a time
@@ -322,7 +331,10 @@ WREP_COVERAGE = ("wrep_n_known", "wrep_known_share")
 # collapses removed >= min_collapse_removed; (5) drift: its adversarial AUC at
 # most max_adv_auc_rise above the baseline's, and no wrep_* input among the top
 # drift_top drifting inputs with a gain share >= drift_max_share. When only (5)
-# fails the next step is a lookback variant (WREP_LOOKBACK_DAYS), not adoption.
+# fails the next step is a lookback variant (WREP_LOOKBACK_DAYS), not adoption;
+# for a variant that already uses a lookback, it means the drift persists with
+# that window (no further step is pre-registered; clause added 15 Oct 2026, the
+# rules themselves unchanged).
 # Literal values on purpose: a later change of GATES must not move these.
 WREP_ADOPTION = {"min_median_lift": 2.0, "min_lift_lower": 1.0, "min_sim_diff_lower": 0.0,
                  "min_collapse_removed": 0.40, "max_adv_auc_rise": 0.02, "drift_top": 3,
@@ -517,13 +529,14 @@ LIFT_CI_Z = 1.96
 
 # --- Variant comparison (train.py --variants) --------------------------------
 # Each variant changes exactly ONE knob from the configured (baseline) values
-# above (except "wallet reputation, quality only": two, see below). They are
+# above (except "wallet reputation, quality only" and "wallet reputation, last
+# 14 days": two each, see below). They are
 # trained and reported only: never saved, never served, never the gates of the
 # saved model (that is always the baseline). "baseline" reuses the results of
 # the saved model. Knobs: VARIANT_KNOBS.
 VARIANT_KNOBS = ("DEAD_IS_COLLAPSE", "DEAD_TRADES_24H", "DEX_INPUTS", "RUNNER_NEEDS_TRADES",
                  "LGBM_REGULARISATION", "LGBM_SEED", "EXCLUDED_INPUTS", "CALLS_PREV_INPUTS",
-                 "WALLET_REP")
+                 "WALLET_REP", "WREP_LOOKBACK_DAYS")
 # "dead threshold 100" was dropped: DEAD_TRADES_24H only changes the labels
 # while the dead rule is on, so with the rule off it would equal the baseline.
 VARIANTS = {
@@ -545,6 +558,10 @@ VARIANTS = {
     # calls_prev exclusion.
     "wallet reputation, quality only": {"WALLET_REP": True,
                                         "EXCLUDED_INPUTS": EXCLUDED_INPUTS + WREP_COVERAGE},
+    # the full wallet variant with a fixed history window (WREP_LOOKBACK_VARIANT_DAYS;
+    # owner decision 15 Oct 2026): the same inputs, its wrep_* values computed
+    # with that lookback (train.py computes the wallet reputation per lookback)
+    WREP_LOOKBACK_VARIANT: {"WALLET_REP": True, "WREP_LOOKBACK_DAYS": WREP_LOOKBACK_VARIANT_DAYS},
 }
 # Variants also retrained with the other STABILITY_SEEDS for the report-only
 # table "Variants across seeds" (ml/README.md). Never a gate; about one normal
@@ -553,17 +570,20 @@ VARIANTS = {
 # 20261015-0554 its seed-7 pooled walk-forward lift at 7d was 2.34 vs the
 # baseline's 1.95 (sim difference +41.2 %), a gap of the size single seeds have
 # shown as noise; the median over the seeds tells which. Not a wallet variant:
-# runs without --live-buys and has no adoption rules.
+# runs without --live-buys and has no adoption rules. WREP_LOOKBACK_VARIANT since
+# 15 Oct 2026: its adoption rules need its median over the seeds.
 SEED_VARIANTS = ("with calls_prev counts (default before 14 Oct)", "wallet reputation (wrep_*)",
-                 "wallet reputation, quality only", "raw dex + dex_family")
+                 "wallet reputation, quality only", "raw dex + dex_family", WREP_LOOKBACK_VARIANT)
 # Variants that only differ from the baseline through trades_24h: not applicable
 # when the export has no trades_24h column.
 TRADES_VARIANTS = ("dead rule on (collapse OR dead)", "runners must be tradeable")
 # Variants that need the wrep_* columns (train.py --live-buys): not applicable
 # when the variants' data has none (no live buys given, or their wallet
 # reputation failed); their pre-registered adoption rules are WREP_ADOPTION
-# (the same rules for each, each judged against the same baseline).
-WALLET_REP_VARIANTS = ("wallet reputation (wrep_*)", "wallet reputation, quality only")
+# (the same rules for each, each judged against the same baseline). train.py
+# computes the wrep_* columns once per distinct WREP_LOOKBACK_DAYS among them.
+WALLET_REP_VARIANTS = ("wallet reputation (wrep_*)", "wallet reputation, quality only",
+                       WREP_LOOKBACK_VARIANT)
 
 # --- Stability diagnostics ---------------------------------------------------------
 # Extra sections at the end of report.md (before the variant comparison) to
@@ -641,6 +661,14 @@ def variant_settings(name: str) -> dict:
     return {**{k: g[k] for k in VARIANT_KNOBS}, **VARIANTS[name]}
 
 
+def check_lookback(days) -> None:
+    """Raise unless `days` is a valid WREP_LOOKBACK_DAYS: None or a positive int."""
+    ok = days is None or (isinstance(days, int) and not isinstance(days, bool) and days > 0)
+    if not ok:
+        raise ValueError(f"WREP_LOOKBACK_DAYS must be None or a positive whole number of days, "
+                         f"not {days!r}")
+
+
 @contextmanager
 def overrides(**knobs):
     """Temporarily set VARIANT_KNOBS (and rebuild CATEGORICAL, NUMERIC_FEATURES,
@@ -654,6 +682,8 @@ def overrides(**knobs):
     if "LGBM_REGULARISATION" in knobs and knobs["LGBM_REGULARISATION"] not in LGBM_REG_SETS:
         raise ValueError(f"LGBM_REGULARISATION must be one of {sorted(LGBM_REG_SETS)}, "
                          f"not {knobs['LGBM_REGULARISATION']!r}")
+    if "WREP_LOOKBACK_DAYS" in knobs:
+        check_lookback(knobs["WREP_LOOKBACK_DAYS"])
     numeric_inputs(knobs.get("EXCLUDED_INPUTS", EXCLUDED_INPUTS),     # raises before anything
                    knobs.get("CALLS_PREV_INPUTS", CALLS_PREV_INPUTS),  # is changed
                    knobs.get("WALLET_REP", WALLET_REP))
