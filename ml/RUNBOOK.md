@@ -438,7 +438,12 @@ adversarial validation 147 s; a whole run with `--variants
 --live-buys` 614 s instead of 453 s; on the prod data not measured yet). The
 wallet reputation, quality only variant costs about as much again (14 Oct
 2026, same data: 165 s, of which other seeds and adversarial validation
-140 s; a whole run with `--variants --live-buys` 759 s). The stability
+140 s; a whole run with `--variants --live-buys` 759 s). Since 15 Oct 2026
+the raw `dex` + `dex_family` variant is retrained with the six other seeds
+too, with or without `--live-buys` (same synthetic data: its line 154 s
+instead of 22 s, of which other seeds and adversarial validation 132 s; a
+whole run with `--variants --live-buys` 891 s instead of 773 s; on the prod
+data not measured yet). The stability
 diagnostics of step 5 also run (before the variants) unless switched off with
 `SCOUT_ML_DIAGNOSTICS=0`, and add their own time on top. Memory as in step 5.
 The model, `meta.json`, `report.md` and `LATEST` are written before the
@@ -469,7 +474,8 @@ decides whether a setting changes.
 The table "Variants across seeds" (see `ml/README.md`; called "calls_prev
 variants across seeds" before 14 Oct 2026) puts the baseline next to the
 `SEED_VARIANTS` (with the calls_prev inputs; wallet reputation; wallet
-reputation, quality only) over every seed. If a variant's median lift is clearly better than the baseline's in
+reputation, quality only; since 15 Oct 2026 raw `dex` + `dex_family`, which
+needs no `--live-buys`) over every seed. If a variant's median lift is clearly better than the baseline's in
 several reports, tell the product manager; the gap between the adversarial
 AUCs shows the drift the inputs a variant changes carry.
 
