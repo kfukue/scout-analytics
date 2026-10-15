@@ -23,8 +23,8 @@
 #                    compare them at the end of report.md; report only, the saved
 #                    model is the baseline. About 6 times the train time. Also
 #                    exports the live buys (step 4b, -export-live-buys) for the
-#                    report-only wallet reputation variant, when the Go program
-#                    has that flag (else a WARNING, and that variant is n/a).
+#                    report-only wallet reputation variants, when the Go program
+#                    has that flag (else a WARNING, and those variants are n/a).
 #   -h, --help       show this help
 #
 # It never connects to the database itself, never prints .env (it only counts
@@ -349,11 +349,11 @@ esac
 
 # ---------------------------------------------------------------------------
 # step 4b (--variants only): the live buys, for the report-only wallet
-# reputation variant. Never stops the run: without them that variant is n/a.
+# reputation variants. Never stops the run: without them those variants are n/a.
 if [ "$VARIANTS" -eq 1 ]; then
     STEP="4b (export the live buys)"; LOG=""
     echo
-    echo "== Step 4b: export the live buys to $LIVE_CSV (for the wallet reputation variant)"
+    echo "== Step 4b: export the live buys to $LIVE_CSV (for the wallet reputation variants)"
     cd "$REPO"
     if [ -n "$BINARY" ]; then
         EXPORT_CMD=("$BINARY")
@@ -372,11 +372,11 @@ if [ "$VARIANTS" -eq 1 ]; then
             else
                 rm -f "$LIVE_CSV"
                 echo "WARNING: the live-buys export failed (see $ML/logs/step4b-live-buys.log); training continues" >&2
-                echo "         without it, so the wallet reputation variant is n/a in the report." >&2
+                echo "         without it, so the wallet reputation variants are n/a in the report." >&2
             fi ;;
         *)
             echo "WARNING: this Go program has no -export-live-buys flag (an older binary or checkout); training" >&2
-            echo "         continues without the live buys, so the wallet reputation variant is n/a in the report." >&2 ;;
+            echo "         continues without the live buys, so the wallet reputation variants are n/a in the report." >&2 ;;
     esac
 fi
 

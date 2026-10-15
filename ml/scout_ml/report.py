@@ -809,7 +809,9 @@ def adversarial_section(ad, st, buckets) -> str:
 
 
 VARIANT_NOTE = (
-    "Each variant changes exactly one setting of the baseline (the saved model) and is trained "
+    "Each variant changes exactly one setting of the baseline (the saved model; \"wallet "
+    "reputation, quality only\" two: the wallet inputs on, their two coverage inputs left out) "
+    "and is trained "
     "on the same rows, splits and seed. Variants are report only: not saved, not served, and "
     "never a gate. Their gate column is the old single-run gate (test-part lift, collapses "
     "removed, every counted week beating buy-all), information only, also for the baseline row; "
@@ -896,8 +898,8 @@ def _variant_time(v: dict) -> str:
 
 def variants_section(variants: dict, buckets: dict, wallet_rep: dict | None = None) -> str:
     """The variant comparison; `wallet_rep` (train.py's wallet reputation stats,
-    None without --live-buys) feeds the wallet reputation blocks, shown when a
-    C.WALLET_REP_VARIANTS entry is among the variants."""
+    None without --live-buys) feeds the wallet reputation blocks, shown once when
+    any C.WALLET_REP_VARIANTS entry is among the variants."""
     out = ["## Variant comparison (report only; not saved, not served)\n", VARIANT_NOTE + "\n",
            variant_read() + "\n"]
     times = [f"{n}: {_variant_time(v)}" for n, v in variants.items()
@@ -908,10 +910,10 @@ def variants_section(variants: dict, buckets: dict, wallet_rep: dict | None = No
         out.append(f"### Bucket `{b}`\n")
         out.append(variant_table(variants, b))
     out.append(across_seeds_section(variants, buckets))
-    for name in C.WALLET_REP_VARIANTS:
-        if name in variants:
-            out.append(wallet_data_section(wallet_rep))
-            out.append(adoption_section(name, variants[name]))
+    wallet = {n: variants[n] for n in C.WALLET_REP_VARIANTS if n in variants}
+    if wallet:
+        out.append(wallet_data_section(wallet_rep))
+        out.append(adoption_section(wallet))
     return "\n".join(out)
 
 
@@ -994,6 +996,12 @@ def _pct(v) -> str:
     return "n/a" if v is None or (isinstance(v, float) and math.isnan(v)) else f"{v:.1%}"
 
 
+def _prior_rug_note() -> list:
+    """The note that the rug prior was changed after a result (C.WREP_PRIOR_RUG_NOTE), as
+    a paragraph of the wallet data block; the adoption rules point to it."""
+    return [C.WREP_PRIOR_RUG_NOTE + "\n"] if C.WREP_PRIOR_RUG_NOTE else []
+
+
 def wallet_data_section(st) -> str:
     """The wallet reputation inputs (train.wallet_rep_data stats): counts, the
     observed 7 d runner / rug rates next to the fixed priors, and the coverage
@@ -1002,12 +1010,12 @@ def wallet_data_section(st) -> str:
     if not isinstance(st, dict):
         out.append("No live buys given (`train.py --live-buys PATH`; `run_training.sh --variants` "
                    "exports them with the Go program's `-export-live-buys` when it has that "
-                   "flag), so the wallet reputation variant is n/a.\n")
-        return "\n".join(out)
+                   "flag), so the wallet reputation variants are n/a.\n")
+        return "\n".join(out + _prior_rug_note())
     if st.get("error"):
-        out.append(f"**Not computed: {st['error']}.** The wallet reputation variant is n/a; "
+        out.append(f"**Not computed: {st['error']}.** The wallet reputation variants are n/a; "
                    "nothing else in this report is affected.\n")
-        return "\n".join(out)
+        return "\n".join(out + _prior_rug_note())
     out.append(
         f"{st['live_buy_rows']} live buys of {st['wallets']} distinct wallets on "
         f"{st['calls_with_live_buys']} calls ({st['rows']} rows in the export); "
@@ -1026,6 +1034,7 @@ def wallet_data_section(st) -> str:
                "running rate would be a calendar proxy). A prior far from the observed rate moves "
                "every lift, and so the good / bad shares, which compare lifts with "
                f"WREP_GOOD_LIFT ({C.WREP_GOOD_LIFT:g}) / WREP_BAD_LIFT ({C.WREP_BAD_LIFT:g}).\n")
+    out += _prior_rug_note()
     weeks = st.get("weeks") or []
     if weeks:
         out.append("Coverage per week (Monday, UTC) over the calls training can use: calls with "
@@ -1042,7 +1051,11 @@ def adoption_rules_text() -> str:
     """The pre-registered adoption rules (C.WREP_ADOPTION), as fixed before any result."""
     r = C.WREP_ADOPTION
     return (
-        f"Fixed on {C.WREP_ADOPTION_SET_ON}, before any result. The variant passes in a bucket "
+        f"Fixed on {C.WREP_ADOPTION_SET_ON}, before any result. "
+        + ("The rules themselves are unchanged, but the rug prior was changed afterwards (see "
+           "the note in \"Wallet reputation data\" above). " if C.WREP_PRIOR_RUG_NOTE else "")
+        + "The same rules apply to each "
+        "wallet reputation variant, each against the same baseline. A variant passes in a bucket "
         "only if ALL hold (report only: never a gate of the saved model, which never uses "
         "wrep_* inputs):\n\n"
         f"1. median lift: its across-seeds median pooled walk-forward lift >= "
@@ -1084,22 +1097,40 @@ def adoption_cells(a: dict) -> list:
             ADOPTION_RESULT[a["result"]]]
 
 
-def adoption_section(name: str, v: dict) -> str:
-    """The pre-registered adoption rules and, when the variant ran, per bucket
-    whether each holds (the variant's "adoption", train.wallet_adoption)."""
-    out = [ADOPTION_TITLE, adoption_rules_text()]
+def adoption_not_evaluated(v: dict) -> str | None:
+    """Why wallet variant `v` has no adoption rows (error, n/a, not evaluated), or None."""
     ad = v.get("adoption")
-    why = (v.get("error") or (f"n/a: {v['not_applicable']}" if v.get("not_applicable") else None)
-           or (ad or {}).get("error") or (None if ad else "not evaluated"))
-    if why:
-        out.append(f"Not evaluated for `{name}`: {why}.\n")
-        return "\n".join(out)
+    return (v.get("error") or (f"n/a: {v['not_applicable']}" if v.get("not_applicable") else None)
+            or (ad or {}).get("error") or (None if ad else "not evaluated"))
+
+
+def adoption_rows(name: str, ad: dict) -> list:
+    """The adoption table rows of one wallet variant: [bucket, name, rule cells..., result]."""
     rows = []
     for b, a in (ad.get("buckets") or {}).items():
-        if a.get("not_applicable"):
-            rows.append([b, f"n/a: {a['not_applicable']}"] + [""] * 5)
+        cells = ([f"n/a: {a['not_applicable']}"] + [""] * 5 if a.get("not_applicable")
+                 else adoption_cells(a))
+        rows.append([b, name, *cells])
+    return rows
+
+
+def adoption_section(wallet: dict) -> str:
+    """The pre-registered adoption rules once, then for each wallet variant of
+    `wallet` ({name: its variant entry}) why it was not evaluated, or per bucket
+    whether each rule holds (its "adoption", train.wallet_adoption): one table,
+    the variants of a bucket next to each other."""
+    out = [ADOPTION_TITLE, adoption_rules_text()]
+    rows = []
+    for name, v in wallet.items():
+        why = adoption_not_evaluated(v)
+        if why:
+            out.append(f"Not evaluated for `{name}`: {why}.\n")
         else:
-            rows.append([b, *adoption_cells(a)])
-    out.append(table(["bucket", "1. median lift", "2. lift lower end", "3. sim lower end (%)",
-                      "4. collapses removed", "5. drift", "result"], rows))
+            rows += adoption_rows(name, v["adoption"])
+    if rows:
+        order = list(dict.fromkeys(r[0] for r in rows))
+        rows.sort(key=lambda r: order.index(r[0]))     # stable: variant order within a bucket
+        out.append(table(["bucket", "variant", "1. median lift", "2. lift lower end",
+                          "3. sim lower end (%)", "4. collapses removed", "5. drift", "result"],
+                         rows))
     return "\n".join(out)

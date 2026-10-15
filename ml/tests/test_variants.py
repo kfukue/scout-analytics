@@ -17,6 +17,7 @@ from scout_ml.model import Bundle
 DEX_VARIANTS = ("raw dex instead of dex_family", "raw dex + dex_family")
 WITH_CALLS_PREV = "with calls_prev counts (default before 14 Oct)"
 WALLET = "wallet reputation (wrep_*)"
+QUALITY = "wallet reputation, quality only"
 CALLS_PREV = {"calls_prev_1h", "calls_prev_24h"}
 
 
@@ -63,9 +64,12 @@ def test_each_variant_changes_exactly_one_knob():
     assert list(C.VARIANTS) == ["baseline", "dead rule on (collapse OR dead)",
                                 "raw dex instead of dex_family", "raw dex + dex_family",
                                 "runners must be tradeable", "stronger regularisation",
-                                "with calls_prev counts (default before 14 Oct)", WALLET]
+                                "with calls_prev counts (default before 14 Oct)", WALLET, QUALITY]
+    # the one two-knob variant: the coverage names are inputs only with WALLET_REP on
+    assert C.VARIANTS[QUALITY] == {"WALLET_REP": True,
+                                   "EXCLUDED_INPUTS": C.EXCLUDED_INPUTS + C.WREP_COVERAGE}
     for name, knobs in C.VARIANTS.items():
-        if name == "baseline":
+        if name in ("baseline", QUALITY):
             continue
         assert len(knobs) == 1, name
         (k, v), = knobs.items()
@@ -245,7 +249,7 @@ def test_variant_table_contents(plain_and_variants):
             top = {f for f, _ in v[name]["across_seeds"]["buckets"][b]["adversarial"]["top"]}
             assert not top & gone, (name, b, top)
     ran = [n for n in C.VARIANTS if n != "baseline" and not v[n].get("not_applicable")]
-    assert WALLET not in ran                                   # n/a: no --live-buys here
+    assert WALLET not in ran and QUALITY not in ran            # n/a: no --live-buys here
     assert all(v[n].get("seconds") is not None for n in ran)
     for n in C.SEED_VARIANTS:
         if n in ran:
@@ -262,10 +266,14 @@ def test_variant_table_contents(plain_and_variants):
     # no --live-buys: the wallet variant is n/a, also in the across-seeds table
     assert v[WALLET] == {"changes": {"WALLET_REP": True},
                          "not_applicable": train_mod.WREP_NOT_APPLICABLE}
+    assert v[QUALITY] == {"changes": {"WALLET_REP": True,     # meta.json: the tuple as a list
+                                      "EXCLUDED_INPUTS": list(C.EXCLUDED_INPUTS + C.WREP_COVERAGE)},
+                          "not_applicable": train_mod.WREP_NOT_APPLICABLE}
     assert "wallet_rep" not in meta
     across = report[report.index("### Variants across seeds (report only)"):]
     assert "calls_prev variants across seeds" not in report
     assert f"| short | {WALLET} | n/a: no live-buy wallet data" in across
+    assert f"| short | {QUALITY} | n/a: no live-buy wallet data" in across
     assert "| median (as the gate) |" in across and "| adversarial AUC (train vs test) |" in across
     for b in meta["metrics"]:
         for name in ("baseline",) + C.SEED_VARIANTS:
@@ -465,7 +473,7 @@ def test_burst_setting_replaces_exactly_the_raw_counts(synthetic_df):
 # --- "Variants across seeds" (report only) -------------------------------------------
 
 def test_every_variant_applies_without_error_and_seed_variants_are_variants():
-    assert isinstance(C.SEED_VARIANTS, tuple) and C.SEED_VARIANTS == (WITH_CALLS_PREV, WALLET)
+    assert isinstance(C.SEED_VARIANTS, tuple) and C.SEED_VARIANTS == (WITH_CALLS_PREV, WALLET, QUALITY)
     assert all(n in C.VARIANTS for n in C.SEED_VARIANTS)
     for name in C.VARIANTS:
         with C.overrides(**C.VARIANTS[name]):
