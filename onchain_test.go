@@ -1170,6 +1170,92 @@ func TestEthFromPoolHistoricalErrors(t *testing.T) {
 	}
 }
 
+// A Chainlink feed at a past block: only the node's own "no state" answer to
+// latestRoundData() switches the price reads to event logs (noState); a revert
+// or an empty answer takes the feed's last AnswerUpdated for this read only
+// (the next read asks the contract again); a busy node or another node error
+// is returned (the caller tries again later). None but "no state" sets noState.
+func TestChainlinkHistoricalErrors(t *testing.T) {
+	const (
+		feed = "0x00000000000000000000000000000000000000fe"
+		agg  = "0x00000000000000000000000000000000000000a2"
+	)
+	day := uint64(864000)
+	for _, c := range []struct {
+		name        string
+		msg         string // latestRoundData() error at past blocks ("" = none)
+		code        int    // its JSON-RPC code (0 = -32000)
+		empty       bool   // latestRoundData() answers "0x" (no code there)
+		noEvents    bool   // the aggregator has no AnswerUpdated within the look-back
+		want        float64
+		wantErr     bool
+		wantNoData  bool   // the error wraps errFeedNoData (quoteUSD asks the next source)
+		wantErrText string // the error text contains this ("" = not checked)
+		wantNoState bool
+	}{
+		{name: "archive answers", want: 170},
+		{name: "nitro full node, no state", msg: nitroNoState, want: 160, wantNoState: true},
+		{name: "revert", msg: "execution reverted", code: 3, want: 160},
+		{name: "revert, no events", msg: "execution reverted", code: 3, noEvents: true, wantErr: true, wantNoData: true, wantErrText: "latestRoundData() failed"},
+		// noState is set only once an event gives the price, so it stays off here.
+		{name: "no state, no events", msg: nitroNoState, noEvents: true, wantErr: true, wantNoData: true, wantErrText: "no historical state on this node"},
+		{name: "no code", empty: true, want: 160},
+		{name: "rate limited", msg: "rate limit exceeded", wantErr: true},
+		{name: "timed out", msg: "request timed out", wantErr: true},
+		{name: "internal error", msg: "internal error", code: -32603, wantErr: true},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			f := newFakeChain(t, 20*24*time.Hour)
+			now := f.latest
+			f.constCall(feed, selDecimals, ret(wInt(8)))
+			f.constCall(feed, selPhaseID, ret(wInt(1)))
+			f.constCall(feed, selPhaseAggregator, ret(wAddr(agg)))
+			f.constCall(feed, selAggregator, ret(wAddr(agg)))
+			round := ret(wInt(9), wInt(170e8), wInt(0), wInt(0), wInt(9))
+			if c.empty {
+				round = "0x"
+			}
+			f.constCall(feed, selLatestRound, round)
+			if !c.noEvents {
+				f.answerUpdated(agg, now-10*day, 150e8)
+				f.answerUpdated(agg, now-6*day, 160e8)
+			}
+			f.callErrCode = c.code
+			f.callErr = func(to, sel string, block uint64) string {
+				if to == feed && sel == selLatestRound && block != f.latest {
+					return c.msg
+				}
+				return ""
+			}
+			o := testOnchain(t, f, nil)
+			ctx := context.Background()
+			p, err := o.chainlink(ctx, feed, now-3*day)
+			switch {
+			case c.wantErr && err == nil:
+				t.Errorf("chainlink with latestRoundData error %q (code %d) = %v, nil; want an error", c.msg, c.code, p)
+			case c.wantErr && errors.Is(err, errFeedNoData) != c.wantNoData:
+				t.Errorf("chainlink with latestRoundData error %q (code %d): errors.Is(%v, errFeedNoData) = %v, want %v", c.msg, c.code, err, !c.wantNoData, c.wantNoData)
+			case !c.wantErr && (err != nil || math.Abs(p-c.want) > 1e-9):
+				t.Errorf("chainlink with latestRoundData error %q (code %d) = %v, %v; want %v, nil", c.msg, c.code, p, err, c.want)
+			}
+			if c.wantErrText != "" && (err == nil || !strings.Contains(err.Error(), c.wantErrText)) {
+				t.Errorf("chainlink with latestRoundData error %q (code %d): error = %v, want it to contain %q", c.msg, c.code, err, c.wantErrText)
+			}
+			if got := o.noState.Load(); got != c.wantNoState {
+				t.Errorf("noState after latestRoundData error %q (code %d) = %v, want %v", c.msg, c.code, got, c.wantNoState)
+			}
+			// The next historical read asks the contract again unless the node
+			// said it has no state.
+			before := f.count["eth_call"]
+			_, _ = o.chainlink(ctx, feed, now-2*day) // only the eth_call count matters here
+			asked := f.count["eth_call"] > before
+			if asked == c.wantNoState {
+				t.Errorf("after latestRoundData error %q (code %d): next historical read called eth_call = %v, want %v", c.msg, c.code, asked, !c.wantNoState)
+			}
+		})
+	}
+}
+
 func TestLastLogBeforeHandlesRangeCaps(t *testing.T) {
 	f := newFakeChain(t, 20*24*time.Hour)
 	f.maxRange = 3000

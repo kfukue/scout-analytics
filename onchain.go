@@ -2521,7 +2521,7 @@ func (o *onchainSource) chainlink(ctx context.Context, feed string, block uint64
 			// later (not "no update", which would move on to the next source).
 			return 0, fmt.Errorf("chainlink %s at block %d: %w", feed, block, err)
 		}
-		stateErr = err // historical state unavailable (full node): use the feed's events
+		stateErr = err // no state at that block (full node), or a revert / no code: the feed's events
 	}
 	fi, err := o.feedAggregators(ctx, feed)
 	if err != nil {
@@ -2532,8 +2532,11 @@ func (o *onchainSource) chainlink(ctx context.Context, feed string, block uint64
 		return 0, fmt.Errorf("chainlink %s: %w", feed, err)
 	}
 	if best == nil || len(best.Topics) < 2 {
-		if stateErr != nil {
+		if isNoStateErr(stateErr) {
 			return 0, fmt.Errorf("chainlink %s: no historical state on this node (%v) and no AnswerUpdated event found before block %d: %w", feed, stateErr, block, errFeedNoData)
+		}
+		if stateErr != nil {
+			return 0, fmt.Errorf("chainlink %s: latestRoundData() failed at block %d (%v) and no AnswerUpdated event found before it: %w", feed, block, stateErr, errFeedNoData)
 		}
 		return 0, fmt.Errorf("chainlink %s: no AnswerUpdated event found before block %d: %w", feed, block, errFeedNoData)
 	}
@@ -2541,7 +2544,10 @@ func (o *onchainSource) chainlink(ctx context.Context, feed string, block uint64
 	if p <= 0 {
 		return 0, fmt.Errorf("chainlink %s: non-positive answer", feed)
 	}
-	if stateErr != nil && o.noState.CompareAndSwap(false, true) {
+	// Only the node's own "no state" answer switches every later historical
+	// read to the event logs (like ethFromPool); a revert or no code says
+	// nothing about the node.
+	if isNoStateErr(stateErr) && o.noState.CompareAndSwap(false, true) {
 		log.Printf("prices: node has no historical state (%v) — reading Chainlink/ETH prices from event logs instead", stateErr)
 	}
 	return p, nil
