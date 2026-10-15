@@ -70,7 +70,7 @@ type config struct {
 	NotifyChatID   string // chat id for NotifyBotToken
 
 	DeliverLevels  map[string]bool // gating verdict levels to deliver (default: clean,caution)
-	RedFlagMarkers []string        // lowercase substrings that mark a report as warning/red flag
+	RedFlagMarkers []string        // lowercase words/phrases that mark a report as warning/red flag (must start a word, "non-" before one cancels it: containsMarker)
 	SafePhrases    []string        // lowercase phrases stripped before marker matching ("no red flags")
 	Chains         map[string]bool
 
@@ -271,14 +271,15 @@ func caKey(ca string) string {
 }
 
 // classify returns (isFlagged, matchedMarker). The safe phrases are removed
-// first, with stripSafePhrase.
+// first, with stripSafePhrase; a marker must start a word and "non-" before one
+// cancels it (containsMarker).
 func classify(report string, markers, safe []string) (bool, string) {
 	t := strings.ToLower(report)
 	for _, p := range safe {
 		t = stripSafePhrase(t, p)
 	}
 	for _, m := range markers {
-		if strings.Contains(t, m) {
+		if containsMarker(t, m) {
 			return true, m
 		}
 	}
