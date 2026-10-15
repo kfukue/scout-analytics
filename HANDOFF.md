@@ -1,8 +1,48 @@
 # Scout analytics: handoff to Claude Code
 
-## Session state (14 Oct 2026, night PDT (15 Oct UTC): main 8d84415 after new-repo PRs #1-#8)
+## Session state (night of 14-15 Oct 2026 PDT (15 Oct UTC): main 062193c after new-repo PRs #1-#9)
 
-New-repo PR numbers. Everything below this section is older.
+New-repo PR numbers. Everything below this section is older; where the
+"14 Oct night" text below differs, this part wins.
+
+**Prod report 20261015-0554** (first with 7 seeds and the wallet variant):
+- Gates: 3d **PASS** (median pooled lift 2.10; seeds 1.71-2.27), 7d FAIL
+  (1.95; 1.79-2.03), 1d FAIL (1.12). The previous run had 7d PASS 2.02 and
+  3d FAIL 1.75: both sit on the line of 2, so which one passes is mostly
+  noise. So the site will mark 3d validated and 7d "n.v." for scores
+  from this model (inferred from the gates, not checked on the site).
+- The top 10 % still lose money on average (3d -7.2 % vs -44.7 % for all
+  calls; 7d -20.4 % vs -51.5 %). The saved 3d model's own test-part lift is
+  1.33 [0.71, 2.35]; the pooled pass leans on the weeks of 8 and 15 Sep.
+  Call volume keeps falling (41 calls in the week of 12 Oct).
+- Wallet reputation (full variant): does not pass in any bucket. Rule 1
+  fails (median lift below the baseline: 3d 2.06 vs 2.10, 7d 1.87 vs 1.95,
+  1d 1.10 vs 1.12) and rule 5 fails (drift AUC 0.975-0.984 vs 0.90). Since
+  rule 1 fails too, the lookback variant is not the next step.
+- Found: the rug prior `WREP_PRIOR_RUG` 0.15 was half the observed rug
+  rate (31.5 %), so wallets with a long history tended to count as bad.
+- Without dead calls, pooled lift is 2.54 (3d) / 2.24 (7d). The dead score
+  (AUC 0.93) would pass its proposed gate, but 136 of 148 dead calls in its
+  two biggest weeks were one uniswap_v4 wave: not adopted.
+- "raw dex + dex_family" at 7d: seed-7 pooled lift 2.34 vs 1.95 (single
+  seed only).
+
+**Owner decisions ("yes to both", night of 14-15 Oct PDT (15 Oct UTC)):** rug prior 0.30;
+run "raw dex + dex_family" across all 7 seeds. Recorded in the PM skill.
+
+**Open PRs (base `main`; tested locally only; nothing deployed):**
+- #10 `work/2026-10-14-wallet-quality-only` (71a6f24, reviewed PASS):
+  variant "wallet reputation, quality only" (option b) and
+  `WREP_PRIOR_RUG` 0.30 (report says it was changed after a result).
+- #11 `work/2026-10-15-dex-seed-variant` (21547b5, reviewed PASS),
+  stacked on #10 (merge #10 first): "raw dex + dex_family" in
+  `SEED_VARIANTS`.
+- This docs PR (independent of #10 and #11).
+
+**Owner's next steps:** merge the PRs (#10 before #11), then
+retrain on the server with `--variants` and send `report.md`.
+
+### Earlier the same night (before the report)
 
 **Merged in the new repo (14 Oct):**
 - #1 model without `calls_prev` inputs (`EXCLUDED_INPUTS`); the report
@@ -26,18 +66,13 @@ New-repo PR numbers. Everything below this section is older.
   no wrep_* in the top 3 drifting inputs with share >= 0.40). The saved
   model is byte-identical with or without live buys.
 
-**In progress (stopped when the session hit its limit; resume here):**
-- Worktree `wallet-quality-only-20261014`, branch
-  `work/2026-10-14-wallet-quality-only` (from 8d84415), UNCOMMITTED,
-  not yet tested or reviewed. Owner decision 14 Oct, option (b): a second
-  report-only variant "wallet reputation, quality only" = the wallet
-  variant minus the two coverage features (`wrep_n_known`,
-  `wrep_known_share`, which grow with calendar time), with the same
-  adoption rules, shown next to the full wallet variant. Files touched so
-  far: ml/README.md, ml/RUNBOOK.md, ml/scout_ml/config.py,
-  ml/scout_ml/report.py, ml/train.py, three test files. Next: have
-  `implement` finish it (run the full `pytest ml/tests` and a synthetic
-  `--variants --live-buys` run), then review, PR.
+**In progress then (done since: PR #10):**
+- Branch `work/2026-10-14-wallet-quality-only` (from 8d84415). Owner
+  decision 14 Oct, option (b): a second report-only variant "wallet
+  reputation, quality only" = the wallet variant minus the two coverage
+  features (`wrep_n_known`, `wrep_known_share`, which grow with calendar
+  time), with the same adoption rules, shown next to the full wallet
+  variant. Finished, reviewed and opened as PR #10.
 
 **Owner's next steps:**
 - After the (b) PR merges: retrain on the server with `--variants`
@@ -48,7 +83,7 @@ New-repo PR numbers. Everything below this section is older.
 - Optional (his files): `.claude/agents/review.md` line 27 and
   `.claude/agents/verify.md` lines 57-58 still say "scratchpad".
 
-**Model facts (latest prod report 20261014-2211, first without
+**Model facts (previous prod report 20261014-2211, first without
 calls_prev):** 7d PASS (median 2.02), 3d FAIL (1.75), 1d FAIL; drift AUC
 0.89-0.90 (was 0.99). The same settings moved by up to ±0.4 between two
 near-identical runs, hence the 7-seed gate. The top 10 % still lose

@@ -485,7 +485,7 @@ From the repo root on the server:
 
 Every Go start applies `scoutanalytics.sql` unless `SCOUT_DB_AUTO_MIGRATE=false`.
 
-## Owner decisions in force (8-14 October 2026)
+## Owner decisions in force (8-15 October 2026)
 
 - The `long` model waits for data (about 25 December) rather than loosening the
   threshold.
@@ -562,6 +562,15 @@ Every Go start applies `scoutanalytics.sql` unless `SCOUT_DB_AUTO_MIGRATE=false`
 - 14 Oct (owner): drained-pool outliers (an outcome above +100,000 %) are
   left out of the Analytics page as in the model's training (being
   implemented page-wide).
+- 14 Oct (owner): live-buy wallet reputation is tested as report-only
+  variants with adoption rules fixed before any result (`WREP_ADOPTION`):
+  the full variant and option (b) "wallet reputation, quality only"
+  (without the coverage inputs `wrep_n_known`, `wrep_known_share`). After
+  report 20261015-0554 ("yes to both", night of 14-15 Oct PDT (15 Oct
+  UTC)): `WREP_PRIOR_RUG` is 0.30, not 0.15 (reason in its comment in
+  `ml/scout_ml/config.py`). It was changed after seeing a result, so a
+  wallet variant's pass needs confirming on a later retrain. The variant
+  "raw dex + dex_family" is also run across all 7 seeds (`SEED_VARIANTS`).
 - 12 Oct: the PM has the `Bash` tool for git only: read-only git, `git fetch`
   and `git worktree add` to create worktrees for `implement`; never stash,
   switch, reset, rebase or merge (add, commit and push of its own `work/...`
