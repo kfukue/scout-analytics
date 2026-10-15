@@ -307,14 +307,15 @@ def test_make_live_buys_layout(small):
     assert (lb.groupby("call_id")["position"].min() == 1).all()
 
 
-# --- guard: not a model input yet ------------------------------------------------
+# --- guard: never an input of the saved model --------------------------------------
 
 def test_wrep_not_model_inputs():
-    """The saved model must not use the wallet-reputation columns until PR C
-    wires them in on purpose (in no variant either)."""
+    """The saved model never uses the wallet-reputation columns; only the
+    report-only C.WALLET_REP_VARIANTS add them (tests/test_wallet_wiring.py)."""
     assert len(C.WREP_FEATURES) == 8
     assert all(c.startswith(C.WREP_PREFIX) for c in C.WREP_FEATURES)
     assert not [c for c in C.FEATURES if c.startswith(C.WREP_PREFIX)]
     for name, knobs in C.VARIANTS.items():
         with C.overrides(**knobs):
-            assert not [c for c in C.FEATURES if c.startswith(C.WREP_PREFIX)], name
+            wrep = [c for c in C.FEATURES if c.startswith(C.WREP_PREFIX)]
+            assert wrep == (list(C.WREP_FEATURES) if name in C.WALLET_REP_VARIANTS else []), name

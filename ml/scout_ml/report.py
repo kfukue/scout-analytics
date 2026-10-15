@@ -399,7 +399,7 @@ def render(res: dict) -> str:
     if res.get("diagnostics"):
         out.append(diagnostics_section(res["diagnostics"], res["buckets"]))
     if res.get("variants"):
-        out.append(variants_section(res["variants"], res["buckets"]))
+        out.append(variants_section(res["variants"], res["buckets"], res.get("wallet_rep")))
     return "\n".join(out)
 
 
@@ -894,7 +894,10 @@ def _variant_time(v: dict) -> str:
     return text
 
 
-def variants_section(variants: dict, buckets: dict) -> str:
+def variants_section(variants: dict, buckets: dict, wallet_rep: dict | None = None) -> str:
+    """The variant comparison; `wallet_rep` (train.py's wallet reputation stats,
+    None without --live-buys) feeds the wallet reputation blocks, shown when a
+    C.WALLET_REP_VARIANTS entry is among the variants."""
     out = ["## Variant comparison (report only; not saved, not served)\n", VARIANT_NOTE + "\n",
            variant_read() + "\n"]
     times = [f"{n}: {_variant_time(v)}" for n, v in variants.items()
@@ -905,10 +908,14 @@ def variants_section(variants: dict, buckets: dict) -> str:
         out.append(f"### Bucket `{b}`\n")
         out.append(variant_table(variants, b))
     out.append(across_seeds_section(variants, buckets))
+    for name in C.WALLET_REP_VARIANTS:
+        if name in variants:
+            out.append(wallet_data_section(wallet_rep))
+            out.append(adoption_section(name, variants[name]))
     return "\n".join(out)
 
 
-ACROSS_SEEDS_TITLE = "### calls_prev variants across seeds (report only)\n"
+ACROSS_SEEDS_TITLE = "### Variants across seeds (report only)\n"
 
 
 def _across_lifts(lifts: dict, seeds) -> str:
@@ -931,6 +938,8 @@ def _across_cells(v: dict, b: str, seeds) -> list:
     acr = v.get("across_seeds") or {}
     if v.get("error") or acr.get("error"):
         return [v.get("error") or acr["error"]] + [""] * 6
+    if v.get("not_applicable"):
+        return [f"n/a: {v['not_applicable']}"] + [""] * 6
     a = (acr.get("buckets") or {}).get(b)
     if a is None or a.get("skipped"):
         return [f"n/a: {(a or {}).get('skipped', 'not trained')}"] + [""] * 6
@@ -945,15 +954,16 @@ def across_seeds_section(variants: dict, buckets: dict) -> str:
     per STABILITY_SEEDS seed, its median, the LGBM_SEED run's pooled numbers and
     the adversarial AUC of their inputs; '' when no variant has them."""
     names = [n for n, v in variants.items() if v.get("across_seeds") is not None
-             or (n in C.SEED_VARIANTS and v.get("error"))]
+             or (n in C.SEED_VARIANTS and (v.get("error") or v.get("not_applicable")))]
     if not any(n != "baseline" for n in names):
         return ""
     seeds = next((s for s in ((variants[n].get("across_seeds") or {}).get("seeds") for n in names)
                   if s), list(C.STABILITY_SEEDS))
     out = [ACROSS_SEEDS_TITLE,
-           "The baseline (the saved model) and the variants about calls_prev_1h / calls_prev_24h "
-           "(SEED_VARIANTS), each trained with every seed of STABILITY_SEEDS "
-           f"({', '.join(str(s) for s in seeds)}). The baseline's numbers are the gates' own (its "
+           "The baseline (the saved model) and the variants of SEED_VARIANTS, each trained "
+           f"with every seed of STABILITY_SEEDS ({', '.join(str(s) for s in seeds)}), so a "
+           "variant is compared with the baseline as the runner-lift gate would judge it, not "
+           "on one seed's luck. The baseline's numbers are the gates' own (its "
            "seed retrains and pooled walk-forward; nothing retrained). Pooled walk-forward lift "
            "per seed and their median are taken as the runner-lift gate takes them (median "
            "n/a unless every seed has a lift); the lift and simulation-difference intervals "
@@ -971,4 +981,125 @@ def across_seeds_section(variants: dict, buckets: dict) -> str:
                       f"pooled sim difference (%) [95%] (seed {C.LGBM_SEED})",
                       "adversarial AUC (train vs test)", "top drifting inputs (gain share)"],
                      rows))
+    return "\n".join(out)
+
+
+# --- Wallet reputation (report-only variant; config WALLET_REP, WREP_*) ---------
+
+WALLET_DATA_TITLE = "### Wallet reputation data (report only)\n"
+ADOPTION_TITLE = "### Wallet reputation: pre-registered adoption rules (report only)\n"
+
+
+def _pct(v) -> str:
+    return "n/a" if v is None or (isinstance(v, float) and math.isnan(v)) else f"{v:.1%}"
+
+
+def wallet_data_section(st) -> str:
+    """The wallet reputation inputs (train.wallet_rep_data stats): counts, the
+    observed 7 d runner / rug rates next to the fixed priors, and the coverage
+    per week."""
+    out = [WALLET_DATA_TITLE]
+    if not isinstance(st, dict):
+        out.append("No live buys given (`train.py --live-buys PATH`; `run_training.sh --variants` "
+                   "exports them with the Go program's `-export-live-buys` when it has that "
+                   "flag), so the wallet reputation variant is n/a.\n")
+        return "\n".join(out)
+    if st.get("error"):
+        out.append(f"**Not computed: {st['error']}.** The wallet reputation variant is n/a; "
+                   "nothing else in this report is affected.\n")
+        return "\n".join(out)
+    out.append(
+        f"{st['live_buy_rows']} live buys of {st['wallets']} distinct wallets on "
+        f"{st['calls_with_live_buys']} calls ({st['rows']} rows in the export); "
+        f"{st['eligible_history']} first calls with a 7 d outcome form the history "
+        f"({st['extreme_dropped']} more left out for a ret_late_7d above {MAX_OUTCOME_PCT:g} %). "
+        f"Computed in {st['seconds']:.0f} s. A wallet's history counts only outcomes known "
+        f"{C.WREP_KNOWN_LAG_HOURS} h after they were due and before the call, never the call's "
+        "own token" + (f", and only the last {C.WREP_LOOKBACK_DAYS} days"
+                       if C.WREP_LOOKBACK_DAYS is not None else "") + ".\n")
+    out.append(table(["7 d outcome of the history calls", "observed rate", "fixed prior (WREP_PRIOR_*)"],
+                     [["runner (medium runner rule, net of tax)", _pct(st.get("y_run_rate")),
+                       _pct(C.WREP_PRIOR_RUNNER)],
+                      [f"rug (raw ret_late_7d <= {C.WREP_RUG_PCT:g} %)", _pct(st.get("y_rug_rate")),
+                       _pct(C.WREP_PRIOR_RUG)]]))
+    out.append("Lifts are the smoothed rates divided by these fixed priors (fixed on purpose: a "
+               "running rate would be a calendar proxy). A prior far from the observed rate moves "
+               "every lift, and so the good / bad shares, which compare lifts with "
+               f"WREP_GOOD_LIFT ({C.WREP_GOOD_LIFT:g}) / WREP_BAD_LIFT ({C.WREP_BAD_LIFT:g}).\n")
+    weeks = st.get("weeks") or []
+    if weeks:
+        out.append("Coverage per week (Monday, UTC) over the calls training can use: calls with "
+                   "live buys, and among them the share with at least one wallet with history "
+                   "and the mean wrep_known_share (it should ramp up as history builds).\n")
+        out.append(table(["week", "calls", "calls with live buys", "share with >= 1 known wallet",
+                          "mean wrep_known_share"],
+                         [[w["week"], w["calls"], w["with_live_buys"], _pct(w["share_known"]),
+                           fmt(w["known_share_mean"])] for w in weeks]))
+    return "\n".join(out)
+
+
+def adoption_rules_text() -> str:
+    """The pre-registered adoption rules (C.WREP_ADOPTION), as fixed before any result."""
+    r = C.WREP_ADOPTION
+    return (
+        f"Fixed on {C.WREP_ADOPTION_SET_ON}, before any result. The variant passes in a bucket "
+        "only if ALL hold (report only: never a gate of the saved model, which never uses "
+        "wrep_* inputs):\n\n"
+        f"1. median lift: its across-seeds median pooled walk-forward lift >= "
+        f"{r['min_median_lift']:g} and >= the baseline's median;\n"
+        f"2. lift lower end: the seed {C.LGBM_SEED} pooled lift's 95% lower end > "
+        f"{r['min_lift_lower']:g};\n"
+        f"3. sim lower end: the pooled simulation difference's 95% lower end > "
+        f"{r['min_sim_diff_lower']:g};\n"
+        f"4. collapses removed >= {r['min_collapse_removed']:.0%} in the variant's row;\n"
+        f"5. drift: its adversarial AUC at most {r['max_adv_auc_rise']:g} above the baseline's, "
+        f"and no wrep_* input among the top {r['drift_top']} drifting inputs with a gain share "
+        f">= {r['drift_max_share']:.2f}.\n\n"
+        "An undefined value (n/a) does not hold. If only rule 5 fails, the next step is a "
+        "lookback variant (WREP_LOOKBACK_DAYS), not adoption.\n")
+
+
+def _holds(rule: dict, text: str) -> str:
+    h = rule.get("holds")
+    return f"{'n/a' if h is None else 'holds' if h else 'fails'}: {text}"
+
+
+ADOPTION_RESULT = {"pass": "PASS (all rules hold)",
+                   "lookback": "not adopted; next step: a lookback variant (WREP_LOOKBACK_DAYS)",
+                   "fail": "does not pass"}
+
+
+def adoption_cells(a: dict) -> list:
+    """The cells of one bucket of the adoption table (train.adoption_bucket)."""
+    r = a["rules"]
+    d = r["drift"]
+    top = ", ".join(f"{f} {g:.2f}" for f, g in d.get("wrep_top") or [])
+    return [_holds(r["median_lift"], f"{fmt(r['median_lift'].get('variant'), 2)} vs baseline "
+                                     f"{fmt(r['median_lift'].get('baseline'), 2)}"),
+            _holds(r["lift_lower"], fmt(r["lift_lower"].get("value"), 2)),
+            _holds(r["sim_lower"], _signed(r["sim_lower"].get("value"))),
+            _holds(r["collapse_removed"], _pct(r["collapse_removed"].get("value"))),
+            _holds(d, f"AUC {fmt(d.get('variant'))} vs baseline {fmt(d.get('baseline'))}"
+                      + (f"; wrep_* in the top: {top}" if top else "")),
+            ADOPTION_RESULT[a["result"]]]
+
+
+def adoption_section(name: str, v: dict) -> str:
+    """The pre-registered adoption rules and, when the variant ran, per bucket
+    whether each holds (the variant's "adoption", train.wallet_adoption)."""
+    out = [ADOPTION_TITLE, adoption_rules_text()]
+    ad = v.get("adoption")
+    why = (v.get("error") or (f"n/a: {v['not_applicable']}" if v.get("not_applicable") else None)
+           or (ad or {}).get("error") or (None if ad else "not evaluated"))
+    if why:
+        out.append(f"Not evaluated for `{name}`: {why}.\n")
+        return "\n".join(out)
+    rows = []
+    for b, a in (ad.get("buckets") or {}).items():
+        if a.get("not_applicable"):
+            rows.append([b, f"n/a: {a['not_applicable']}"] + [""] * 5)
+        else:
+            rows.append([b, *adoption_cells(a)])
+    out.append(table(["bucket", "1. median lift", "2. lift lower end", "3. sim lower end (%)",
+                      "4. collapses removed", "5. drift", "result"], rows))
     return "\n".join(out)

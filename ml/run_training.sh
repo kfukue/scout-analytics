@@ -21,13 +21,16 @@
 #                    (a relative PATH is taken from the directory you start in)
 #   --variants       also train the one-change variants (train.py --variants) and
 #                    compare them at the end of report.md; report only, the saved
-#                    model is the baseline. About 6 times the train time.
+#                    model is the baseline. About 6 times the train time. Also
+#                    exports the live buys (step 4b, -export-live-buys) for the
+#                    report-only wallet reputation variant, when the Go program
+#                    has that flag (else a WARNING, and that variant is n/a).
 #   -h, --help       show this help
 #
 # It never connects to the database itself, never prints .env (it only counts
-# SCOUT_MODEL_URL lines in it), and always deletes $ML/data/calls.csv when it
-# exits (success, error or Ctrl+C). It does not start serve.py and does not
-# set SCOUT_MODEL_URL.
+# SCOUT_MODEL_URL lines in it), and always deletes $ML/data/calls.csv (and
+# $ML/data/live_buys.csv) when it exits (success, error or Ctrl+C). It does
+# not start serve.py and does not set SCOUT_MODEL_URL.
 
 set -euo pipefail
 # umask 077 is set just before step 4 (the export), not here: step 1 writes
@@ -39,12 +42,13 @@ usage() {  # the header comment above, up to the first non-comment line
 
 SKIP_INSTALL=0
 BINARY=""
+VARIANTS=0
 TRAIN_ARGS=()   # extra train.py arguments
 while [ $# -gt 0 ]; do
     case "$1" in
         -h|--help) usage; exit 0 ;;
         --skip-install) SKIP_INSTALL=1; shift ;;
-        --variants) TRAIN_ARGS+=(--variants); shift ;;
+        --variants) TRAIN_ARGS+=(--variants); VARIANTS=1; shift ;;
         --binary)
             [ $# -ge 2 ] || { echo "run_training.sh: --binary needs a path" >&2; exit 2; }
             BINARY="$2"; shift 2 ;;
@@ -56,11 +60,12 @@ done
 # ---------------------------------------------------------------------------
 # failure handling: one line saying which step failed; when a logged command
 # failed, also the last 20 lines of its output (never the CSV or .env).
-# The CSV is always removed.
+# The CSVs are always removed.
 STEP="setup"
 LOG=""          # output log of the running step, shown on failure
 DIED=0          # set by die(): message already printed
 CSV=""
+LIVE_CSV=""     # live buys (step 4b, --variants only)
 
 die() {
     DIED=1
@@ -75,6 +80,11 @@ on_exit() {
     if [ -n "$CSV" ]; then
         [ ! -e "$CSV" ] || had_csv=1
         rm -f "$CSV"
+    fi
+    if [ -n "$LIVE_CSV" ]; then
+        rm -f "$LIVE_CSV"
+        [ ! -e "$LIVE_CSV" ] \
+            || echo "WARNING: could not delete ${LIVE_CSV}; delete it by hand: rm -f \"${LIVE_CSV}\"" >&2
     fi
     if [ "$rc" -ne 0 ] && [ "$DIED" -eq 0 ]; then
         echo >&2
@@ -181,6 +191,7 @@ mkdir -p "$ML"
 mkdir -p "$ML/logs"
 chmod 700 "$ML/logs"   # logs are created before umask 077; keep them private
 CSV="$ML/data/calls.csv"
+LIVE_CSV="$ML/data/live_buys.csv"
 VENV_PY="$ML/venv/bin/python"
 
 if [ -n "$BINARY" ]; then
@@ -194,8 +205,8 @@ fi
 echo "REPO=$REPO"
 echo "ML=$ML"
 
-# a CSV left behind by a run that was killed with SIGKILL
-rm -f "$CSV"
+# CSVs left behind by a run that was killed with SIGKILL
+rm -f "$CSV" "$LIVE_CSV"
 
 # ---------------------------------------------------------------------------
 STEP="1 (get the ml/ code)"; LOG=""
@@ -337,6 +348,39 @@ case ",${CSV_HEADER}," in
 esac
 
 # ---------------------------------------------------------------------------
+# step 4b (--variants only): the live buys, for the report-only wallet
+# reputation variant. Never stops the run: without them that variant is n/a.
+if [ "$VARIANTS" -eq 1 ]; then
+    STEP="4b (export the live buys)"; LOG=""
+    echo
+    echo "== Step 4b: export the live buys to $LIVE_CSV (for the wallet reputation variant)"
+    cd "$REPO"
+    if [ -n "$BINARY" ]; then
+        EXPORT_CMD=("$BINARY")
+    else
+        EXPORT_CMD=(go run .)
+    fi
+    # the flag list (-h) captured first: under pipefail, `-h | grep -q` can fail
+    # on the program's exit code or SIGPIPE even when the flag is there
+    flag_help="$(env SCOUT_DB_AUTO_MIGRATE=false "${EXPORT_CMD[@]}" -h 2>&1 || true)"
+    case "$flag_help" in
+        *export-live-buys*)
+            if run_logged step4b-live-buys env SCOUT_DB_AUTO_MIGRATE=false "${EXPORT_CMD[@]}" -export-live-buys "$LIVE_CSV" \
+                    && [ -s "$LIVE_CSV" ]; then
+                echo "live buys CSV has $(wc -l < "$LIVE_CSV" | tr -d ' ') lines (header included; not shown)"
+                TRAIN_ARGS+=(--live-buys "$LIVE_CSV")
+            else
+                rm -f "$LIVE_CSV"
+                echo "WARNING: the live-buys export failed (see $ML/logs/step4b-live-buys.log); training continues" >&2
+                echo "         without it, so the wallet reputation variant is n/a in the report." >&2
+            fi ;;
+        *)
+            echo "WARNING: this Go program has no -export-live-buys flag (an older binary or checkout); training" >&2
+            echo "         continues without the live buys, so the wallet reputation variant is n/a in the report." >&2 ;;
+    esac
+fi
+
+# ---------------------------------------------------------------------------
 STEP="5 (train)"; LOG=""
 echo
 echo "== Step 5: train"
@@ -352,9 +396,11 @@ TRAIN_SECONDS=$((t1 - t0))
 STEP="6 (delete the CSV)"; LOG=""
 echo
 echo "== Step 6: delete the CSV"
-rm -f "$CSV"
+rm -f "$CSV" "$LIVE_CSV"
 [ ! -e "$CSV" ] || die "could not delete $CSV; delete it by hand"
+[ ! -e "$LIVE_CSV" ] || die "could not delete $LIVE_CSV; delete it by hand"
 echo "deleted $CSV"
+[ "$VARIANTS" -eq 0 ] || echo "deleted $LIVE_CSV (if it was written)"
 
 # ---------------------------------------------------------------------------
 STEP="report"; LOG=""
