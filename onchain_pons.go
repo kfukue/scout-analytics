@@ -164,49 +164,90 @@ func curveTrade(l rpcLog, quoteDec int) (buy bool, vol float64, ok bool) {
 }
 
 // isRevertOrNoCode: an eth_call that reverted (JSON-RPC code 3 or a "revert"
-// text) or hit an address without code (an empty result), as opposed to a
-// node that could not answer (no historical state, busy, any other error).
+// text), failed in the EVM (isEVMFailure: invalid opcode, invalid jump, stack
+// underflow, out of gas) or hit an address without code (an empty result), as
+// opposed to a node that could not answer (no historical state, busy, any
+// other error).
 func isRevertOrNoCode(err error) bool {
-	return errors.Is(err, errEmptyResult) || isRevert(err)
+	return errors.Is(err, errEmptyResult) || isRevert(err) || isEVMFailure(err)
+}
+
+// isEVMFailure: a JSON-RPC error whose message is one of noSuchValueTexts (the
+// contract refused or failed the call: "invalid opcode: INVALID", "out of
+// gas", …), the contract's own answer just like a revert. "revert" is in that
+// list too, overlapping isRevert on purpose; isRevert also covers code 3. These
+// texts come from the EVM, not from a revert reason, so no busy-word check is
+// needed. Unlike isNoSuchValue, the node's "no state" texts do not count.
+func isEVMFailure(err error) bool {
+	var re *rpcError
+	if !errors.As(err, &re) {
+		return false
+	}
+	msg := strings.ToLower(re.Message)
+	for _, s := range noSuchValueTexts {
+		if strings.Contains(msg, s) {
+			return true
+		}
+	}
+	return false
+}
+
+// ponsCallErr sorts the error of an eth_call that asks whether a token or an
+// address is Pons V2 (curve(), factory(), token(), pairToken() at block
+// latest). nil: the contract answered (it reverted, failed in the EVM or
+// returned nothing, isRevertOrNoCode), i.e. it is not a Pons token or curve.
+// Any other error (a busy or rate limiting node, a time-out, "header not
+// found", an internal error, no state, a transport error) says nothing about
+// the contract: it is returned, wrapped with the call and the address, so
+// discovery fails and the call is tried again later, never read as "not a
+// Pons token".
+func ponsCallErr(err error, call, addr string) error {
+	if err == nil || isRevertOrNoCode(err) {
+		return nil
+	}
+	return fmt.Errorf("pons %s of %s: %w", call, addr, err)
 }
 
 // ponsCurveFor checks whether curve is the Pons V2 curve of token (factory()
 // is the configured Pons factory and token() is the token) and returns its
-// quote asset. ok is false when it is not; err only for node trouble.
+// quote asset. ok is false when the curve answers that it is not; err when the
+// node could not answer (ponsCallErr).
 func (o *onchainSource) ponsCurveFor(ctx context.Context, token, curve string) (quote string, ok bool, err error) {
 	if o.cfg.PonsFactory == "" || curve == zeroAddr {
 		return "", false, nil
 	}
 	fb, err := o.rpc.ethCall(ctx, curve, selPonsFactory, 0)
 	if err != nil {
-		return "", false, nonRPC(err)
+		return "", false, ponsCallErr(err, "factory()", curve)
 	}
 	if addrFromWord(fb) != o.cfg.PonsFactory {
 		return "", false, nil
 	}
 	tb, err := o.rpc.ethCall(ctx, curve, selPonsToken, 0)
 	if err != nil {
-		return "", false, nonRPC(err)
+		return "", false, ponsCallErr(err, "token()", curve)
 	}
 	if addrFromWord(tb) != token {
 		return "", false, nil
 	}
 	pb, err := o.rpc.ethCall(ctx, curve, selPonsPairToken, 0)
 	if err != nil {
-		return "", false, nonRPC(err)
+		return "", false, ponsCallErr(err, "pairToken()", curve)
 	}
 	return addrFromWord(pb), true, nil
 }
 
 // ponsCurveOfToken asks the token for its curve (PonsV2LauncherToken.curve())
-// and checks it. "" = not a Pons V2 token (or the token has no such getter).
+// and checks it. "" = not a Pons V2 token (or the token has no such getter);
+// err when the node could not answer (ponsCallErr): the caller tries again
+// later.
 func (o *onchainSource) ponsCurveOfToken(ctx context.Context, token string) (curve, quote string, err error) {
 	if o.cfg.PonsFactory == "" {
 		return "", "", nil
 	}
 	b, err := o.rpc.ethCall(ctx, token, selPonsCurve, 0)
 	if err != nil {
-		return "", "", nonRPC(err)
+		return "", "", ponsCallErr(err, "curve()", token)
 	}
 	curve = addrFromWord(b)
 	q, ok, err := o.ponsCurveFor(ctx, token, curve)
@@ -216,9 +257,10 @@ func (o *onchainSource) ponsCurveOfToken(ctx context.Context, token string) (cur
 	return curve, q, nil
 }
 
-// ponsGraduatedAt reads curve.graduated() at a block (0 = latest). A revert
-// or no code there (the curve did not exist yet) is false; any other error
-// (e.g. no historical state on a full node) is returned.
+// ponsGraduatedAt reads curve.graduated() at a block (0 = latest). A revert,
+// an EVM failure or no code there (the curve did not exist yet;
+// isRevertOrNoCode) is false; any other error (e.g. no historical state on a
+// full node) is returned.
 func (o *onchainSource) ponsGraduatedAt(ctx context.Context, curve string, block uint64) (bool, error) {
 	b, err := o.rpc.ethCall(ctx, curve, selPonsGraduated, block)
 	if err != nil {
