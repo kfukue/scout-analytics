@@ -268,8 +268,9 @@ OPTIONAL_DERIVED = [CALLS_PREV_BURST]
 # Not inputs of the saved model: with WALLET_REP = False (the default, which
 # train.py enforces) these names are NOT in FEATURES / NUMERIC_FEATURES, so the
 # saved model cannot use them (serving cannot compute them yet). They are
-# inputs only in the report-only variant "wallet reputation (wrep_*)"
-# (WALLET_REP = True), which train.py runs with --variants --live-buys PATH.
+# inputs only in the report-only WALLET_REP_VARIANTS "wallet reputation (wrep_*)"
+# and "wallet reputation, quality only" (WALLET_REP = True), which train.py runs
+# with --variants --live-buys PATH.
 # The three shares are in NO_LOG; the count and the lifts are log1p-scaled by
 # the logistic baseline.
 WALLET_REP = False                     # a VARIANT_KNOB: True appends WREP_FEATURES to the numeric inputs
@@ -281,14 +282,38 @@ WREP_FEATURES = ("wrep_n_known", "wrep_known_share",                # how many o
 WREP_KNOWN_LAG_HOURS = 6               # the 7 d outcome counts as known this long after it is due (tracker delay)
 WREP_RUG_PCT = -90.0                   # raw ret_late_7d at or below this is a rug (rugged / rug_at are set later: never read)
 WREP_PRIOR_RUNNER = 0.05               # fixed prior runner rate, not a running rate (a running rate would be a calendar proxy)
-WREP_PRIOR_RUG = 0.15                  # fixed prior rug rate, for the same reason
+# Fixed prior rug rate, for the same reason. 0.15 until 14 Oct 2026; raised to
+# 0.30 then (owner decision), AFTER seeing a result: the first prod report with
+# the wallet variants (model 20261015-0554) showed an observed rug rate (raw
+# ret_late_7d <= WREP_RUG_PCT) of 31.5 % in the wallet history. With 0.15 (and
+# WREP_PRIOR_STRENGTH 20) a wallet at that average rug rate had a rug lift of
+# 1.22 at 5 known calls, crossed WREP_BAD_LIFT (1.5) from about 17 known calls
+# (1.55 at 20) and tended to 2.1, so wallets with a long history tended to count
+# as bad, and history length grows with calendar time. Because it was set after
+# a result, a variant pass needs confirming on a later retrain. The report says
+# so (WREP_PRIOR_RUG_NOTE).
+WREP_PRIOR_RUG = 0.30
+WREP_PRIOR_RUG_NOTE = ("The rug prior was raised from 0.15 to 0.30 on 14 Oct 2026, after report "
+                       "20261015-0554 (observed rug rate 31.5 %): a change made after seeing a "
+                       "result, so a wallet variant passing its adoption rules needs confirming "
+                       "on a later retrain.")
 WREP_PRIOR_STRENGTH = 20               # pseudo-calls behind each prior: few calls barely move a wallet off it
-WREP_MIN_CALLS = 5                     # a wallet needs this many known calls to count as good or bad
+# A wallet needs this many known calls to count as good or bad. On the bad side
+# the smoothing, not this minimum, sets the floor: with WREP_PRIOR_RUG 0.30 and
+# strength 20 an all-rug wallet has a rug lift of 1.47 at 5 known calls and
+# reaches WREP_BAD_LIFT (1.5) only from 6, and in the long run "bad" means a rug
+# rate of at least 45 % (1.5 x 0.30).
+WREP_MIN_CALLS = 5
 WREP_GOOD_LIFT = 2.0                   # good wallet: runner lift at least this
 WREP_BAD_LIFT = 1.5                    # bad wallet: rug lift at least this
 WREP_LOOKBACK_DAYS = None              # None = all history; N = only outcomes known in the N days before the call
 WREP_SHARES = ("wrep_known_share", "wrep_good_share", "wrep_bad_share")   # bounded 0..1: in NO_LOG
-# Pre-registered adoption rules of the wallet reputation variant (fixed on
+# The two coverage inputs (how many of C's wallets have history). They grow with
+# calendar time as the history builds up from August 2026, so they act as a time
+# proxy; the variant "wallet reputation, quality only" leaves them out (owner
+# decision 14 Oct 2026, "option b") and keeps the six quality inputs.
+WREP_COVERAGE = ("wrep_n_known", "wrep_known_share")
+# Pre-registered adoption rules of each wallet reputation variant (fixed on
 # 14 Oct 2026, before any result; report only, never a gate of the saved model).
 # The variant passes in a bucket only if ALL hold: (1) its across-seeds median
 # pooled walk-forward lift >= min_median_lift AND >= the baseline's median;
@@ -492,9 +517,10 @@ LIFT_CI_Z = 1.96
 
 # --- Variant comparison (train.py --variants) --------------------------------
 # Each variant changes exactly ONE knob from the configured (baseline) values
-# above. They are trained and reported only: never saved, never served, never
-# the gates of the saved model (that is always the baseline). "baseline" reuses
-# the results of the saved model. Knobs: VARIANT_KNOBS.
+# above (except "wallet reputation, quality only": two, see below). They are
+# trained and reported only: never saved, never served, never the gates of the
+# saved model (that is always the baseline). "baseline" reuses the results of
+# the saved model. Knobs: VARIANT_KNOBS.
 VARIANT_KNOBS = ("DEAD_IS_COLLAPSE", "DEAD_TRADES_24H", "DEX_INPUTS", "RUNNER_NEEDS_TRADES",
                  "LGBM_REGULARISATION", "LGBM_SEED", "EXCLUDED_INPUTS", "CALLS_PREV_INPUTS",
                  "WALLET_REP")
@@ -513,18 +539,26 @@ VARIANTS = {
     # the live-buy wallet reputation test (owner-approved, report only): WREP_FEATURES
     # added to the inputs; needs train.py --live-buys (WALLET_REP_VARIANTS)
     "wallet reputation (wrep_*)": {"WALLET_REP": True},
+    # the same without the two coverage inputs (WREP_COVERAGE, a time proxy; owner
+    # decision 14 Oct 2026): the one variant that changes two knobs, as the
+    # coverage names are inputs only with WALLET_REP on. Keeps the default
+    # calls_prev exclusion.
+    "wallet reputation, quality only": {"WALLET_REP": True,
+                                        "EXCLUDED_INPUTS": EXCLUDED_INPUTS + WREP_COVERAGE},
 }
 # Variants also retrained with the other STABILITY_SEEDS for the report-only
 # table "Variants across seeds" (ml/README.md). Never a gate; about one normal
 # training per extra seed and variant; empty it to skip the table.
-SEED_VARIANTS = ("with calls_prev counts (default before 14 Oct)", "wallet reputation (wrep_*)")
+SEED_VARIANTS = ("with calls_prev counts (default before 14 Oct)", "wallet reputation (wrep_*)",
+                 "wallet reputation, quality only")
 # Variants that only differ from the baseline through trades_24h: not applicable
 # when the export has no trades_24h column.
 TRADES_VARIANTS = ("dead rule on (collapse OR dead)", "runners must be tradeable")
 # Variants that need the wrep_* columns (train.py --live-buys): not applicable
 # when the variants' data has none (no live buys given, or their wallet
-# reputation failed); their pre-registered adoption rules are WREP_ADOPTION.
-WALLET_REP_VARIANTS = ("wallet reputation (wrep_*)",)
+# reputation failed); their pre-registered adoption rules are WREP_ADOPTION
+# (the same rules for each, each judged against the same baseline).
+WALLET_REP_VARIANTS = ("wallet reputation (wrep_*)", "wallet reputation, quality only")
 
 # --- Stability diagnostics ---------------------------------------------------------
 # Extra sections at the end of report.md (before the variant comparison) to

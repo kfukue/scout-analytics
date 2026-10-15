@@ -16,6 +16,9 @@ from scout_ml.features import assert_no_leakage, build_features
 from scout_ml.model import fit_baseline
 
 WALLET = "wallet reputation (wrep_*)"
+QUALITY = "wallet reputation, quality only"
+QUALITY_INPUTS = ["wrep_runner_lift_mean", "wrep_runner_lift_max", "wrep_rug_lift_mean",
+                  "wrep_rug_lift_max", "wrep_good_share", "wrep_bad_share"]
 SHARES = {"wrep_known_share", "wrep_good_share", "wrep_bad_share"}
 
 
@@ -25,7 +28,8 @@ def test_default_is_off_and_the_saved_inputs_have_no_wrep():
     assert C.WALLET_REP is False and "WALLET_REP" in C.VARIANT_KNOBS
     assert not [c for c in C.FEATURES if c.startswith(C.WREP_PREFIX)]
     assert C.VARIANTS[WALLET] == {"WALLET_REP": True}
-    assert C.WALLET_REP_VARIANTS == (WALLET,) and WALLET in C.SEED_VARIANTS
+    assert C.WALLET_REP_VARIANTS == (WALLET, QUALITY)
+    assert WALLET in C.SEED_VARIANTS and QUALITY in C.SEED_VARIANTS
     assert set(C.WREP_SHARES) == SHARES and SHARES <= C.NO_LOG
     assert not (set(C.WREP_FEATURES) - SHARES) & C.NO_LOG          # count and lifts: log1p
 
@@ -48,6 +52,23 @@ def test_the_variant_adds_wrep_also_in_a_nested_seed_override(synthetic_df):
         assert (X["wrep_n_known"] == 2.0).all() and X["wrep_runner_lift_max"].isna().all()
         fit_baseline(X, (np.arange(len(X)) % 3 == 0).astype(int))   # the logistic follows
     assert (list(C.FEATURES), list(C.NUMERIC_FEATURES), list(C.LOG1P_FEATURES)) == before
+
+
+def test_quality_only_variant_has_the_six_quality_inputs_and_no_coverage(synthetic_df):
+    assert C.WREP_COVERAGE == ("wrep_n_known", "wrep_known_share")
+    assert [c for c in C.WREP_FEATURES if c not in C.WREP_COVERAGE] == QUALITY_INPUTS
+    base = C.numeric_inputs(C.EXCLUDED_INPUTS)                 # the baseline's numeric inputs
+    banned = set(C.WREP_COVERAGE) | set(C.CALLS_PREV_RAW)
+    with C.overrides(**C.VARIANTS[QUALITY]):
+        assert C.NUMERIC_FEATURES == base + QUALITY_INPUTS
+        assert not banned & set(C.FEATURES)
+        assert set(C.LOG1P_FEATURES) - set(base) == {c for c in QUALITY_INPUTS if "lift" in c}
+        assert_no_leakage(C.FEATURES)
+        with C.overrides(LGBM_SEED=11):                       # its seed retrains keep it
+            assert C.NUMERIC_FEATURES == base + QUALITY_INPUTS
+        X = build_features(synthetic_df.head(100).assign(wrep_n_known=2.0), {})
+        assert list(X.columns) == C.FEATURES and "wrep_n_known" not in X.columns
+    assert C.NUMERIC_FEATURES == base                         # restored
 
 
 def test_excluded_inputs_may_name_wrep_columns():
@@ -143,10 +164,32 @@ def test_wallet_adoption_per_bucket_and_not_applicable():
     assert out["buckets"]["short"]["result"] == "pass"
     assert out["buckets"]["medium"] == {"not_applicable": "too few"}
     assert out["buckets"]["3day"] == {"not_applicable": "no across-seeds row"}
-    text = R.adoption_section(WALLET, {**variants[WALLET], "adoption": out})
-    assert "| short | holds: 2.30 vs baseline 2.10 | holds: 1.20 |" in text
-    assert "| PASS (all rules hold) |" in text and "| medium | n/a: too few |" in text
+    text = R.adoption_section({WALLET: {**variants[WALLET], "adoption": out}})
+    assert f"| short | {WALLET} | holds: 2.30 vs baseline 2.10 | holds: 1.20 |" in text
+    assert "| PASS (all rules hold) |" in text and f"| medium | {WALLET} | n/a: too few |" in text
     assert "| holds: 45.0% |" in text                         # rule 4 as a percentage, as "40%"
+
+
+def test_adoption_is_computed_per_wallet_variant_against_the_same_baseline():
+    base, var, summary = _rows()
+    _, weak, _ = _rows(v_median=1.8)                          # below 2: rule 1 fails
+    variants = {"baseline": {"across_seeds": {"buckets": {"short": base}}},
+                WALLET: {"buckets": {"short": summary}, "across_seeds": {"buckets": {"short": var}}},
+                QUALITY: {"buckets": {"short": summary},
+                          "across_seeds": {"buckets": {"short": weak}}},
+                "other": {"buckets": {"short": summary}, "across_seeds": {"buckets": {"short": var}}}}
+    train_mod.add_wallet_adoption(variants)
+    assert "adoption" not in variants["other"]                # only the C.WALLET_REP_VARIANTS
+    assert variants[WALLET]["adoption"]["buckets"]["short"]["result"] == "pass"
+    q = variants[QUALITY]["adoption"]["buckets"]["short"]
+    assert q["result"] == "fail" and q["rules"]["median_lift"]["baseline"] == 2.1
+    text = R.adoption_section({n: variants[n] for n in C.WALLET_REP_VARIANTS})
+    assert text.count(R.ADOPTION_TITLE) == 1 and text.count("Fixed on 14 Oct 2026") == 1
+    assert "| bucket | variant | 1. median lift | 2. lift lower end |" in text
+    lines = [ln for ln in text.splitlines() if ln.startswith("| short |")]
+    assert [ln.split(" | ")[1] for ln in lines] == [WALLET, QUALITY]   # next to each other
+    assert f"| short | {QUALITY} | fails: 1.80 vs baseline 2.10 |" in text
+    assert "| does not pass |" in text and "| PASS (all rules hold) |" in text
 
 
 def test_drift_rule_reads_drift_top_inputs(monkeypatch):
@@ -175,12 +218,17 @@ def test_wrep_not_applicable_reasons():
 
 def test_report_blocks_without_live_buys_or_after_an_error():
     na = {"changes": {"WALLET_REP": True}, "not_applicable": train_mod.WREP_NOT_APPLICABLE}
-    text = R.variants_section({"baseline": {"changes": {}}, WALLET: na}, {})
-    assert R.WALLET_DATA_TITLE in text and "No live buys given" in text
-    assert R.ADOPTION_TITLE in text and "Fixed on 14 Oct 2026, before any result" in text
-    assert f"Not evaluated for `{WALLET}`: n/a: no live-buy wallet data" in text
+    text = R.variants_section({"baseline": {"changes": {}}, WALLET: na, QUALITY: na}, {})
+    assert text.count(R.WALLET_DATA_TITLE) == 1 and "No live buys given" in text
+    assert text.count(R.ADOPTION_TITLE) == 1 and "Fixed on 14 Oct 2026, before any result" in text
+    for name in (WALLET, QUALITY):
+        assert f"Not evaluated for `{name}`: n/a: no live-buy wallet data" in text
+    assert "| bucket | variant | 1. median lift |" not in text   # no table without results
+    # the adoption rules point to the rug prior note: it is there without live buys too
+    assert text.count(C.WREP_PRIOR_RUG_NOTE) == 1 and "rug prior was changed afterwards" in text
     text = R.wallet_data_section({"error": "error: FileNotFoundError: x", "seconds": 0.0})
     assert "**Not computed: error: FileNotFoundError: x.**" in text
+    assert C.WREP_PRIOR_RUG_NOTE in text
     # without the wallet variant (e.g. VARIANTS trimmed) there is no wallet block
     assert R.WALLET_DATA_TITLE not in R.variants_section({"baseline": {"changes": {}}}, {})
 
@@ -191,10 +239,10 @@ def test_report_blocks_without_live_buys_or_after_an_error():
 def wallet_runs(tmp_path_factory):
     """make_synthetic's CLI writes calls + live buys; train.py's CLI then runs
     --variants without and with --live-buys, and once with --live-buys but no
-    --variants (short and medium buckets, baseline + the wallet variant)."""
+    --variants (short and medium buckets, baseline + both wallet variants)."""
     mp = pytest.MonkeyPatch()
     mp.setattr(C, "BUCKETS", {b: C.BUCKETS[b] for b in ("short", "medium")})
-    mp.setattr(C, "VARIANTS", {k: C.VARIANTS[k] for k in ("baseline", WALLET)})
+    mp.setattr(C, "VARIANTS", {k: C.VARIANTS[k] for k in ("baseline", WALLET, QUALITY)})
     root = tmp_path_factory.mktemp("wallet")
     csv, lb = root / "calls.csv", root / "live_buys.csv"
     try:
@@ -239,18 +287,27 @@ def test_saved_model_and_gates_identical_with_and_without_live_buys(wallet_runs)
 
 def test_wallet_variant_runs_with_live_buys_and_is_na_without(wallet_runs):
     runs, _ = wallet_runs
-    without = json.loads((runs["without"] / "meta.json").read_text())["variants"][WALLET]
-    assert without["not_applicable"] == train_mod.WREP_NOT_APPLICABLE and "buckets" not in without
+    for name in (WALLET, QUALITY):
+        without = json.loads((runs["without"] / "meta.json").read_text())["variants"][name]
+        assert without["not_applicable"] == train_mod.WREP_NOT_APPLICABLE, name
+        assert not {"buckets", "across_seeds", "adoption"} & set(without), name
     meta = json.loads((runs["with"] / "meta.json").read_text())
-    v = meta["variants"][WALLET]
-    assert "error" not in v and set(v["buckets"]) == {"short", "medium"}
     base = meta["variants"]["baseline"]["buckets"]["short"]
-    # more numeric inputs: the logistic baseline differs, the rows and simulation do not
-    assert v["buckets"]["short"]["runner_auc_logistic"] != base["runner_auc_logistic"]
-    assert v["buckets"]["short"]["sim_all_mean"] == base["sim_all_mean"]
-    assert set(v["across_seeds"]["buckets"]) == {"short", "medium"}
-    assert set(v["adoption"]["buckets"]) == {"short", "medium"}
-    assert v["adoption"]["buckets"]["short"]["result"] in ("pass", "lookback", "fail")
+    for name in (WALLET, QUALITY):
+        v = meta["variants"][name]
+        assert "error" not in v and set(v["buckets"]) == {"short", "medium"}, name
+        # more numeric inputs: the logistic baseline differs, the rows and simulation do not
+        assert v["buckets"]["short"]["runner_auc_logistic"] != base["runner_auc_logistic"], name
+        assert v["buckets"]["short"]["sim_all_mean"] == base["sim_all_mean"], name
+        assert set(v["across_seeds"]["buckets"]) == {"short", "medium"}, name
+        assert set(v["adoption"]["buckets"]) == {"short", "medium"}, name
+        assert v["adoption"]["buckets"]["short"]["result"] in ("pass", "lookback", "fail"), name
+    # the coverage inputs left out: a different logistic model than the full wallet variant
+    q, w = (meta["variants"][n]["buckets"]["short"] for n in (QUALITY, WALLET))
+    assert q["runner_auc_logistic"] != w["runner_auc_logistic"]
+    for b in ("short", "medium"):          # its probe never sees the coverage inputs
+        top = meta["variants"][QUALITY]["across_seeds"]["buckets"][b]["adversarial"]["top"]
+        assert not {f for f, _ in top} & set(C.WREP_COVERAGE), (b, top)
     st = meta["wallet_rep"]
     for k in ("rows", "live_buy_rows", "wallets", "calls_with_live_buys", "eligible_history",
               "extreme_dropped", "y_run_rate", "y_rug_rate", "seconds", "weeks"):
@@ -270,20 +327,29 @@ def test_report_has_the_wallet_blocks(wallet_runs):
     assert (f"{st['live_buy_rows']} live buys of {st['wallets']} distinct wallets on "
             f"{st['calls_with_live_buys']} calls") in data
     assert f"| runner (medium runner rule, net of tax) | {st['y_run_rate']:.1%} | 5.0% |" in data
-    assert "| rug (raw ret_late_7d <= -90 %) |" in data and "| 15.0% |" in data
+    assert (f"| rug (raw ret_late_7d <= -90 %) | {st['y_rug_rate']:.1%} | "
+            f"{C.WREP_PRIOR_RUG:.1%} |") in data
     assert "| week | calls | calls with live buys | share with >= 1 known wallet |" in data
     assert f"| {st['weeks'][-1]['week']} |" in data
+    # the rug prior was changed after a result: the wallet block says so once
+    assert C.WREP_PRIOR_RUG_NOTE and report.count(C.WREP_PRIOR_RUG_NOTE) == 1
+    assert C.WREP_PRIOR_RUG_NOTE in data and "20261015-0554" in data
+    assert report.count(R.WALLET_DATA_TITLE) == 1 and report.count(R.ADOPTION_TITLE) == 1
     rules = report[report.index(R.ADOPTION_TITLE):]
     assert "1. median lift" in rules and "next step is a lookback variant" in rules
-    assert "| bucket | 1. median lift | 2. lift lower end |" in rules
-    for b in ("short", "medium"):
-        assert f"| {b} | " in rules
+    assert "The rules themselves are unchanged, but the rug prior was changed afterwards" in rules
+    assert "| bucket | variant | 1. median lift | 2. lift lower end |" in rules
     across = report[report.index("### Variants across seeds (report only)"):]
-    assert f"| short | {WALLET} | " in across and f"| short | {WALLET} | n/a" not in across
+    for name in (WALLET, QUALITY):
+        for b in ("short", "medium"):
+            assert f"| {b} | {name} | " in rules, (b, name)
+        assert f"| short | {name} | " in across and f"| short | {name} | n/a" not in across
     plain = (runs["plain"] / "report.md").read_text(encoding="utf-8")
     assert R.WALLET_DATA_TITLE not in plain and "Variant comparison" not in plain
     without = (runs["without"] / "report.md").read_text(encoding="utf-8")
-    assert "No live buys given" in without and "Not evaluated for" in without
+    assert "No live buys given" in without
+    for name in (WALLET, QUALITY):
+        assert f"Not evaluated for `{name}`" in without
 
 
 def test_a_failing_wallet_reputation_is_recorded_and_the_run_succeeds(small_live_df, tmp_path,
@@ -305,22 +371,24 @@ def test_a_header_only_live_buys_csv_makes_the_variant_na(small_live_df, tmp_pat
     an all-NaN wrep_* frame: the variant is n/a with its own reason, not trained."""
     # the medium bucket stays: the wallet history uses its runner rule
     monkeypatch.setattr(C, "BUCKETS", {b: C.BUCKETS[b] for b in ("short", "medium")})
-    monkeypatch.setattr(C, "VARIANTS", {k: C.VARIANTS[k] for k in ("baseline", WALLET)})
+    monkeypatch.setattr(C, "VARIANTS", {k: C.VARIANTS[k] for k in ("baseline", WALLET, QUALITY)})
     lb = tmp_path / "live_buys.csv"
     lb.write_text("call_id,position,tier,amount_usd,wallet_display,wallet_prefix,wallet_suffix\n",
                   encoding="utf-8")
     out = train_mod.train(small_live_df, tmp_path / "models", "v1", variants=True, live_buys=lb)
     meta = json.loads((out / "meta.json").read_text())
     assert meta["wallet_rep"]["calls_with_live_buys"] == 0 and "error" not in meta["wallet_rep"]
-    v = meta["variants"][WALLET]
-    assert v["not_applicable"] == train_mod.WREP_NO_LIVE_BUYS
-    assert not {"buckets", "across_seeds", "adoption"} & set(v)
+    for name in (WALLET, QUALITY):
+        v = meta["variants"][name]
+        assert v["not_applicable"] == train_mod.WREP_NO_LIVE_BUYS, name
+        assert not {"buckets", "across_seeds", "adoption"} & set(v), name
     assert "short_runner" in meta["models"]
     report = (out / "report.md").read_text(encoding="utf-8")
-    assert f"Not evaluated for `{WALLET}`: n/a: no live buys in the export" in report
     assert "0 live buys of 0 distinct wallets on 0 calls" in report
     across = report[report.index("### Variants across seeds (report only)"):]
-    assert f"| short | {WALLET} | n/a: no live buys in the export" in across
+    for name in (WALLET, QUALITY):
+        assert f"Not evaluated for `{name}`: n/a: no live buys in the export" in report
+        assert f"| short | {name} | n/a: no live buys in the export" in across
 
 
 @pytest.fixture(scope="module")

@@ -245,13 +245,23 @@ def test_aggregate_values_and_nan_rules():
         assert np.isnan(e[c]), c
 
 
-def test_bad_share_needs_enough_calls():
-    """b's rug lift is above WREP_BAD_LIFT, but it has fewer than WREP_MIN_CALLS calls."""
-    counts = pd.DataFrame({"call_id": [1, 1], "wallet": ["a", "b"], "n": [10, 4],
-                           "k_run": [0, 0], "k_rug": [8, 4]})
+def rug_lift(k, n):
+    return W.posterior(k, n, C.WREP_PRIOR_RUG, C.WREP_PRIOR_STRENGTH) / C.WREP_PRIOR_RUG
+
+
+def test_bad_share_needs_enough_calls(monkeypatch):
+    """b's rug lift is above WREP_BAD_LIFT, but it has fewer than WREP_MIN_CALLS calls.
+    WREP_MIN_CALLS is raised to 10 here: with the prior 0.30 (strength 20) an all-rug
+    wallet with 4 calls has a rug lift of only 1.39, and with 5 calls (the real
+    WREP_MIN_CALLS) only 1.47, both < WREP_BAD_LIFT; it takes 6 calls. So the rule could
+    not be seen with the real WREP_MIN_CALLS: the smoothing sets the floor there."""
+    assert rug_lift(4, 4) < rug_lift(5, 5) < C.WREP_BAD_LIFT <= rug_lift(6, 6)
+    monkeypatch.setattr(C, "WREP_MIN_CALLS", 10)
+    counts = pd.DataFrame({"call_id": [1, 1], "wallet": ["a", "b"], "n": [12, 8],
+                           "k_run": [0, 0], "k_rug": [10, 8]})
     out = W.aggregate_wallets(counts).loc[1]
-    assert C.WREP_MIN_CALLS > 4
-    assert W.posterior(4, 4, C.WREP_PRIOR_RUG, C.WREP_PRIOR_STRENGTH) / C.WREP_PRIOR_RUG >= C.WREP_BAD_LIFT
+    assert rug_lift(10, 12) >= C.WREP_BAD_LIFT and rug_lift(8, 8) >= C.WREP_BAD_LIFT
+    assert 8 < C.WREP_MIN_CALLS <= 12
     assert out["wrep_bad_share"] == pytest.approx(0.5)
 
 
@@ -318,4 +328,6 @@ def test_wrep_not_model_inputs():
     for name, knobs in C.VARIANTS.items():
         with C.overrides(**knobs):
             wrep = [c for c in C.FEATURES if c.startswith(C.WREP_PREFIX)]
-            assert wrep == (list(C.WREP_FEATURES) if name in C.WALLET_REP_VARIANTS else []), name
+            want = [c for c in C.WREP_FEATURES if c not in C.EXCLUDED_INPUTS]   # effective here
+            assert wrep == (want if name in C.WALLET_REP_VARIANTS else []), name
+            assert len(wrep) in ((8, 6) if name in C.WALLET_REP_VARIANTS else (0,)), name

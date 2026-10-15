@@ -4,7 +4,7 @@
     python train.py --dsn postgres://user:pass@host/db --out models/
     python train.py --csv calls.csv --out models/ --variants   # plus the variant comparison
     python train.py --csv calls.csv --out models/ --variants --live-buys live_buys.csv
-                                        # plus the wallet reputation variant (report only)
+                                        # plus the wallet reputation variants (report only)
 """
 import argparse
 import json
@@ -582,7 +582,8 @@ def has_wrep_columns(df: pd.DataFrame) -> bool:
 
 
 def wrep_not_applicable(df: pd.DataFrame) -> str | None:
-    """Why the wallet reputation variant cannot run on `df`, or None when it can:
+    """Why the wallet reputation variants (C.WALLET_REP_VARIANTS) cannot run on
+    `df`, or None when they can:
     no wrep_* column (WREP_NOT_APPLICABLE), or every wrep_* value missing, e.g. a
     header-only or zero-row live_buys.csv (WREP_NO_LIVE_BUYS)."""
     if not has_wrep_columns(df):
@@ -633,7 +634,7 @@ def wallet_rep_data(df: pd.DataFrame, live_buys, rows) -> tuple:
     except Exception as exc:  # not BaseException: Ctrl-C still stops the run
         wrep, stats = None, {"error": variant_error(exc)}
         print(f"WARNING: the wallet reputation failed ({stats['error']}); the wallet reputation "
-              "variant is n/a, the saved models are not affected", flush=True)
+              "variants are n/a, the saved models are not affected", flush=True)
     stats["seconds"] = round(time.time() - t0, 1)
     if wrep is not None:
         print(f"[wallet rep] {stats['live_buy_rows']} live buys, {stats['wallets']} wallets, "
@@ -696,9 +697,10 @@ def adoption_bucket(base: dict, var: dict, summary: dict) -> dict:
 
 
 def wallet_adoption(baseline: dict, variant: dict) -> dict:
-    """The pre-registered adoption rules of the wallet reputation variant per
-    bucket (`adoption_bucket`), from the baseline's and the variant's
-    across-seeds rows. Report only: never a gate of the saved model."""
+    """The pre-registered adoption rules of one wallet reputation variant
+    (any of C.WALLET_REP_VARIANTS) per bucket (`adoption_bucket`), from the
+    baseline's and that variant's across-seeds rows. Report only: never a
+    gate of the saved model."""
     out = {"rules": dict(C.WREP_ADOPTION), "set_on": C.WREP_ADOPTION_SET_ON,
            "saved_seed": C.LGBM_SEED, "buckets": {}}
     b_acr, v_acr = baseline.get("across_seeds") or {}, variant.get("across_seeds") or {}
@@ -946,7 +948,7 @@ def train(df: pd.DataFrame, out_root, version: str | None = None, variants: bool
     if leaked:   # serving cannot compute them: never inputs of the saved model
         raise ValueError(f"the saved model's inputs (config FEATURES) must not include the "
                          f"wallet reputation columns {leaked}; set WALLET_REP = False (the "
-                         "variant \"wallet reputation (wrep_*)\" tests them, report only)")
+                         "WALLET_REP_VARIANTS test them, report only)")
     diag = diagnostics_on(diagnostics)
     version = version or datetime.now(timezone.utc).strftime("%Y%m%d-%H%M")
     out_dir = Path(out_root) / version
@@ -1370,7 +1372,8 @@ def main(argv=None) -> int:
                          "in report.md (report only: the saved model is always the baseline)")
     ap.add_argument("--live-buys", metavar="PATH",
                     help="with --variants: the Go program's -export-live-buys CSV; adds the "
-                         "report-only variant \"wallet reputation (wrep_*)\" (n/a without it); "
+                         "report-only wallet reputation variants (config WALLET_REP_VARIANTS; "
+                         "n/a without it); "
                          "never used by the saved model")
     args = ap.parse_args(argv)
     df = pd.read_csv(args.csv, low_memory=False) if args.csv else read_dsn(args.dsn)

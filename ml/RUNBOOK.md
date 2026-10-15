@@ -273,8 +273,8 @@ than the ~4,733 first calls. Do not open, copy or paste the file.
 
 ### 4b. Export the live buys (only for the variant comparison, step 5b)
 
-The report-only variant "wallet reputation (wrep_*)" of step 5b needs the live
-buys of every call (one row per buy: call id, position, tier, amount and the
+The report-only variants "wallet reputation (wrep_*)" and "wallet reputation,
+quality only" of step 5b need the live buys of every call (one row per buy: call id, position, tier, amount and the
 shortened wallet). Same rules as step 4 (same directory, same `.env`, same
 `umask 077`, read-only apart from the tool registry upsert):
 
@@ -286,8 +286,8 @@ SCOUT_DB_AUTO_MIGRATE=false go run . -export-live-buys "$ML/data/live_buys.csv"
 
 Expected: `wrote N live buys to .../live_buys.csv`. Do not open, copy or paste
 the file. A program older than this flag stops with `flag provided but not
-defined: -export-live-buys`; then skip 4b, and the wallet reputation variant
-is shown as "n/a" (the rest of 5b is unchanged). `run_training.sh --variants`
+defined: -export-live-buys`; then skip 4b, and the two wallet reputation variants
+are shown as "n/a" (the rest of 5b is unchanged). `run_training.sh --variants`
 does 4b itself: it first checks `-h` for the flag, and when the flag is
 missing or the export fails it prints a `WARNING` and trains without it.
 
@@ -396,8 +396,8 @@ time "$ML/venv/bin/python" train.py --csv "$ML/data/calls.csv" --out "$ML/models
 ```
 
 It trains the normal model
-exactly as in step 5 (that is the one saved, served and gated), then seven
-variants that each change one setting (dead rule on, i.e. collapse OR dead;
+exactly as in step 5 (that is the one saved, served and gated), then eight
+variants that each change one setting, except the last (dead rule on, i.e. collapse OR dead;
 raw `dex` instead of `dex_family`; raw `dex` + `dex_family`; runners must have
 `trades_24h >= 100`; stronger regularisation, i.e. smaller trees with more
 calls per leaf, a stronger L2 penalty and fewer inputs per tree,
@@ -405,7 +405,12 @@ calls per leaf, a stronger L2 penalty and fewer inputs per tree,
 counts (default before 14 Oct), i.e. with `calls_prev_1h` and
 `calls_prev_24h` back in, `EXCLUDED_INPUTS = ()`; wallet reputation
 (wrep_*), i.e. the live-buy wallet reputation inputs added, `WALLET_REP =
-True`, which needs `--live-buys` from step 4b and is "n/a" without it). Since 14 Oct 2026 the
+True`, which needs `--live-buys` from step 4b and is "n/a" without it;
+wallet reputation, quality only, i.e. the same without the two coverage
+inputs `wrep_n_known` and `wrep_known_share`, which grow with calendar time
+as wallet history builds up and so act as a time proxy: `WALLET_REP = True`
+plus `EXCLUDED_INPUTS` extended by `WREP_COVERAGE`, also "n/a" without
+`--live-buys`). Since 14 Oct 2026 the
 baseline leaves those two out (owner decision after report 20261014-1842:
 they act as a calendar proxy), so this row keeps the old setting in every
 report. The "dead rule off" and "dead threshold 100" rows of
@@ -430,7 +435,10 @@ instead of 280 s. The wallet reputation variant (with `--live-buys`) costs as
 much again: its own run plus the six other seeds and an adversarial probe
 (14 Oct 2026, same synthetic data: 170 s, of which other seeds and
 adversarial validation 147 s; a whole run with `--variants
---live-buys` 614 s instead of 453 s; on the prod data not measured yet). The stability
+--live-buys` 614 s instead of 453 s; on the prod data not measured yet). The
+wallet reputation, quality only variant costs about as much again (14 Oct
+2026, same data: 165 s, of which other seeds and adversarial validation
+140 s; a whole run with `--variants --live-buys` 759 s). The stability
 diagnostics of step 5 also run (before the variants) unless switched off with
 `SCOUT_ML_DIAGNOSTICS=0`, and add their own time on top. Memory as in step 5.
 The model, `meta.json`, `report.md` and `LATEST` are written before the
@@ -460,12 +468,12 @@ decides whether a setting changes.
 
 The table "Variants across seeds" (see `ml/README.md`; called "calls_prev
 variants across seeds" before 14 Oct 2026) puts the baseline next to the
-`SEED_VARIANTS` (with the calls_prev inputs; wallet reputation) over every
-seed. If a variant's median lift is clearly better than the baseline's in
+`SEED_VARIANTS` (with the calls_prev inputs; wallet reputation; wallet
+reputation, quality only) over every seed. If a variant's median lift is clearly better than the baseline's in
 several reports, tell the product manager; the gap between the adversarial
 AUCs shows the drift the inputs a variant changes carry.
 
-With the wallet reputation variant two more blocks follow:
+With the wallet reputation variants two more blocks follow (once for both):
 
 - "Wallet reputation data": how many live buys, wallets and calls with live
   buys the export had, the observed 7 d runner and rug rates of the history
@@ -473,9 +481,12 @@ With the wallet reputation variant two more blocks follow:
   and a table per week (calls with live buys, the share with at least one
   wallet that has history, the mean `wrep_known_share`), so the coverage
   ramp is visible. Without `--live-buys` it says so; `WARNING: the wallet
-  reputation failed (...)` (paste it) means only that variant is "n/a".
+  reputation failed (...)` (paste it) means only the two wallet variants are
+  "n/a".
 - "Wallet reputation: pre-registered adoption rules": the five rules fixed
-  on 14 Oct 2026, before any result, and per bucket whether each holds.
+  on 14 Oct 2026, before any result, and per bucket whether each holds, one
+  row per wallet variant (the same rules for both, each against the same
+  baseline).
   Report only: never a gate, and the saved model never uses `wrep_*` inputs.
   When only the drift rule fails the result says "next step: a lookback
   variant (WREP_LOOKBACK_DAYS)", which is not an adoption. Paste the whole

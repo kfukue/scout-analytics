@@ -399,7 +399,7 @@ of both calibrations (information only; test rows never choose).
 
 trains, in addition to the normal model, one variant per entry of `VARIANTS`
 (`scout_ml/config.py`), each changing exactly ONE setting of the configured
-baseline:
+baseline (except "wallet reputation, quality only", which changes two):
 
 | variant | change |
 |---|---|
@@ -411,6 +411,7 @@ baseline:
 | stronger regularisation | `LGBM_REGULARISATION = "strong"`: `num_leaves` 15 -> 7, `min_child_samples` (min_data_in_leaf) 20 -> 50, `reg_lambda` (lambda_l2) 1 -> 10, `colsample_bytree` (feature_fraction) 0.8 -> 0.6 (`LGBM_REG_SETS`); rounds still from early stopping / the purged k-fold |
 | with calls_prev counts (default before 14 Oct) | `EXCLUDED_INPUTS = ()`: the model and the logistic baseline with `calls_prev_1h` and `calls_prev_24h` back in, i.e. the inputs of the saved models up to 14 Oct 2026, so every report compares against the old setting. The baseline leaves them out (see the start of this file). `EXCLUDED_INPUTS` can only remove numeric inputs; an outcome, a categorical or an unknown name raises |
 | wallet reputation (wrep_*) | `WALLET_REP = True`: the eight `WREP_FEATURES` of `scout_ml/wallet_rep.py` appended to the numeric inputs (the three shares as is, the count and the lifts log1p-scaled in the logistic baseline). Needs `--live-buys PATH` (the `-export-live-buys` CSV); "n/a" without it. See the `wallet_rep.py` paragraph in "Layout and tests" |
+| wallet reputation, quality only | `WALLET_REP = True` and `EXCLUDED_INPUTS` extended by `WREP_COVERAGE` (`wrep_n_known`, `wrep_known_share`): the six quality inputs only (runner lift mean / max, rug lift mean / max, good share, bad share), calls_prev still left out. The two coverage inputs grow with calendar time as wallet history builds up from August, so they act as a time proxy (owner decision 14 Oct 2026, "option b"). Needs `--live-buys PATH`; "n/a" without it |
 
 Variants are report only: they are never saved or served, and the saved model,
 its `meta.json` (features, levels, rules) and its gates are always the
@@ -454,9 +455,10 @@ three drifting inputs. The variants are retrained with the other seeds of
 `STABILITY_SEEDS` (six since 14 Oct 2026, 11 and 23 before); the
 baseline row reuses the gates' and diagnostics' numbers. Report only, never a
 gate; an error there keeps the variant's other numbers. Empty `SEED_VARIANTS`
-to skip it. A `SEED_VARIANTS` entry that is n/a (the wallet variant without
+to skip it. A `SEED_VARIANTS` entry that is n/a (the wallet variants without
 `--live-buys`) gets an "n/a" row. Since 14 Oct 2026 `SEED_VARIANTS` is "with
-calls_prev counts (default before 14 Oct)" and "wallet reputation (wrep_*)";
+calls_prev counts (default before 14 Oct)", "wallet reputation (wrep_*)" and
+"wallet reputation, quality only";
 the "no calls_prev inputs" variant became the
 baseline, and the owner rejected "calls_prev as a burst ratio" (worse in
 report 20261014-1842), so it was removed. Its setting
@@ -479,7 +481,7 @@ retrain per extra seed (two with 3 seeds, six with 7) plus one adversarial
 probe per bucket for each `SEED_VARIANTS` entry
 (the baseline row reuses the diagnostics' probe): about 93 s for two
 entries on that synthetic data (13 Oct 2026, the sum of their `[variant]`
-lines' "of which" times; one entry since 14 Oct 2026); on the prod data an
+lines' "of which" times; three entries since 14 Oct 2026, see below); on the prod data an
 estimated 40 to 50 s for two, not measured. Runs without `--variants` are unchanged.
 With 7 seeds (14 Oct 2026, same synthetic data, `make_synthetic.py --calls
 6000 --days 170 --seed 11`, one desktop PC): a whole run with `--variants`
@@ -491,6 +493,10 @@ own run, six more seed retrains and an adversarial probe per bucket
 17,359 live buys): its `[variant]` line 170 s, of which other seeds and
 adversarial validation 147 s; computing the wallet reputation itself took
 under 1 s; a whole run with `--variants --live-buys` 614 s instead of 453 s.
+The variant "wallet reputation, quality only" costs as much again (14 Oct
+2026, same data and PC: its `[variant]` line 165 s, of which other seeds and
+adversarial validation 140 s; the full wallet variant's line 164 s in the
+same run); a whole run with `--variants --live-buys` took 759 s.
 
 ### Stability diagnostics
 
@@ -741,24 +747,28 @@ calls they bought into turned out at 7 d, counting only outcomes known before
 the call and never the call's own token (settings `WREP_*` in `config.py`).
 It is wired in as a report-only variant (14 Oct 2026): `train.py --variants
 --live-buys PATH` computes it once (`[wallet rep] ...` line) and joins the
-`wrep_*` columns to the rows of the variants only, for the variant "wallet
-reputation (wrep_*)" (`WALLET_REP = True`; retrained with every seed, see
-"Variant comparison"). The saved model, its gates, the dead score and the
+`wrep_*` columns to the rows of the variants only, for the
+`WALLET_REP_VARIANTS` "wallet reputation (wrep_*)" (`WALLET_REP = True`) and
+"wallet reputation, quality only" (the same without the two coverage inputs
+`WREP_COVERAGE`); both are retrained with every seed, see "Variant
+comparison". The saved model, its gates, the dead score and the
 diagnostics use the rows without them, so they and the model files are the
 same with or without `--live-buys` (a test compares them byte for byte);
 `train()` raises if a `wrep_*` name is in the configured `FEATURES` (serving
 cannot compute them). Without `--live-buys`, or when the CSV cannot be read
 (`WARNING: the wallet reputation failed`), or when it has no live buys for
-the calls (header only or zero rows: every `wrep_*` input empty), the variant
-is "n/a", with its reason, also in the adoption block.
+the calls (header only or zero rows: every `wrep_*` input empty), both
+variants are "n/a", with their reason, also in the adoption block.
 `run_training.sh --variants` exports the CSV (`-export-live-buys`, RUNBOOK
 step 4b) when the Go program has the flag. `meta.json` `"wallet_rep"` and
 the block "Wallet reputation data" give the counts, the observed 7 d runner
 and rug rates next to the fixed priors and the coverage per week; the block
 after it prints the pre-registered adoption rules (`WREP_ADOPTION`, fixed on
-14 Oct 2026 before any result) and per bucket whether each holds (report
-only, never a gate; `meta.json` `"variants"` -> the variant -> `"adoption"`).
-The variant passes in a bucket only if all hold: across-seeds median pooled
+14 Oct 2026 before any result) and per bucket and wallet variant whether each
+holds, in one table (report only, never a gate; `meta.json` `"variants"` ->
+each wallet variant -> `"adoption"`). The same rules apply to both wallet
+variants, each against the same baseline. A variant passes in a bucket only
+if all hold: across-seeds median pooled
 walk-forward lift >= 2.0 and >= the baseline's; the seed-7 pooled lift's 95%
 lower end > 1.0; the pooled simulation difference's 95% lower end > 0;
 collapses removed >= 0.40; and its adversarial AUC no more than 0.02 above
