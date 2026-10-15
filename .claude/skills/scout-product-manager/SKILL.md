@@ -576,6 +576,14 @@ Every Go start applies `scoutanalytics.sql` unless `SCOUT_DB_AUTO_MIGRATE=false`
   named by the pre-registered rules is run ("wallet reputation, last 14
   days", same adoption rules, across 7 seeds), instead of parking the
   wallet work as the PM had recommended.
+- 15 Oct (owner, after report 20261015-2148, where the lookback variant
+  also failed the drift rule): the wallet reputation work is parked (code
+  stays, report-only; retest with much more data). `SEED_VARIANTS` stays
+  as it is ("might be useful in the future when we have more data"). The
+  model is not tuned further for now; `investigate` studies presenting it
+  on the site as a risk filter (collapse avoidance) and a weekly retrain
+  cadence. The two URL-leak fixes are approved (DB connection URL in
+  errors; node URL in stored and logged errors).
 - 12 Oct: the PM has the `Bash` tool for git only: read-only git, `git fetch`
   and `git worktree add` to create worktrees for `implement`; never stash,
   switch, reset, rebase or merge (add, commit and push of its own `work/...`
