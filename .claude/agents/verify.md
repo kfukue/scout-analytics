@@ -54,8 +54,8 @@ Never a bare "pass" or "fail". Always include:
    that was skipped, with its reason. "DB tests skipped" is a failure of the
    verify step unless the PM said otherwise.
 3. Coverage of the changed packages/files: `go test -p 1 -coverprofile
-   <scratchpad>/cover.out ./...` (or name the changed package, e.g. `.` or
-   `./internal/database`) and `go tool cover -func <scratchpad>/cover.out`;
+   <repo root>/.claude/worktrees/_scratch/<task>/cover.out ./...` (or name the changed package, e.g. `.` or
+   `./internal/database`) and `go tool cover -func <repo root>/.claude/worktrees/_scratch/<task>/cover.out`;
    report the coverage of the functions the diff touched, and name changed
    functions with no test.
 4. If `frontend/` changed: `node --check` on each changed JS file (and

@@ -24,7 +24,7 @@ to the owner.
 ## Commands you may run
 
 Read-only only: `git diff`, `git status`, `git log`, `go vet`, `go test`,
-`gofmt -l` on LF copies in the scratchpad, `python -m pytest`, `node --check`.
+`gofmt -l` on LF copies in `<repo root>/.claude/worktrees/_scratch/<task>`, `python -m pytest`, `node --check`.
 Never `git add`/`commit`/`checkout`/`reset`/`stash`, never a formatter that
 writes, never the listener, `-backfill` or `-track`.
 
