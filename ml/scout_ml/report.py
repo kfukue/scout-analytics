@@ -810,7 +810,9 @@ def adversarial_section(ad, st, buckets) -> str:
 
 VARIANT_NOTE = (
     "Each variant changes exactly one setting of the baseline (the saved model; \"wallet "
-    "reputation, quality only\" two: the wallet inputs on, their two coverage inputs left out) "
+    "reputation, quality only\" two: the wallet inputs on, their two coverage inputs left out; "
+    f"\"{C.WREP_LOOKBACK_VARIANT}\" two: the wallet inputs on, computed from the last "
+    f"{C.WREP_LOOKBACK_VARIANT_DAYS} days of history only) "
     "and is trained "
     "on the same rows, splits and seed. Variants are report only: not saved, not served, and "
     "never a gate. Their gate column is the old single-run gate (test-part lift, collapses "
@@ -1013,9 +1015,10 @@ def wallet_data_section(st) -> str:
                    "flag), so the wallet reputation variants are n/a.\n")
         return "\n".join(out + _prior_rug_note())
     if st.get("error"):
-        out.append(f"**Not computed: {st['error']}.** The wallet reputation variants are n/a; "
-                   "nothing else in this report is affected.\n")
-        return "\n".join(out + _prior_rug_note())
+        out.append(f"**Not computed: {st['error']}.** The wallet reputation variants"
+                   f"{_failed_scope(st.get('lookbacks'))} are n/a; nothing else in this report "
+                   "is affected.\n")
+        return "\n".join(out + lookback_lines(st.get("lookbacks")) + _prior_rug_note())
     out.append(
         f"{st['live_buy_rows']} live buys of {st['wallets']} distinct wallets on "
         f"{st['calls_with_live_buys']} calls ({st['rows']} rows in the export); "
@@ -1025,6 +1028,7 @@ def wallet_data_section(st) -> str:
         f"{C.WREP_KNOWN_LAG_HOURS} h after they were due and before the call, never the call's "
         "own token" + (f", and only the last {C.WREP_LOOKBACK_DAYS} days"
                        if C.WREP_LOOKBACK_DAYS is not None else "") + ".\n")
+    out += lookback_lines(st.get("lookbacks"))
     out.append(table(["7 d outcome of the history calls", "observed rate", "fixed prior (WREP_PRIOR_*)"],
                      [["runner (medium runner rule, net of tax)", _pct(st.get("y_run_rate")),
                        _pct(C.WREP_PRIOR_RUNNER)],
@@ -1040,11 +1044,53 @@ def wallet_data_section(st) -> str:
         out.append("Coverage per week (Monday, UTC) over the calls training can use: calls with "
                    "live buys, and among them the share with at least one wallet with history "
                    "and the mean wrep_known_share (it should ramp up as history builds).\n")
-        out.append(table(["week", "calls", "calls with live buys", "share with >= 1 known wallet",
-                          "mean wrep_known_share"],
-                         [[w["week"], w["calls"], w["with_live_buys"], _pct(w["share_known"]),
-                           fmt(w["known_share_mean"])] for w in weeks]))
+        out.append(coverage_table(weeks, st.get("lookbacks")))
     return "\n".join(out)
+
+
+def _lookback_days(lookbacks) -> list:
+    """The lookback entries (train.wallet_rep_frames' stats["lookbacks"]), by days."""
+    return sorted((v for v in (lookbacks or {}).values() if isinstance(v, dict)),
+                  key=lambda v: v.get("days") or 0)
+
+
+def _failed_scope(lookbacks) -> str:
+    """Which wallet variants a failed configured lookback makes n/a: "" (all of
+    them) unless another lookback was computed, then only those using its history."""
+    if not [lb for lb in _lookback_days(lookbacks) if not lb.get("error")]:
+        return ""
+    return (" using all history" if C.WREP_LOOKBACK_DAYS is None
+            else f" using the last {C.WREP_LOOKBACK_DAYS} days")
+
+
+def lookback_lines(lookbacks) -> list:
+    """One line per wallet lookback variant's history: only the last N days, or its error."""
+    out = []
+    for lb in _lookback_days(lookbacks):
+        names = [n for n in C.WALLET_REP_VARIANTS
+                 if n in C.VARIANTS and C.variant_settings(n)["WREP_LOOKBACK_DAYS"] == lb["days"]]
+        who = ", ".join(f"\"{n}\"" for n in names) or f"a {lb['days']}-day lookback"
+        if lb.get("error"):
+            out.append(f"The wallet reputation for {who} (last {lb['days']} days) was **not "
+                       f"computed: {lb['error']}**; that variant is n/a.\n")
+        else:
+            out.append(f"{who} uses only outcomes known in the last {lb['days']} days before the "
+                       f"call (WREP_LOOKBACK_DAYS = {lb['days']}); the same rules otherwise. "
+                       f"Computed in {lb.get('seconds', 0):.0f} s.\n")
+    return out
+
+
+def coverage_table(weeks: list, lookbacks) -> str:
+    """The coverage per week; one more column per computed lookback: its mean
+    wrep_known_share in the same week (matched by week)."""
+    extra = [lb for lb in _lookback_days(lookbacks) if lb.get("weeks")]
+    means = [{w["week"]: w["known_share_mean"] for w in lb["weeks"]} for lb in extra]
+    return table(["week", "calls", "calls with live buys", "share with >= 1 known wallet",
+                  "mean wrep_known_share"]
+                 + [f"mean wrep_known_share, last {lb['days']} days" for lb in extra],
+                 [[w["week"], w["calls"], w["with_live_buys"], _pct(w["share_known"]),
+                   fmt(w["known_share_mean"])] + [fmt(m.get(w["week"])) for m in means]
+                  for w in weeks])
 
 
 def adoption_rules_text() -> str:
@@ -1069,7 +1115,9 @@ def adoption_rules_text() -> str:
         f"and no wrep_* input among the top {r['drift_top']} drifting inputs with a gain share "
         f">= {r['drift_max_share']:.2f}.\n\n"
         "An undefined value (n/a) does not hold. If only rule 5 fails, the next step is a "
-        "lookback variant (WREP_LOOKBACK_DAYS), not adoption.\n")
+        "lookback variant (WREP_LOOKBACK_DAYS), not adoption; for a variant that already "
+        "uses a lookback, it means the drift persists with that window (no further step "
+        "is pre-registered).\n")
 
 
 def _holds(rule: dict, text: str) -> str:
@@ -1082,8 +1130,23 @@ ADOPTION_RESULT = {"pass": "PASS (all rules hold)",
                    "fail": "does not pass"}
 
 
-def adoption_cells(a: dict) -> list:
-    """The cells of one bucket of the adoption table (train.adoption_bucket)."""
+def adoption_result_label(result: str, lookback_days=None) -> str:
+    """The result cell for train.adoption_bucket's `result`. For a variant that
+    already uses a lookback (`lookback_days` set), "lookback" (only the drift rule
+    fails) means the drift persists with that window, not "next step: a lookback"."""
+    if result == "lookback" and lookback_days is not None:
+        return f"not adopted; drift persists with a {lookback_days}-day window"
+    return ADOPTION_RESULT[result]
+
+
+def variant_lookback(v: dict):
+    """The WREP_LOOKBACK_DAYS a variant entry ran with (its recorded "changes"), or None."""
+    return (v.get("changes") or {}).get("WREP_LOOKBACK_DAYS")
+
+
+def adoption_cells(a: dict, lookback_days=None) -> list:
+    """The cells of one bucket of the adoption table (train.adoption_bucket);
+    `lookback_days` is the variant's WREP_LOOKBACK_DAYS (for the result label)."""
     r = a["rules"]
     d = r["drift"]
     top = ", ".join(f"{f} {g:.2f}" for f, g in d.get("wrep_top") or [])
@@ -1094,7 +1157,7 @@ def adoption_cells(a: dict) -> list:
             _holds(r["collapse_removed"], _pct(r["collapse_removed"].get("value"))),
             _holds(d, f"AUC {fmt(d.get('variant'))} vs baseline {fmt(d.get('baseline'))}"
                       + (f"; wrep_* in the top: {top}" if top else "")),
-            ADOPTION_RESULT[a["result"]]]
+            adoption_result_label(a["result"], lookback_days)]
 
 
 def adoption_not_evaluated(v: dict) -> str | None:
@@ -1104,12 +1167,13 @@ def adoption_not_evaluated(v: dict) -> str | None:
             or (ad or {}).get("error") or (None if ad else "not evaluated"))
 
 
-def adoption_rows(name: str, ad: dict) -> list:
-    """The adoption table rows of one wallet variant: [bucket, name, rule cells..., result]."""
+def adoption_rows(name: str, ad: dict, lookback_days=None) -> list:
+    """The adoption table rows of one wallet variant: [bucket, name, rule cells..., result];
+    `lookback_days` is its WREP_LOOKBACK_DAYS (for the result label)."""
     rows = []
     for b, a in (ad.get("buckets") or {}).items():
         cells = ([f"n/a: {a['not_applicable']}"] + [""] * 5 if a.get("not_applicable")
-                 else adoption_cells(a))
+                 else adoption_cells(a, lookback_days))
         rows.append([b, name, *cells])
     return rows
 
@@ -1126,7 +1190,7 @@ def adoption_section(wallet: dict) -> str:
         if why:
             out.append(f"Not evaluated for `{name}`: {why}.\n")
         else:
-            rows += adoption_rows(name, v["adoption"])
+            rows += adoption_rows(name, v["adoption"], variant_lookback(v))
     if rows:
         order = list(dict.fromkeys(r[0] for r in rows))
         rows.sort(key=lambda r: order.index(r[0]))     # stable: variant order within a bucket

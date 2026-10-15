@@ -487,15 +487,19 @@ def variant_across_seeds(df, L, has_trades: bool, store: dict) -> dict:
 
 def run_variants(df: pd.DataFrame, baseline: dict, has_trades: bool,
                  baseline_pooled: dict | None = None, baseline_runs: dict | None = None,
-                 baseline_keeps: dict | None = None, baseline_adv: dict | None = None) -> dict:
+                 baseline_keeps: dict | None = None, baseline_adv: dict | None = None,
+                 wrep_frames: dict | None = None) -> dict:
     """Train every C.VARIANTS entry (one knob changed from the configured
     values) on the same rows and splits; report only, nothing is saved.
     `baseline`: the bucket results of the saved model, reused for "baseline"
     (`baseline_pooled`: its pooled walk-forward per bucket, from the gate inputs).
-    `df`: sorted rows as prepared by `train` (with the wrep_* columns joined
-    when live buys were given). `has_trades`: the data has the
+    `df`: sorted rows as prepared by `train`. `wrep_frames` ({WREP_LOOKBACK_DAYS:
+    wrep_* frame}, `wallet_rep_frames`; None without live buys): each
+    C.WALLET_REP_VARIANTS entry trains on `df` joined with the frame of its own
+    lookback (`variant_data`), also in its seed retrains and adversarial
+    validation. `has_trades`: the data has the
     trades_24h column (else the C.TRADES_VARIANTS equal the baseline: n/a).
-    The C.WALLET_REP_VARIANTS are n/a when `df` has no wrep_* column or only
+    The C.WALLET_REP_VARIANTS are n/a when their rows have no wrep_* column or only
     empty ones (`wrep_not_applicable`; they would otherwise train on all-NaN
     inputs); when they ran, their pre-registered
     adoption rules (`wallet_adoption`) are added under "adoption".
@@ -527,21 +531,22 @@ def run_variants(df: pd.DataFrame, baseline: dict, has_trades: bool,
             entry["not_applicable"] = (f"the data has no {C.DEAD_COLUMN} column, so this "
                                        "variant equals the baseline")
             continue
-        if name in C.WALLET_REP_VARIANTS and wrep_not_applicable(df):
-            entry["not_applicable"] = wrep_not_applicable(df)
+        df_v = variant_data(df, name, wrep_frames)
+        if name in C.WALLET_REP_VARIANTS and wrep_not_applicable(df_v):
+            entry["not_applicable"] = wrep_not_applicable(df_v)
             continue
         t0 = time.time()
         attempted += 1
         store = {} if name in seed_variants else None
         try:  # around overrides too; its `finally` restores the config after an error
             with C.overrides(**knobs):
-                policy = dead_policy(df)
-                L = build_labels(df, policy)
-                entry["buckets"] = {b: _variant_bucket(b, df, L, has_trades, store)
+                policy = dead_policy(df_v)
+                L = build_labels(df_v, policy)
+                entry["buckets"] = {b: _variant_bucket(b, df_v, L, has_trades, store)
                                     for b in C.BUCKETS}
                 if store is not None:
                     try:
-                        entry["across_seeds"] = variant_across_seeds(df, L, has_trades, store)
+                        entry["across_seeds"] = variant_across_seeds(df_v, L, has_trades, store)
                     except Exception as exc:  # the variant's own row is kept
                         entry["across_seeds"] = {"error": variant_error(exc)}
                         print(f"WARNING: the across-seeds part of variant {name!r} failed "
@@ -621,26 +626,95 @@ def wrep_weeks(dates: pd.Series, wrep: pd.DataFrame, rows) -> list:
     return out
 
 
-def wallet_rep_data(df: pd.DataFrame, live_buys, rows) -> tuple:
+def _wrep_window() -> str:
+    """", last N days" for C.WREP_LOOKBACK_DAYS = N, "" for all history (None)."""
+    return "" if C.WREP_LOOKBACK_DAYS is None else f", last {C.WREP_LOOKBACK_DAYS} days"
+
+
+def wrep_failure_warning(error: str, others_ok: bool = False) -> None:
+    """The WARNING after the wallet reputation of C.WREP_LOOKBACK_DAYS failed.
+    `others_ok`: another lookback's frame exists, so with all history only the
+    variants using all history are n/a (not every wallet variant)."""
+    window = _wrep_window()
+    scope = "using that window " if window else ("using all history " if others_ok else "")
+    print(f"WARNING: the wallet reputation{window} failed ({error}); the wallet reputation "
+          f"variants {scope}are n/a, the saved models are not affected", flush=True)
+
+
+def wallet_rep_data(df: pd.DataFrame, live_buys, rows, warn: bool = True) -> tuple:
     """(the wrep_* frame indexed like `df`, or None after an error; its stats:
     W.wrep_frame's, the fixed priors, `wrep_weeks` over the calls `rows` (the
     rows training can use) and the seconds taken, or {"error": ...}). Never
-    raises: the wallet reputation only feeds a report-only variant."""
+    raises: the wallet reputation only feeds a report-only variant. `warn`:
+    print `wrep_failure_warning` itself after an error."""
     t0 = time.time()
+    window = _wrep_window()
     try:
         wrep, stats = W.wrep_frame(df, read_live_buys(live_buys))
         stats = {**stats, "prior_runner": C.WREP_PRIOR_RUNNER, "prior_rug": C.WREP_PRIOR_RUG,
                  "weeks": wrep_weeks(df["message_date"], wrep, rows)}
     except Exception as exc:  # not BaseException: Ctrl-C still stops the run
         wrep, stats = None, {"error": variant_error(exc)}
-        print(f"WARNING: the wallet reputation failed ({stats['error']}); the wallet reputation "
-              "variants are n/a, the saved models are not affected", flush=True)
+        if warn:
+            wrep_failure_warning(stats["error"])
     stats["seconds"] = round(time.time() - t0, 1)
     if wrep is not None:
-        print(f"[wallet rep] {stats['live_buy_rows']} live buys, {stats['wallets']} wallets, "
+        print(f"[wallet rep{window}] {stats['live_buy_rows']} live buys, {stats['wallets']} wallets, "
               f"{stats['calls_with_live_buys']} calls with live buys; {stats['seconds']:.0f} s",
               flush=True)
     return wrep, stats
+
+
+def wrep_lookbacks() -> list:
+    """The distinct WREP_LOOKBACK_DAYS the wallet reputation is computed for:
+    the configured one (C.WREP_LOOKBACK_DAYS) first, then those of the
+    C.WALLET_REP_VARIANTS among C.VARIANTS (e.g. C.WREP_LOOKBACK_VARIANT_DAYS)."""
+    days = [C.WREP_LOOKBACK_DAYS] + [C.variant_settings(n)["WREP_LOOKBACK_DAYS"]
+                                     for n in C.WALLET_REP_VARIANTS if n in C.VARIANTS]
+    return list(dict.fromkeys(days))
+
+
+def _live_buys_once(src):
+    """read_live_buys(src), read once for every lookback; `src` itself when
+    that fails (each wallet_rep_data then records the error)."""
+    try:
+        return read_live_buys(src)
+    except Exception:  # not BaseException: Ctrl-C still stops the run
+        return src
+
+
+def wallet_rep_frames(df: pd.DataFrame, live_buys, rows) -> tuple:
+    """({lookback: the wrep_* frame, or None after an error} for each of
+    `wrep_lookbacks`, each computed by `wallet_rep_data` inside
+    C.overrides(WREP_LOOKBACK_DAYS=lookback); the configured lookback's stats,
+    with "lookbacks": {str(days): {"days", "seconds", "weeks"} or {"days",
+    "seconds", "error"}} for the others). Never raises. The configured
+    lookback's WARNING comes after the others are computed, so it can say
+    whether only the variants using that history are n/a."""
+    src = _live_buys_once(live_buys)
+    frames, stats = {}, None
+    for days in wrep_lookbacks():
+        with C.overrides(WREP_LOOKBACK_DAYS=days):
+            frames[days], st = wallet_rep_data(df, src, rows, warn=stats is not None)
+        if stats is None:
+            stats = {**st, "lookbacks": {}}
+        else:
+            stats["lookbacks"][str(days)] = {"days": days, **{k: st[k] for k in
+                                             ("seconds", "weeks", "error") if k in st}}
+    if stats.get("error"):
+        wrep_failure_warning(stats["error"], any(f is not None for f in frames.values()))
+    return frames, stats
+
+
+def variant_data(df: pd.DataFrame, name: str, frames: dict | None) -> pd.DataFrame:
+    """The rows variant `name` trains on: `df` itself, or for a
+    C.WALLET_REP_VARIANTS entry `df` joined with the wrep_* frame of its own
+    WREP_LOOKBACK_DAYS (`frames`, from `wallet_rep_frames`); `df` alone when that
+    frame is missing (the variant is then n/a, `wrep_not_applicable`)."""
+    if name not in C.WALLET_REP_VARIANTS:
+        return df
+    frame = (frames or {}).get(C.variant_settings(name)["WREP_LOOKBACK_DAYS"])
+    return df if frame is None else df.join(frame)
 
 
 def _as_float(x) -> float:
@@ -671,7 +745,9 @@ def adoption_bucket(base: dict, var: dict, summary: dict) -> dict:
     `base` / `var` the baseline's / the variant's across-seeds row, `summary` the
     variant's bucket row. Each rule: {"holds": True / False / None (n/a), values};
     "result": "pass" (all hold), "lookback" (only the drift rule does not hold:
-    next step a WREP_LOOKBACK_DAYS variant, not adoption) or "fail"."""
+    next step a WREP_LOOKBACK_DAYS variant, not adoption; for a variant that
+    already has a lookback, the drift persists: report.adoption_result_label)
+    or "fail"."""
     r = C.WREP_ADOPTION
     v_med, b_med = _as_float(var.get("median")), _as_float(base.get("median"))
     lift_lo, sim_lo = _as_float(var.get("lift_lo")), _as_float(var.get("sim_gain_lo"))
@@ -940,8 +1016,9 @@ def train(df: pd.DataFrame, out_root, version: str | None = None, variants: bool
     `diagnostics`: the report-only stability diagnostics (None: `diagnostics_on`,
     i.e. C.DIAGNOSTICS unless C.DIAGNOSTICS_ENV says otherwise).
     `live_buys` (the -export-live-buys rows, a DataFrame or a CSV path; used only
-    with `variants`): the wallet reputation (wrep_*) is computed and joined to the
-    rows of the variants only, for the C.WALLET_REP_VARIANTS. The saved model,
+    with `variants`): the wallet reputation (wrep_*) is computed once per
+    lookback the C.WALLET_REP_VARIANTS use (`wallet_rep_frames`) and joined to
+    their rows only (`variant_data`). The saved model,
     its gates, the dead score and the diagnostics never see it, so they are the
     same with or without it."""
     leaked = [c for c in C.FEATURES if c.startswith(C.WREP_PREFIX)]
@@ -972,12 +1049,12 @@ def train(df: pd.DataFrame, out_root, version: str | None = None, variants: bool
     first = call & ~L["repeat"]  # later calls of a token: out of training, counted on their own
     extreme = first & ~L["no_pool"] & ~L["not_usd"] & L["extreme"]
     eligible = first & ~L["no_pool"] & ~L["not_usd"] & ~L["extreme"]
-    wrep = wrep_stats = None   # the wallet reputation: for the variants only
+    wrep_frames = wrep_stats = None   # the wallet reputation, per lookback: for the variants only
     if live_buys is not None and not variants:
         print("NOTE: --live-buys is used only with --variants (the wallet reputation "
               "variant); ignored", flush=True)
     elif live_buys is not None:
-        wrep, wrep_stats = wallet_rep_data(df, live_buys, eligible.to_numpy())
+        wrep_frames, wrep_stats = wallet_rep_frames(df, live_buys, eligible.to_numpy())
 
     raw_cols = C.NUMERIC_RAW + C.CATEGORICAL_VIEW + ["pre_vol_unit", "message_date"]
     blank = df.reindex(columns=raw_cols).replace("", np.nan)
@@ -1063,10 +1140,10 @@ def train(df: pd.DataFrame, out_root, version: str | None = None, variants: bool
         adv_known = ({b: v["split"] for b, v in adv.items()
                       if isinstance(v, dict) and isinstance(v.get("split"), dict)}
                      if isinstance(adv, dict) else {})
-        # the wrep_* columns reach the variants only (the baseline above used `df`)
-        df_var = df if wrep is None else df.join(wrep)
-        res["variants"] = run_variants(df_var, res["buckets"], has_trades, gate_in["pooled"],
-                                       gate_in["runs"], keeps, adv_known)
+        # the wrep_* columns reach the wallet variants only, each with its own
+        # lookback (the baseline above used `df`)
+        res["variants"] = run_variants(df, res["buckets"], has_trades, gate_in["pooled"],
+                                       gate_in["runs"], keeps, adv_known, wrep_frames)
         meta["variants"] = _json_safe(res["variants"])
         if wrep_stats is not None:
             res["wallet_rep"] = wrep_stats
@@ -1372,8 +1449,8 @@ def main(argv=None) -> int:
                          "in report.md (report only: the saved model is always the baseline)")
     ap.add_argument("--live-buys", metavar="PATH",
                     help="with --variants: the Go program's -export-live-buys CSV; adds the "
-                         "report-only wallet reputation variants (config WALLET_REP_VARIANTS; "
-                         "n/a without it); "
+                         "report-only wallet reputation variants (config WALLET_REP_VARIANTS, "
+                         "each with its own WREP_LOOKBACK_DAYS; n/a without it); "
                          "never used by the saved model")
     args = ap.parse_args(argv)
     df = pd.read_csv(args.csv, low_memory=False) if args.csv else read_dsn(args.dsn)

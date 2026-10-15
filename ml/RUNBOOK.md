@@ -273,8 +273,8 @@ than the ~4,733 first calls. Do not open, copy or paste the file.
 
 ### 4b. Export the live buys (only for the variant comparison, step 5b)
 
-The report-only variants "wallet reputation (wrep_*)" and "wallet reputation,
-quality only" of step 5b need the live buys of every call (one row per buy: call id, position, tier, amount and the
+The report-only variants "wallet reputation (wrep_*)", "wallet reputation,
+quality only" and "wallet reputation, last 14 days" of step 5b need the live buys of every call (one row per buy: call id, position, tier, amount and the
 shortened wallet). Same rules as step 4 (same directory, same `.env`, same
 `umask 077`, read-only apart from the tool registry upsert):
 
@@ -286,7 +286,7 @@ SCOUT_DB_AUTO_MIGRATE=false go run . -export-live-buys "$ML/data/live_buys.csv"
 
 Expected: `wrote N live buys to .../live_buys.csv`. Do not open, copy or paste
 the file. A program older than this flag stops with `flag provided but not
-defined: -export-live-buys`; then skip 4b, and the two wallet reputation variants
+defined: -export-live-buys`; then skip 4b, and the three wallet reputation variants
 are shown as "n/a" (the rest of 5b is unchanged). `run_training.sh --variants`
 does 4b itself: it first checks `-h` for the flag, and when the flag is
 missing or the export fails it prints a `WARNING` and trains without it.
@@ -396,8 +396,8 @@ time "$ML/venv/bin/python" train.py --csv "$ML/data/calls.csv" --out "$ML/models
 ```
 
 It trains the normal model
-exactly as in step 5 (that is the one saved, served and gated), then eight
-variants that each change one setting, except the last (dead rule on, i.e. collapse OR dead;
+exactly as in step 5 (that is the one saved, served and gated), then nine
+variants that each change one setting, except the last two (dead rule on, i.e. collapse OR dead;
 raw `dex` instead of `dex_family`; raw `dex` + `dex_family`; runners must have
 `trades_24h >= 100`; stronger regularisation, i.e. smaller trees with more
 calls per leaf, a stronger L2 penalty and fewer inputs per tree,
@@ -410,7 +410,12 @@ wallet reputation, quality only, i.e. the same without the two coverage
 inputs `wrep_n_known` and `wrep_known_share`, which grow with calendar time
 as wallet history builds up and so act as a time proxy: `WALLET_REP = True`
 plus `EXCLUDED_INPUTS` extended by `WREP_COVERAGE`, also "n/a" without
-`--live-buys`). Since 14 Oct 2026 the
+`--live-buys`; wallet reputation, last 14 days, i.e. the same inputs as
+wallet reputation (wrep_*) but a wallet's history counts only outcomes
+known in the 14 days before the call, a fixed window instead of all
+history: `WALLET_REP = True` plus `WREP_LOOKBACK_DAYS = 14`, also "n/a"
+without `--live-buys`, owner decision 15 Oct 2026 after report
+20261015-1944). Since 14 Oct 2026 the
 baseline leaves those two out (owner decision after report 20261014-1842:
 they act as a calendar proxy), so this row keeps the old setting in every
 report. The "dead rule off" and "dead threshold 100" rows of
@@ -443,7 +448,11 @@ the raw `dex` + `dex_family` variant is retrained with the six other seeds
 too, with or without `--live-buys` (same synthetic data: its line 154 s
 instead of 22 s, of which other seeds and adversarial validation 132 s; a
 whole run with `--variants --live-buys` 891 s instead of 773 s; on the prod
-data not measured yet). The stability
+data not measured yet). The wallet reputation, last 14 days variant (15 Oct
+2026, same synthetic data) costs about as much again: its line 191 s, of
+which other seeds and adversarial validation 163 s; a whole run with
+`--variants --live-buys` 1,142 s instead of 944 s; on the prod data not
+measured yet. The stability
 diagnostics of step 5 also run (before the variants) unless switched off with
 `SCOUT_ML_DIAGNOSTICS=0`, and add their own time on top. Memory as in step 5.
 The model, `meta.json`, `report.md` and `LATEST` are written before the
@@ -475,27 +484,33 @@ The table "Variants across seeds" (see `ml/README.md`; called "calls_prev
 variants across seeds" before 14 Oct 2026) puts the baseline next to the
 `SEED_VARIANTS` (with the calls_prev inputs; wallet reputation; wallet
 reputation, quality only; since 15 Oct 2026 raw `dex` + `dex_family`, which
-needs no `--live-buys`) over every seed. If a variant's median lift is clearly better than the baseline's in
+needs no `--live-buys`, and wallet reputation, last 14 days) over every seed. If a variant's median lift is clearly better than the baseline's in
 several reports, tell the product manager; the gap between the adversarial
 AUCs shows the drift the inputs a variant changes carry.
 
-With the wallet reputation variants two more blocks follow (once for both):
+With the wallet reputation variants two more blocks follow (once for all
+three):
 
 - "Wallet reputation data": how many live buys, wallets and calls with live
   buys the export had, the observed 7 d runner and rug rates of the history
   calls next to the fixed priors (`WREP_PRIOR_RUNNER` / `WREP_PRIOR_RUG`),
   and a table per week (calls with live buys, the share with at least one
   wallet that has history, the mean `wrep_known_share`), so the coverage
-  ramp is visible. Without `--live-buys` it says so; `WARNING: the wallet
-  reputation failed (...)` (paste it) means only the two wallet variants are
-  "n/a".
+  ramp is visible. One line says the 14-day variant uses only the last 14
+  days, and the table has one more column, the mean `wrep_known_share` of
+  that window. Without `--live-buys` it says so; `WARNING: the wallet
+  reputation failed (...)` (paste it) means only the wallet variants are
+  "n/a"; `WARNING: the wallet reputation, last 14 days failed (...)` means
+  only the 14-day variant is (the block then says "not computed" for it).
 - "Wallet reputation: pre-registered adoption rules": the five rules fixed
   on 14 Oct 2026, before any result, and per bucket whether each holds, one
-  row per wallet variant (the same rules for both, each against the same
+  row per wallet variant (the same rules for each, each against the same
   baseline).
   Report only: never a gate, and the saved model never uses `wrep_*` inputs.
   When only the drift rule fails the result says "next step: a lookback
-  variant (WREP_LOOKBACK_DAYS)", which is not an adoption. Paste the whole
+  variant (WREP_LOOKBACK_DAYS)", which is not an adoption; for the 14-day
+  variant itself it says "drift persists with a 14-day window" (no further
+  step is pre-registered). Paste the whole
   report; the product manager and the owner decide.
 
 ## 6. Delete the CSV

@@ -12,11 +12,14 @@ import make_synthetic
 import train as train_mod
 from scout_ml import config as C
 from scout_ml import report as R
+from scout_ml import wallet_rep as W
 from scout_ml.features import assert_no_leakage, build_features
 from scout_ml.model import fit_baseline
 
 WALLET = "wallet reputation (wrep_*)"
 QUALITY = "wallet reputation, quality only"
+LOOKBACK = "wallet reputation, last 14 days"
+ALL_WALLET = (WALLET, QUALITY, LOOKBACK)
 QUALITY_INPUTS = ["wrep_runner_lift_mean", "wrep_runner_lift_max", "wrep_rug_lift_mean",
                   "wrep_rug_lift_max", "wrep_good_share", "wrep_bad_share"]
 SHARES = {"wrep_known_share", "wrep_good_share", "wrep_bad_share"}
@@ -28,8 +31,8 @@ def test_default_is_off_and_the_saved_inputs_have_no_wrep():
     assert C.WALLET_REP is False and "WALLET_REP" in C.VARIANT_KNOBS
     assert not [c for c in C.FEATURES if c.startswith(C.WREP_PREFIX)]
     assert C.VARIANTS[WALLET] == {"WALLET_REP": True}
-    assert C.WALLET_REP_VARIANTS == (WALLET, QUALITY)
-    assert WALLET in C.SEED_VARIANTS and QUALITY in C.SEED_VARIANTS
+    assert C.WALLET_REP_VARIANTS == ALL_WALLET
+    assert set(ALL_WALLET) <= set(C.SEED_VARIANTS)
     assert set(C.WREP_SHARES) == SHARES and SHARES <= C.NO_LOG
     assert not (set(C.WREP_FEATURES) - SHARES) & C.NO_LOG          # count and lifts: log1p
 
@@ -183,13 +186,39 @@ def test_adoption_is_computed_per_wallet_variant_against_the_same_baseline():
     assert variants[WALLET]["adoption"]["buckets"]["short"]["result"] == "pass"
     q = variants[QUALITY]["adoption"]["buckets"]["short"]
     assert q["result"] == "fail" and q["rules"]["median_lift"]["baseline"] == 2.1
-    text = R.adoption_section({n: variants[n] for n in C.WALLET_REP_VARIANTS})
+    text = R.adoption_section({n: variants[n] for n in C.WALLET_REP_VARIANTS if n in variants})
     assert text.count(R.ADOPTION_TITLE) == 1 and text.count("Fixed on 14 Oct 2026") == 1
     assert "| bucket | variant | 1. median lift | 2. lift lower end |" in text
     lines = [ln for ln in text.splitlines() if ln.startswith("| short |")]
     assert [ln.split(" | ")[1] for ln in lines] == [WALLET, QUALITY]   # next to each other
     assert f"| short | {QUALITY} | fails: 1.80 vs baseline 2.10 |" in text
     assert "| does not pass |" in text and "| PASS (all rules hold) |" in text
+
+
+def test_drift_only_label_depends_on_the_variants_own_lookback():
+    """Only rule 5 fails in both: the full wallet variant's next step is a lookback
+    variant; for the lookback variant itself the drift persists with its window."""
+    base, var, summary = _rows(v_auc=0.63)                    # drift only
+    variants = {"baseline": {"across_seeds": {"buckets": {"short": base}}},
+                WALLET: {"changes": {"WALLET_REP": True}, "buckets": {"short": summary},
+                         "across_seeds": {"buckets": {"short": var}}},
+                LOOKBACK: {"changes": C.VARIANTS[LOOKBACK], "buckets": {"short": summary},
+                           "across_seeds": {"buckets": {"short": var}}}}
+    train_mod.add_wallet_adoption(variants)
+    for name in (WALLET, LOOKBACK):
+        assert variants[name]["adoption"]["buckets"]["short"]["result"] == "lookback"
+    text = R.adoption_section({n: variants[n] for n in (WALLET, LOOKBACK)})
+    rows = {ln.split(" | ")[1]: ln for ln in text.splitlines() if ln.startswith("| short |")}
+    assert rows[WALLET].endswith(
+        "| not adopted; next step: a lookback variant (WREP_LOOKBACK_DAYS) |")
+    assert rows[LOOKBACK].endswith("| not adopted; drift persists with a 14-day window |")
+    assert "next step" not in rows[LOOKBACK]
+    assert ("for a variant that already uses a lookback, it means the drift persists with "
+            "that window (no further step is pre-registered)") in text
+    # the days come from the variant's own setting; pass and fail are unchanged
+    assert R.adoption_result_label("lookback", 30).endswith("with a 30-day window")
+    assert R.adoption_result_label("pass", 14) == R.ADOPTION_RESULT["pass"]
+    assert R.adoption_result_label("fail", 14) == R.ADOPTION_RESULT["fail"]
 
 
 def test_drift_rule_reads_drift_top_inputs(monkeypatch):
@@ -218,10 +247,10 @@ def test_wrep_not_applicable_reasons():
 
 def test_report_blocks_without_live_buys_or_after_an_error():
     na = {"changes": {"WALLET_REP": True}, "not_applicable": train_mod.WREP_NOT_APPLICABLE}
-    text = R.variants_section({"baseline": {"changes": {}}, WALLET: na, QUALITY: na}, {})
+    text = R.variants_section({"baseline": {"changes": {}}, **{n: na for n in ALL_WALLET}}, {})
     assert text.count(R.WALLET_DATA_TITLE) == 1 and "No live buys given" in text
     assert text.count(R.ADOPTION_TITLE) == 1 and "Fixed on 14 Oct 2026, before any result" in text
-    for name in (WALLET, QUALITY):
+    for name in ALL_WALLET:
         assert f"Not evaluated for `{name}`: n/a: no live-buy wallet data" in text
     assert "| bucket | variant | 1. median lift |" not in text   # no table without results
     # the adoption rules point to the rug prior note: it is there without live buys too
@@ -239,10 +268,10 @@ def test_report_blocks_without_live_buys_or_after_an_error():
 def wallet_runs(tmp_path_factory):
     """make_synthetic's CLI writes calls + live buys; train.py's CLI then runs
     --variants without and with --live-buys, and once with --live-buys but no
-    --variants (short and medium buckets, baseline + both wallet variants)."""
+    --variants (short and medium buckets, baseline + all three wallet variants)."""
     mp = pytest.MonkeyPatch()
     mp.setattr(C, "BUCKETS", {b: C.BUCKETS[b] for b in ("short", "medium")})
-    mp.setattr(C, "VARIANTS", {k: C.VARIANTS[k] for k in ("baseline", WALLET, QUALITY)})
+    mp.setattr(C, "VARIANTS", {k: C.VARIANTS[k] for k in ("baseline", *ALL_WALLET)})
     root = tmp_path_factory.mktemp("wallet")
     csv, lb = root / "calls.csv", root / "live_buys.csv"
     try:
@@ -287,13 +316,13 @@ def test_saved_model_and_gates_identical_with_and_without_live_buys(wallet_runs)
 
 def test_wallet_variant_runs_with_live_buys_and_is_na_without(wallet_runs):
     runs, _ = wallet_runs
-    for name in (WALLET, QUALITY):
+    for name in ALL_WALLET:
         without = json.loads((runs["without"] / "meta.json").read_text())["variants"][name]
         assert without["not_applicable"] == train_mod.WREP_NOT_APPLICABLE, name
         assert not {"buckets", "across_seeds", "adoption"} & set(without), name
     meta = json.loads((runs["with"] / "meta.json").read_text())
     base = meta["variants"]["baseline"]["buckets"]["short"]
-    for name in (WALLET, QUALITY):
+    for name in ALL_WALLET:
         v = meta["variants"][name]
         assert "error" not in v and set(v["buckets"]) == {"short", "medium"}, name
         # more numeric inputs: the logistic baseline differs, the rows and simulation do not
@@ -316,6 +345,15 @@ def test_wallet_variant_runs_with_live_buys_and_is_na_without(wallet_runs):
     assert st["prior_runner"] == C.WREP_PRIOR_RUNNER and st["prior_rug"] == C.WREP_PRIOR_RUG
     shares = [w["share_known"] for w in st["weeks"] if w["with_live_buys"]]
     assert shares[0] < shares[-1]                         # history builds up: the coverage ramp
+    # the 14-day lookback: same inputs as the full wallet variant, other values
+    lk = meta["variants"][LOOKBACK]
+    assert lk["changes"] == {"WALLET_REP": True, "WREP_LOOKBACK_DAYS": 14}
+    assert lk["buckets"]["short"]["runner_auc_logistic"] != w["runner_auc_logistic"]
+    assert set(st["lookbacks"]) == {"14"} and "error" not in st["lookbacks"]["14"]
+    weeks14 = {x["week"]: x["known_share_mean"] for x in st["lookbacks"]["14"]["weeks"]}
+    assert set(weeks14) == {x["week"] for x in st["weeks"]}
+    late = [x for x in st["weeks"] if x["with_live_buys"]][-1]     # old history exists here
+    assert weeks14[late["week"]] < late["known_share_mean"]
 
 
 def test_report_has_the_wallet_blocks(wallet_runs):
@@ -337,18 +375,27 @@ def test_report_has_the_wallet_blocks(wallet_runs):
     assert report.count(R.WALLET_DATA_TITLE) == 1 and report.count(R.ADOPTION_TITLE) == 1
     rules = report[report.index(R.ADOPTION_TITLE):]
     assert "1. median lift" in rules and "next step is a lookback variant" in rules
+    assert "it means the drift persists with that window" in rules
+    # through render: the lookback variant's own result never points to a lookback variant
+    lk_rows = [ln for ln in rules.splitlines() if f" | {LOOKBACK} | " in ln]
+    assert lk_rows and not [ln for ln in lk_rows if "next step: a lookback variant" in ln]
     assert "The rules themselves are unchanged, but the rug prior was changed afterwards" in rules
     assert "| bucket | variant | 1. median lift | 2. lift lower end |" in rules
     across = report[report.index("### Variants across seeds (report only)"):]
-    for name in (WALLET, QUALITY):
+    for name in ALL_WALLET:
         for b in ("short", "medium"):
             assert f"| {b} | {name} | " in rules, (b, name)
         assert f"| short | {name} | " in across and f"| short | {name} | n/a" not in across
+    # the lookback variant's history: one line, and its coverage column
+    assert ('"wallet reputation, last 14 days" uses only outcomes known in the last 14 days '
+            "before the call (WREP_LOOKBACK_DAYS = 14)") in data
+    assert "| mean wrep_known_share | mean wrep_known_share, last 14 days |" in data
+    assert f"| {LOOKBACK} | WALLET_REP = True, WREP_LOOKBACK_DAYS = 14 |" in report
     plain = (runs["plain"] / "report.md").read_text(encoding="utf-8")
     assert R.WALLET_DATA_TITLE not in plain and "Variant comparison" not in plain
     without = (runs["without"] / "report.md").read_text(encoding="utf-8")
     assert "No live buys given" in without
-    for name in (WALLET, QUALITY):
+    for name in ALL_WALLET:
         assert f"Not evaluated for `{name}`" in without
 
 
@@ -371,14 +418,14 @@ def test_a_header_only_live_buys_csv_makes_the_variant_na(small_live_df, tmp_pat
     an all-NaN wrep_* frame: the variant is n/a with its own reason, not trained."""
     # the medium bucket stays: the wallet history uses its runner rule
     monkeypatch.setattr(C, "BUCKETS", {b: C.BUCKETS[b] for b in ("short", "medium")})
-    monkeypatch.setattr(C, "VARIANTS", {k: C.VARIANTS[k] for k in ("baseline", WALLET, QUALITY)})
+    monkeypatch.setattr(C, "VARIANTS", {k: C.VARIANTS[k] for k in ("baseline", *ALL_WALLET)})
     lb = tmp_path / "live_buys.csv"
     lb.write_text("call_id,position,tier,amount_usd,wallet_display,wallet_prefix,wallet_suffix\n",
                   encoding="utf-8")
     out = train_mod.train(small_live_df, tmp_path / "models", "v1", variants=True, live_buys=lb)
     meta = json.loads((out / "meta.json").read_text())
     assert meta["wallet_rep"]["calls_with_live_buys"] == 0 and "error" not in meta["wallet_rep"]
-    for name in (WALLET, QUALITY):
+    for name in ALL_WALLET:
         v = meta["variants"][name]
         assert v["not_applicable"] == train_mod.WREP_NO_LIVE_BUYS, name
         assert not {"buckets", "across_seeds", "adoption"} & set(v), name
@@ -386,7 +433,7 @@ def test_a_header_only_live_buys_csv_makes_the_variant_na(small_live_df, tmp_pat
     report = (out / "report.md").read_text(encoding="utf-8")
     assert "0 live buys of 0 distinct wallets on 0 calls" in report
     across = report[report.index("### Variants across seeds (report only)"):]
-    for name in (WALLET, QUALITY):
+    for name in ALL_WALLET:
         assert f"Not evaluated for `{name}`: n/a: no live buys in the export" in report
         assert f"| short | {name} | n/a: no live buys in the export" in across
 
@@ -394,3 +441,156 @@ def test_a_header_only_live_buys_csv_makes_the_variant_na(small_live_df, tmp_pat
 @pytest.fixture(scope="module")
 def small_live_df():
     return make_synthetic.make(n=1500, days=40, seed=5)
+
+
+# --- the 14-day lookback variant (WREP_LOOKBACK_DAYS per variant) -------------------------
+
+def test_lookback_variant_config_and_knob():
+    assert C.WREP_LOOKBACK_VARIANT_DAYS == 14 and C.WREP_LOOKBACK_VARIANT == LOOKBACK
+    assert C.WREP_LOOKBACK_DAYS is None and "WREP_LOOKBACK_DAYS" in C.VARIANT_KNOBS
+    assert C.variant_settings(WALLET)["WREP_LOOKBACK_DAYS"] is None
+    assert C.variant_settings(LOOKBACK)["WREP_LOOKBACK_DAYS"] == 14
+    with C.overrides(**C.VARIANTS[WALLET]):
+        wallet_inputs = (list(C.FEATURES), list(C.LOG1P_FEATURES))
+    with C.overrides(**C.VARIANTS[LOOKBACK]):                 # the same inputs as the full one
+        assert (list(C.FEATURES), list(C.LOG1P_FEATURES)) == wallet_inputs
+        with C.overrides(LGBM_SEED=11):                       # its seed retrains keep the window
+            assert C.WREP_LOOKBACK_DAYS == 14 and list(C.FEATURES) == wallet_inputs[0]
+        assert C.WREP_LOOKBACK_DAYS == 14
+    assert C.WREP_LOOKBACK_DAYS is None
+    for bad in (0, -3, 1.5, "14", True):
+        with pytest.raises(ValueError, match="WREP_LOOKBACK_DAYS"):
+            with C.overrides(WREP_LOOKBACK_DAYS=bad):
+                pass
+    assert C.WREP_LOOKBACK_DAYS is None
+    assert train_mod.wrep_lookbacks() == [None, 14]
+
+
+@pytest.fixture(scope="module")
+def lookback_frames():
+    """60 days of synthetic calls and live buys; train.wallet_rep_frames on them."""
+    d = make_synthetic.make(n=1500, days=60, seed=3)
+    lb = make_synthetic.make_live_buys(d, n_wallets=300, skilled_share=0.05, seed=3)
+    frames, stats = train_mod.wallet_rep_frames(d, lb, np.ones(len(d), dtype=bool))
+    return d, lb, frames, stats
+
+
+def test_wallet_rep_frames_per_lookback(lookback_frames, monkeypatch):
+    d, lb, frames, stats = lookback_frames
+    assert list(frames) == [None, 14] and C.WREP_LOOKBACK_DAYS is None
+    full, last14 = frames[None], frames[14]
+    pd.testing.assert_frame_equal(full, W.wrep_frame(d, lb)[0])          # the default: all history
+    monkeypatch.setattr(C, "WREP_LOOKBACK_DAYS", 14)
+    pd.testing.assert_frame_equal(last14, W.wrep_frame(d, lb)[0])        # computed with 14 days
+    monkeypatch.undo()
+    # the same calls have live buys; with old history the window knows fewer wallets
+    live = full["wrep_known_share"].notna()
+    assert (last14["wrep_known_share"].notna() == live).all()
+    assert (last14.loc[live, "wrep_n_known"] <= full.loc[live, "wrep_n_known"]).all()
+    assert (last14.loc[live, "wrep_n_known"] < full.loc[live, "wrep_n_known"]).any()
+    assert not full["wrep_rug_lift_max"].equals(last14["wrep_rug_lift_max"])
+    # stats: the default's at the top, the 14-day window's under "lookbacks"
+    assert stats["calls_with_live_buys"] > 0 and "error" not in stats
+    lk = stats["lookbacks"]["14"]
+    assert lk["days"] == 14 and set(lk) == {"days", "seconds", "weeks"}
+    assert [w["week"] for w in lk["weeks"]] == [w["week"] for w in stats["weeks"]]
+    text = R.wallet_data_section(stats)
+    assert f'"{LOOKBACK}" uses only outcomes known in the last 14 days before the call' in text
+
+
+def test_each_wallet_variant_trains_on_its_own_lookback_also_in_seed_retrains(
+        lookback_frames, monkeypatch):
+    """run_variants with a recording _train_bucket: the variant's own run (seed 7)
+    and its nested seed retrain (seed 11) both get the rows joined with the
+    frame of the variant's own lookback."""
+    d, _, frames, _ = lookback_frames
+    df = d.copy()
+    df["message_date"] = pd.to_datetime(df["message_date"], utc=True, format="ISO8601")
+    seen = []
+
+    def record(b, rows, L, out_dir, with_dead=False, keep=None):
+        seen.append({"variant_lookback": C.WREP_LOOKBACK_DAYS, "seed": C.LGBM_SEED,
+                     "inputs": list(C.FEATURES), "wrep": rows[list(C.WREP_FEATURES)].copy()})
+        return {"skipped": "recorded"}, None, None
+
+    monkeypatch.setattr(C, "VARIANTS", {k: C.VARIANTS[k] for k in ("baseline", WALLET, LOOKBACK)})
+    monkeypatch.setattr(C, "BUCKETS", {b: C.BUCKETS[b] for b in ("short", "medium")})
+    monkeypatch.setattr(C, "STABILITY_SEEDS", (7, 11))
+    monkeypatch.setattr(train_mod, "_train_bucket", record)
+    out = train_mod.run_variants(df, {}, True, wrep_frames=frames)
+    assert {(s["variant_lookback"], s["seed"]) for s in seen} == {(None, 7), (None, 11),
+                                                                    (14, 7), (14, 11)}
+    for s in seen:
+        want = frames[s["variant_lookback"]]
+        other = frames[None if s["variant_lookback"] == 14 else 14]
+        pd.testing.assert_frame_equal(s["wrep"], want)
+        assert not s["wrep"].equals(other)
+        assert set(C.WREP_FEATURES) <= set(s["inputs"])
+    assert {k for k in ("adoption", "across_seeds") if k in out[LOOKBACK]} == {"adoption",
+                                                                               "across_seeds"}
+    # without that lookback's frame (e.g. its computation failed) only that variant is n/a
+    seen.clear()
+    out = train_mod.run_variants(df, {}, True, wrep_frames={None: frames[None], 14: None})
+    assert out[LOOKBACK]["not_applicable"] == train_mod.WREP_NOT_APPLICABLE
+    assert "not_applicable" not in out[WALLET] and {s["variant_lookback"] for s in seen} == {None}
+    assert train_mod.variant_data(df, "baseline", frames) is df          # no wrep_* elsewhere
+
+
+def test_a_failing_lookback_makes_only_that_variant_na(lookback_frames, monkeypatch, capsys):
+    d, lb, _, _ = lookback_frames
+    real = W.wrep_frame
+
+    def fail_on_14(*a, **k):
+        if C.WREP_LOOKBACK_DAYS == 14:
+            raise RuntimeError("window down")
+        return real(*a, **k)
+
+    monkeypatch.setattr(W, "wrep_frame", fail_on_14)
+    frames, stats = train_mod.wallet_rep_frames(d, lb, np.ones(len(d), dtype=bool))
+    assert frames[14] is None and frames[None] is not None and "error" not in stats
+    printed = capsys.readouterr().out
+    assert ("WARNING: the wallet reputation, last 14 days failed (error: RuntimeError: window "
+            "down); the wallet reputation variants using that window are n/a") in printed
+    assert "[wallet rep] " in printed
+    assert stats["lookbacks"]["14"]["error"] == "error: RuntimeError: window down"
+    text = R.wallet_data_section(stats)
+    assert "**not computed: error: RuntimeError: window down**; that variant is n/a" in text
+    assert "mean wrep_known_share, last 14 days" not in text
+
+
+def test_a_failing_all_history_makes_only_its_variants_na(lookback_frames, monkeypatch, capsys):
+    """All history fails, the 14-day window runs: the WARNING and the report say only
+    the variants using all history are n/a and show the 14-day line; when every
+    lookback fails, they keep saying all wallet variants are n/a."""
+    d, lb, _, _ = lookback_frames
+    real = W.wrep_frame
+
+    def fail_on(days):
+        def wrep_frame(*a, **k):
+            if C.WREP_LOOKBACK_DAYS in days:
+                raise RuntimeError("history down")
+            return real(*a, **k)
+        return wrep_frame
+
+    monkeypatch.setattr(W, "wrep_frame", fail_on({None}))
+    frames, stats = train_mod.wallet_rep_frames(d, lb, np.ones(len(d), dtype=bool))
+    assert frames[None] is None and frames[14] is not None
+    assert stats["error"] == "error: RuntimeError: history down"
+    assert "error" not in stats["lookbacks"]["14"]
+    printed = capsys.readouterr().out
+    assert ("WARNING: the wallet reputation failed (error: RuntimeError: history down); the "
+            "wallet reputation variants using all history are n/a") in printed
+    text = R.wallet_data_section(stats)
+    assert ("**Not computed: error: RuntimeError: history down.** The wallet reputation "
+            "variants using all history are n/a;") in text
+    assert f'"{LOOKBACK}" uses only outcomes known in the last 14 days before the call' in text
+    # every lookback fails: the wording for all wallet variants stays
+    monkeypatch.setattr(W, "wrep_frame", fail_on({None, 14}))
+    frames, stats = train_mod.wallet_rep_frames(d, lb, np.ones(len(d), dtype=bool))
+    assert frames == {None: None, 14: None}
+    printed = capsys.readouterr().out
+    assert ("WARNING: the wallet reputation failed (error: RuntimeError: history down); the "
+            "wallet reputation variants are n/a") in printed and "using all history" not in printed
+    text = R.wallet_data_section(stats)
+    assert "The wallet reputation variants are n/a;" in text and "using all history" not in text
+    assert "**not computed: error: RuntimeError: history down**; that variant is n/a" in text

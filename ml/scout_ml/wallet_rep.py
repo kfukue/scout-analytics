@@ -14,8 +14,9 @@ The labels are the medium bucket's runner rule (net of tax) and a rug = raw
 ret_late_7d <= C.WREP_RUG_PCT. `rugged`, `rug_at` and every 30 d column are
 never read: the tracker sets them later, so they would leak.
 
-Report-only for now: train.py calls `wrep_frame` only for the variant
-"wallet reputation (wrep_*)" (--variants --live-buys PATH); C.WREP_FEATURES
+Report-only for now: train.py calls `wrep_frame` only for the
+C.WALLET_REP_VARIANTS (--variants --live-buys PATH), once per distinct
+C.WREP_LOOKBACK_DAYS they use; C.WREP_FEATURES
 are never inputs of the saved model (train.py raises if they are in
 C.FEATURES), and serve.py does not call this module."""
 import numpy as np
