@@ -34,8 +34,6 @@ root).
   owner's personal notes folder. Its path comes in your
   brief when you need it; it is not in this repo and you do not look for it
   elsewhere. Never run git in the notes folder; the owner commits it.
-  - Where an agent file says `<scratchpad>`, use your `_scratch` subdirectory
-    (below) instead.
   - Never use the session scratchpad under `AppData\Local\Temp` or any other
     folder.
   - Scratch files (throwaway Postgres data, coverage files, logs, LF copies
