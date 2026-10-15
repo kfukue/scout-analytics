@@ -1088,6 +1088,7 @@ def train(df: pd.DataFrame, out_root, version: str | None = None, variants: bool
     # walk-forward, in every training (also with the diagnostics off), before meta.json.
     gate_in = gate_inputs(df, L, res["buckets"], keeps, has_trades)
     apply_gates(res["buckets"], gate_in)
+    apply_collapse_filter(res["buckets"], keeps, gate_in["pooled"])   # report only
     for b, status in res["buckets"].items():
         print(f"[{b}] " + (f"skipped: {status['skipped']}" if status.get("skipped") else
                            "PASS" if status["gates"]["passed"] else
@@ -1261,7 +1262,7 @@ def gate_inputs(df, L, buckets: dict, keeps: dict, has_trades: bool) -> dict:
     pooled = {}
     for b, k in keeps.items():
         try:
-            pooled[b] = D.pooled(_wf_weeks(k))
+            pooled[b] = D.pooled(_wf_weeks(k), with_filter=True)   # filter_*: report only
         except Exception as exc:
             pooled[b] = {"error": variant_error(exc)}
             print(f"WARNING: the pooled walk-forward of {b} failed ({pooled[b]['error']}); "
@@ -1280,6 +1281,89 @@ def apply_gates(buckets: dict, gate_in: dict) -> None:
             continue
         r["gates"] = V.pooled_gates(r["gates"], r["trading"], gate_in["pooled"].get(b),
                                     _seed_lifts(gate_in["runs"], b))
+
+
+# --- Collapse filter (report only): metrics[b]["collapse_filter"] ---
+
+def filter_labels(b: str) -> dict:
+    """The runner and collapse label rules of bucket `b` as text, and whether
+    one call can be both (the two rules read different columns, e.g. 1d: the
+    runner label is the peak max_gain_late_1d, the collapse label the return;
+    or the collapse label also counts rugged calls)."""
+    cfg = C.BUCKETS[b]
+
+    def rule(lab):
+        return f"{cfg[lab][0]} {cfg[lab][1]} {cfg[lab][2]:g}%"
+    return {"runner_label": rule("runner"),
+            "collapse_label": rule("collapse") + (" OR rugged" if cfg["collapse_or_rugged"] else ""),
+            "can_be_both": bool(cfg["runner"][0] != cfg["collapse"][0] or cfg["collapse_or_rugged"])}
+
+
+def filter_weeks(keep: dict) -> list:
+    """Per counted walk-forward week (the pooled gate's weeks): the collapse
+    filter of that week's test calls, flagged by the week's own collapse model."""
+    out = []
+    for w in keep["wf"]:
+        if not w["counted"]:
+            continue
+        row = {"week": w["week"], "start": w["start"]}
+        if w["s_collapse"] is None:
+            out.append({**row, "skipped": "no collapse model"})
+            continue
+        idx = w["idx"]
+        out.append({**row, **V.collapse_filter_stats(
+            keep["y_plain"][idx], keep["Y"]["runner"][idx], keep["net_ret"][idx],
+            V.top_mask(w["s_collapse"], C.SKIP_FRAC))})
+    return out
+
+
+def filter_pooled(p: dict | None, weeks: list) -> dict:
+    """The pooled collapse filter: the "filter_*" rates of the pooled expanding
+    walk-forward `p` (D.pooled of the gate weeks, so `collapses_caught` is its
+    `collapse_removed`; 95% week-block bootstrap as `<key>_lo` / `<key>_hi`)
+    and the counts summed over `weeks` (`filter_weeks`). Every rate key is
+    there, NaN when undefined (e.g. no counted week)."""
+    if p is None or p.get("error"):
+        return {"error": (p or {}).get("error") or "pooled walk-forward not computed"}
+    out = {"weeks": p["weeks"], "reps": p["reps"], "seed": p["seed"]}
+    counted = [w for w in weeks if not w.get("skipped")]
+    for k in V.FILTER_COUNTS:
+        out[k] = sum(w[k] for w in counted) if len(counted) == len(weeks) else None
+    for k in V.FILTER_RATES:
+        for key in (k, f"{k}_lo", f"{k}_hi"):
+            out[key] = p.get(f"filter_{key}", np.nan)
+    return out
+
+
+def collapse_filter(b: str, keep: dict, pooled: dict | None) -> dict:
+    """The collapse filter of bucket `b` (report only; never a gate, never
+    served): skip the C.SKIP_FRAC calls with the highest collapse score (the
+    calls "collapses removed" counts) and see what that catches and costs, on
+    the saved model's test part ("test", = trading.collapse_removed) and on the
+    pooled expanding walk-forward ("pooled", "weeks"). Collapse = the plain
+    collapse label, as the gate."""
+    s_c = keep["scores"].get("collapse")
+    te = keep["te"]
+    test = ({"skipped": "no collapse model"} if s_c is None else V.collapse_filter_stats(
+        keep["y_plain"][te], keep["Y"]["runner"][te], keep["net_ret"][te],
+        V.top_mask(s_c, C.SKIP_FRAC)))
+    weeks = filter_weeks(keep)
+    return {"flag_frac": C.SKIP_FRAC, "random_skip_expected": C.SKIP_FRAC,
+            "sim_max_ret_pct": C.SIM_MAX_RET_PCT, **filter_labels(b),
+            "test": test, "pooled": filter_pooled(pooled, weeks), "weeks": weeks}
+
+
+def apply_collapse_filter(buckets: dict, keeps: dict, pooled: dict) -> None:
+    """metrics[b]["collapse_filter"] for every trained bucket (report only).
+    An error is recorded there with a WARNING; it never fails the run."""
+    for b, k in keeps.items():
+        try:
+            buckets[b]["collapse_filter"] = collapse_filter(b, k, pooled.get(b))
+        except Exception as exc:
+            buckets[b]["collapse_filter"] = {"error": variant_error(exc)}
+            print(f"WARNING: the collapse filter of {b} failed "
+                  f"({buckets[b]['collapse_filter']['error']}); nothing else is affected",
+                  flush=True)
 
 
 def gate_rules() -> dict:
@@ -1334,7 +1418,7 @@ def walk_forward_diagnostics(buckets: dict, keeps: dict, pooled: dict) -> dict:
             w["counted"] = w["week"] in same and not w.get("skipped")
         by_week = {w["week"]: w for w in weeks_roll}
         counted_roll = [w for w in weeks_roll if w["counted"]]
-        out[b] = {"expanding": pooled[b],
+        out[b] = {"expanding": D.without_filter(pooled[b]),
                   "rolling": D.pooled(_wf_weeks({**k, "wf": roll})),
                   "rolling_weeks": C.WF_ROLLING_WEEKS,
                   "expanding_gate": {x: V.single_run_gates(buckets[b]["gates"])[x]

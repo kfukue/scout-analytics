@@ -610,6 +610,77 @@ The `model.py`, `validate.py`, `features.py` (`MIN_CATEGORY_COUNT`) and
 runs, not bound at import, so every knob (`C.overrides`, the variants, the
 seeds) takes effect.
 
+### Collapse filter (report only)
+
+Asked by the owner on 15 Oct 2026: the evidence for presenting the model as a
+risk filter ("avoid likely collapses") instead of "top picks". Each trained
+bucket's section of `report.md` has a "Collapse filter (report only)" table
+after its walk-forward table. It never passes or fails anything, is never
+served, and does not change the saved model, the gates or `passed`.
+
+Flagged = the `SKIP_FRAC` (30%) calls with the highest collapse score, the
+same calls "collapses removed" counts (`top_mask`); kept = the others.
+Collapse = the plain collapse label, as the gate. For (a) the saved model's
+test part and (b) the pooled expanding walk-forward (the gate's counted weeks,
+each week flagged by its own model):
+
+- calls and flagged calls (share);
+- collapses caught = collapses removed (for (a) the gate value, for (b) the
+  pooled collapses removed of "Pooled walk-forward", same 95% week-block
+  bootstrap);
+- collapse rate among the flagged vs the kept calls;
+- runners lost = the share of all runners that are flagged, and the runner
+  rate flagged vs kept;
+- mean net return (each call capped at `SIM_MAX_RET_PCT`, +1,000 %, as the
+  money simulation) of the kept calls vs all calls and the difference; for
+  (b) with its 95% week-block bootstrap interval (the same resamples as the
+  gates);
+- random skip for comparison: skipping 30% at random catches 30% of the
+  collapses and loses 30% of the runners on average, and leaves the mean
+  unchanged.
+
+The 30% cut is taken within each part (the test part, each walk-forward week)
+after its scores are known, as for "collapses removed"; a live filter would
+need a fixed score threshold set in advance, so these rates are likely
+optimistic for such a filter.
+
+Then a per-week table for (b) (week, flagged/calls, collapses caught, runners
+lost, kept vs all mean) to show the trend over time. `short` (1d): the runner
+label is the peak (`max_gain_late_1d >= 100%`) and the collapse label the
+return (`ret_late_1d <= -50%`), so one call can be both; `3day` and `medium`
+read the same return column for both, so no call is both (`long`: a rugged
+call counts as a collapse, so it can be both too). The section says which
+applies.
+
+Computed in every training, also with `SCOUT_ML_DIAGNOSTICS=0`, from the
+arrays the gates already use (nothing is retrained; well under a second).
+An error in it shows "Not computed: error: ..." with a `WARNING` and changes
+nothing else. Code: `validate.collapse_filter_sums` /
+`collapse_filter_rates` / `collapse_filter_stats` (pure), the filter columns
+of `diagnostics.week_sums` and `diagnostics.pooled(..., with_filter=True)`,
+`train.collapse_filter`. Tests: `tests/test_collapse_filter.py` and
+`test_collapse_filter_pooled_is_the_pooled_collapses_removed` in
+`tests/test_diagnostics.py`.
+
+`meta.json`: `metrics[<bucket>]["collapse_filter"]` (plain numbers; null =
+undefined, e.g. no collapses):
+
+- `flag_frac`, `random_skip_expected` (both `SKIP_FRAC`), `sim_max_ret_pct`,
+  `runner_label`, `collapse_label` (text), `can_be_both` (bool);
+- `test`, `pooled` and each entry of `weeks` (which also has `week` and
+  `start`) hold the counts `calls`, `flagged`, `collapses`,
+  `collapses_flagged`, `runners`, `runners_flagged` and the rates
+  `flagged_share`, `collapses_caught`, `collapse_rate_flagged`,
+  `collapse_rate_kept`, `runners_lost`, `runner_rate_flagged`,
+  `runner_rate_kept`, `all_mean`, `kept_mean`, `kept_minus_all` (mean net %,
+  capped);
+- `pooled` also has `weeks`, `reps`, `seed` and `<rate>_lo` / `<rate>_hi`
+  (95% week-block bootstrap) for every rate;
+- `test` is `{"skipped": "no collapse model"}` when the bucket has no
+  collapse model (a week likewise), `pooled` is `{"error": ...}` when the
+  pooled walk-forward failed, and the whole block is `{"error": ...}` when
+  it failed.
+
 ## Read the report
 
 `models/<version>/report.md`, top to bottom:
@@ -632,7 +703,8 @@ seeds) takes effect.
 3. Per bucket: class balance (with warnings for labels under 10% / over 90%
    and for skipped models), test metrics for LightGBM and the logistic
    baseline (ROC AUC, PR AUC, Brier), the gate values, the money simulation,
-   the walk-forward table, calibration by decile, top features. `medium` and
+   the walk-forward table, the "Collapse filter (report only)" table (see
+   "Collapse filter" above), calibration by decile, top features. `medium` and
    `long` also show the purged k-fold (folds used, rounds per fold,
    out-of-fold rows used for calibration). Each bucket also has a "Dead after
    the call" table with the collapse ROC AUC on the plain collapse label
