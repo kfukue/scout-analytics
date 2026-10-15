@@ -100,7 +100,6 @@ func stripSafePhrase(t, p string) string {
 	if !checkStart && !checkEnd {
 		return strings.ReplaceAll(t, p, " ")
 	}
-	alnum := func(r rune) bool { return unicode.IsLetter(r) || unicode.IsDigit(r) }
 	var b strings.Builder
 	done, from := 0, 0 // t[:done] is written to b; search again from t[from:]
 	for {
@@ -111,7 +110,7 @@ func stripSafePhrase(t, p string) string {
 		i, j := from+k, from+k+len(p)
 		before, _ := utf8.DecodeLastRuneInString(t[:i]) // RuneError at the start
 		after, _ := utf8.DecodeRuneInString(t[j:])      // RuneError at the end
-		if (checkStart && alnum(before)) || (checkEnd && alnum(after)) {
+		if (checkStart && isWordRune(before)) || (checkEnd && isWordRune(after)) {
 			from = i + len(string(first)) // not standalone: look further on
 			continue
 		}
@@ -124,6 +123,65 @@ func stripSafePhrase(t, p string) string {
 	}
 	b.WriteString(t[done:])
 	return b.String()
+}
+
+// isWordRune reports whether r is part of a word: a letter or a digit. Any
+// other rune ("-", "_", "'", spaces, punctuation, emoji) is a word boundary.
+func isWordRune(r rune) bool {
+	return unicode.IsLetter(r) || unicode.IsDigit(r)
+}
+
+// markerNegation right before a marker cancels it: "non-mintable" is not
+// "mintable". Only this one hyphenated prefix, as a word of its own ("canon-"
+// does not count); "not mintable" and "non mintable" still match.
+const markerNegation = "non-"
+
+// containsMarker reports whether the red flag marker m occurs in t at the
+// start of a word (markerStartsWord). So "caution" is not found in
+// "precaution", nor "mintable" in "unmintable" or "non-mintable", while "🚩"
+// is found anywhere. Only the start is checked: a word that begins with a
+// marker counts ("red flags", "blacklisted", "scammer", and also "scamper"),
+// because missing a real red flag is worse than a false one. t and m are
+// lowercase (classify lowercases t, splitList m).
+func containsMarker(t, m string) bool {
+	if m == "" {
+		return false
+	}
+	_, size := utf8.DecodeRuneInString(m)
+	for from := 0; ; {
+		k := strings.Index(t[from:], m)
+		if k < 0 {
+			return false
+		}
+		i := from + k
+		if markerStartsWord(t, m, i) {
+			return true
+		}
+		from = i + size // not at the start of a word: look further on
+	}
+}
+
+// markerStartsWord reports whether the marker m found at t[i:] starts a word.
+// A marker that starts with a non-word rune ("🚩", "⚠️") always does. One
+// that starts with a letter or digit must not follow a letter or digit, nor
+// the negation "non-".
+func markerStartsWord(t, m string, i int) bool {
+	first, _ := utf8.DecodeRuneInString(m)
+	if !isWordRune(first) {
+		return true
+	}
+	before, _ := utf8.DecodeLastRuneInString(t[:i]) // RuneError at the start
+	return !isWordRune(before) && !negatedAt(t, i)
+}
+
+// negatedAt reports whether t[:i] ends in the word markerNegation ("non-").
+func negatedAt(t string, i int) bool {
+	head, ok := strings.CutSuffix(t[:i], markerNegation)
+	if !ok {
+		return false
+	}
+	before, _ := utf8.DecodeLastRuneInString(head) // RuneError at the start
+	return !isWordRune(before)
 }
 
 // levelFromLabel maps a verdict phrase to a level. Order matters:

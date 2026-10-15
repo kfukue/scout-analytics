@@ -1,6 +1,10 @@
 package main
 
-import "testing"
+import (
+	"strings"
+	"testing"
+	"unicode/utf8"
+)
 
 // A Perceptor answer that counts zero red flags ("0 red flags", "Red flags: 0",
 // "zero red flags", "Red flags: none") means the same as "no red flags".
@@ -133,6 +137,134 @@ func TestStripSafePhrase(t *testing.T) {
 	} {
 		if got := stripSafePhrase(c.text, c.phrase); got != c.want {
 			t.Errorf("stripSafePhrase(%q, %q) = %q, want %q", c.text, c.phrase, got, c.want)
+		}
+	}
+}
+
+// A red flag marker must start a word, and "non-" before it cancels it.
+// Before, markers matched as substrings: "non-mintable" was a red flag
+// ("mintable") and "precaution" a caution ("caution"). The end of the word is
+// not checked, so "blacklisted" or "scammer" still match, as before.
+func TestClassifyMarkerStartsWord(t *testing.T) {
+	mk, sf := splitList(defaultMarkers), splitList(defaultSafe)
+	for _, c := range []struct {
+		text, marker string // marker "" = not flagged
+	}{
+		// the two examples from HANDOFF.md
+		{"Token is non-mintable", ""},
+		{"Take precaution: low LP", ""},
+		// inside other words, or after "non-"
+		{"unmintable supply", ""},
+		{"NON-MINTABLE", ""},
+		{"non-mintable, non-honeypot", ""},
+		{"endangered", ""},
+		{"prewarning", ""},
+		{"2mintable", ""},
+		{"émintable", ""},
+		// a word that starts with a marker matches, whatever follows
+		{"dangerous", "danger"},
+		{"Blacklisted: yes", "blacklist"},
+		{"rugpulled", "rugpull"},
+		{"scammer", "scam"},
+		{"scamper", "scam"}, // known, accepted false red flag (PM, 15 Oct 2026)
+		// still matched
+		{"non-mintable but honeypot", "honeypot"},
+		{"precaution, caution", "caution"},
+		{"not mintable", "mintable"},           // only "non-" negates
+		{"non mintable", "mintable"},           // only the hyphenated "non-"
+		{"canon-mintable", "mintable"},         // "non-" must be a word of its own
+		{"honeypot-like contract", "honeypot"}, // "-" is a boundary
+		{"MINTABLE", "mintable"},
+		{"Mintable: yes.", "mintable"},
+		{"(honeypot)", "honeypot"},
+		{"scam!", "scam"},
+		{"Red flags: liquidity pulled", "red flag"},
+		{"2 WARNINGS", "warning"},
+		{"honeypots", "honeypot"},
+		{"Owner: CAN'T SELL", "can't sell"},
+		{"proxy contract detected", "proxy contract"},
+		{"low LP⚠️", "⚠️"},
+		{"🚩🚩", "🚩"},
+		{"liquidity🔴pulled", "🔴"},
+	} {
+		t.Run(c.text, func(t *testing.T) {
+			got, m := classify(c.text, mk, sf)
+			if got != (c.marker != "") || m != c.marker {
+				t.Errorf("classify(%q) = %v, %q; want %v, %q", c.text, got, m, c.marker != "", c.marker)
+			}
+		})
+	}
+}
+
+// Every default marker still matches on its own, at the start or end of the
+// text, next to punctuation, in upper case and with a suffix glued after it.
+// A marker that starts with a letter or digit does not match with a letter or
+// digit glued before it, or after "non-".
+func TestDefaultMarkersMatchAtWordStart(t *testing.T) {
+	sf := splitList(defaultSafe)
+	for _, m := range splitList(defaultMarkers) {
+		t.Run(m, func(t *testing.T) {
+			match := []string{m, m + " at start", "at end " + m, "(" + m + ")", "- " + m + "!",
+				strings.ToUpper(m), m + "s", m + "zz"}
+			var noMatch []string
+			if first, _ := utf8.DecodeRuneInString(m); isWordRune(first) {
+				noMatch = append(noMatch, "zz"+m, "9"+m, "non-"+m)
+			}
+			for _, text := range match {
+				if got, gotM := classify(text, []string{m}, sf); !got || gotM != m {
+					t.Errorf("classify(%q, [%q]) = %v, %q; want true, %q", text, m, got, gotM, m)
+				}
+			}
+			for _, text := range noMatch {
+				if got, _ := classify(text, []string{m}, sf); got {
+					t.Errorf("classify(%q, [%q]) = true, want false", text, m)
+				}
+			}
+		})
+	}
+}
+
+func TestContainsMarker(t *testing.T) {
+	for _, c := range []struct {
+		text, marker string
+		want         bool
+	}{
+		{"mintable", "mintable", true},
+		{"mintable yes", "mintable", true},
+		{"yes mintable", "mintable", true},
+		{"premintable mintable", "mintable", true}, // second occurrence stands alone
+		{"non-mintable mintable", "mintable", true},
+		{"premintable", "mintable", false},
+		{"mintablex", "mintable", true}, // only the start of the word is checked
+		{"non-mintable", "mintable", false},
+		{"x-non-mintable", "mintable", false}, // "-" before "non-" is a boundary
+		{"non-", "mintable", false},
+		{"⚠️low", "⚠️", true},
+		{"anything", "", false},
+		{"", "mintable", false},
+	} {
+		if got := containsMarker(c.text, c.marker); got != c.want {
+			t.Errorf("containsMarker(%q, %q) = %v, want %v", c.text, c.marker, got, c.want)
+		}
+	}
+}
+
+// What the word-start rule for markers changes for a reply without a report
+// link.
+func TestTextVerdictMarkerWordStart(t *testing.T) {
+	mk, sf := splitList(defaultMarkers), splitList(defaultSafe)
+	for text, want := range map[string]string{
+		"No red flags found. Token is non-mintable.":  levelClean,    // was red_flags
+		"No red flags found. Take precaution: low LP": levelClean,    // was caution
+		"$X check: non-mintable, LP locked":           levelUnknown,  // was red_flags
+		"No red flags found. Mintable: yes":           levelRedFlags, // unchanged
+		"$NH on-chain check: red flags.":              levelRedFlags, // unchanged
+		"$X check: 2 warnings":                        levelCaution,  // unchanged
+		"$X check: Blacklisted: yes":                  levelRedFlags, // unchanged
+		"$X check: dev is a scammer":                  levelRedFlags, // unchanged
+	} {
+		if v := textVerdict(text, mk, sf); v.Level != want {
+			t.Errorf("textVerdict(%q) = %s (label %q), want %s", text, v.Level, v.Label, want)
 		}
 	}
 }
