@@ -260,8 +260,53 @@ CALLS_PREV_INPUT_CHOICES = ("counts", "burst")
 # Derived inputs that are model inputs only when a knob selects them.
 OPTIONAL_DERIVED = [CALLS_PREV_BURST]
 
+# --- Live-buy wallet reputation (scout_ml/wallet_rep.py; report-only test) -----
+# For each call C, the wallets in its "Live buys" (the -export-live-buys CSV)
+# are scored by how the earlier FIRST calls they bought into turned out at 7 d
+# (the medium bucket's runner rule; a rug = raw ret_late_7d <= WREP_RUG_PCT),
+# counting only outcomes known before C was posted and never C's own token.
+# Not inputs of the saved model: with WALLET_REP = False (the default, which
+# train.py enforces) these names are NOT in FEATURES / NUMERIC_FEATURES, so the
+# saved model cannot use them (serving cannot compute them yet). They are
+# inputs only in the report-only variant "wallet reputation (wrep_*)"
+# (WALLET_REP = True), which train.py runs with --variants --live-buys PATH.
+# The three shares are in NO_LOG; the count and the lifts are log1p-scaled by
+# the logistic baseline.
+WALLET_REP = False                     # a VARIANT_KNOB: True appends WREP_FEATURES to the numeric inputs
+WREP_PREFIX = "wrep_"                  # every wallet-reputation column starts with this
+WREP_FEATURES = ("wrep_n_known", "wrep_known_share",                # how many of C's wallets have history
+                 "wrep_runner_lift_mean", "wrep_runner_lift_max",   # smoothed runner rate / prior
+                 "wrep_rug_lift_mean", "wrep_rug_lift_max",         # smoothed rug rate / prior
+                 "wrep_good_share", "wrep_bad_share")               # share of known wallets judged good / bad
+WREP_KNOWN_LAG_HOURS = 6               # the 7 d outcome counts as known this long after it is due (tracker delay)
+WREP_RUG_PCT = -90.0                   # raw ret_late_7d at or below this is a rug (rugged / rug_at are set later: never read)
+WREP_PRIOR_RUNNER = 0.05               # fixed prior runner rate, not a running rate (a running rate would be a calendar proxy)
+WREP_PRIOR_RUG = 0.15                  # fixed prior rug rate, for the same reason
+WREP_PRIOR_STRENGTH = 20               # pseudo-calls behind each prior: few calls barely move a wallet off it
+WREP_MIN_CALLS = 5                     # a wallet needs this many known calls to count as good or bad
+WREP_GOOD_LIFT = 2.0                   # good wallet: runner lift at least this
+WREP_BAD_LIFT = 1.5                    # bad wallet: rug lift at least this
+WREP_LOOKBACK_DAYS = None              # None = all history; N = only outcomes known in the N days before the call
+WREP_SHARES = ("wrep_known_share", "wrep_good_share", "wrep_bad_share")   # bounded 0..1: in NO_LOG
+# Pre-registered adoption rules of the wallet reputation variant (fixed on
+# 14 Oct 2026, before any result; report only, never a gate of the saved model).
+# The variant passes in a bucket only if ALL hold: (1) its across-seeds median
+# pooled walk-forward lift >= min_median_lift AND >= the baseline's median;
+# (2) the LGBM_SEED run's pooled lift, 95% lower end > min_lift_lower; (3) the
+# pooled simulation difference, 95% lower end > min_sim_diff_lower; (4) its
+# collapses removed >= min_collapse_removed; (5) drift: its adversarial AUC at
+# most max_adv_auc_rise above the baseline's, and no wrep_* input among the top
+# drift_top drifting inputs with a gain share >= drift_max_share. When only (5)
+# fails the next step is a lookback variant (WREP_LOOKBACK_DAYS), not adoption.
+# Literal values on purpose: a later change of GATES must not move these.
+WREP_ADOPTION = {"min_median_lift": 2.0, "min_lift_lower": 1.0, "min_sim_diff_lower": 0.0,
+                 "min_collapse_removed": 0.40, "max_adv_auc_rise": 0.02, "drift_top": 3,
+                 "drift_max_share": 0.40}
+WREP_ADOPTION_SET_ON = "14 Oct 2026"
+
+
 # Inputs left out of new models (a VARIANT_KNOB). Only numeric inputs
-# (NUMERIC_RAW + DERIVED + OPTIONAL_DERIVED) can be left out; it can only
+# (NUMERIC_RAW + DERIVED + OPTIONAL_DERIVED + WREP_FEATURES) can be left out; it can only
 # remove inputs, never add one. The columns stay in the view and in NUMERIC_RAW.
 # Owner decision 14 Oct 2026: calls_prev_1h / calls_prev_24h are left out by
 # default. They act as a calendar proxy (adversarial AUC 0.99, mostly from
@@ -277,30 +322,36 @@ EXCLUDED_INPUTS = ("calls_prev_1h", "calls_prev_24h")
 NO_LOG = set(["liq_pct", "tax_buy_pct", "tax_sell_pct", "proof_elite", "proof_good",
               "hour_utc", "weekday_utc"]
              + [f"pre_price_chg_{w}_pct" for w in _WINDOWS]
-             + [f"pre_buy_vol_share_{w}" for w in _WINDOWS])
+             + [f"pre_buy_vol_share_{w}" for w in _WINDOWS]
+             + list(WREP_SHARES))
 
 
-def numeric_inputs(excluded=(), calls_prev: str = "counts") -> list:
+def numeric_inputs(excluded=(), calls_prev: str = "counts", wallet_rep: bool = False) -> list:
     """The numeric model inputs for a CALLS_PREV_INPUTS setting (`calls_prev`;
-    "burst": CALLS_PREV_RAW replaced, in place, by CALLS_PREV_BURST), without
+    "burst": CALLS_PREV_RAW replaced, in place, by CALLS_PREV_BURST) and a
+    WALLET_REP setting (`wallet_rep` True: WREP_FEATURES appended), without
     `excluded` (raises on a name that is not a numeric input, or a bad setting)."""
     if calls_prev not in CALLS_PREV_INPUT_CHOICES:
         raise ValueError(f"CALLS_PREV_INPUTS must be one of {CALLS_PREV_INPUT_CHOICES}, "
                          f"not {calls_prev!r}")
+    if not isinstance(wallet_rep, bool):
+        raise ValueError(f"WALLET_REP must be True or False, not {wallet_rep!r}")
     excluded = set(excluded)
-    bad = sorted(excluded - set(NUMERIC_RAW + DERIVED + OPTIONAL_DERIVED))
+    bad = sorted(excluded - set(NUMERIC_RAW + DERIVED + OPTIONAL_DERIVED + list(WREP_FEATURES)))
     if bad:
         raise ValueError(f"EXCLUDED_INPUTS must name numeric inputs only, not {bad}")
     base = NUMERIC_RAW + DERIVED
     if calls_prev == "burst":
         base = [CALLS_PREV_BURST if c == CALLS_PREV_RAW[0] else c
                 for c in base if c != CALLS_PREV_RAW[1]]
+    if wallet_rep:
+        base = base + list(WREP_FEATURES)
     return [c for c in base if c not in excluded]
 
 
 # The model inputs of new models (rebuilt by `overrides`).
 CATEGORICAL = categorical_inputs(DEX_INPUTS)
-NUMERIC_FEATURES = numeric_inputs(EXCLUDED_INPUTS, CALLS_PREV_INPUTS)
+NUMERIC_FEATURES = numeric_inputs(EXCLUDED_INPUTS, CALLS_PREV_INPUTS, WALLET_REP)
 FEATURES = NUMERIC_FEATURES + CATEGORICAL
 LOG1P_FEATURES = [c for c in NUMERIC_FEATURES if c not in NO_LOG]
 # Category levels are learned from the training rows of each split only (main
@@ -445,7 +496,8 @@ LIFT_CI_Z = 1.96
 # the gates of the saved model (that is always the baseline). "baseline" reuses
 # the results of the saved model. Knobs: VARIANT_KNOBS.
 VARIANT_KNOBS = ("DEAD_IS_COLLAPSE", "DEAD_TRADES_24H", "DEX_INPUTS", "RUNNER_NEEDS_TRADES",
-                 "LGBM_REGULARISATION", "LGBM_SEED", "EXCLUDED_INPUTS", "CALLS_PREV_INPUTS")
+                 "LGBM_REGULARISATION", "LGBM_SEED", "EXCLUDED_INPUTS", "CALLS_PREV_INPUTS",
+                 "WALLET_REP")
 # "dead threshold 100" was dropped: DEAD_TRADES_24H only changes the labels
 # while the dead rule is on, so with the rule off it would equal the baseline.
 VARIANTS = {
@@ -458,14 +510,21 @@ VARIANTS = {
     # the default before 14 Oct 2026 (see EXCLUDED_INPUTS): calls_prev_1h /
     # calls_prev_24h back in, so every report compares against the old setting
     "with calls_prev counts (default before 14 Oct)": {"EXCLUDED_INPUTS": ()},
+    # the live-buy wallet reputation test (owner-approved, report only): WREP_FEATURES
+    # added to the inputs; needs train.py --live-buys (WALLET_REP_VARIANTS)
+    "wallet reputation (wrep_*)": {"WALLET_REP": True},
 }
 # Variants also retrained with the other STABILITY_SEEDS for the report-only
-# table "calls_prev variants across seeds" (ml/README.md). Never a gate; about
-# one normal training per extra seed and variant; empty it to skip the table.
-SEED_VARIANTS = ("with calls_prev counts (default before 14 Oct)",)
+# table "Variants across seeds" (ml/README.md). Never a gate; about one normal
+# training per extra seed and variant; empty it to skip the table.
+SEED_VARIANTS = ("with calls_prev counts (default before 14 Oct)", "wallet reputation (wrep_*)")
 # Variants that only differ from the baseline through trades_24h: not applicable
 # when the export has no trades_24h column.
 TRADES_VARIANTS = ("dead rule on (collapse OR dead)", "runners must be tradeable")
+# Variants that need the wrep_* columns (train.py --live-buys): not applicable
+# when the variants' data has none (no live buys given, or their wallet
+# reputation failed); their pre-registered adoption rules are WREP_ADOPTION.
+WALLET_REP_VARIANTS = ("wallet reputation (wrep_*)",)
 
 # --- Stability diagnostics ---------------------------------------------------------
 # Extra sections at the end of report.md (before the variant comparison) to
@@ -532,29 +591,6 @@ ADV_PER_WEEK = True
 ADV_MAX_WEEKS = 6
 ADV_WEEK_FOLDS = 3
 
-# --- Live-buy wallet reputation (scout_ml/wallet_rep.py; report-only test) -----
-# For each call C, the wallets in its "Live buys" (the -export-live-buys CSV)
-# are scored by how the earlier FIRST calls they bought into turned out at 7 d
-# (the medium bucket's runner rule; a rug = raw ret_late_7d <= WREP_RUG_PCT),
-# counting only outcomes known before C was posted and never C's own token.
-# Not model inputs yet: these names are deliberately NOT in FEATURES /
-# NUMERIC_FEATURES (a test checks it), so the saved model cannot use them.
-WREP_PREFIX = "wrep_"                  # every wallet-reputation column starts with this
-WREP_FEATURES = ("wrep_n_known", "wrep_known_share",                # how many of C's wallets have history
-                 "wrep_runner_lift_mean", "wrep_runner_lift_max",   # smoothed runner rate / prior
-                 "wrep_rug_lift_mean", "wrep_rug_lift_max",         # smoothed rug rate / prior
-                 "wrep_good_share", "wrep_bad_share")               # share of known wallets judged good / bad
-WREP_KNOWN_LAG_HOURS = 6               # the 7 d outcome counts as known this long after it is due (tracker delay)
-WREP_RUG_PCT = -90.0                   # raw ret_late_7d at or below this is a rug (rugged / rug_at are set later: never read)
-WREP_PRIOR_RUNNER = 0.05               # fixed prior runner rate, not a running rate (a running rate would be a calendar proxy)
-WREP_PRIOR_RUG = 0.15                  # fixed prior rug rate, for the same reason
-WREP_PRIOR_STRENGTH = 20               # pseudo-calls behind each prior: few calls barely move a wallet off it
-WREP_MIN_CALLS = 5                     # a wallet needs this many known calls to count as good or bad
-WREP_GOOD_LIFT = 2.0                   # good wallet: runner lift at least this
-WREP_BAD_LIFT = 1.5                    # bad wallet: rug lift at least this
-WREP_LOOKBACK_DAYS = None              # None = all history; N = only outcomes known in the N days before the call
-
-
 def is_forbidden(col: str) -> bool:
     """True if `col` is an outcome/bookkeeping/identity column."""
     return col in FORBIDDEN_COLUMNS or col.startswith(FORBIDDEN_PREFIXES)
@@ -570,7 +606,8 @@ def variant_settings(name: str) -> dict:
 def overrides(**knobs):
     """Temporarily set VARIANT_KNOBS (and rebuild CATEGORICAL, NUMERIC_FEATURES,
     LOG1P_FEATURES and FEATURES from DEX_INPUTS / EXCLUDED_INPUTS /
-    CALLS_PREV_INPUTS); everything is restored on exit, also after an error."""
+    CALLS_PREV_INPUTS / WALLET_REP, as currently set: a nested overrides(LGBM_SEED=...)
+    keeps the outer one's inputs); everything is restored on exit, also after an error."""
     g = globals()
     bad = sorted(set(knobs) - set(VARIANT_KNOBS))
     if bad:
@@ -579,13 +616,15 @@ def overrides(**knobs):
         raise ValueError(f"LGBM_REGULARISATION must be one of {sorted(LGBM_REG_SETS)}, "
                          f"not {knobs['LGBM_REGULARISATION']!r}")
     numeric_inputs(knobs.get("EXCLUDED_INPUTS", EXCLUDED_INPUTS),     # raises before anything
-                   knobs.get("CALLS_PREV_INPUTS", CALLS_PREV_INPUTS))  # is changed
+                   knobs.get("CALLS_PREV_INPUTS", CALLS_PREV_INPUTS),  # is changed
+                   knobs.get("WALLET_REP", WALLET_REP))
     saved = {k: g[k] for k in (*VARIANT_KNOBS, "CATEGORICAL", "FEATURES", "NUMERIC_FEATURES",
                                "LOG1P_FEATURES")}
     try:
         g.update(knobs)
         g["CATEGORICAL"] = categorical_inputs(g["DEX_INPUTS"])
-        g["NUMERIC_FEATURES"] = numeric_inputs(g["EXCLUDED_INPUTS"], g["CALLS_PREV_INPUTS"])
+        g["NUMERIC_FEATURES"] = numeric_inputs(g["EXCLUDED_INPUTS"], g["CALLS_PREV_INPUTS"],
+                                               g["WALLET_REP"])
         g["LOG1P_FEATURES"] = [c for c in g["NUMERIC_FEATURES"] if c not in NO_LOG]
         g["FEATURES"] = g["NUMERIC_FEATURES"] + g["CATEGORICAL"]
         yield

@@ -3,6 +3,8 @@
     python train.py --csv calls.csv --out models/
     python train.py --dsn postgres://user:pass@host/db --out models/
     python train.py --csv calls.csv --out models/ --variants   # plus the variant comparison
+    python train.py --csv calls.csv --out models/ --variants --live-buys live_buys.csv
+                                        # plus the wallet reputation variant (report only)
 """
 import argparse
 import json
@@ -25,6 +27,7 @@ from scout_ml.model import (apply_calibrator, best_rounds, choose_platt, fit_bas
                             fit_platt, fit_platt_recent, predict, usable_holdout)
 from scout_ml.report import render, variant_error
 from scout_ml import validate as V
+from scout_ml import wallet_rep as W
 
 
 def read_dsn(dsn: str) -> pd.DataFrame:
@@ -407,7 +410,7 @@ def _variant_bucket(b, df, L, has_trades, store: dict | None = None) -> dict:
     return variant_summary(r, pooled)
 
 
-# --- "calls_prev variants across seeds" (report only; config SEED_VARIANTS) ---
+# --- "Variants across seeds" (report only; config SEED_VARIANTS) ---
 
 def seed_median(seed_lifts: dict) -> dict:
     """Per seed of C.STABILITY_SEEDS its pooled walk-forward lift (None when there
@@ -417,15 +420,18 @@ def seed_median(seed_lifts: dict) -> dict:
     return V.seed_lift_median(seed_lifts, C.STABILITY_SEEDS)
 
 
-def _top3(adv: dict) -> dict:
-    return {**adv, "top": list(adv.get("top") or [])[:3]}
+def _top_inputs(adv: dict) -> dict:
+    """`adv` with its top drifting inputs cut to as many as the report shows (3)
+    or the wallet drift rule reads (C.WREP_ADOPTION["drift_top"]), the larger."""
+    n = max(3, C.WREP_ADOPTION["drift_top"])
+    return {**adv, "top": list(adv.get("top") or [])[:n]}
 
 
 def adversarial_split(keep: dict) -> dict:
     """D.adversarial on a trained bucket's own feature matrix: its train part vs
-    its test part (as the diagnostics' "split" row; top 3 drifting inputs)."""
+    its test part (as the diagnostics' "split" row; top drifting inputs: `_top_inputs`)."""
     m = keep["tr"] | keep["te"]
-    return _top3(D.adversarial(keep["X"][m], keep["te"][m]))
+    return _top_inputs(D.adversarial(keep["X"][m], keep["te"][m]))
 
 
 def across_row(seed_lifts: dict, pooled, adversarial) -> dict:
@@ -460,7 +466,7 @@ def across_seeds(buckets: dict, runs: dict, pooled: dict | None, keeps: dict,
             out["buckets"][b] = {"skipped": r.get("skipped") or "not trained"}
             continue
         known = (adv_known or {}).get(b)
-        adv = _top3(known) if isinstance(known, dict) else _adv_or_error(keeps[b])
+        adv = _top_inputs(known) if isinstance(known, dict) else _adv_or_error(keeps[b])
         out["buckets"][b] = across_row(_seed_lifts(runs, b), (pooled or {}).get(b), adv)
     out["seconds"] = round(time.time() - t0, 1)
     return out
@@ -486,8 +492,13 @@ def run_variants(df: pd.DataFrame, baseline: dict, has_trades: bool,
     values) on the same rows and splits; report only, nothing is saved.
     `baseline`: the bucket results of the saved model, reused for "baseline"
     (`baseline_pooled`: its pooled walk-forward per bucket, from the gate inputs).
-    `df`: sorted rows as prepared by `train`. `has_trades`: the data has the
+    `df`: sorted rows as prepared by `train` (with the wrep_* columns joined
+    when live buys were given). `has_trades`: the data has the
     trades_24h column (else the C.TRADES_VARIANTS equal the baseline: n/a).
+    The C.WALLET_REP_VARIANTS are n/a when `df` has no wrep_* column or only
+    empty ones (`wrep_not_applicable`; they would otherwise train on all-NaN
+    inputs); when they ran, their pre-registered
+    adoption rules (`wallet_adoption`) are added under "adoption".
     The C.SEED_VARIANTS also get "across_seeds" (`variant_across_seeds`), and
     then the baseline row too (`across_seeds` from `baseline_runs`, the
     gates' seed retrains, `baseline_keeps` and `baseline_adv`; left out when
@@ -515,6 +526,9 @@ def run_variants(df: pd.DataFrame, baseline: dict, has_trades: bool,
         if not has_trades and name in C.TRADES_VARIANTS:
             entry["not_applicable"] = (f"the data has no {C.DEAD_COLUMN} column, so this "
                                        "variant equals the baseline")
+            continue
+        if name in C.WALLET_REP_VARIANTS and wrep_not_applicable(df):
+            entry["not_applicable"] = wrep_not_applicable(df)
             continue
         t0 = time.time()
         attempted += 1
@@ -548,7 +562,169 @@ def run_variants(df: pd.DataFrame, baseline: dict, has_trades: bool,
     if attempted and failed == attempted:
         print(f"WARNING: all {attempted} variants failed; report.md has no variant numbers "
               "(the saved baseline model and its gates are complete and valid)", flush=True)
+    add_wallet_adoption(out)
     return out
+
+
+# --- Wallet reputation (report-only variant; config WALLET_REP, WREP_*) ---------
+
+WREP_NOT_APPLICABLE = ("no live-buy wallet data (train.py --live-buys PATH not given, or its "
+                       "wallet reputation failed: see \"Wallet reputation data\")")
+
+
+WREP_NO_LIVE_BUYS = ("no live buys in the export (the --live-buys CSV has no rows for these "
+                     "calls, so every wrep_* input is empty)")
+
+
+def has_wrep_columns(df: pd.DataFrame) -> bool:
+    """Whether `df` has any wrep_* column (the wallet reputation joined)."""
+    return any(str(c).startswith(C.WREP_PREFIX) for c in df.columns)
+
+
+def wrep_not_applicable(df: pd.DataFrame) -> str | None:
+    """Why the wallet reputation variant cannot run on `df`, or None when it can:
+    no wrep_* column (WREP_NOT_APPLICABLE), or every wrep_* value missing, e.g. a
+    header-only or zero-row live_buys.csv (WREP_NO_LIVE_BUYS)."""
+    if not has_wrep_columns(df):
+        return WREP_NOT_APPLICABLE
+    cols = [c for c in df.columns if str(c).startswith(C.WREP_PREFIX)]
+    return WREP_NO_LIVE_BUYS if df[cols].isna().all().all() else None
+
+
+def read_live_buys(src) -> pd.DataFrame:
+    """The -export-live-buys CSV (`src` a path; a DataFrame is returned as is).
+    Every column is read as text, so a wallet suffix such as "0042" or "1e10"
+    stays the string it was (the call id is parsed by wallet_rep); only an
+    empty field is missing."""
+    if isinstance(src, pd.DataFrame):
+        return src
+    return pd.read_csv(src, dtype=str, keep_default_na=False, na_values=[""])
+
+
+def wrep_weeks(dates: pd.Series, wrep: pd.DataFrame, rows) -> list:
+    """Per calendar week (Monday, UTC) of the calls `rows` (a mask over `wrep`):
+    calls, calls with live buys, the share of those with at least one known
+    wallet, and their mean wrep_known_share (the coverage ramp)."""
+    rows = np.asarray(rows, dtype=bool)
+    week = pd.to_datetime(dates, utc=True).dt.tz_localize(None).dt.to_period("W-SUN").dt.start_time
+    f = pd.DataFrame({"week": week.to_numpy()[rows],
+                      "live": wrep["wrep_known_share"].notna().to_numpy()[rows],
+                      "known": (wrep["wrep_n_known"] >= 1).to_numpy()[rows],
+                      "share": wrep["wrep_known_share"].to_numpy()[rows]})
+    out = []
+    for w, g in f.groupby("week", sort=True):
+        live = g[g["live"]]
+        out.append({"week": w.strftime("%Y-%m-%d"), "calls": len(g), "with_live_buys": len(live),
+                    "share_known": float(live["known"].mean()) if len(live) else np.nan,
+                    "known_share_mean": float(live["share"].mean()) if len(live) else np.nan})
+    return out
+
+
+def wallet_rep_data(df: pd.DataFrame, live_buys, rows) -> tuple:
+    """(the wrep_* frame indexed like `df`, or None after an error; its stats:
+    W.wrep_frame's, the fixed priors, `wrep_weeks` over the calls `rows` (the
+    rows training can use) and the seconds taken, or {"error": ...}). Never
+    raises: the wallet reputation only feeds a report-only variant."""
+    t0 = time.time()
+    try:
+        wrep, stats = W.wrep_frame(df, read_live_buys(live_buys))
+        stats = {**stats, "prior_runner": C.WREP_PRIOR_RUNNER, "prior_rug": C.WREP_PRIOR_RUG,
+                 "weeks": wrep_weeks(df["message_date"], wrep, rows)}
+    except Exception as exc:  # not BaseException: Ctrl-C still stops the run
+        wrep, stats = None, {"error": variant_error(exc)}
+        print(f"WARNING: the wallet reputation failed ({stats['error']}); the wallet reputation "
+              "variant is n/a, the saved models are not affected", flush=True)
+    stats["seconds"] = round(time.time() - t0, 1)
+    if wrep is not None:
+        print(f"[wallet rep] {stats['live_buy_rows']} live buys, {stats['wallets']} wallets, "
+              f"{stats['calls_with_live_buys']} calls with live buys; {stats['seconds']:.0f} s",
+              flush=True)
+    return wrep, stats
+
+
+def _as_float(x) -> float:
+    """x as a float, NaN when missing (None) or not a number."""
+    try:
+        return float(x)
+    except (TypeError, ValueError):
+        return np.nan
+
+
+def _rule(ok, **values) -> dict:
+    """One adoption rule: holds True / False, or None (n/a) when an input is undefined."""
+    if any(np.isnan(v) for v in values.values()):
+        return {"holds": None, **values}
+    return {"holds": bool(ok()), **values}
+
+
+def _wrep_drift(adv: dict, rules: dict) -> list:
+    """The wrep_* inputs among the top `drift_top` drifting inputs with a gain
+    share >= `drift_max_share` (both from `rules`, C.WREP_ADOPTION): [[name, share], ...]."""
+    top = list((adv or {}).get("top") or [])[:rules["drift_top"]]
+    return [[f, float(g)] for f, g in top
+            if str(f).startswith(C.WREP_PREFIX) and float(g) >= rules["drift_max_share"]]
+
+
+def adoption_bucket(base: dict, var: dict, summary: dict) -> dict:
+    """The pre-registered adoption rules (C.WREP_ADOPTION) for one bucket:
+    `base` / `var` the baseline's / the variant's across-seeds row, `summary` the
+    variant's bucket row. Each rule: {"holds": True / False / None (n/a), values};
+    "result": "pass" (all hold), "lookback" (only the drift rule does not hold:
+    next step a WREP_LOOKBACK_DAYS variant, not adoption) or "fail"."""
+    r = C.WREP_ADOPTION
+    v_med, b_med = _as_float(var.get("median")), _as_float(base.get("median"))
+    lift_lo, sim_lo = _as_float(var.get("lift_lo")), _as_float(var.get("sim_gain_lo"))
+    removed = _as_float(summary.get("collapse_removed"))
+    v_adv, b_adv = var.get("adversarial") or {}, base.get("adversarial") or {}
+    v_auc, b_auc = _as_float(v_adv.get("auc")), _as_float(b_adv.get("auc"))
+    drifting = _wrep_drift(v_adv, r)
+    rules = {
+        "median_lift": _rule(lambda: v_med >= r["min_median_lift"] and v_med >= b_med,
+                             variant=v_med, baseline=b_med),
+        "lift_lower": _rule(lambda: lift_lo > r["min_lift_lower"], value=lift_lo),
+        "sim_lower": _rule(lambda: sim_lo > r["min_sim_diff_lower"], value=sim_lo),
+        "collapse_removed": _rule(lambda: removed >= r["min_collapse_removed"], value=removed),
+        # rounded: 0.52 - 0.50 is 0.020000000000000018 in floating point
+        "drift": {**_rule(lambda: round(v_auc - b_auc, 9) <= r["max_adv_auc_rise"] and not drifting,
+                          variant=v_auc, baseline=b_auc),
+                  "wrep_top": drifting},
+    }
+    others = all(rules[k]["holds"] is True for k in rules if k != "drift")
+    result = ("pass" if others and rules["drift"]["holds"] is True
+              else "lookback" if others else "fail")
+    return {"rules": rules, "result": result}
+
+
+def wallet_adoption(baseline: dict, variant: dict) -> dict:
+    """The pre-registered adoption rules of the wallet reputation variant per
+    bucket (`adoption_bucket`), from the baseline's and the variant's
+    across-seeds rows. Report only: never a gate of the saved model."""
+    out = {"rules": dict(C.WREP_ADOPTION), "set_on": C.WREP_ADOPTION_SET_ON,
+           "saved_seed": C.LGBM_SEED, "buckets": {}}
+    b_acr, v_acr = baseline.get("across_seeds") or {}, variant.get("across_seeds") or {}
+    for b, summary in (variant.get("buckets") or {}).items():
+        v_row = (v_acr.get("buckets") or {}).get(b)
+        b_row = (b_acr.get("buckets") or {}).get(b)
+        why = (v_acr.get("error") or b_acr.get("error")
+               or (summary or {}).get("skipped") or (v_row or {}).get("skipped")
+               or (None if v_row is not None and b_row is not None else "no across-seeds row"))
+        out["buckets"][b] = ({"not_applicable": why} if why
+                             else adoption_bucket(b_row, v_row, summary))
+    return out
+
+
+def add_wallet_adoption(variants: dict) -> None:
+    """Add "adoption" (`wallet_adoption`) to every C.WALLET_REP_VARIANTS entry of
+    `variants` (run_variants' result) that ran without an error. Report only: an
+    error is recorded as {"error": ...}, never raised."""
+    for name in C.WALLET_REP_VARIANTS:
+        entry = variants.get(name)
+        if entry is None or entry.get("not_applicable") or entry.get("error"):
+            continue
+        try:  # report only: never fails the run
+            entry["adoption"] = wallet_adoption(variants.get("baseline") or {}, entry)
+        except Exception as exc:
+            entry["adoption"] = {"error": variant_error(exc)}
 
 
 def _top_stats(y, score) -> list:
@@ -756,11 +932,21 @@ def diagnostics_on(flag: bool | None = None) -> bool:
 
 
 def train(df: pd.DataFrame, out_root, version: str | None = None, variants: bool = False,
-          diagnostics: bool | None = None) -> Path:
+          diagnostics: bool | None = None, live_buys=None) -> Path:
     """Run the whole pipeline on raw view rows; returns the version directory.
     `variants`: also train C.VARIANTS for the report (never saved or served).
     `diagnostics`: the report-only stability diagnostics (None: `diagnostics_on`,
-    i.e. C.DIAGNOSTICS unless C.DIAGNOSTICS_ENV says otherwise)."""
+    i.e. C.DIAGNOSTICS unless C.DIAGNOSTICS_ENV says otherwise).
+    `live_buys` (the -export-live-buys rows, a DataFrame or a CSV path; used only
+    with `variants`): the wallet reputation (wrep_*) is computed and joined to the
+    rows of the variants only, for the C.WALLET_REP_VARIANTS. The saved model,
+    its gates, the dead score and the diagnostics never see it, so they are the
+    same with or without it."""
+    leaked = [c for c in C.FEATURES if c.startswith(C.WREP_PREFIX)]
+    if leaked:   # serving cannot compute them: never inputs of the saved model
+        raise ValueError(f"the saved model's inputs (config FEATURES) must not include the "
+                         f"wallet reputation columns {leaked}; set WALLET_REP = False (the "
+                         "variant \"wallet reputation (wrep_*)\" tests them, report only)")
     diag = diagnostics_on(diagnostics)
     version = version or datetime.now(timezone.utc).strftime("%Y%m%d-%H%M")
     out_dir = Path(out_root) / version
@@ -784,6 +970,12 @@ def train(df: pd.DataFrame, out_root, version: str | None = None, variants: bool
     first = call & ~L["repeat"]  # later calls of a token: out of training, counted on their own
     extreme = first & ~L["no_pool"] & ~L["not_usd"] & L["extreme"]
     eligible = first & ~L["no_pool"] & ~L["not_usd"] & ~L["extreme"]
+    wrep = wrep_stats = None   # the wallet reputation: for the variants only
+    if live_buys is not None and not variants:
+        print("NOTE: --live-buys is used only with --variants (the wallet reputation "
+              "variant); ignored", flush=True)
+    elif live_buys is not None:
+        wrep, wrep_stats = wallet_rep_data(df, live_buys, eligible.to_numpy())
 
     raw_cols = C.NUMERIC_RAW + C.CATEGORICAL_VIEW + ["pre_vol_unit", "message_date"]
     blank = df.reindex(columns=raw_cols).replace("", np.nan)
@@ -863,15 +1055,20 @@ def train(df: pd.DataFrame, out_root, version: str | None = None, variants: bool
                   "the saved models are not affected", flush=True)
             _write_version(out_dir, meta, res)
     if variants:
-        # the baseline row of "calls_prev variants across seeds" reuses the diagnostics'
+        # the baseline row of "Variants across seeds" reuses the diagnostics'
         # adversarial validation when it ran (else it is computed from `keeps`)
         adv = (res.get("diagnostics") or {}).get("adversarial")
         adv_known = ({b: v["split"] for b, v in adv.items()
                       if isinstance(v, dict) and isinstance(v.get("split"), dict)}
                      if isinstance(adv, dict) else {})
-        res["variants"] = run_variants(df, res["buckets"], has_trades, gate_in["pooled"],
+        # the wrep_* columns reach the variants only (the baseline above used `df`)
+        df_var = df if wrep is None else df.join(wrep)
+        res["variants"] = run_variants(df_var, res["buckets"], has_trades, gate_in["pooled"],
                                        gate_in["runs"], keeps, adv_known)
         meta["variants"] = _json_safe(res["variants"])
+        if wrep_stats is not None:
+            res["wallet_rep"] = wrep_stats
+            meta["wallet_rep"] = _json_safe(wrep_stats)
         _write_version(out_dir, meta, res)
     keeps.clear()
     return out_dir
@@ -1171,9 +1368,13 @@ def main(argv=None) -> int:
     ap.add_argument("--variants", action="store_true",
                     help="also train the one-change variants of config.VARIANTS and compare them "
                          "in report.md (report only: the saved model is always the baseline)")
+    ap.add_argument("--live-buys", metavar="PATH",
+                    help="with --variants: the Go program's -export-live-buys CSV; adds the "
+                         "report-only variant \"wallet reputation (wrep_*)\" (n/a without it); "
+                         "never used by the saved model")
     args = ap.parse_args(argv)
     df = pd.read_csv(args.csv, low_memory=False) if args.csv else read_dsn(args.dsn)
-    out_dir = train(df, args.out, variants=args.variants)
+    out_dir = train(df, args.out, variants=args.variants, live_buys=args.live_buys)
     print(f"wrote {out_dir} (report: {out_dir / 'report.md'})")
     return 0  # gate failures are reported, not errors
 

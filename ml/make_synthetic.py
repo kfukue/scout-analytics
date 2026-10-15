@@ -3,7 +3,7 @@ end to end without a database.  The numbers are invented; only the column
 layout, missingness pattern and CSV conventions mimic the real export.
 
     python make_synthetic.py --out calls.csv [--calls 6000 --days 70 --seed 7 --end 2026-10-01T00:00:00Z]
-                                             [--dex-names drifting]
+                                             [--dex-names drifting] [--live-buys live_buys.csv]
 """
 import argparse
 
@@ -253,7 +253,7 @@ def write_csv(d: pd.DataFrame, path) -> None:
     d.to_csv(path, index=False)
 
 
-if __name__ == "__main__":
+def main(argv=None) -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawTextHelpFormatter)
     ap.add_argument("--out", default="calls.csv")
     ap.add_argument("--calls", type=int, default=6000)
@@ -262,6 +262,18 @@ if __name__ == "__main__":
     ap.add_argument("--end", default="2026-10-01T00:00:00Z", help="time of the newest call (UTC)")
     ap.add_argument("--dex-names", default="plain", choices=["plain", "drifting"],
                     help="drifting: real-looking DEX names that change over time")
-    a = ap.parse_args()
-    write_csv(make(a.calls, a.days, a.seed, a.end, a.dex_names), a.out)
+    ap.add_argument("--live-buys", metavar="PATH",
+                    help="also write invented live buys of these calls (the -export-live-buys "
+                         "layout, make_live_buys) to PATH, for train.py --live-buys")
+    a = ap.parse_args(argv)
+    d = make(a.calls, a.days, a.seed, a.end, a.dex_names)
+    write_csv(d, a.out)
     print(f"wrote {a.out}: {a.calls} synthetic calls over {a.days:g} days")
+    if a.live_buys:
+        lb = make_live_buys(d, seed=a.seed)
+        lb.to_csv(a.live_buys, index=False)
+        print(f"wrote {a.live_buys}: {len(lb)} synthetic live buys")
+
+
+if __name__ == "__main__":
+    main()

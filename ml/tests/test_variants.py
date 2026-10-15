@@ -16,6 +16,7 @@ from scout_ml.model import Bundle
 
 DEX_VARIANTS = ("raw dex instead of dex_family", "raw dex + dex_family")
 WITH_CALLS_PREV = "with calls_prev counts (default before 14 Oct)"
+WALLET = "wallet reputation (wrep_*)"
 CALLS_PREV = {"calls_prev_1h", "calls_prev_24h"}
 
 
@@ -62,7 +63,7 @@ def test_each_variant_changes_exactly_one_knob():
     assert list(C.VARIANTS) == ["baseline", "dead rule on (collapse OR dead)",
                                 "raw dex instead of dex_family", "raw dex + dex_family",
                                 "runners must be tradeable", "stronger regularisation",
-                                "with calls_prev counts (default before 14 Oct)"]
+                                "with calls_prev counts (default before 14 Oct)", WALLET]
     for name, knobs in C.VARIANTS.items():
         if name == "baseline":
             continue
@@ -101,6 +102,8 @@ def test_overrides_rebuild_features_never_leak_and_restore():
             if knobs.get("CALLS_PREV_INPUTS") == "burst":   # the raw counts replaced in place
                 numeric = [C.CALLS_PREV_BURST if c == "calls_prev_1h" else c
                            for c in numeric if c != "calls_prev_24h"]
+            if knobs.get("WALLET_REP"):                     # the wrep_* columns appended
+                numeric = numeric + list(C.WREP_FEATURES)
             assert C.NUMERIC_FEATURES == [c for c in numeric if c not in dropped]
             has, lacks = want.get(name, want["baseline"])
             assert has <= set(C.CATEGORICAL) and not lacks & set(C.CATEGORICAL), name
@@ -196,6 +199,8 @@ def test_variant_table_contents(plain_and_variants):
         assert trd["sim_all_mean"] == base[b]["sim_all_mean"]   # simulation still on all calls
         assert trd["collapse_auc_trained_lightgbm"] == base[b]["collapse_auc_trained_lightgbm"]
         for name in C.VARIANTS:
+            if v[name].get("not_applicable"):                       # the wallet variant here
+                continue
             s = v[name]["buckets"][b]
             for k in ("top_lift", "top_lift_lo", "top_lift_hi", "runner_auc_lightgbm",
                       "runner_auc_logistic", "collapse_auc_plain_lightgbm",
@@ -210,10 +215,11 @@ def test_variant_table_contents(plain_and_variants):
         wcp = v[WITH_CALLS_PREV]["buckets"][b]
         assert wcp["sim_all_mean"] == base[b]["sim_all_mean"]
         assert wcp["runner_auc_logistic"] != base[b]["runner_auc_logistic"]   # more inputs
-        # "calls_prev variants across seeds": the baseline and the SEED_VARIANTS only
+        # "Variants across seeds": the baseline and the SEED_VARIANTS that ran only
         seeds = [str(s) for s in C.STABILITY_SEEDS]
         for name in C.VARIANTS:
-            has = name == "baseline" or name in C.SEED_VARIANTS
+            has = name == "baseline" or (name in C.SEED_VARIANTS
+                                         and not v[name].get("not_applicable"))
             assert ("across_seeds" in v[name]) == has, name
             if not has:
                 continue
@@ -225,7 +231,8 @@ def test_variant_table_contents(plain_and_variants):
             for k in ("lift", "lift_lo", "lift_hi", "sim_gain", "sim_gain_lo", "sim_gain_hi"):
                 assert a[k] == v[name]["buckets"][b][f"wf_pooled_{k}"], (name, b, k)
             adv = a["adversarial"]
-            assert "auc" in adv and len(adv["top"]) <= 3 and "error" not in adv
+            assert "auc" in adv and "error" not in adv
+            assert len(adv["top"]) <= max(3, C.WREP_ADOPTION["drift_top"])
             assert not {f for f, _ in adv["top"]} & set(C.ADV_EXCLUDE)
         # baseline row = the gates' own numbers (nothing retrained)
         ab = v["baseline"]["across_seeds"]["buckets"][b]
@@ -237,9 +244,12 @@ def test_variant_table_contents(plain_and_variants):
                            (WITH_CALLS_PREV, {C.CALLS_PREV_BURST})):
             top = {f for f, _ in v[name]["across_seeds"]["buckets"][b]["adversarial"]["top"]}
             assert not top & gone, (name, b, top)
-    assert all(v[n].get("seconds") is not None for n in C.VARIANTS if n != "baseline")
+    ran = [n for n in C.VARIANTS if n != "baseline" and not v[n].get("not_applicable")]
+    assert WALLET not in ran                                   # n/a: no --live-buys here
+    assert all(v[n].get("seconds") is not None for n in ran)
     for n in C.SEED_VARIANTS:
-        assert v[n]["across_seeds"]["seconds"] <= v[n]["seconds"]
+        if n in ran:
+            assert v[n]["across_seeds"]["seconds"] <= v[n]["seconds"]
     report = (var / "report.md").read_text(encoding="utf-8")
     assert "## Variant comparison (report only; not saved, not served)" in report
     assert "risks fitting the test period" in report and "walk-forward weeks" in report
@@ -249,7 +259,13 @@ def test_variant_table_contents(plain_and_variants):
     assert "pooled WF lift [95%]; sim difference [95%] (seed 7 only; information)" in report
     assert f"| {WITH_CALLS_PREV} | EXCLUDED_INPUTS = () |" in report
     assert "no calls_prev inputs" not in report and "burst ratio" not in report
-    across = report[report.index("### calls_prev variants across seeds (report only)"):]
+    # no --live-buys: the wallet variant is n/a, also in the across-seeds table
+    assert v[WALLET] == {"changes": {"WALLET_REP": True},
+                         "not_applicable": train_mod.WREP_NOT_APPLICABLE}
+    assert "wallet_rep" not in meta
+    across = report[report.index("### Variants across seeds (report only)"):]
+    assert "calls_prev variants across seeds" not in report
+    assert f"| short | {WALLET} | n/a: no live-buy wallet data" in across
     assert "| median (as the gate) |" in across and "| adversarial AUC (train vs test) |" in across
     for b in meta["metrics"]:
         for name in ("baseline",) + C.SEED_VARIANTS:
@@ -295,13 +311,16 @@ def test_trades_variants_not_applicable_without_trades_24h(small_df, tmp_path, m
 
 def test_cli_passes_variants(monkeypatch, tmp_path):
     seen = {}
-    monkeypatch.setattr(train_mod, "train", lambda df, out, variants=False: seen.update(
-        variants=variants) or tmp_path)
+    monkeypatch.setattr(train_mod, "train", lambda df, out, variants=False, live_buys=None:
+                        seen.update(variants=variants, live_buys=live_buys) or tmp_path)
     monkeypatch.setattr(train_mod.pd, "read_csv", lambda *a, **k: pd.DataFrame())
     assert train_mod.main(["--csv", "x.csv", "--out", str(tmp_path), "--variants"]) == 0
-    assert seen["variants"] is True
+    assert seen == {"variants": True, "live_buys": None}
     assert train_mod.main(["--csv", "x.csv", "--out", str(tmp_path)]) == 0
-    assert seen["variants"] is False
+    assert seen == {"variants": False, "live_buys": None}
+    assert train_mod.main(["--csv", "x.csv", "--out", str(tmp_path), "--variants",
+                           "--live-buys", "lb.csv"]) == 0
+    assert seen == {"variants": True, "live_buys": "lb.csv"}   # read (as text) inside train
 
 
 def _main_with_failing_variants(small_df, tmp_path, monkeypatch, fail_when):
@@ -443,10 +462,10 @@ def test_burst_setting_replaces_exactly_the_raw_counts(synthetic_df):
         assert list(C.FEATURES) == before[0]
 
 
-# --- "calls_prev variants across seeds" (report only) --------------------------------
+# --- "Variants across seeds" (report only) -------------------------------------------
 
 def test_every_variant_applies_without_error_and_seed_variants_are_variants():
-    assert isinstance(C.SEED_VARIANTS, tuple) and C.SEED_VARIANTS == (WITH_CALLS_PREV,)
+    assert isinstance(C.SEED_VARIANTS, tuple) and C.SEED_VARIANTS == (WITH_CALLS_PREV, WALLET)
     assert all(n in C.VARIANTS for n in C.SEED_VARIANTS)
     for name in C.VARIANTS:
         with C.overrides(**C.VARIANTS[name]):
