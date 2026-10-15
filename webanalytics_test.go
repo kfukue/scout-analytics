@@ -1172,6 +1172,30 @@ func TestAnalyticsPageFiles(t *testing.T) {
 	}
 }
 
+// TestTimingKMWording checks that the Timing tab describes the Kaplan–Meier
+// median as time held at 2× in the first stretch (holdItem), not as clock
+// time since the first 2×, in both the table cell tooltip and the chart title.
+func TestTimingKMWording(t *testing.T) {
+	b, err := fs.ReadFile(frontendFS, "frontend/analytics.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	js := string(b)
+	for _, want := range []string{
+		"' calls that reached 2× fell back below 2× after ' + A.fmtDur(km.median) +",
+		"' of time held at 2× in the first stretch (Kaplan–Meier median; calls still at 2× at the window end count as censored)'",
+		"'(Kaplan–Meier over time held at 2× in the first stretch; calls still at 2× at the window end count as censored)'",
+		"' of time held at 2× in the first stretch (the median, where the curve first drops to 50% or below)'",
+	} {
+		if !strings.Contains(js, want) {
+			t.Errorf("analytics.js: missing %q (Kaplan–Meier median is time held at 2×)", want)
+		}
+	}
+	if old := "had fallen back ' + A.fmtDur(km.median) + ' after the first 2×'"; strings.Contains(js, old) {
+		t.Errorf("analytics.js: the tooltip still says %q (clock time since the first 2×)", old)
+	}
+}
+
 // TestAnalyticsStatsNode runs the tests of the Analytics page's calculations
 // (frontend/analytics-stats.js, testdata/analytics-stats.test.js) with node,
 // when node is on the PATH (skipped otherwise), and checks every page script
