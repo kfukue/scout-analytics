@@ -1,5 +1,76 @@
 # Scout analytics: handoff to Claude Code
 
+## Session state (15 Oct 2026 PDT (15-16 Oct UTC), evening: main 9972b62 after PRs #13-#17)
+
+This section supersedes the ones below wherever they differ.
+
+**Merged 15 Oct:** #13 wallet variant "last 14 days" (lookback); #14 docs.
+The owner retrained on the server with `--variants`.
+
+**Prod report 20261015-2148:**
+- Gates: all FAIL. 3d 1.93 (seeds 1.59-2.28), 7d 1.93 (1.62-2.24), 1d
+  1.11 (seed-7 lower end 0.97). One more row than report 20261015-1944
+  moved 3d and 7d by about 0.07: both sit just under 2, inside run-to-run
+  noise. Skipping the top 30 % by collapse score removes about half of
+  the collapses on the saved model's test part (0.48-0.50), but only
+  0.38-0.40 pooled over the walk-forward weeks (random skipping: 0.30;
+  the gate's 40 % is the single-run test-part figure).
+- Lookback variant "wallet reputation, last 14 days": drift 0.97 vs
+  baseline 0.90 (full variant 0.98); its 14-day coverage still rises
+  (about 0.33 in September to 0.67 in October). 3d holds rules 1-4 (2.15
+  vs 1.93) and fails drift: "not adopted; drift persists with a 14-day
+  window", no further step pre-registered. 7d 1.93 = baseline; 1d fails.
+- Full wallet variant at 3d over three reports: 2.06, 2.08, 2.15, while
+  the baseline moved between 1.93 and 2.10; its inputs always carry heavy
+  drift, so a time proxy cannot be ruled out.
+
+**Owner decisions (15 Oct):** wallet work parked; `SEED_VARIANTS` kept;
+no further tuning, risk-filter study instead; the two URL-leak fixes
+approved. Recorded in the PM skill.
+
+**Merged later on 15 Oct:** #15 agent files point to the `_scratch`
+folder; #16 Timing tab KM median described as time held at 2× (deploy:
+`-web`); #17 `chainlink()` sets `noState` only on a real no-state error
+(deploy: `-track`). Whether #16/#17 are deployed is not confirmed.
+
+**Open PRs (base `main`, independent; reviewed PASS; tested locally only;
+nothing deployed):**
+- This docs PR.
+- #18 DB connection URL never shown in parse errors (`ConnStringError`);
+  connect errors still show host/user/database (never the password).
+  Deploy: listener, `-track`, `-web`.
+- #19 a busy node no longer makes a token "not Pons" (`ponsCallErr`;
+  EVM failures such as invalid opcode count as the contract's answer).
+  Deploy: `-track`.
+- #20 marker words must start a word; "non-" cancels them (PM choice:
+  start of word only, so "blacklisted"/"dangerous" still match; "scamper"
+  accepted). A Perceptor fallback reply saying only "take precaution"
+  is now unknown, not caution. Deploy: listener.
+- #21 node URLs never stored in errors or logged (`urlredact.go`; start-up
+  lines show scheme://host). Deploy: `-track`.
+
+**Read-only SQL given to the owner (results pending):**
+- Error texts that still contain a URL per table (`scout_call_tracking`,
+  `scout_investigations`, `scout_deliveries`; the last may hold Bot API
+  URLs with the bot token from before `botAPIRedact`). Rows found → a
+  cleanup PR with run and rollback scripts.
+- Pons candidates in `scout_call_tracking` (`no_pool`/`gave_up`, generic
+  v2/v3/v4 state without `pons_curve`, tracked as Pons); confirming a
+  candidate needs `-price-check` on the server.
+
+**Risk filter (study done, `investigate`):** the site and delivery line
+are runner-based; the collapse number is marked "n.v." with the runner
+side. Plan of small PRs: A report-only "collapse filter" evidence
+(collapses caught, runners lost, kept vs all; test part and pooled
+walk-forward; in progress on `work/2026-10-15-collapse-filter-evidence`)
+→ A2 `collapse_reference` + collapse verdict → B serve a collapse rank →
+C store it (schema change with run/rollback) → D `/api/calls` → E call
+list wording → F Model insights live check → G (optional) delivery line;
+H RUNBOOK cadence. Owner decisions after A's numbers: collapse validation
+rule (single-run vs pooled), site wording, buckets, delivery line.
+Cadence: the PM proposed a manual retrain every two weeks (no cron:
+every retrain would go live unread); owner answer pending.
+
 ## Session state (15 Oct 2026 PDT: main d3a2197 after PRs #10-#12)
 
 This section supersedes the ones below wherever they differ.
