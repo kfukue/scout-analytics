@@ -2421,7 +2421,7 @@ func runPriceCheck(ctx context.Context, cfg *config, token, at string) error {
 	fmt.Println(feedsLine)
 	latest, err := o.rpc.blockNumber(ctx)
 	if err != nil {
-		return fmt.Errorf("RPC %s: %w", cfg.Price.Onchain.RPCURL, err)
+		return fmt.Errorf("RPC %s: %w", urlOrigin(cfg.Price.Onchain.RPCURL), err)
 	}
 	lt, _ := o.rpc.blockTime(ctx, latest)
 	fmt.Printf("latest block: %d (%s)\n", latest, time.Unix(lt, 0).UTC().Format(time.RFC3339))

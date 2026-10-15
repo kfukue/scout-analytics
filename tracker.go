@@ -34,6 +34,14 @@ const trackChunkMin = 4
 // horizon check is due (or until that check is done, whichever comes first).
 var latestDeferFor = 10 * time.Minute
 
+// geckoTrackingLine is the tracker's start-up line for the GeckoTerminal
+// source. It names the price API by scheme and host only: a
+// SCOUT_PRICE_API_BASE path or query can hold an API key.
+func geckoTrackingLine(pc *priceConfig) string {
+	return fmt.Sprintf("performance tracking on: %s via %s (network %q, %d req/min)",
+		horizonNames(pc.Horizons), urlOrigin(pc.BaseURL), pc.Network, pc.RPM)
+}
+
 // trackLoop processes due tracking rows every PriceCfg.Interval.
 func (s *scanner) trackLoop(ctx context.Context) {
 	if s.db == nil || !s.pc.Enabled {
@@ -49,8 +57,7 @@ func (s *scanner) trackLoop(ctx context.Context) {
 			log.Printf("latest prices off (SCOUT_LATEST_REFRESH=off)")
 		}
 	} else {
-		log.Printf("performance tracking on: %s via %s (network %q, %d req/min)",
-			horizonNames(s.pc.Horizons), s.pc.BaseURL, s.pc.Network, s.pc.RPM)
+		log.Print(geckoTrackingLine(&s.pc))
 	}
 	// One pool of workers for the whole run: a call still running when a cycle
 	// ends keeps its worker, and the other workers go on with the next cycle.
@@ -762,15 +769,15 @@ func (s *scanner) trackOne(ctx context.Context, t *ScoutCallTracking) {
 			interrupted = true
 			return
 		}
-		msg := err.Error()
+		msg := redactURLs(err.Error()) // stored and logged without URLs (a price API URL can hold a key)
 		t.Error = &msg
 		t.Status = status
 		// Give up only when waiting can't help (no pool / no trades), never on transient errors.
-		if now.After(deadline) && (status == TrackNoPool || strings.Contains(msg, "no trades")) {
+		if now.After(deadline) && (status == TrackNoPool || strings.Contains(err.Error(), "no trades")) {
 			t.Status = TrackGaveUp
 		}
 		t.NextCheckAt = now.Add(retryIn)
-		log.Printf("tracking call %d (%s): %s: %v", t.CallID, t.ContractAddress, t.Status, err)
+		log.Printf("tracking call %d (%s): %s: %s", t.CallID, t.ContractAddress, t.Status, msg)
 	}
 	defer func() {
 		if interrupted {

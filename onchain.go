@@ -694,7 +694,7 @@ func (c *rpcClient) call(ctx context.Context, out any, method string, params ...
 		}
 		f := &rpcInflight{what: what, since: since, attempt: attempt + 1}
 		if lastErr != nil {
-			f.lastErr = lastErr.Error()
+			f.lastErr = redactURLs(lastErr.Error(), c.url) // shown in heartbeat log lines
 		}
 		f.url = c.url
 		c.inflight.Store(f)
@@ -711,7 +711,10 @@ func (c *rpcClient) call(ctx context.Context, out any, method string, params ...
 		resp, err := c.http.Do(req)
 		if err != nil {
 			<-c.slots
-			lastErr = err
+			// A transport error (*url.Error) names the node URL, which can
+			// hold an API key: every caller that logs or stores it gets the
+			// text without it (errors.Is / As still see the original).
+			lastErr = redactErr(err, c.url)
 		} else {
 			raw, _ := io.ReadAll(io.LimitReader(resp.Body, int64(maxResponseBytes)+1))
 			resp.Body.Close()
@@ -728,7 +731,10 @@ func (c *rpcClient) call(ctx context.Context, out any, method string, params ...
 					Error  *rpcError       `json:"error"`
 				}
 				if err := json.Unmarshal(raw, &r); err != nil {
-					return fmt.Errorf("%s: bad response: %.120s", method, raw)
+					// A proxy's error page can echo the request URL: its
+					// text goes out without URLs (redacted before the cut,
+					// so a URL cut in half is still removed whole).
+					return fmt.Errorf("%s: bad response: %.120s", method, redactURLs(string(raw), c.url))
 				}
 				if r.Error != nil {
 					return r.Error // not retried: the caller decides (e.g. shrink the log range)
@@ -2841,9 +2847,9 @@ func (o *onchainSource) describe() string {
 	fm := o.feedMaps()
 	s := fmt.Sprintf("eth_getLogs ranges of up to %d blocks, %d ranges per scan, up to %d requests in flight, %s; ", o.rpc.maxChunk, o.cfg.Parallel, cap(o.rpc.slots), limit) +
 		fmt.Sprintf("on-chain pools via %s (v4 PoolManager %s, %d Chainlink feed(s) on Robinhood Chain, %d of them from the asset database)",
-			o.cfg.RPCURL, o.cfg.PoolManagerV4, len(fm.rh), fm.dbRH)
+			urlOrigin(o.cfg.RPCURL), o.cfg.PoolManagerV4, len(fm.rh), fm.dbRH)
 	if o.mainnet != nil {
-		s += fmt.Sprintf("; ETH/USD + %d other feed(s) from Ethereum mainnet via %s", len(fm.mainnet)-1, o.cfg.MainnetRPCURL)
+		s += fmt.Sprintf("; ETH/USD + %d other feed(s) from Ethereum mainnet via %s", len(fm.mainnet)-1, urlOrigin(o.cfg.MainnetRPCURL))
 	}
 	return s
 }

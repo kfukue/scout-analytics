@@ -46,7 +46,7 @@ func (s *scanner) trackOneOnchain(ctx context.Context, t *ScoutCallTracking, pos
 			log.Printf("%s: interrupted — progress kept, it resumes on the next run", tag)
 			return
 		}
-		msg := err.Error()
+		msg := redactURLs(err.Error(), o.cfg.RPCURL, o.cfg.MainnetRPCURL) // stored and logged without the node URL
 		t.Error = &msg
 		t.Status = status
 		// Give up only when waiting can't help: no pool / no trades, well after the last horizon.
@@ -55,7 +55,7 @@ func (s *scanner) trackOneOnchain(ctx context.Context, t *ScoutCallTracking, pos
 			t.Status = TrackGaveUp
 		}
 		t.NextCheckAt = now.Add(retryIn)
-		log.Printf("%s: %s: %v (retry in %s)", tag, t.Status, err, retryIn.Round(time.Minute))
+		log.Printf("%s: %s: %s (retry in %s)", tag, t.Status, msg, retryIn.Round(time.Minute))
 	}
 	defer func() {
 		if interrupted {
