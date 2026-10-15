@@ -17,9 +17,22 @@ from scout_ml.model import Bundle
 NAN = float("nan")
 
 
+# The seeds of report 20261013-0702 (STABILITY_SEEDS until 14 Oct 2026): the unit
+# tests below replay its three-seed numbers.
+REPORT_0702_SEEDS = (7, 11, 23)
+
+
 @pytest.fixture
-def seeds(monkeypatch, shipped_seeds):
-    """The shipped STABILITY_SEEDS (7, 11, 23) for the unit tests of the verdict."""
+def seeds(monkeypatch):
+    """STABILITY_SEEDS set to REPORT_0702_SEEDS, for the unit tests of the verdict
+    on three-seed numbers (`_verdict` zips the lifts with C.STABILITY_SEEDS)."""
+    monkeypatch.setattr(C, "STABILITY_SEEDS", REPORT_0702_SEEDS)
+    return REPORT_0702_SEEDS
+
+
+@pytest.fixture
+def shipped(monkeypatch, shipped_seeds):
+    """STABILITY_SEEDS as shipped (the suite otherwise trains with LGBM_SEED only)."""
     monkeypatch.setattr(C, "STABILITY_SEEDS", shipped_seeds)
     return shipped_seeds
 
@@ -39,11 +52,15 @@ def _pooled(lift, lo, hi, sim, sim_lo, sim_hi, weeks=8, top=5.0, all_=-30.0):
 
 def _verdict(lifts, pooled, collapse_removed=0.46, single=None):
     test = {"top_lift": 1.9, "collapse_removed": collapse_removed}
-    return V.pooled_gates(single or _single(), test, pooled, dict(zip((7, 11, 23), lifts)))
+    assert len(lifts) == len(C.STABILITY_SEEDS)
+    return V.pooled_gates(single or _single(), test, pooled, dict(zip(C.STABILITY_SEEDS, lifts)))
 
 
 def test_shipped_gate_settings(shipped_seeds):
-    assert shipped_seeds == (7, 11, 23) and C.LGBM_SEED == 7
+    # owner decision of 14 Oct 2026: 7 seeds instead of 3, the saved seed first
+    assert shipped_seeds == (7, 11, 23, 31, 47, 61, 89) and C.LGBM_SEED == 7
+    assert shipped_seeds[0] == C.LGBM_SEED and len(set(shipped_seeds)) == len(shipped_seeds)
+    assert len(shipped_seeds) % 2 == 1                  # odd: the median is one seed's lift
     assert C.GATES == {"min_top_lift": 2.0, "min_collapse_removed": 0.40}
     assert (C.GATE_POOLED_LIFT_LOWER, C.GATE_SIM_DIFF_LOWER, C.GATE_MIN_POOLED_WEEKS) == (1.0, 0.0, 2)
     assert C.GATES_SET_ON == "13 Oct 2026"
@@ -144,14 +161,62 @@ def test_verdict_cells_and_reasons_in_the_report(seeds):
     assert "Gates (owner decision of 13 Oct 2026)" in R.gate_rule_text()
 
 
+# --- the shipped seeds (owner decision of 14 Oct 2026) ------------------------------
+
+def _middle_on_the_other_side(seeds, saved_passes: bool) -> list:
+    """Lifts per seed (saved seed first) where the saved seed and len(seeds) // 2 of
+    the others are on one side of 2 and the median (the middle value) on the other."""
+    k = len(seeds) // 2
+    high = [2.5 + 0.1 * i for i in range(k + (0 if saved_passes else 1))]
+    low = [1.9 - 0.05 * i for i in range(len(seeds) - len(high))]
+    first, rest = (high[0], low + high[1:]) if saved_passes else (low[0], high + low[1:])
+    return [first] + rest
+
+
+def test_the_median_over_the_shipped_seeds_is_their_middle_value(shipped):
+    k = len(shipped) // 2
+    lifts = _middle_on_the_other_side(shipped, saved_passes=True)
+    g = _verdict(lifts, _pooled(lifts[0], 1.8, 3.1, 40.0, 20.0, 60.0))
+    assert lifts[0] >= 2 and sum(v >= 2 for v in lifts) == k        # not a majority
+    assert g["pooled_lift_median"] == pytest.approx(sorted(lifts)[k]) and not g["passed"]
+    assert g["pooled_lift_seeds"] == {str(s): pytest.approx(v) for s, v in zip(shipped, lifts)}
+    assert g["reasons"] == [f"median pooled lift {sorted(lifts)[k]:.2f} < 2"]
+    lifts = _middle_on_the_other_side(shipped, saved_passes=False)   # the other way round
+    g = _verdict(lifts, _pooled(lifts[0], 1.3, 2.5, 40.0, 20.0, 60.0))
+    assert lifts[0] < 2 and sum(v >= 2 for v in lifts) == k + 1
+    assert g["pooled_lift_median"] == pytest.approx(sorted(lifts)[k]) and g["passed"]
+
+
+def test_every_shipped_seed_is_needed(shipped):
+    p = _pooled(2.5, 1.8, 3.2, 40.0, 20.0, 60.0)
+    assert _verdict([2.5] * len(shipped), p)["passed"]
+    last = shipped[-1]
+    lifts = {s: 2.5 for s in shipped[:-1]}                          # the last seed missing
+    g = V.pooled_gates(_single(), {"collapse_removed": 0.5}, p, lifts)
+    assert not g["passed"] and np.isnan(g["pooled_lift_median"])
+    assert g["reasons"] == [f"pooled lift of seed {last}: undefined"]
+
+
+def test_report_shows_every_shipped_seed(shipped):
+    from scout_ml import report as R
+    lifts = [2.0 + 0.1 * i for i in range(len(shipped))]
+    g = _verdict(lifts, _pooled(2.0, 1.5, 2.5, 10.0, 5.0, 15.0))
+    values = " / ".join(f"{v:.2f}" for v in lifts)
+    assert R.gate_cells(g)[0] == f"yes: {sorted(lifts)[len(lifts) // 2]:.2f} ({values})"
+    seeds_text = " / ".join(str(s) for s in shipped)
+    assert R.verdict_headers()[2] == f"runner lift: median pooled WF lift >= 2 (seeds {seeds_text})"
+    assert f"LightGBM seeds {seeds_text} (STABILITY_SEEDS)" in R.gate_rule_text()
+
+
 # --- missing or undefined inputs: always FAIL, with a reason -------------------------
 
 @pytest.mark.parametrize("case", ["one week", "no week", "pooled missing", "pooled error",
                                   "seed failed", "seed skipped", "seed NaN", "seed absent",
                                   "lift_lo NaN", "sim_lo NaN", "collapse NaN"])
-def test_missing_inputs_fail_with_a_reason(seeds, case):
+def test_missing_inputs_fail_with_a_reason(shipped, case):
     good = _pooled(2.5, 1.8, 3.2, 40.0, 20.0, 60.0)
-    lifts = {7: 2.5, 11: 2.4, 23: 2.6}
+    lifts = {s: 2.4 + 0.05 * i for i, s in enumerate(shipped)}
+    second, last = shipped[1], shipped[-1]
     pooled, collapse = dict(good), 0.5
     if case == "one week":       # D.pooled leaves the interval NaN with one week
         pooled.update(weeks=1, lift_lo=NAN, lift_hi=NAN, sim_gain_lo=NAN, sim_gain_hi=NAN)
@@ -162,13 +227,13 @@ def test_missing_inputs_fail_with_a_reason(seeds, case):
     elif case == "pooled error":
         pooled = {"error": "error: RuntimeError: x"}
     elif case == "seed failed":
-        lifts[11] = "retrain failed (error: RuntimeError: x)"
+        lifts[second] = "retrain failed (error: RuntimeError: x)"
     elif case == "seed skipped":
-        lifts[23] = "bucket skipped (only 10 usable rows (need 300))"
+        lifts[last] = "bucket skipped (only 10 usable rows (need 300))"
     elif case == "seed NaN":
-        lifts[11] = NAN
+        lifts[second] = NAN
     elif case == "seed absent":
-        del lifts[23]
+        del lifts[last]
     elif case == "lift_lo NaN":
         pooled["lift_lo"] = NAN
     elif case == "sim_lo NaN":
@@ -182,10 +247,10 @@ def test_missing_inputs_fail_with_a_reason(seeds, case):
             "no week": "only 0 counted walk-forward week(s)",
             "pooled missing": "pooled walk-forward not computed",
             "pooled error": "pooled walk-forward not computed (error: RuntimeError: x)",
-            "seed failed": "pooled lift of seed 11: retrain failed (error: RuntimeError: x)",
-            "seed skipped": "pooled lift of seed 23: bucket skipped",
-            "seed NaN": "pooled lift of seed 11: undefined",
-            "seed absent": "pooled lift of seed 23: undefined",
+            "seed failed": f"pooled lift of seed {second}: retrain failed (error: RuntimeError: x)",
+            "seed skipped": f"pooled lift of seed {last}: bucket skipped",
+            "seed NaN": f"pooled lift of seed {second}: undefined",
+            "seed absent": f"pooled lift of seed {last}: undefined",
             "lift_lo NaN": "pooled lift 95% interval undefined",
             "sim_lo NaN": "pooled simulation difference 95% interval undefined",
             "collapse NaN": "collapses removed undefined"}[case]

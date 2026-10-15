@@ -484,6 +484,30 @@ def test_seed_median_and_the_gate_share_one_median(monkeypatch, seed_lifts):
                    for r in g["reasons"])
 
 
+def test_seed_median_and_the_across_seeds_table_follow_the_shipped_seeds(monkeypatch,
+                                                                       shipped_seeds):
+    """With the shipped STABILITY_SEEDS: the table's median and the gate's are the
+    middle value of every seed's lift, and the table shows every seed."""
+    from scout_ml import report as R
+    monkeypatch.setattr(C, "STABILITY_SEEDS", shipped_seeds)
+    n = len(shipped_seeds)
+    seed_lifts = {s: 1.0 + 0.25 * ((3 * i) % n) for i, s in enumerate(shipped_seeds)}
+    s = train_mod.seed_median(seed_lifts)
+    g = V.pooled_gates({}, {"collapse_removed": 0.5}, None, seed_lifts)
+    assert list(s["lifts"]) == [str(x) for x in shipped_seeds]
+    assert s["median"] == pytest.approx(sorted(seed_lifts.values())[n // 2])
+    assert s["median"] == g["pooled_lift_median"] and s["lifts"] == g["pooled_lift_seeds"]
+    row = {**s, "weeks": 5, "lift": 1.5, "lift_lo": 1.1, "lift_hi": 2.0, "sim_gain": 3.0,
+           "sim_gain_lo": 1.0, "sim_gain_hi": 5.0, "adversarial": {"auc": 0.6, "top": []}}
+    across = {"seeds": list(shipped_seeds), "buckets": {"short": row}}
+    text = R.across_seeds_section({"baseline": {"across_seeds": across},
+                                   WITH_CALLS_PREV: {"across_seeds": across}}, {"short": {}})
+    seeds_text = " / ".join(str(x) for x in shipped_seeds)
+    lifts_text = " / ".join(f"{seed_lifts[x]:.2f}" for x in shipped_seeds)
+    assert f"| pooled WF lift, seed {seeds_text} |" in text
+    assert f"| short | {WITH_CALLS_PREV} | 5 | {lifts_text} | {s['median']:.2f} |" in text
+
+
 def test_calls_prev_variants_are_retrained_with_every_seed(small_df, tmp_path, monkeypatch):
     """With two seeds: the variant is retrained once more (seed 11), the baseline not
     at all (its row is the gates' seed retrains), and the baseline's adversarial

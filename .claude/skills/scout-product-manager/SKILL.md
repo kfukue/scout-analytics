@@ -46,8 +46,9 @@ anything non-trivial (`DEPLOY.md` and `ml/RUNBOOK.md` for deploy and training).
   in prod since 8 October 2026.
 - **Model** (`ml/`): LightGBM plus a logistic baseline, buckets `short`, `3day`,
   `medium`, `long`; first calls only. Gates since PR #34 (382b1b6,
-  13 Oct; owner option (b)): a bucket passes only if the median over seeds
-  7/11/23 of the pooled expanding walk-forward top-10% lift is >= 2 and the
+  13 Oct; owner option (b)): a bucket passes only if the median over the
+  `STABILITY_SEEDS` (7 seeds since 14 Oct: 7/11/23/31/47/61/89; were
+  7/11/23) of the pooled expanding walk-forward top-10% lift is >= 2 and the
   saved seed's week-block bootstrap lower end is > 1.0; the pooled
   simulation difference (top 10% minus buy-all) has a 95% lower end > 0;
   and skipping the 30% highest collapse scores removes >= 40% of (plain)
@@ -525,6 +526,9 @@ Every Go start applies `scoutanalytics.sql` unless `SCOUT_DB_AUTO_MIGRATE=false`
 - 13 Oct (supersedes "touch-and-drop calls count as 0 held"): time-held
   figures use the real time held (`above_2x_s`) for every call that touched
   2×; "reached 2×" still needs 1 hour held (PR #33).
+- 14 Oct (owner): the gate's seed median uses 7 seeds instead of 3, because
+  the 3-seed median moved by up to ±0.4 between near-identical runs and
+  buckets near 2 flipped PASS/FAIL (`STABILITY_SEEDS` in config.py).
 - 13 Oct: ML gates option (b), pooled walk-forward + seed median (PR #34;
   see "Model" under "The project").
 - 13 Oct (owner): every database change, to the structure or the data, ships

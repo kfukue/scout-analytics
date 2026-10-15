@@ -170,7 +170,8 @@ together, each week ranked by its own model (the expanding walk-forward;
 counted = training part of at least 1000 rows).
 
 1. **Runner lift**: the median over the LightGBM seeds `STABILITY_SEEDS`
-   (7, 11, 23; the baseline retrained with each, nothing saved) of the pooled
+   (7, 11, 23, 31, 47, 61, 89; the baseline retrained with each, nothing
+   saved; with 7 seeds the median is the 4th value) of the pooled
    top-10% lift >= `GATES["min_top_lift"]` (2), and the lower end of the 95%
    week-block bootstrap interval of the saved seed's (`LGBM_SEED` = 7) pooled
    lift > `GATE_POOLED_LIFT_LOWER` (1.0). Pooled lift = runner rate in the
@@ -448,7 +449,8 @@ and the `SEED_VARIANTS`, per bucket: the pooled walk-forward lift of each seed
 of `STABILITY_SEEDS` and their median (as the runner-lift gate takes it), the
 seed-7 pooled lift and simulation difference with their 95% intervals, and
 the adversarial AUC (train vs test) on each one's own inputs with its top
-three drifting inputs. The variants are retrained with seeds 11 and 23; the
+three drifting inputs. The variants are retrained with the other seeds of
+`STABILITY_SEEDS` (six since 14 Oct 2026, 11 and 23 before); the
 baseline row reuses the gates' and diagnostics' numbers. Report only, never a
 gate; an error there keeps the variant's other numbers. Empty `SEED_VARIANTS`
 to skip it. Since 14 Oct 2026 `SEED_VARIANTS` is "with calls_prev counts
@@ -469,12 +471,18 @@ Runtime: each variant costs about one training of the normal model (on
 synthetic data of the fixture's size, 6,000 calls over 170 days: about 25 s,
 the dead score about 2 s of it; a whole run with `--variants` took about
 2 min before the gates of 13 Oct 2026, whose seed retrains add about 47 s to
-every run, see "Stability diagnostics"). The across-seeds table adds two
-retrains plus one adversarial probe per bucket for each `SEED_VARIANTS` entry
+every run, see "Stability diagnostics"). The across-seeds table adds one
+retrain per extra seed (two with 3 seeds, six with 7) plus one adversarial
+probe per bucket for each `SEED_VARIANTS` entry
 (the baseline row reuses the diagnostics' probe): about 93 s for two
 entries on that synthetic data (13 Oct 2026, the sum of their `[variant]`
 lines' "of which" times; one entry since 14 Oct 2026); on the prod data an
 estimated 40 to 50 s for two, not measured. Runs without `--variants` are unchanged.
+With 7 seeds (14 Oct 2026, same synthetic data, `make_synthetic.py --calls
+6000 --days 170 --seed 11`, one desktop PC): a whole run with `--variants`
+took 453 s instead of 280 s; the gates' seed retrains 134 s instead of 47 s,
+and the calls_prev variant's other seeds and adversarial validation 139 s
+instead of 48 s.
 
 ### Stability diagnostics
 
@@ -492,8 +500,12 @@ checks this). Settings: the "Stability diagnostics" block of
 `scout_ml/config.py`.
 
 - **Seed stability**: the baseline retrained with each LightGBM seed in
-  `STABILITY_SEEDS` (7, 11, 23; 7 is the saved model's `LGBM_SEED`, its
-  numbers are reused). Per bucket and seed: test top-10% lift with its
+  `STABILITY_SEEDS` (7, 11, 23, 31, 47, 61, 89; 7 is the saved model's
+  `LGBM_SEED`, its numbers are reused). Owner decision of 14 Oct 2026: 7
+  seeds instead of 3 (7, 11, 23), because in reports 20261014-1842 and
+  20261014-2211, on almost the same data, the median pooled lift over 3 seeds
+  moved by up to ±0.4 and buckets near the threshold of 2 flipped PASS / FAIL
+  from run to run; a median over 7 seeds is steadier. Per bucket and seed: test top-10% lift with its
   interval, collapses removed, runner ROC AUC, simulation top 10% vs all,
   counted walk-forward weeks beating buy-all, pooled walk-forward lift (its
   median over the seeds is the runner-lift gate) and the run's old single-run
@@ -552,7 +564,12 @@ per variant in report 20261012-2209, `long` still skipped) expect roughly 20
 to 30 s more per run then. `--variants` adds two more variant rows ("stronger
 regularisation", "with calls_prev counts (default before 14 Oct)"), about one
 normal run each, and the across-seeds table (two more runs for the calls_prev
-variant; see "Variant comparison").
+variant; see "Variant comparison"). Since 14 Oct 2026 (7 seeds) the seed
+retrains are six runs of the baseline, not two: on the same synthetic data
+134 s instead of 47 s (about 22 s per seed), so a run with the section on
+takes about 187 s instead of 102 s; the across-seeds table then costs six
+more runs for the calls_prev variant (139 s instead of 48 s). On the prod
+data expect roughly 3 times the earlier extra time, not measured.
 
 The `model.py`, `validate.py`, `features.py` (`MIN_CATEGORY_COUNT`) and
 `labels.py` (`MAX_OUTCOME_PCT`) settings are read from `config` when a function
