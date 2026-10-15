@@ -1,5 +1,67 @@
 # Scout analytics: handoff to Claude Code
 
+## Session state (14 Oct 2026, night PDT (15 Oct UTC): main 8d84415 after new-repo PRs #1-#8)
+
+New-repo PR numbers. Everything below this section is older.
+
+**Merged in the new repo (14 Oct):**
+- #1 model without `calls_prev` inputs (`EXCLUDED_INPUTS`); the report
+  keeps a "with calls_prev counts (default before 14 Oct)" variant.
+- #2 file-access rule (repo and the owner's notes folder only; scratch
+  in `<repo root>/.claude/worktrees/_scratch/<task>`; no system digging).
+- #3 `-export-live-buys PATH` (CSV of `scout_call_live_buys`).
+- #4 / #5 docs: repo move recorded; no local or server paths in the repo
+  (`<repo root>`, `$REPO` for the server checkout, `$ML` for the ML
+  folder); PR texts are public too.
+- #6 `ml/scout_ml/wallet_rep.py`: point-in-time live-buy wallet
+  reputation (8 `wrep_*` features; history = earlier first calls of other
+  tokens whose 7d outcome was known before the call; never `rugged`).
+- #7 runner-lift gate median over 7 seeds (7/11/23/31/47/61/89; seed 7
+  is still the saved model).
+- #8 wallet reputation as a REPORT-ONLY variant; `run_training.sh
+  --variants` exports `live_buys.csv`; report blocks "Wallet reputation
+  data" and "pre-registered adoption rules" (fixed 14 Oct: median lift
+  >= 2 and >= baseline; seed-7 lower end > 1; sim lower end > 0;
+  collapses removed >= 40 %; no added drift: AUC <= baseline + 0.02 and
+  no wrep_* in the top 3 drifting inputs with share >= 0.40). The saved
+  model is byte-identical with or without live buys.
+
+**In progress (stopped when the session hit its limit; resume here):**
+- Worktree `wallet-quality-only-20261014`, branch
+  `work/2026-10-14-wallet-quality-only` (from 8d84415), UNCOMMITTED,
+  not yet tested or reviewed. Owner decision 14 Oct, option (b): a second
+  report-only variant "wallet reputation, quality only" = the wallet
+  variant minus the two coverage features (`wrep_n_known`,
+  `wrep_known_share`, which grow with calendar time), with the same
+  adoption rules, shown next to the full wallet variant. Files touched so
+  far: ml/README.md, ml/RUNBOOK.md, ml/scout_ml/config.py,
+  ml/scout_ml/report.py, ml/train.py, three test files. Next: have
+  `implement` finish it (run the full `pytest ml/tests` and a synthetic
+  `--variants --live-buys` run), then review, PR.
+
+**Owner's next steps:**
+- After the (b) PR merges: retrain on the server with `--variants`
+  (refresh `$REPO` with `git pull`, copy the new `run_training.sh` into
+  `$ML`, run it from `$REPO`; see RUNBOOK) and send `report.md`.
+  Expect a longer run (7 seeds plus two wallet variants).
+- Optional: set `REPO` and `ML` in the server's `~/.bashrc`.
+- Optional (his files): `.claude/agents/review.md` line 27 and
+  `.claude/agents/verify.md` lines 57-58 still say "scratchpad".
+
+**Model facts (latest prod report 20261014-2211, first without
+calls_prev):** 7d PASS (median 2.02), 3d FAIL (1.75), 1d FAIL; drift AUC
+0.89-0.90 (was 0.99). The same settings moved by up to ±0.4 between two
+near-identical runs, hence the 7-seed gate. The top 10 % still lose
+money on average (-13.6 % at 7d vs -51.7 % for all calls).
+
+**Expected for the wallet test:** the full wallet variant will probably
+fail the drift rule (coverage grows from August); the quality-only
+variant tests the signal more cleanly; a lookback variant
+(`WREP_LOOKBACK_DAYS`) is for later, with more data.
+
+**Owner's notes:** kept outside the repo (path in his user-level
+`CLAUDE.md`); `rules.md` there was refreshed and pushed on 14 Oct.
+
 ## Repo moved and history rewritten (14 Oct 2026, afternoon PDT (14–15 Oct UTC))
 
 The repo is public, so on 14 Oct the owner rewrote its history to remove
