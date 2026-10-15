@@ -571,6 +571,11 @@ Every Go start applies `scoutanalytics.sql` unless `SCOUT_DB_AUTO_MIGRATE=false`
   `ml/scout_ml/config.py`). It was changed after seeing a result, so a
   wallet variant's pass needs confirming on a later retrain. The variant
   "raw dex + dex_family" is also run across all 7 seeds (`SEED_VARIANTS`).
+- 15 Oct (owner, "go with b"): after report 20261015-1944, where the full
+  wallet variant failed only the drift rule in 3d, the lookback variant
+  named by the pre-registered rules is run ("wallet reputation, last 14
+  days", same adoption rules, across 7 seeds), instead of parking the
+  wallet work as the PM had recommended.
 - 12 Oct: the PM has the `Bash` tool for git only: read-only git, `git fetch`
   and `git worktree add` to create worktrees for `implement`; never stash,
   switch, reset, rebase or merge (add, commit and push of its own `work/...`

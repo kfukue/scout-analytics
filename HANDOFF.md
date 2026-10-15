@@ -1,5 +1,57 @@
 # Scout analytics: handoff to Claude Code
 
+## Session state (15 Oct 2026 PDT: main d3a2197 after PRs #10-#12)
+
+This section supersedes the ones below wherever they differ.
+
+**Merged 15 Oct:** #10 wallet variant "quality only" and rug prior 0.30;
+#11 "raw dex + dex_family" across 7 seeds; #12 docs. The owner retrained
+on the server with `--variants`.
+
+**Prod report 20261015-1944:**
+- Gates: all FAIL. 3d 1.99 (seeds 1.77-2.12), 7d 1.86 (1.62-2.17), 1d
+  1.11. With only 18 more rows than report 20261015-0554, 3d moved from
+  2.10 to 1.99: 3d and 7d sit at about 2x and runs move by 0.1-0.2, so
+  PASS/FAIL near 2 is mostly chance. The PM proposed no gate change. So the site
+  will mark every bucket "n.v." for scores from this model (inferred from
+  the gates, not checked on the site).
+- Collapses: skipping the top 30 % by collapse score still removes about
+  half of them at every horizon. The top 10 % by runner score still lose
+  money on average (3d -15.0 % vs -44.6 % for all calls; 7d -24.1 % vs
+  -51.4 %). Call volume: 50 calls in the week of 12 Oct.
+- "raw dex + dex_family" across 7 seeds: no gain (3d 1.99 vs 1.99, 7d
+  1.93 vs 1.86, 1d 1.13 vs 1.11). The 2.34 of the previous report was one
+  seed. Not adopted.
+- Wallet reputation (rug prior 0.30 now matches the observed 31.4 %):
+  - Full variant: 3d holds rules 1-4 (median 2.08 vs baseline 1.99) and
+    fails only rule 5 (drift), so by the pre-registered rules the next step
+    is a lookback variant. The gap is within run-to-run noise, and in the
+    previous report the same variant was below the baseline. 1d and 7d do
+    not pass.
+  - Quality only: below 2 everywhere (3d 1.77); drift still 0.96-0.97, led
+    by `wrep_rug_lift_max`: the wallet inputs themselves grow with the
+    history, not only the two coverage inputs.
+
+**Owner decision (15 Oct, "go with b"):** run the lookback variant as the
+pre-registered rules say (the PM had recommended parking the wallet work).
+Recorded in the PM skill.
+
+**Open PRs (base `main`; tested locally only; nothing deployed):**
+- #13 `work/2026-10-15-wallet-lookback` (600d634, reviewed PASS):
+  report-only variant "wallet reputation, last 14 days"
+  (`WREP_LOOKBACK_VARIANT_DAYS` 14, fixed before any result), same adoption rules,
+  across 7 seeds; a drift-only failure of it reads "drift persists with a
+  14-day window" (no further step pre-registered).
+- This docs PR (independent of #13).
+
+**Owner's next steps:** merge #13, retrain on the server with
+`--variants`, send `report.md`.
+
+**Not decided:** dropping "raw dex + dex_family" and "quality only" from
+`SEED_VARIANTS` (they have given their answer; saves about 1.5 min per
+retrain); the two URL-leak fixes (DB connection URL in an error message,
+node URL in stored errors).
+
 ## Session state (night of 14-15 Oct 2026 PDT (15 Oct UTC): main 062193c after new-repo PRs #1-#9)
 
 New-repo PR numbers. Everything below this section is older; where the
