@@ -15,6 +15,7 @@ from scout_ml.labels import build_labels
 from scout_ml.model import Bundle
 
 DEX_VARIANTS = ("raw dex instead of dex_family", "raw dex + dex_family")
+DEX_BOTH = DEX_VARIANTS[1]
 WITH_CALLS_PREV = "with calls_prev counts (default before 14 Oct)"
 WALLET = "wallet reputation (wrep_*)"
 QUALITY = "wallet reputation, quality only"
@@ -283,6 +284,29 @@ def test_variant_table_contents(plain_and_variants):
     assert "Variant comparison" not in plain_report
 
 
+def test_dex_both_is_across_seeds_without_live_buys(plain_and_variants):
+    """"raw dex + dex_family" (SEED_VARIANTS since 15 Oct 2026) gets its across-seeds
+    row from a run without --live-buys: retrained with every seed, own inputs probed."""
+    _, var, _ = plain_and_variants
+    meta = json.loads((var / "meta.json").read_text())
+    assert "wallet_rep" not in meta                               # no live buys in this run
+    v = meta["variants"][DEX_BOTH]
+    assert v["changes"] == {"DEX_INPUTS": "both"}
+    assert not {"not_applicable", "error", "adoption"} & set(v)
+    acr = v["across_seeds"]
+    assert "error" not in acr and acr["seeds"] == list(C.STABILITY_SEEDS)
+    across = (var / "report.md").read_text(encoding="utf-8")
+    across = across[across.index("### Variants across seeds (report only)"):]
+    trained = [b for b, m in meta["metrics"].items() if not m.get("skipped")]
+    assert trained
+    for b in trained:
+        a = acr["buckets"][b]
+        assert list(a["lifts"]) == [str(s) for s in C.STABILITY_SEEDS]
+        assert a["lift"] == v["buckets"][b]["wf_pooled_lift"]
+        assert "auc" in a["adversarial"]
+        assert f"| {b} | {DEX_BOTH} | {a['weeks']} |" in across
+
+
 def test_variant_walk_forward_summary_uses_counted_weeks_only():
     """The walk-forward means of the variant table leave out the weeks the gate does
     not count (training part below WF_MIN_TRAIN_ROWS), as the gate does."""
@@ -473,7 +497,9 @@ def test_burst_setting_replaces_exactly_the_raw_counts(synthetic_df):
 # --- "Variants across seeds" (report only) -------------------------------------------
 
 def test_every_variant_applies_without_error_and_seed_variants_are_variants():
-    assert isinstance(C.SEED_VARIANTS, tuple) and C.SEED_VARIANTS == (WITH_CALLS_PREV, WALLET, QUALITY)
+    assert isinstance(C.SEED_VARIANTS, tuple)
+    assert C.SEED_VARIANTS == (WITH_CALLS_PREV, WALLET, QUALITY, DEX_BOTH)
+    assert DEX_BOTH not in C.WALLET_REP_VARIANTS                  # no --live-buys, no adoption
     assert all(n in C.VARIANTS for n in C.SEED_VARIANTS)
     for name in C.VARIANTS:
         with C.overrides(**C.VARIANTS[name]):

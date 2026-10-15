@@ -549,8 +549,13 @@ VARIANTS = {
 # Variants also retrained with the other STABILITY_SEEDS for the report-only
 # table "Variants across seeds" (ml/README.md). Never a gate; about one normal
 # training per extra seed and variant; empty it to skip the table.
+# "raw dex + dex_family" since 15 Oct 2026 (owner decision): in report
+# 20261015-0554 its seed-7 pooled walk-forward lift at 7d was 2.34 vs the
+# baseline's 1.95 (sim difference +41.2 %), a gap of the size single seeds have
+# shown as noise; the median over the seeds tells which. Not a wallet variant:
+# runs without --live-buys and has no adoption rules.
 SEED_VARIANTS = ("with calls_prev counts (default before 14 Oct)", "wallet reputation (wrep_*)",
-                 "wallet reputation, quality only")
+                 "wallet reputation, quality only", "raw dex + dex_family")
 # Variants that only differ from the baseline through trades_24h: not applicable
 # when the export has no trades_24h column.
 TRADES_VARIANTS = ("dead rule on (collapse OR dead)", "runners must be tradeable")

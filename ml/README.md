@@ -464,7 +464,12 @@ baseline, and the owner rejected "calls_prev as a burst ratio" (worse in
 report 20261014-1842), so it was removed. Its setting
 `CALLS_PREV_INPUTS = "burst"` is still in `config.py` (the two raw counts
 replaced in place by `calls_burst_1h = calls_prev_1h * 24 /
-max(calls_prev_24h, 1)`), but no variant uses it.
+max(calls_prev_24h, 1)`), but no variant uses it. Since 15 Oct 2026
+`SEED_VARIANTS` also has "raw dex + dex_family" (owner decision: in report
+20261015-0554 its seed-7 pooled walk-forward lift at 7d was 2.34 vs the
+baseline's 1.95, sim difference +41.2 %, a gap of the size single seeds have
+shown as noise; the median over the seeds tells which). It is not a wallet
+variant: it runs without `--live-buys` and has no adoption rules.
 
 A variant that raises an error is recorded as `error: <message>` (in its
 table row and in `meta.json` `"variants"`), a `WARNING` line is printed, the
@@ -481,7 +486,7 @@ retrain per extra seed (two with 3 seeds, six with 7) plus one adversarial
 probe per bucket for each `SEED_VARIANTS` entry
 (the baseline row reuses the diagnostics' probe): about 93 s for two
 entries on that synthetic data (13 Oct 2026, the sum of their `[variant]`
-lines' "of which" times; three entries since 14 Oct 2026, see below); on the prod data an
+lines' "of which" times; three entries since 14 Oct 2026, four since 15 Oct, see below); on the prod data an
 estimated 40 to 50 s for two, not measured. Runs without `--variants` are unchanged.
 With 7 seeds (14 Oct 2026, same synthetic data, `make_synthetic.py --calls
 6000 --days 170 --seed 11`, one desktop PC): a whole run with `--variants`
@@ -497,6 +502,12 @@ The variant "wallet reputation, quality only" costs as much again (14 Oct
 2026, same data and PC: its `[variant]` line 165 s, of which other seeds and
 adversarial validation 140 s; the full wallet variant's line 164 s in the
 same run); a whole run with `--variants --live-buys` took 759 s.
+"raw dex + dex_family" in `SEED_VARIANTS` (15 Oct 2026, same synthetic data,
+`make_synthetic.py --calls 6000 --days 170 --seed 11 --live-buys`, one
+desktop PC, synthetic, not the prod data): its `[variant]` line 154 s instead of 22 s, of
+which other seeds and adversarial validation 132 s; a whole run with
+`--variants --live-buys` 891 s instead of 773 s (the run before the change,
+same day).
 
 ### Stability diagnostics
 
