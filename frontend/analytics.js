@@ -1933,8 +1933,10 @@
     } else {
       var km = A.kaplanMeier(a.holds);
       var kmTd = el('td', 'num', km.n ? (isNum(km.median) ? A.fmtDur(km.median) : 'not reached') : DASH);
-      kmTd.title = km.n ? (isNum(km.median) ? 'Half of the ' + fmtInt(km.n) + ' calls that reached 2× had fallen back ' + A.fmtDur(km.median) + ' after the first 2×'
-        : 'Fewer than half of the ' + fmtInt(km.n) + ' calls that reached 2× fell back within the window') : 'No call reached 2×';
+      kmTd.title = km.n ? (isNum(km.median) ? 'Half of the ' + fmtInt(km.n) + ' calls that reached 2× fell back below 2× after ' + A.fmtDur(km.median) +
+          ' of time held at 2× in the first stretch (Kaplan–Meier median; calls still at 2× at the window end count as censored)'
+        : 'Fewer than half of the ' + fmtInt(km.n) + ' calls that reached 2× fell back below 2× within the window ' +
+          '(Kaplan–Meier over time held at 2× in the first stretch; calls still at 2× at the window end count as censored)') : 'No call reached 2×';
       tr.appendChild(kmTd);
     }
     tr.appendChild(rateCell(a.rugIn.length, a.n, 'timed calls rugged within the window (event rug times)'));
@@ -2029,7 +2031,8 @@
     var aKM = A.kaplanMeier(all.holds);
     drawStep('ch-tm-km', 'key-tm-km', H, series, 'the first 2×',
       'Share still at 2× after the first 2×, Kaplan–Meier, ' + fmtInt(aKM.n) + ' calls that reached 2× in the ' + hz + ' window' +
-      (isNum(aKM.median) ? '; half had fallen back by ' + A.fmtDur(aKM.median) : '; fewer than half fell back'));
+      (isNum(aKM.median) ? '; half fell back by ' + A.fmtDur(aKM.median) + ' of time held at 2× in the first stretch (the median, where the curve first drops to 50% or below)'
+        : '; the curve never drops to 50%, so fewer than half fell back below 2× within the window'));
     $('cap-tm-km').textContent = 'Of the ' + fmtInt(aKM.n) + ' timed calls that reached 2×, the share still at or above 2× t after first reaching it (Kaplan–Meier). ' +
       rule2x() + ' The other ' + fmtInt(all.n - all.reached) + ' timed calls are not in it (' + fmtInt(all.short) +
       ' of them touched 2× but held it under ' + A.holdWords(A.MIN_HELD_2X_S) + '). ' +
