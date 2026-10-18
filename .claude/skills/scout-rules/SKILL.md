@@ -67,6 +67,23 @@ root).
   split instead of growing one large diff. Write new code as small,
   single-purpose, testable functions; split a function that grows long
   rather than adding to it.
+- Setting names in one file (owner, 18 Oct 2026): a constant that names a
+  setting, such as `const databaseURLSetting = "SCOUT_DATABASE_URL"`, goes
+  in one dedicated file per Go package, `config.go`, so all of them are
+  easy to find and maintain. In Go, name it `<name>Setting`. Never declare it in
+  the file that uses it.
+  - Go and Python code reads a setting through its constant, never
+    through a `"SCOUT_..."` string literal. Error and log messages may
+    still name a setting in their text.
+  - Tests may write the literal name (that also catches an accidental
+    rename). Shell scripts, deploy files and docs write names as they are.
+  - In `ml/`, `ml/scout_ml/config.py` already plays this role; put new ML
+    setting names there, never in a second file.
+  - This applies to new code now. New code that reads a setting still
+    written as a literal elsewhere adds its constant to `config.go` and
+    uses it; the old literals stay until their move PR. Existing names
+    move to `config.go` only in their own small PRs (one function per
+    PR), when the task asks for it.
 
 ## Database changes: run script and rollback
 

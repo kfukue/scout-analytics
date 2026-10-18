@@ -167,6 +167,14 @@ back.
     long R is safe to run) from the folder README.
   - A small one-off write you give the owner in a message carries its
     backup step and rollback in that same message.
+- **Setting names in `config.go`** (owner, 18 Oct 2026): every `implement`
+  and `simplify` brief that adds or reads a setting says "constants that
+  name a setting go in the package's `config.go` (rule in `scout-rules`,
+  Hard rules)"; every `review` brief on Go code says "FAIL if a new
+  setting name is declared outside `config.go` or read through a
+  `"SCOUT_..."` literal in non-test Go or Python code".
+  `.claude/agents/review.md` is the owner's file and does not have this
+  check yet.
 - **Verification wording:** the production database and the nodes are only
   reachable from the prod server. Anything not run there is "tested locally",
   never "verified in prod".
@@ -534,6 +542,13 @@ Every Go start applies `scoutanalytics.sql` unless `SCOUT_DB_AUTO_MIGRATE=false`
 - 13 Oct (owner): every database change, to the structure or the data, ships
   with a run script and a rollback script ("Rules to follow and pass on";
   the rule in full is in `scout-rules`).
+- 18 Oct (owner): constants that name a setting (e.g. `const
+  databaseURLSetting = "SCOUT_DATABASE_URL"`) live in one `config.go` per
+  Go package; non-test Go and Python code reads settings through those
+  constants, not `"SCOUT_..."` literals; `ml/` keeps
+  using `ml/scout_ml/config.py`. New code now; existing names move only
+  in their own small PRs. The rule in full is in `scout-rules` ("Hard
+  rules"); pass it on to `implement`, `simplify` and `review`.
 - 13 Oct: the call list's Perceptor filter uses each token's latest
   Perceptor report with a verdict, re-scans included (PR #40); display only,
   the dataset view and the Analytics "verdict at the call" stay call-time.
