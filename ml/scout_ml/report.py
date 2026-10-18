@@ -386,6 +386,8 @@ def render(res: dict) -> str:
                              + [fmt(w["sim_top_mean"], 1), fmt(w["sim_all_mean"], 1),
                                 w["sim_beats_all"]])
                           + [wf_gate_note(w)] for w in r["walk_forward"]]))
+        if "collapse_filter" in r:
+            out.append(collapse_filter_section(r["collapse_filter"]))
         for lab, m in r["labels"].items():
             if m.get("skipped"):
                 continue
@@ -400,6 +402,105 @@ def render(res: dict) -> str:
         out.append(diagnostics_section(res["diagnostics"], res["buckets"]))
     if res.get("variants"):
         out.append(variants_section(res["variants"], res["buckets"], res.get("wallet_rep")))
+    return "\n".join(out)
+
+
+COLLAPSE_FILTER_TITLE = "### Collapse filter (report only)\n"
+
+
+def collapse_filter_intro(cf: dict) -> str:
+    """What the collapse filter table means, with the bucket's label rules."""
+    frac, cap = cf["flag_frac"], cf["sim_max_ret_pct"]
+    run_col, coll_col = cf["runner_label"].split()[0], cf["collapse_label"].split()[0]
+    if run_col != coll_col:
+        peak = " (the peak, not the return)" if run_col.startswith("max_gain") else ""
+        both = (f" The runner label reads {run_col}{peak} and the collapse label {coll_col}, "
+                "so one call can be both a runner and a collapse.")
+    elif cf["can_be_both"]:
+        both = (" A rugged call counts as a collapse whatever its return, so one call can be "
+                "both a runner and a collapse.")
+    else:
+        both = f" Both labels read the same return column ({run_col}), so no call is both."
+    return (f"What skipping the calls the collapse model flags would catch and cost. Flagged = "
+            f"the {frac:.0%} of calls with the highest collapse score (the calls \"collapses "
+            "removed\" counts; per walk-forward week by that week's own model); kept = the "
+            f"others. The {frac:.0%} cut is taken within each part (the test part, each "
+            "walk-forward week) after its scores are known, as for \"collapses removed\"; a live "
+            "filter would need a fixed score threshold set in advance, so these rates are "
+            "likely optimistic for such a filter. Report only: no gate, nothing served. "
+            "Collapse = the plain collapse label "
+            f"({cf['collapse_label']}), runner = {cf['runner_label']}." + both
+            + f" Mean net return: each call capped at +{cap:,.0f} %, as the money simulation. "
+            f"Random skip = skipping {cf['random_skip_expected']:.0%} of the calls at random: on "
+            f"average it catches {cf['random_skip_expected']:.0%} of the collapses, loses "
+            f"{cf['random_skip_expected']:.0%} of the runners and leaves the mean unchanged. "
+            "Test part = the saved model's; pooled = the counted weeks of the gate's expanding "
+            "walk-forward, 95% interval by the same week-block bootstrap as the gates "
+            "(its collapses caught is the pooled collapses removed of the diagnostics' "
+            "\"Pooled walk-forward\" table, when the diagnostics are on).\n")
+
+
+def _filter_part(s: dict, interval: bool) -> list:
+    """One column of the collapse filter table (`interval`: with [95%] ends)."""
+    if not s or s.get("skipped") or s.get("error"):
+        why = (s or {}).get("skipped") or (s or {}).get("error") or "not computed"
+        return [f"n/a: {why}"] + [""] * 7
+
+    def ci(k, show=fmt):
+        if not interval:
+            return show(s.get(k))
+        return f"{show(s.get(k))} [{show(s.get(k + '_lo'))}, {show(s.get(k + '_hi'))}]"
+
+    def counts(a, b):
+        return "" if s.get(a) is None else f" ({s[a]}/{s[b]})"
+
+    return [fmt(s.get("calls")), f"{fmt(s.get('flagged'))} ({fmt(s.get('flagged_share'))})",
+            ci("collapses_caught") + counts("collapses_flagged", "collapses"),
+            f"{fmt(s.get('collapse_rate_flagged'))} / {fmt(s.get('collapse_rate_kept'))}",
+            ci("runners_lost") + counts("runners_flagged", "runners"),
+            f"{fmt(s.get('runner_rate_flagged'))} / {fmt(s.get('runner_rate_kept'))}",
+            f"{_signed(s.get('kept_mean'))} vs {_signed(s.get('all_mean'))}",
+            ci("kept_minus_all", _signed)]
+
+
+FILTER_ROWS = ["calls", "flagged calls (share)",
+               "collapses caught = collapses removed (flagged/all collapses)",
+               "collapse rate flagged / kept", "runners lost (flagged/all runners)",
+               "runner rate flagged / kept", "mean net % kept vs all calls",
+               "kept minus all (mean net %)"]
+
+
+def collapse_filter_table(cf: dict) -> str:
+    p = cf.get("pooled") or {}
+    rnd = fmt(cf["random_skip_expected"])
+    cols = [_filter_part(cf.get("test"), False), _filter_part(p, True),
+            ["", "", rnd, "", rnd, "", "", "+0.0"]]
+    head = ["", "test part (saved model)",
+            f"pooled walk-forward ({p.get('weeks', 0)} counted weeks) [95%]",
+            "random skip (expected)"]
+    return table(head, [[name] + [c[i] for c in cols] for i, name in enumerate(FILTER_ROWS)])
+
+
+def collapse_filter_weeks(weeks: list) -> str:
+    """The per-week table of the pooled collapse filter (the trend over time)."""
+    rows = [[w["week"], w["start"]] + (["n/a: " + w["skipped"]] + [""] * 4 if w.get("skipped") else
+            [f"{w['flagged']}/{w['calls']}", w["collapses_caught"], w["runners_lost"],
+             f"{_signed(w['kept_mean'])} vs {_signed(w['all_mean'])}",
+             _signed(w["kept_minus_all"])]) for w in weeks]
+    return table(["week", "from", "flagged/calls", "collapses caught", "runners lost",
+                  "mean net % kept vs all", "kept minus all"], rows)
+
+
+def collapse_filter_section(cf: dict) -> str:
+    """The bucket's "Collapse filter (report only)" section (train.collapse_filter)."""
+    out = [COLLAPSE_FILTER_TITLE]
+    if cf.get("error"):
+        return "\n".join(out + [f"**Not computed: {cf['error']}.** Nothing else in this report "
+                                "is affected.\n"])
+    out += [collapse_filter_intro(cf), collapse_filter_table(cf)]
+    if cf.get("weeks"):
+        out += ["Per counted walk-forward week (each flagged by its own model):\n",
+                collapse_filter_weeks(cf["weeks"])]
     return "\n".join(out)
 
 

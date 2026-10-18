@@ -575,8 +575,36 @@ From the top:
    `medium` and `long` the purged k-fold inside train (rounds, calibration),
    test metrics (LightGBM vs the logistic baseline), the gate table (the
    gates, then the information rows and a "Why FAIL:" line), the money
-   simulation on the test part, the walk-forward table, calibration and top
-   features.
+   simulation on the test part, the walk-forward table, the "Collapse filter
+   (report only)" table (below), calibration and top features.
+   **Collapse filter (report only)**, after the walk-forward table: what
+   skipping the 30% of calls with the highest collapse score would catch and
+   cost, if the model were shown as a risk filter ("avoid likely collapses")
+   instead of "top picks". It passes or fails nothing and is not served.
+   The 30% cut is taken within each part (the test part, each walk-forward
+   week) after its scores are known, as for "collapses removed"; a live
+   filter would need a fixed score threshold set in advance, so these rates
+   are likely optimistic for such a filter.
+   Columns: the saved model's test part, the pooled walk-forward (the gate's
+   counted weeks, each week flagged by its own model, with 95% intervals
+   from the same week-block bootstrap), and what skipping 30% at random
+   would give. Read the rows as:
+   - "collapses caught" is the same number as "collapses removed" (test part)
+     and the pooled collapses removed of "Pooled walk-forward"; well above
+     0.30 (random) = the flag finds collapses;
+   - "collapse rate flagged / kept": how much riskier the flagged calls are;
+   - "runners lost": the share of all runners that are flagged, i.e. the
+     cost; well below 0.30 = the filter rarely flags a runner. "runner rate
+     flagged / kept" says the same per call;
+   - "mean net % kept vs all calls" and "kept minus all": the mean net return
+     (each call capped at +1,000 %) of the calls left after skipping the
+     flagged ones vs buying every call. A pooled interval entirely above 0 =
+     skipping the flagged calls helped in the walk-forward weeks.
+   The per-week table under it shows whether this holds week by week or
+   only in some weeks. For `short` (1d) the runner label is the peak
+   (`max_gain_late_1d`) and the collapse label the return (`ret_late_1d`),
+   so one call can be both; for `3day` and `medium` both use the same
+   return, so no call is both (the section says which applies).
    Each label's "Platt calibration:" line names the calibration it uses
    (**recent window** or **all held-out rows**), chosen on held-out rows only
    (comparison Brier values given, or the reason no comparison was made);
@@ -692,7 +720,8 @@ passed with seed 7 and failed with seeds 11 and 23).
 - The whole `report.md` (it has only counts and metrics, no calls or
   addresses), or at least: Verdict, Data and exclusions, and per bucket the
   Split line, the gate table (with its "Why FAIL:" line), the money
-  simulation line and the walk-forward table.
+  simulation line, the walk-forward table and the "Collapse filter (report
+  only)" tables.
 - The output of the step 3 queries, if you ran them.
 - The train time (`real` from `time`), the `[gates] ...` line and the
   `[diagnostics] ...` line (step 5), if the diagnostics ran.

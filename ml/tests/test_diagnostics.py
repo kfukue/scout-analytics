@@ -306,6 +306,38 @@ def test_pooled_walk_forward_matches_the_gate_weeks(off_and_on):
         assert r.get("weeks_beating", 0) == wd[b]["rolling_gate"]["windows_beating"]
 
 
+def test_collapse_filter_pooled_is_the_pooled_collapses_removed(off_and_on):
+    """The collapse filter (report only) reuses the gate's pooled walk-forward:
+    its collapses caught and 95% interval are the pooled collapses removed of
+    "Pooled walk-forward", its test part the gate's collapses removed; the
+    diagnostics' pooled rows carry no filter keys."""
+    _, on = off_and_on
+    meta = json.loads((on / "meta.json").read_text())
+    wd = meta["diagnostics"]["walk_forward"]
+    trained = [b for b, m in meta["metrics"].items() if not m.get("skipped")]
+    assert trained
+    checked = 0
+    for b in trained:
+        m, e = meta["metrics"][b], wd[b]["expanding"]
+        cf = m["collapse_filter"]
+        for k in ("", "_lo", "_hi"):     # null when there is no counted week
+            assert cf["pooled"][f"collapses_caught{k}"] == e.get(f"collapse_removed{k}"), (b, k)
+        assert cf["test"]["collapses_caught"] == m["trading"]["collapse_removed"]
+        assert cf["pooled"]["weeks"] == e["weeks"] == len(cf["weeks"])
+        assert cf["pooled"]["calls"] == e["rows"]
+        if e.get("sim_all_mean") is None:
+            assert cf["pooled"]["all_mean"] is None
+        else:
+            assert cf["pooled"]["all_mean"] == pytest.approx(e["sim_all_mean"])
+        checked += e["weeks"] >= 2 and cf["pooled"]["collapses_caught_lo"] is not None
+        for row in ("expanding", "rolling"):
+            assert not [k for k in wd[b][row] if k.startswith("filter_")], (b, row)
+    assert checked                       # at least one bucket with a real interval compared
+    for b, m in meta["metrics"].items():
+        if m.get("skipped"):
+            assert "collapse_filter" not in m
+
+
 def test_evaluation_without_dead_calls(off_and_on):
     _, on = off_and_on
     meta = json.loads((on / "meta.json").read_text())

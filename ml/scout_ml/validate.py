@@ -224,6 +224,75 @@ def collapse_removed(y_collapse, collapse_score) -> float:
     return float(y[top_mask(collapse_score, C.SKIP_FRAC)].sum() / y.sum())
 
 
+# --- Collapse filter (report only): what skipping the flagged calls catches and costs ---
+
+def _ratio(a, b):
+    """a / b where b > 0, else NaN (scalars or arrays; NaN inputs stay NaN)."""
+    a, b = np.asarray(a, dtype=float), np.asarray(b, dtype=float)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        return np.where(b > 0, a / np.where(b > 0, b, 1.0), np.nan)
+
+
+def collapse_filter_sums(y_collapse, y_runner, ret, flag) -> dict:
+    """The sums the collapse filter numbers are built from: calls `n`, flagged
+    calls `flag_n`, collapses and runners overall and among the flagged calls,
+    and the net returns of all / the flagged calls, each capped at
+    C.SIM_MAX_RET_PCT (as the money simulation)."""
+    flag = np.asarray(flag, dtype=bool)
+    yc, yr = np.asarray(y_collapse, dtype=float), np.asarray(y_runner, dtype=float)
+    ret = np.minimum(np.asarray(ret, dtype=float), C.SIM_MAX_RET_PCT)
+    return {"n": float(len(flag)), "flag_n": float(flag.sum()),
+            "coll_all": float(yc.sum()), "coll_flag": float(yc[flag].sum()),
+            "run_all": float(yr.sum()), "run_flag": float(yr[flag].sum()),
+            "ret_all": float(ret.sum()), "ret_flag": float(ret[flag].sum())}
+
+
+def collapse_filter_rates(s: dict) -> dict:
+    """The filter's rates from `collapse_filter_sums` (values may be arrays,
+    e.g. bootstrap resamples; NaN where a denominator is 0). Kept = not flagged.
+
+    flagged_share          flagged calls / calls
+    collapses_caught       collapses among the flagged / all collapses
+                           (= "collapses removed" by skipping them)
+    collapse_rate_flagged  collapse rate among the flagged calls
+    collapse_rate_kept     collapse rate among the kept calls
+    runners_lost           runners among the flagged / all runners
+    runner_rate_flagged    runner rate among the flagged calls
+    runner_rate_kept       runner rate among the kept calls
+    all_mean / kept_mean   mean capped net return of all / the kept calls (%)
+    kept_minus_all         kept_mean - all_mean"""
+    kept_n = np.asarray(s["n"], dtype=float) - np.asarray(s["flag_n"], dtype=float)
+    coll_kept = np.asarray(s["coll_all"], dtype=float) - np.asarray(s["coll_flag"], dtype=float)
+    run_kept = np.asarray(s["run_all"], dtype=float) - np.asarray(s["run_flag"], dtype=float)
+    ret_kept = np.asarray(s["ret_all"], dtype=float) - np.asarray(s["ret_flag"], dtype=float)
+    all_mean, kept_mean = _ratio(s["ret_all"], s["n"]), _ratio(ret_kept, kept_n)
+    return {"flagged_share": _ratio(s["flag_n"], s["n"]),
+            "collapses_caught": _ratio(s["coll_flag"], s["coll_all"]),
+            "collapse_rate_flagged": _ratio(s["coll_flag"], s["flag_n"]),
+            "collapse_rate_kept": _ratio(coll_kept, kept_n),
+            "runners_lost": _ratio(s["run_flag"], s["run_all"]),
+            "runner_rate_flagged": _ratio(s["run_flag"], s["flag_n"]),
+            "runner_rate_kept": _ratio(run_kept, kept_n),
+            "all_mean": all_mean, "kept_mean": kept_mean, "kept_minus_all": kept_mean - all_mean}
+
+
+FILTER_RATES = ("flagged_share", "collapses_caught", "collapse_rate_flagged", "collapse_rate_kept",
+                "runners_lost", "runner_rate_flagged", "runner_rate_kept", "all_mean", "kept_mean",
+                "kept_minus_all")   # the keys of collapse_filter_rates
+FILTER_COUNTS = {"calls": "n", "flagged": "flag_n", "collapses": "coll_all",
+                 "collapses_flagged": "coll_flag", "runners": "run_all", "runners_flagged": "run_flag"}
+
+
+def collapse_filter_stats(y_collapse, y_runner, ret, flag) -> dict:
+    """The collapse filter on one set of calls: `flag` marks the calls it would
+    skip (the C.SKIP_FRAC highest collapse scores, `top_mask`). Counts
+    (FILTER_COUNTS keys, ints) plus the `collapse_filter_rates` (floats, NaN
+    where undefined). `ret` is capped at C.SIM_MAX_RET_PCT."""
+    s = collapse_filter_sums(y_collapse, y_runner, ret, flag)
+    return {**{k: int(s[v]) for k, v in FILTER_COUNTS.items()},
+            **{k: float(v) for k, v in collapse_filter_rates(s).items()}}
+
+
 def wf_enough_train(w: dict) -> bool:
     """The week's training part has at least C.WF_MIN_TRAIN_ROWS rows (`n_train`
     is required: a week without it is an error, never silently counted)."""
