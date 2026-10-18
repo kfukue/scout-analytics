@@ -599,6 +599,13 @@ Every Go start applies `scoutanalytics.sql` unless `SCOUT_DB_AUTO_MIGRATE=false`
   on the site as a risk filter (collapse avoidance) and a weekly retrain
   cadence. The two URL-leak fixes are approved (DB connection URL in
   errors; node URL in stored and logged errors).
+- 18 Oct (owner, "ok then don't redact it then"; supersedes the node-URL
+  half of the 15 Oct entry above): node URLs are not redacted from
+  stored errors or logs. They only appear on the prod server, and anyone
+  who gets into that box already has `.env`. #21 was closed unmerged
+  and old node-URL error rows are not cleaned up. The DB connection URL
+  fix (#18) stays. Old bot-token URLs in `scout_deliveries` errors are
+  not covered by this decision (undecided).
 - 12 Oct: the PM has the `Bash` tool for git only: read-only git, `git fetch`
   and `git worktree add` to create worktrees for `implement`; never stash,
   switch, reset, rebase or merge (add, commit and push of its own `work/...`
