@@ -27,6 +27,20 @@ const (
 	sslkey      = `client-key.pem`
 )
 
+// repoConnStringSetting names the connection string SetupDatabase builds, in
+// errors that never quote it (see ConnStringError).
+const repoConnStringSetting = "the asset database connection string (built from the DB_* settings or secrets)"
+
+// parseRepoConnString parses the connection string SetupDatabase builds; its
+// error never quotes the string.
+func parseRepoConnString(dbURI string) (*pgxpool5.Config, error) {
+	cfg, err := pgxpool5.ParseConfig(dbURI)
+	if err != nil {
+		return nil, ConnStringError(repoConnStringSetting, err)
+	}
+	return cfg, nil
+}
+
 var DbConn *sql.DB
 var DbConnPgx *pgxpool5.Pool
 var DbConnV5 *pgx5.Conn
@@ -93,6 +107,14 @@ func SetupDatabaseMaxConns(maxConns int32) (*sql.DB, *pgxpool5.Pool, error) {
 			dbURI = fmt.Sprintf(dbURI, host, port, user, password, dbname, sslmode, filepath.Join(dir, sslrootcert), filepath.Join(dir, sslcert), filepath.Join(dir, sslkey))
 		}
 	}
+	// Parse before sql.Open: database/sql parses only at Ping, and pgx's
+	// parse error can quote the connection string (user, password). The
+	// panic is the one Ping raises below, so callers that recover it see the
+	// same kind of failure.
+	config5, err := parseRepoConnString(dbURI)
+	if err != nil {
+		panic(err)
+	}
 	DbConn, err := sql.Open("pgx", dbURI)
 	// DbConn, err = sql.Open("postgres", connStr)
 	if err != nil {
@@ -109,10 +131,6 @@ func SetupDatabaseMaxConns(maxConns int32) (*sql.DB, *pgxpool5.Pool, error) {
 	DbConn.SetMaxOpenConns(5000)
 	DbConn.SetMaxIdleConns(5000)
 	DbConn.SetConnMaxLifetime(600 * time.Second)
-	config5, err := pgxpool5.ParseConfig(dbURI)
-	if err != nil {
-		log.Fatal(err)
-	}
 	if maxConns > 0 {
 		config5.MaxConns = maxConns
 	}

@@ -17,6 +17,8 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/kfukue/scout-analytics/internal/database"
 )
 
 //go:embed scoutanalytics.sql
@@ -73,7 +75,7 @@ func applyPoolMaxConns(dsn string, cfg *pgxpool.Config, workers int) (string, er
 	// with pgxpool's default would miss an explicit value equal to it.
 	cc, err := pgx.ParseConfig(dsn)
 	if err != nil {
-		return "", fmt.Errorf("parse SCOUT_DATABASE_URL: %w", err)
+		return "", database.ConnStringError(databaseURLSetting, err)
 	}
 	if _, ok := cc.RuntimeParams["pool_max_conns"]; ok {
 		return "pool_max_conns in SCOUT_DATABASE_URL", nil
@@ -95,7 +97,7 @@ func defaultPoolSource(workers int) string {
 func NewScoutStore(ctx context.Context, dsn string, workers int) (*ScoutStore, error) {
 	cfg, err := pgxpool.ParseConfig(dsn)
 	if err != nil {
-		return nil, fmt.Errorf("parse SCOUT_DATABASE_URL: %w", err)
+		return nil, database.ConnStringError(databaseURLSetting, err)
 	}
 	from, err := applyPoolMaxConns(dsn, cfg, workers)
 	if err != nil {
