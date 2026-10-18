@@ -1,5 +1,8 @@
 """Model fitting, calibrated prediction, and the loaded bundle used for serving."""
 import json
+import os
+import secrets
+import shutil
 import warnings
 from pathlib import Path
 
@@ -300,3 +303,31 @@ def resolve_version_dir(model_dir) -> Path:
     if (model_dir / "meta.json").exists():
         return model_dir
     return model_dir / (model_dir / "LATEST").read_text().strip()
+
+
+def write_pointer(root, name: str, version: str) -> None:
+    """Write `version` + newline to `root/name` atomically (temp file in the same
+    directory, fsync, then os.replace), so a reader such as the scoring service
+    never sees an empty or partial pointer. On error the old pointer is left as
+    it was and the temp file is removed. A new file gets the usual umask mode, an
+    existing one keeps its mode, as with Path.write_text."""
+    target = Path(root) / name
+    tmp = Path(root) / f".{name}.{secrets.token_hex(8)}.tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0), 0o666)
+    try:
+        try:
+            os.write(fd, (version + "\n").encode())
+            os.fsync(fd)
+        finally:
+            os.close(fd)  # closed before replace/unlink: Windows refuses both on an open file
+        if target.exists():
+            shutil.copymode(target, tmp)
+        os.replace(tmp, target)
+    except BaseException:
+        # Cleanup must never mask the original error: on Windows a read-only
+        # pointer makes the temp read-only via copymode, and unlink then fails.
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise

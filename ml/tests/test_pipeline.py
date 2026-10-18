@@ -29,6 +29,7 @@ def test_synthetic_csv_has_exact_view_columns(synthetic_df):
 def test_end_to_end_training_artifacts(trained, shipped_seeds):
     root, vdir = trained
     assert (root / "LATEST").read_text().strip() == vdir.name
+    assert not list(root.glob("*.tmp"))                    # write_pointer left no temp file
     meta = json.loads((vdir / "meta.json").read_text())
     assert meta["version"] == vdir.name and meta["features"] == C.FEATURES
     assert "prior_calls" not in meta["features"] and "secs_since_prev_call" not in meta["features"]
