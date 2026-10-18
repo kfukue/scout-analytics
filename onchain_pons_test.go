@@ -680,8 +680,8 @@ func TestPonsGraduationFarFromCallFullNode(t *testing.T) {
 // Finding the close by bisection over graduated() at past blocks: only the
 // node's own "no state" answer switches to the event logs and sets noState; a
 // busy node or another node error is returned (the call is tried again later)
-// and leaves noState alone; a revert or no code before the curve existed is
-// "not graduated yet", as before.
+// and leaves noState alone; a revert, an EVM failure or no code before the
+// curve existed is "not graduated yet".
 func TestPonsFindCurveDoneHistoricalErrors(t *testing.T) {
 	for _, c := range []struct {
 		name        string
@@ -699,6 +699,7 @@ func TestPonsFindCurveDoneHistoricalErrors(t *testing.T) {
 		{name: "unknown block", msg: "header not found", wantErr: true},
 		{name: "internal error", msg: "internal error", code: -32603, wantErr: true},
 		{name: "revert before the curve", msg: "execution reverted", code: 3, beforeCurve: true},
+		{name: "invalid opcode before the curve", msg: "invalid opcode: INVALID", beforeCurve: true},
 		{name: "no code before the curve", noCode: true, beforeCurve: true},
 	} {
 		t.Run(c.name, func(t *testing.T) {
@@ -740,8 +741,9 @@ func TestPonsFindCurveDoneHistoricalErrors(t *testing.T) {
 	}
 }
 
-// isRevertOrNoCode: a revert or an address without code is a contract-level
-// answer; a busy node, another node error or no state is not.
+// isRevertOrNoCode: a revert, an EVM failure (noSuchValueTexts) or an address
+// without code is a contract-level answer; a busy node, another node error or
+// no state is not.
 func TestIsRevertOrNoCode(t *testing.T) {
 	rpc := func(code int, msg string) error { return &rpcError{Code: code, Message: msg} }
 	for _, c := range []struct {
@@ -754,7 +756,13 @@ func TestIsRevertOrNoCode(t *testing.T) {
 		{"empty result, wrapped", fmt.Errorf("graduated(): %w", errEmptyResult), true},
 		{"execution reverted", rpc(-32000, "execution reverted"), true},
 		{"code 3", rpc(3, "execution reverted: not open"), true},
+		{"invalid opcode", rpc(-32000, "invalid opcode: INVALID"), true},
+		{"invalid jump", rpc(-32000, "invalid jump destination"), true},
+		{"stack underflow", rpc(-32000, "stack underflow (0 <=> 1)"), true},
+		{"out of gas", rpc(-32000, "out of gas"), true},
 		{"nitro full node, no state", rpc(-32000, nitroNoState), false},
+		{"geth hash scheme, no state", rpc(-32000, "required historical state unavailable (reexec=128)"), false},
+		{"geth path scheme, no state", rpc(-32000, "historical state 0xabc is not available"), false},
 		{"rate limited", rpc(-32005, "rate limit exceeded"), false},
 		{"timed out", rpc(-32000, "request timed out"), false},
 		{"unknown block", rpc(-32000, "header not found"), false},
@@ -839,5 +847,156 @@ func TestPonsCloseNotFoundIsAnError(t *testing.T) {
 				t.Fatalf("got %d PoolManager-wide swap scans, want 0", n)
 			}
 		})
+	}
+}
+
+// A node that cannot answer a Pons getter at block latest (busy, rate
+// limiting, timed out, "header not found", an internal error, no state) has
+// said nothing about the token: discovery fails with that error (the tracker
+// tries again with its back-off) instead of reading "not a Pons token" and
+// going on to the generic pool search (errNoPool, or some other pool that is
+// then kept for good). Nothing is remembered: once the node answers, the same
+// token is found on its curve. Covers the token's curve() getter and the
+// curve's own getters, reached through the token and through the
+// counterparty search.
+func TestPonsDiscoveryNodeErrorIsNotAnAnswer(t *testing.T) {
+	token := "0x4444444444444444444444444444444444444444"
+	nodeErrs := []struct {
+		name string
+		msg  string
+		code int // JSON-RPC code (0 = -32000)
+	}{
+		{"rate limited", "rate limit exceeded", -32005},
+		{"busy", "server busy, try again later", 0},
+		{"timed out", "request timed out", 0},
+		{"unknown block", "header not found", 0},
+		{"internal error", "internal error", -32603},
+		{"no state", nitroNoState, 0},
+	}
+	for _, c := range []struct {
+		name          string
+		to, sel       string // the eth_call the node fails at block latest
+		noCurveGetter bool   // the curve is found as a counterparty of the token's transfers
+	}{
+		{"token curve()", token, selPonsCurve, false},
+		{"curve factory()", tPonsCurve, selPonsFactory, false},
+		{"curve token()", tPonsCurve, selPonsToken, false},
+		{"curve pairToken()", tPonsCurve, selPonsPairToken, false},
+		{"counterparty factory()", tPonsCurve, selPonsFactory, true},
+		{"counterparty pairToken()", tPonsCurve, selPonsPairToken, true},
+	} {
+		for _, e := range nodeErrs {
+			t.Run(c.name+": "+e.name, func(t *testing.T) {
+				f := newFakeChain(t, 5*24*time.Hour)
+				eb := f.blockAtTime(time.Now().Add(-24 * time.Hour))
+				newFakePons(f, token, tPonsCurve, zeroAddr, 18, 1000, 1e9, c.noCurveGetter).buy(eb-100, e18(1))
+				f.callErrCode = e.code
+				f.callErr = func(to, sel string, block uint64) string {
+					if to == c.to && sel == c.sel && block == f.latest {
+						return e.msg
+					}
+					return ""
+				}
+				o := testOnchain(t, f, nil)
+				st, err := o.discover(context.Background(), token, eb)
+				if err == nil || errors.Is(err, errNoPool) {
+					t.Fatalf("%s fails with %q (code %d): discover = %+v, %v; want that node error", c.name, e.msg, e.code, st, err)
+				}
+				f.mu.Lock()
+				f.callErr = nil
+				f.mu.Unlock()
+				st, err = o.discover(context.Background(), token, eb)
+				if err != nil || st.Kind != "pons" || st.Curve != tPonsCurve {
+					t.Fatalf("%s answers again: discover = %+v, %v; want a pons state on curve %s", c.name, st, err, tPonsCurve)
+				}
+			})
+		}
+	}
+}
+
+// The token's own answer that it has no Pons curve keeps it out of the Pons
+// path, as before: curve() reverts (also with a revert reason that reads like
+// a busy node), fails in the EVM (invalid opcode), returns nothing (no such
+// function or no code) or names no curve (the zero address). The token goes
+// on to the generic pool search (errNoPool here: it has no transfers).
+func TestPonsDiscoveryNotPonsAnswers(t *testing.T) {
+	token := "0x4444444444444444444444444444444444444444"
+	for _, c := range []struct {
+		name   string
+		result string // curve()'s result, when msg is ""
+		msg    string // curve()'s JSON-RPC error
+		code   int    // its code (0 = -32000)
+	}{
+		{name: "reverted", msg: "execution reverted"},
+		{name: "reverted, code 3", msg: "execution reverted", code: 3},
+		{name: "revert reason reads like a busy node", msg: "execution reverted: rate limit", code: 3},
+		{name: "invalid opcode", msg: "invalid opcode: INVALID"},
+		{name: "empty result", result: "0x"},
+		{name: "zero address", result: ret(wAddr(zeroAddr))},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			f := newFakeChain(t, 5*24*time.Hour)
+			eb := f.blockAtTime(time.Now().Add(-24 * time.Hour))
+			f.addToken(token, 18, "TOK")
+			if c.msg == "" {
+				f.constCall(token, selPonsCurve, c.result)
+			}
+			asked := 0 // curve() calls; read and written with f.mu held
+			f.callErrCode = c.code
+			f.callErr = func(to, sel string, block uint64) string {
+				if to == token && sel == selPonsCurve {
+					asked++
+					return c.msg
+				}
+				return ""
+			}
+			o := testOnchain(t, f, nil)
+			if _, err := o.discover(context.Background(), token, eb); !errors.Is(err, errNoPool) {
+				t.Fatalf("curve() %s: discover error = %v, want errNoPool", c.name, err)
+			}
+			f.mu.Lock()
+			defer f.mu.Unlock()
+			if asked == 0 {
+				t.Fatalf("curve() %s: the token was never asked for its curve", c.name)
+			}
+		})
+	}
+}
+
+// ponsCallErr: only the contract's own answer (a revert, also one whose reason
+// reads like a busy node, an EVM failure or an empty result) means "not Pons"
+// (nil); a node that could not answer is an error that keeps the original
+// error.
+func TestPonsCallErr(t *testing.T) {
+	rpc := func(code int, msg string) error { return &rpcError{Code: code, Message: msg} }
+	for _, c := range []struct {
+		name    string
+		err     error
+		wantErr bool
+	}{
+		{"nil", nil, false},
+		{"empty result", errEmptyResult, false},
+		{"empty result, wrapped", fmt.Errorf("eth_call: %w", errEmptyResult), false},
+		{"execution reverted", rpc(-32000, "execution reverted"), false},
+		{"code 3", rpc(3, "execution reverted"), false},
+		{"revert reason reads like a busy node", rpc(3, "execution reverted: rate limit"), false},
+		{"invalid opcode", rpc(-32000, "invalid opcode: INVALID"), false},
+		{"invalid jump", rpc(-32000, "invalid jump destination"), false},
+		{"stack underflow", rpc(-32000, "stack underflow (0 <=> 1)"), false},
+		{"out of gas", rpc(-32000, "out of gas"), false},
+		{"rate limited", rpc(-32005, "rate limit exceeded"), true},
+		{"busy", rpc(-32000, "server busy, try again later"), true},
+		{"timed out", rpc(-32000, "request timed out"), true},
+		{"unknown block", rpc(-32000, "header not found"), true},
+		{"internal error", rpc(-32603, "internal error"), true},
+		{"no state", rpc(-32000, nitroNoState), true},
+		{"HTTP 429", errors.New("eth_call: HTTP 429 Too Many Requests"), true},
+		{"transport", errors.New("dial tcp: connection refused"), true},
+		{"context canceled", context.Canceled, true},
+	} {
+		got := ponsCallErr(c.err, "curve()", "0x44")
+		if (got != nil) != c.wantErr || (got != nil && !errors.Is(got, c.err)) {
+			t.Errorf("%s: ponsCallErr(%v) = %v, want error %v (wrapping the original)", c.name, c.err, got, c.wantErr)
+		}
 	}
 }
