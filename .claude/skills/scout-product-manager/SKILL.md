@@ -606,6 +606,12 @@ Every Go start applies `scoutanalytics.sql` unless `SCOUT_DB_AUTO_MIGRATE=false`
   and old node-URL error rows are not cleaned up. The DB connection URL
   fix (#18) stays. Old bot-token URLs in `scout_deliveries` errors are
   not covered by this decision (undecided).
+- 18 Oct (owner): model retraining on the prod server is to be automated
+  (owner: "want to automate this"), weekly (owner: "weekly"). Supersedes
+  the PM's proposal of a manual retrain every two weeks. Until a promote
+  step exists, a run makes its model live at once (`train.py` writes
+  `LATEST`), so the schedule ships only after the candidate/promote
+  change; whether promotion is automatic is still the owner's decision.
 - 12 Oct: the PM has the `Bash` tool for git only: read-only git, `git fetch`
   and `git worktree add` to create worktrees for `implement`; never stash,
   switch, reset, rebase or merge (add, commit and push of its own `work/...`

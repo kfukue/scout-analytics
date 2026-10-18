@@ -1,6 +1,6 @@
 # Scout analytics: handoff to Claude Code
 
-## Session state (18 Oct 2026 PDT: main c72e6b7 after PRs #18-#20, #22-#24)
+## Session state (18 Oct 2026 PDT: main c72e6b7 after PRs #18-#20, #22-#24; #21 closed)
 
 This section supersedes the ones below wherever they differ.
 
@@ -25,8 +25,22 @@ Supersedes the node-URL half of the 15 Oct "two URL-leak fixes"; #18
 **Also merged 18 Oct:** #23 report-only "collapse filter" evidence
 (risk-filter step A). Next: a plain retrain (no `--variants`) on the
 server; its `report.md` gives step A's numbers for the owner's
-risk-filter decisions. Still pending: the Pons-candidates query result
-and the retrain cadence answer.
+risk-filter decisions.
+
+**Pons candidates (owner's read-only query, 18 Oct; answers the 15 Oct
+query below):** 37 calls `no_pool`/`gave_up`, 2,600 tracked on an
+ordinary v2/v3/v4 pool (an upper bound on Pons tokens mis-tracked as
+ordinary pools, nearly all really ordinary), 2,899 tracked as Pons. The 37 are the likely victims of the
+old busy-node bug (#19); two sharper read-only queries (the 37 with
+their errors, URLs masked; ordinary-pool calls whose pool appeared after
+the call) were given to the owner, results pending.
+
+**Retraining (owner, 18 Oct; supersedes the PM's two-weekly manual
+proposal in the 15 Oct section):** automate it, weekly. `train.py` writes
+`LATEST` on every run and serving re-reads it, so a scheduled run would
+go live unread: first a candidate/promote step with a rollback, then the
+timer. `investigate` is drafting the plan for the PR series; the owner still decides
+automatic vs manual promotion.
 
 ## Session state (15 Oct 2026 PDT (15-16 Oct UTC), evening: main 9972b62 after PRs #13-#17)
 
