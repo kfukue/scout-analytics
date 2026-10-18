@@ -16,7 +16,8 @@ description: Rules for Go code in scout analytics (conventions, schema, SCOUT_* 
   schema change also needs a rollback script: see "Database changes: run
   script and rollback" in `scout-rules`.
 - Configuration is read from environment variables named `SCOUT_*`; document any
-  new one in `README.md`.
+  new one in `README.md`. Its name is a constant in the package's
+  `config.go` (rule in `scout-rules`, Hard rules).
 
 ## Go practices
 
