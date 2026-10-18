@@ -21,10 +21,6 @@ import (
 	"github.com/kfukue/scout-analytics/internal/database"
 )
 
-// databaseURLSetting names SCOUT_DATABASE_URL in errors, which never quote
-// its value (see database.ConnStringError).
-const databaseURLSetting = "SCOUT_DATABASE_URL"
-
 //go:embed scoutanalytics.sql
 var scoutSchemaSQL string
 
