@@ -1,5 +1,76 @@
 # Scout analytics: handoff to Claude Code
 
+## Session state (18 Oct 2026, 22:35 PDT (19 Oct 05:35 UTC): main 09e2293 after #25, #26)
+
+This section supersedes the ones below wherever they differ. The owner
+is restarting his PC; any agent running then was stopped.
+
+**Merged since the section below:** #25 docs (node URLs not redacted;
+weekly automated retraining); #26 `write_pointer`: `train.py` writes
+`LATEST` atomically (temp file + `os.replace`), first PR of the
+retraining series. Owner's notes record updated for #24, #25 decisions.
+
+**Prod report 20261018-2204** (plain retrain, first with the collapse
+filter section; that model is live):
+- Gates: 3d PASS 2.02 (seeds 1.80-2.32), 7d FAIL 1.98, 1d FAIL 1.10.
+  3d/7d still sit on the line of 2.
+- Collapse filter (skip the top 30 % by collapse score), pooled
+  walk-forward [95 %]: collapses caught 1d 0.381 [0.358, 0.436], 3d 0.380
+  [0.350, 0.444], 7d 0.395 [0.352, 0.488] (random 0.30); runners lost 1d
+  0.323, 3d 0.143, 7d 0.154 (random 0.30); kept minus all (mean net %)
+  1d +11.0 [+9.9, +12.9], 3d +10.7 [+9.1, +13.2], 7d +9.2 [+6.6, +13.2];
+  every counted week positive. Test part: caught 0.47-0.52. Kept calls
+  still lose on average (3d -33.8 % vs -44.5 %). Cut taken after seeing
+  each week's scores, so likely optimistic for a fixed threshold.
+- Adversarial AUC 0.88-0.90 (inputs drift).
+
+**Waiting on the owner:**
+1. Risk-filter decisions; PM recommendations sent: (1) validate the
+   filter by "beats random skipping" (lower end of pooled collapses
+   caught > 0.30 and kept-minus-all lower end > 0; all three pass now;
+   set after seeing this report, so it must hold again on the next
+   retrain) instead of the single-run >= 40 %; (2) a "collapse risk:
+   high" flag on the call list, runner scores unchanged; (3) 3d and 7d
+   only (1d loses runners at the random rate); (4) delivery line later.
+   "go with your recommendations" = start A2 (fixed cut-off,
+   `collapse_reference`).
+2. Retraining: automatic promotion or by hand (PM recommends by hand
+   for the first 3 runs, with the summary saying what the auto-check
+   would do; then auto with checks H1-H6 + no bucket's median lift
+   drops more than 0.20; never "no PASS->FAIL", which would have held
+   2 of the last 3 runs). Also: notice to the private delivery group;
+   train from the deployed commit; diagnostics on; Sundays 17:00 UTC.
+3. The two Pons follow-up queries (below).
+4. Deploy of #16-#20 not confirmed.
+
+**Owner, 18 Oct: the website's "not scanned" count (4,340) stays as
+it is.** It is calls without a real Perceptor verdict: history from
+before Perceptor scanning, plus the re-scan lane's limits (30 days,
+100/day, no rugged/wiped tokens, 2 failures). No change to
+`SCOUT_RESCAN_MAX_AGE`.
+
+**Retraining series (plan by `investigate`, 18 Oct; one PR at a time,
+base main):** 1 atomic `LATEST` (#26, merged) → 2 `train.py
+--candidate` (writes `CANDIDATE`, never `LATEST`; refuses an existing
+version dir) → 3 `ml/promote.py` promote/rollback/status (loads and
+scores a sample row first; `PREVIOUS`; `promotions.log`) → 4 `flock` in
+`run_training.sh` → 5 `run_training.sh --candidate` → 6 `--src deployed`
++ `meta["source_commit"]` → 7 `promote.py check` + allow-listed
+`summary.txt` (thresholds in `config.py`) → 8 Go `-notify-file PATH`
+(Bot API sender, no DB, no user session; independent) → 9
+`ops/scout-train.sh` wrapper (PAUSE file, skip if `-track` up < 30 min)
+→ 10 systemd service + timer (weekly, owner installs).
+
+**In progress, not committed:** PR 2 in worktree
+`.claude/worktrees/train-candidate-20261018` (branch
+`work/2026-10-18-train-candidate`, from b0415fd). The `implement`
+agent was still running its tests when the PC restarted. Files changed:
+`ml/train.py`, `ml/README.md`, `ml/RUNBOOK.md`,
+`ml/tests/test_pipeline.py`, `ml/tests/test_variants.py`, new
+`ml/tests/test_candidate.py`. Next session: have `implement` check that
+diff against the brief, finish it and run the full ml suite, then
+`review`, then commit and PR.
+
 ## Session state (18 Oct 2026 PDT: main c72e6b7 after PRs #18-#20, #22-#24; #21 closed)
 
 This section supersedes the ones below wherever they differ.
@@ -39,8 +110,8 @@ the call) were given to the owner, results pending.
 proposal in the 15 Oct section):** automate it, weekly. `train.py` writes
 `LATEST` on every run and serving re-reads it, so a scheduled run would
 go live unread: first a candidate/promote step with a rollback, then the
-timer. `investigate` is drafting the plan for the PR series; the owner still decides
-automatic vs manual promotion.
+timer. The plan for the PR series is in the section above; the owner
+still decides automatic vs manual promotion.
 
 ## Session state (15 Oct 2026 PDT (15-16 Oct UTC), evening: main 9972b62 after PRs #13-#17)
 
