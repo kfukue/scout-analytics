@@ -276,6 +276,56 @@ def _dead_stats(L, b, use, te):
     return out
 
 
+def cutoff_rows(split: dict, dates: pd.Series, horizon_days: float) -> np.ndarray:
+    """The rows the collapse filter's fixed cut-off is taken on: the bucket's
+    usable rows posted after the saved model's training rows end and before
+    its test part starts. 70/15/15 split (`time_split`): [t1 - horizon, t2),
+    i.e. the validation part with both embargo gaps; forward split
+    (`forward_split`): [t_train_end, t_test), the embargo gap. Never a test
+    row (a test row's token has its first call at or after the test start);
+    the test mask is removed anyway."""
+    d = pd.to_datetime(dates, utc=True)
+    if "t_test" in split:
+        lo, hi = split["t_train_end"], split["t_test"]
+    else:
+        lo, hi = split["t1"] - pd.Timedelta(days=horizon_days), split["t2"]
+    return ((d >= lo) & (d < hi)).to_numpy() & ~np.asarray(split["test"], dtype=bool)
+
+
+def collapse_reference_block(fitted, X: pd.DataFrame, mask, dates: pd.Series) -> dict:
+    """The collapse filter's fixed cut-off (meta.json collapse_reference.<bucket>):
+    the saved collapse model's probabilities (`predict`, as the scoring
+    service's collapse_prob, unrounded) on the `cutoff_rows` rows `mask` of the
+    bucket's feature matrix `X` (inputs only, never outcomes), their
+    (1 - C.SKIP_FRAC) quantile (`V.collapse_cutoff`) and C.N_REF_QUANTILES
+    quantiles. {"skipped": reason} without a collapse model or with fewer than
+    C.FILTER_CUTOFF_MIN_ROWS rows."""
+    mask = np.asarray(mask, dtype=bool)
+    if fitted is None:
+        return {"skipped": "no collapse model"}
+    n = int(mask.sum())
+    if n < C.FILTER_CUTOFF_MIN_ROWS:
+        return {"skipped": f"only {n} pre-test held-out rows (need {C.FILTER_CUTOFF_MIN_ROWS})"}
+    scores = predict(fitted, X[mask])
+    d = pd.to_datetime(dates, utc=True)[mask]
+    return {"cutoff": V.collapse_cutoff(scores), "quantile": 1 - C.SKIP_FRAC, "n": n,
+            "from": d.min().strftime("%Y-%m-%d %H:%M"), "to": d.max().strftime("%Y-%m-%d %H:%M"),
+            "rows": "pre-test held-out", "calibrated": fitted.get("calibrator") is not None,
+            "quantiles": np.quantile(scores, np.linspace(0, 1, C.N_REF_QUANTILES)).tolist()}
+
+
+def _collapse_reference(fitted, X, split, dates, h) -> dict:
+    """`collapse_reference_block` on the `cutoff_rows`; an error is recorded as
+    {"error": ...} with a WARNING and never stops the saved model."""
+    try:
+        return collapse_reference_block(fitted, X, cutoff_rows(split, dates, h), dates)
+    except Exception as exc:  # not BaseException: Ctrl-C still stops the run
+        out = {"error": variant_error(exc)}
+        print(f"WARNING: the collapse cut-off failed ({out['error']}); no cut-off, the saved "
+              "models are not affected", flush=True)
+        return out
+
+
 def _train_bucket(b, df, L, out_dir, with_dead=False, keep=None):
     """Returns (results, runner reference quantiles or None, category levels or None).
     `out_dir` None: nothing is saved (a --variants run). `with_dead` (the data
@@ -284,9 +334,10 @@ def _train_bucket(b, df, L, out_dir, with_dead=False, keep=None):
     `keep` (a dict; every caller passes it, since the pooled gates need the
     walk-forward arrays): filled with the bucket's rows, labels, masks, feature
     matrix, test scores and walk-forward scores, the input of gate_inputs and of
-    the stability diagnostics. The results are the same with or without it; the
-    arrays never reach meta.json (only the gate values apply_gates computes
-    from them do)."""
+    the stability diagnostics, and "collapse_reference" (`_collapse_reference`,
+    the collapse filter's fixed cut-off). The results are the same with or
+    without it; the arrays never reach meta.json (only the gate values
+    apply_gates computes from them do)."""
     cfg = C.BUCKETS[b]
     use = L[f"usable_{b}"].to_numpy()
     res = {"usable": int(use.sum())}
@@ -331,6 +382,8 @@ def _train_bucket(b, df, L, out_dir, with_dead=False, keep=None):
         else:
             out = _train_label(X, Y[lab], split, lab, out_dir, b, dates)
         res["labels"][lab], fitted, scores[lab] = out
+        if lab == "collapse" and keep is not None:   # the filter's fixed cut-off (no outcomes)
+            keep["collapse_reference"] = _collapse_reference(fitted, X, split, dates, h)
         if fitted is not None:
             rounds[lab] = res["labels"][lab]["rounds"]
             logistic[lab] = fitted["p_logistic"]
@@ -1082,6 +1135,7 @@ def train(df: pd.DataFrame, out_root, version: str | None = None, variants: bool
         "coverage": {c: float(blank[c][eligible].notna().mean()) if eligible.any() else 0.0
                      for c in raw_cols}}}
     reference, cat_levels = {}, {}  # per trained bucket: learned from its training rows
+    collapse_ref = {}   # per trained bucket: the collapse filter's fixed cut-off
     keeps = {}   # arrays of each trained bucket: gate inputs and diagnostics (never in meta.json)
     for b in C.BUCKETS:
         keep = {}
@@ -1090,11 +1144,13 @@ def train(df: pd.DataFrame, out_root, version: str | None = None, variants: bool
             keeps[b] = keep
         if ref is not None:
             reference[b], cat_levels[b] = ref, levels
+            collapse_ref[b] = keep.get("collapse_reference") or {"skipped": "not computed"}
+    res["collapse_reference"] = collapse_ref
     # The bucket gates (owner decision of 13 Oct 2026): seed retrains and the pooled
     # walk-forward, in every training (also with the diagnostics off), before meta.json.
     gate_in = gate_inputs(df, L, res["buckets"], keeps, has_trades)
     apply_gates(res["buckets"], gate_in)
-    apply_collapse_filter(res["buckets"], keeps, gate_in["pooled"])   # report only
+    apply_collapse_filter(res["buckets"], keeps, gate_in["pooled"])   # never a gate
     for b, status in res["buckets"].items():
         print(f"[{b}] " + (f"skipped: {status['skipped']}" if status.get("skipped") else
                            "PASS" if status["gates"]["passed"] else
@@ -1107,14 +1163,15 @@ def train(df: pd.DataFrame, out_root, version: str | None = None, variants: bool
     meta = {"version": version, "trained_at": datetime.now(timezone.utc).isoformat(),
             "features": list(C.FEATURES), "categorical": C.CATEGORICAL,
             "category_levels": cat_levels,
-            "thresholds": {"buckets": C.BUCKETS, "gates": C.GATES, "gate_rules": gate_rules()},
+            "thresholds": {"buckets": C.BUCKETS, "gates": C.GATES, "gate_rules": gate_rules(),
+                           "filter_rules": filter_rules()},
             "dead": {"policy": res["data"]["dead_policy"], "column": C.DEAD_COLUMN,
                      "max_trades_24h": C.DEAD_TRADES_24H},
             "dex_family_rules": dex_family_rules(),  # serving maps dex -> family with these
             "calib_recent_days": C.CALIB_RECENT_DAYS,
             "calib_choice_fit_frac": C.CALIB_CHOICE_FIT_FRAC,
             "wf_min_train_rows": C.WF_MIN_TRAIN_ROWS,
-            "models": models, "runner_reference": reference,
+            "models": models, "runner_reference": reference, "collapse_reference": collapse_ref,
             "data": res["data"], "metrics": res["buckets"]}
     meta = json.loads(json.dumps(_json_safe(meta), allow_nan=False))  # fixed before any variant runs
     _write_version(out_dir, meta, res)
@@ -1313,7 +1370,7 @@ def apply_gates(buckets: dict, gate_in: dict) -> None:
                                     _seed_lifts(gate_in["runs"], b))
 
 
-# --- Collapse filter (report only): metrics[b]["collapse_filter"] ---
+# --- Collapse filter (never a gate): metrics[b]["collapse_filter"] ---
 
 def filter_labels(b: str) -> dict:
     """The runner and collapse label rules of bucket `b` as text, and whether
@@ -1383,12 +1440,34 @@ def collapse_filter(b: str, keep: dict, pooled: dict | None) -> dict:
             "test": test, "pooled": filter_pooled(pooled, weeks), "weeks": weeks}
 
 
+def filter_at_cutoff(keep: dict) -> dict:
+    """The collapse filter on the saved model's test part with the FIXED cut-off
+    (keep["collapse_reference"]["cutoff"]): flagged = test calls whose collapse
+    score is >= it. Information only (the live flagged share; the verdict is
+    taken on the pooled walk-forward). {"skipped": reason} without a cut-off."""
+    ref = keep.get("collapse_reference") or {}
+    s_c = keep["scores"].get("collapse")
+    cutoff = ref.get("cutoff")
+    if s_c is None or cutoff is None or not V._finite(cutoff):
+        return {"skipped": ref.get("skipped") or ref.get("error") or "no cut-off"}
+    te = keep["te"]
+    return {"cutoff": cutoff, **V.collapse_filter_stats(
+        keep["y_plain"][te], keep["Y"]["runner"][te], keep["net_ret"][te],
+        np.asarray(s_c, dtype=float) >= cutoff)}
+
+
 def apply_collapse_filter(buckets: dict, keeps: dict, pooled: dict) -> None:
-    """metrics[b]["collapse_filter"] for every trained bucket (report only).
-    An error is recorded there with a WARNING; it never fails the run."""
+    """metrics[b]["collapse_filter"] for every trained bucket, with its
+    "verdict" (V.filter_verdict on the pooled block; owner decision of
+    18 Oct 2026; never a gate) and "test_at_cutoff" (`filter_at_cutoff`,
+    information). An error is recorded there with a WARNING and leaves no
+    verdict (= not validated); it never fails the run or changes anything else."""
     for b, k in keeps.items():
         try:
-            buckets[b]["collapse_filter"] = collapse_filter(b, k, pooled.get(b))
+            cf = collapse_filter(b, k, pooled.get(b))
+            cf["verdict"] = V.filter_verdict(cf["pooled"], b in C.FILTER_BUCKETS)
+            cf["test_at_cutoff"] = filter_at_cutoff(k)
+            buckets[b]["collapse_filter"] = cf
         except Exception as exc:
             buckets[b]["collapse_filter"] = {"error": variant_error(exc)}
             print(f"WARNING: the collapse filter of {b} failed "
@@ -1407,6 +1486,16 @@ def gate_rules() -> dict:
             "bootstrap_reps": C.POOLED_BOOTSTRAP_REPS, "bootstrap_seed": C.POOLED_BOOTSTRAP_SEED,
             "ci": list(C.POOLED_CI), "wf_min_train_rows": C.WF_MIN_TRAIN_ROWS,
             "sim_max_ret_pct": C.SIM_MAX_RET_PCT}
+
+
+def filter_rules() -> dict:
+    """The collapse filter verdict settings written to meta.json
+    (thresholds.filter_rules; owner decision of 18 Oct 2026)."""
+    return {"set_on": C.FILTER_RULES_SET_ON, "seen_report": C.FILTER_RULES_SEEN_REPORT,
+            "note": C.FILTER_RULES_NOTE, "buckets": list(C.FILTER_BUCKETS),
+            **C.FILTER_RULES, "flag_frac": C.SKIP_FRAC,
+            "min_pooled_weeks": C.GATE_MIN_POOLED_WEEKS,
+            "cutoff_min_rows": C.FILTER_CUTOFF_MIN_ROWS}
 
 
 def seed_stability(runs: dict, buckets: dict) -> dict:

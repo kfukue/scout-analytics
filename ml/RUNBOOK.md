@@ -588,17 +588,33 @@ From the top:
    `medium` and `long` the purged k-fold inside train (rounds, calibration),
    test metrics (LightGBM vs the logistic baseline), the gate table (the
    gates, then the information rows and a "Why FAIL:" line), the money
-   simulation on the test part, the walk-forward table, the "Collapse filter
-   (report only)" table (below), calibration and top features.
-   **Collapse filter (report only)**, after the walk-forward table: what
+   simulation on the test part, the walk-forward table, the "Collapse
+   filter" table (below), calibration and top features.
+   **Collapse filter verdict (owner rule of 18 Oct 2026)**, under the bucket
+   verdict at the top: per bucket whether the collapse filter is
+   "validated", i.e. beats random skipping on the pooled walk-forward
+   (lower end of the pooled collapses caught > 0.30 AND lower end of the
+   pooled kept minus all > 0; `3day` and `medium` only, `short` and `long`
+   show "n/a (not a filter bucket)"), the counted weeks, the fixed cut-off
+   (a probability), its reference rows and the test-part share flagged at
+   it (information). Each filter bucket that is not validated gets a line
+   with its reasons. It never changes PASS/FAIL. The rule was set after
+   seeing report 20261018-2204 (the report says so); every training run
+   since then computes the verdict. Quote this table, and the
+   cut-off of `3day` and `medium`, when you paste the report back.
+   **Collapse filter**, after the walk-forward table: what
    skipping the 30% of calls with the highest collapse score would catch and
    cost, if the model were shown as a risk filter ("avoid likely collapses")
-   instead of "top picks". It passes or fails nothing and is not served.
+   instead of "top picks". Its first line is the bucket's verdict (above).
+   It is never a bucket gate and is not served.
    The 30% cut is taken within each part (the test part, each walk-forward
    week) after its scores are known, as for "collapses removed"; a live
    filter would need a fixed score threshold set in advance, so these rates
    are likely optimistic for such a filter.
-   Columns: the saved model's test part, the pooled walk-forward (the gate's
+   Columns: the saved model's test part, the test part at the fixed cut-off
+   (information: flagged = collapse score at or above the cut-off taken on
+   the pre-test held-out rows, as a live filter would flag; its flagged
+   share need not be 30%), the pooled walk-forward (the gate's
    counted weeks, each week flagged by its own model, with 95% intervals
    from the same week-block bootstrap), and what skipping 30% at random
    would give. Read the rows as:
@@ -733,8 +749,8 @@ passed with seed 7 and failed with seeds 11 and 23).
 - The whole `report.md` (it has only counts and metrics, no calls or
   addresses), or at least: Verdict, Data and exclusions, and per bucket the
   Split line, the gate table (with its "Why FAIL:" line), the money
-  simulation line, the walk-forward table and the "Collapse filter (report
-  only)" tables.
+  simulation line, the walk-forward table, the "Collapse filter verdict"
+  table and the "Collapse filter" tables.
 - The output of the step 3 queries, if you ran them.
 - The train time (`real` from `time`), the `[gates] ...` line and the
   `[diagnostics] ...` line (step 5), if the diagnostics ran.

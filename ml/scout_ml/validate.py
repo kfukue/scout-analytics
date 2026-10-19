@@ -224,7 +224,7 @@ def collapse_removed(y_collapse, collapse_score) -> float:
     return float(y[top_mask(collapse_score, C.SKIP_FRAC)].sum() / y.sum())
 
 
-# --- Collapse filter (report only): what skipping the flagged calls catches and costs ---
+# --- Collapse filter (never a gate): what skipping the flagged calls catches and costs ---
 
 def _ratio(a, b):
     """a / b where b > 0, else NaN (scalars or arrays; NaN inputs stay NaN)."""
@@ -281,6 +281,17 @@ FILTER_RATES = ("flagged_share", "collapses_caught", "collapse_rate_flagged", "c
                 "kept_minus_all")   # the keys of collapse_filter_rates
 FILTER_COUNTS = {"calls": "n", "flagged": "flag_n", "collapses": "coll_all",
                  "collapses_flagged": "coll_flag", "runners": "run_all", "runners_flagged": "run_flag"}
+
+
+def collapse_cutoff(scores, frac: float | None = None) -> float:
+    """The fixed collapse-score cut-off of the filter: the (1 - frac) quantile
+    of `scores` (`frac` None: C.SKIP_FRAC), so about `frac` of them are >= it.
+    NaN when there is no score."""
+    s = np.asarray(scores, dtype=float)
+    if not len(s):
+        return np.nan
+    frac = C.SKIP_FRAC if frac is None else frac
+    return float(np.quantile(s, 1 - frac))
 
 
 def collapse_filter_stats(y_collapse, y_runner, ret, flag) -> dict:
@@ -432,6 +443,55 @@ def pooled_gates(single: dict, test: dict, pooled: dict | None, seed_lifts: dict
          "reasons": reasons}
     g["passed"] = bool(lift_ok and lower_ok and sim_ok and collapse_ok)
     return g
+
+
+def _filter_rule(value, minimum: float, enough: bool, name: str, reasons: list) -> bool:
+    """One rule of `filter_verdict`: `value` (a 95% lower end) > `minimum`;
+    False with a reason when it does not hold or is undefined (only judged
+    with `enough` counted weeks)."""
+    ok = enough and _finite(value) and value > minimum
+    if enough and not _finite(value):
+        reasons.append(f"pooled {name} 95% interval undefined")
+    elif enough and not ok:
+        reasons.append(f"pooled {name} 95% lower end {value:.3f} <= {minimum:g}")
+    return bool(ok)
+
+
+def filter_verdict(pooled_filter: dict | None, applies: bool) -> dict:
+    """Whether the collapse filter is validated in a bucket (owner decision of
+    18 Oct 2026, config "Collapse filter verdict"): it beats random skipping on
+    the pooled walk-forward. `pooled_filter`: the bucket's
+    metrics[b]["collapse_filter"]["pooled"] (train.filter_pooled: the rates with
+    their `<rate>_lo` / `<rate>_hi` and `weeks`, or {"error": ...}). `applies`:
+    the bucket is one of C.FILTER_BUCKETS. Validated only when it applies, there
+    are at least C.GATE_MIN_POOLED_WEEKS counted weeks, and both lower ends are
+    defined and above C.FILTER_RULES; else not, with the reasons. Never a gate."""
+    p = pooled_filter if isinstance(pooled_filter, dict) else {}
+    rules, reasons = C.FILTER_RULES, []
+    if not applies:
+        reasons.append("not a filter bucket (FILTER_BUCKETS: "
+                       + ", ".join(C.FILTER_BUCKETS) + ")")
+    if pooled_filter is None or p.get("error"):
+        reasons.append("pooled walk-forward not computed"
+                       + (f" ({p['error']})" if p.get("error") else ""))
+    weeks = int(p.get("weeks") or 0)
+    enough = weeks >= C.GATE_MIN_POOLED_WEEKS
+    if not enough:
+        reasons.append(f"only {weeks} counted walk-forward week(s); the verdict needs at "
+                       f"least {C.GATE_MIN_POOLED_WEEKS}")
+    caught_lo = p.get("collapses_caught_lo", np.nan)
+    kept_lo = p.get("kept_minus_all_lo", np.nan)
+    caught_ok = _filter_rule(caught_lo, rules["min_caught_lower"], enough, "collapses caught",
+                             reasons)
+    kept_ok = _filter_rule(kept_lo, rules["min_kept_minus_all_lower"], enough,
+                           "kept minus all (mean net %)", reasons)
+    return {"applies": bool(applies), "validated": bool(applies and caught_ok and kept_ok),
+            "weeks": weeks, "min_weeks": C.GATE_MIN_POOLED_WEEKS,
+            "caught_lo": caught_lo, "min_caught_lower": rules["min_caught_lower"],
+            "caught_ok": caught_ok, "kept_minus_all_lo": kept_lo,
+            "min_kept_minus_all_lower": rules["min_kept_minus_all_lower"], "kept_ok": kept_ok,
+            "reasons": reasons, "set_on": C.FILTER_RULES_SET_ON,
+            "seen_report": C.FILTER_RULES_SEEN_REPORT}
 
 
 def single_run_gates(g: dict) -> dict:

@@ -270,6 +270,7 @@ def render(res: dict) -> str:
            reasons_lines(res["buckets"]),
            gate_rule_text(),
            wf_rule_line(),
+           filter_verdict_section(res),
            ("The saved model and these gates are the baseline configuration. Variant comparison "
             "(report only): see the last section.\n" if res.get("variants") else ""),
            "## Data and exclusions\n",
@@ -405,7 +406,111 @@ def render(res: dict) -> str:
     return "\n".join(out)
 
 
-COLLAPSE_FILTER_TITLE = "### Collapse filter (report only)\n"
+FILTER_VERDICT_TITLE = f"### Collapse filter verdict (owner rule of {C.FILTER_RULES_SET_ON})\n"
+
+
+def filter_rule_text() -> str:
+    """How the collapse filter verdict is decided (owner decision of 18 Oct 2026)."""
+    r = C.FILTER_RULES
+    return (f"Collapse filter rule (owner decision of {C.FILTER_RULES_SET_ON}): in "
+            f"{', '.join(C.FILTER_BUCKETS)} (FILTER_BUCKETS) the filter (skip the "
+            f"{SKIP_FRAC:.0%} of calls with the highest collapse score) is validated when it "
+            "beats random skipping on the pooled expanding walk-forward (the gates' counted "
+            f"weeks, 95% week-block bootstrap): lower end of collapses caught > "
+            f"{r['min_caught_lower']:g} AND lower end of kept minus all (mean net %) > "
+            f"{r['min_kept_minus_all_lower']:g}. Fewer than {C.GATE_MIN_POOLED_WEEKS} counted "
+            "weeks or any undefined value: not validated. Never a bucket gate: the PASS/FAIL "
+            f"above is unchanged. Cut-off = the {1 - SKIP_FRAC:.0%} quantile of the saved "
+            "collapse model's probabilities on the bucket's pre-test held-out rows (after its "
+            "training rows, before its test part; inputs only); the test-part flagged share at "
+            "that cut-off is information.\n")
+
+
+def _verdict_cell(cf) -> str:
+    """The "validated" cell of a bucket's collapse filter verdict."""
+    v = (cf or {}).get("verdict")
+    if v is None:
+        return "no (not computed: " + ((cf or {}).get("error") or "no collapse filter") + ")"
+    if not v["applies"]:
+        return "n/a (not a filter bucket)"
+    return fmt(v["validated"])
+
+
+def _cutoff_cells(ref, cf) -> list:
+    """The cut-off, its reference rows and the test-part flagged share at it."""
+    ref = ref or {}
+    at = (cf or {}).get("test_at_cutoff") or {}
+    if "cutoff" not in ref:
+        why = ref.get("skipped") or ref.get("error") or "not computed"
+        return [f"n/a: {why}", fmt(ref.get("n")), "n/a"]
+    return [fmt(ref["cutoff"]), ref["n"], fmt(at.get("flagged_share"))]
+
+
+def filter_verdict_rows(res: dict) -> list:
+    """One row per bucket of the collapse filter verdict table."""
+    rows = []
+    for b, r in res["buckets"].items():
+        if r.get("skipped"):
+            rows.append([b, "skipped"] + [""] * 6)
+            continue
+        cf = r.get("collapse_filter") or {}
+        v = cf.get("verdict") or {}
+        ref = (res.get("collapse_reference") or {}).get(b)
+        rows.append([b, _verdict_cell(cf),
+                     f"{fmt(v.get('caught_ok'))}: {fmt(v.get('caught_lo'))}" if v else "n/a",
+                     f"{fmt(v.get('kept_ok'))}: {_signed(v.get('kept_minus_all_lo'))}" if v
+                     else "n/a", v.get("weeks", "n/a")] + _cutoff_cells(ref, cf))
+    return rows
+
+
+def filter_verdict_reasons(buckets: dict) -> str:
+    """One line per filter bucket that is not validated, with its reasons."""
+    lines = []
+    for b, r in buckets.items():
+        if r.get("skipped") or b not in C.FILTER_BUCKETS:
+            continue
+        cf = r.get("collapse_filter") or {}
+        v = cf.get("verdict")
+        if v is None:
+            lines.append(f"- `{b}` not validated: the collapse filter was not computed ("
+                         + (cf.get("error") or "no collapse filter") + ")")
+        elif not v["validated"]:
+            lines.append(f"- `{b}` not validated: " + "; ".join(v["reasons"] or ["see the table"]))
+    return ("\n".join(lines) + "\n") if lines else ""
+
+
+def filter_verdict_section(res: dict) -> str:
+    """The collapse filter verdict table under the bucket verdict (owner rule of
+    18 Oct 2026), its reasons, the rule and C.FILTER_RULES_NOTE."""
+    r = C.FILTER_RULES
+    head = ["bucket", "collapse filter validated",
+            f"pooled collapses caught 95% lower end > {r['min_caught_lower']:g}",
+            f"pooled kept minus all (mean net %) 95% lower end > {r['min_kept_minus_all_lower']:g}",
+            "counted weeks", "cut-off (probability)", "reference rows n",
+            "test-part flagged share at the cut-off (information)"]
+    out = [FILTER_VERDICT_TITLE, table(head, filter_verdict_rows(res)),
+           filter_verdict_reasons(res["buckets"]), filter_rule_text()]
+    if C.FILTER_RULES_NOTE:
+        out.append(C.FILTER_RULES_NOTE + "\n")
+    return "\n".join(out)
+
+
+COLLAPSE_FILTER_TITLE = "### Collapse filter\n"
+
+
+def collapse_filter_verdict_line(cf: dict) -> str:
+    """The bucket's collapse filter verdict in one line (V.filter_verdict)."""
+    v = cf.get("verdict")
+    if v is None:
+        return ""
+    if not v["applies"]:
+        text = "n/a (not a filter bucket; FILTER_BUCKETS: " + ", ".join(C.FILTER_BUCKETS) + ")"
+    elif v["validated"]:
+        text = "validated"
+    else:
+        text = "not validated (" + "; ".join(v["reasons"]) + ")"
+    return (f"**Collapse filter verdict (owner rule of {v.get('set_on')}): {text}.** Never a "
+            "bucket gate.\n")
 
 
 def collapse_filter_intro(cf: dict) -> str:
@@ -427,7 +532,10 @@ def collapse_filter_intro(cf: dict) -> str:
             f"others. The {frac:.0%} cut is taken within each part (the test part, each "
             "walk-forward week) after its scores are known, as for \"collapses removed\"; a live "
             "filter would need a fixed score threshold set in advance, so these rates are "
-            "likely optimistic for such a filter. Report only: no gate, nothing served. "
+            "likely optimistic for such a filter. The column \"test part at the fixed cut-off\" "
+            "(information) flags instead the test calls whose collapse score is at or above the "
+            "fixed cut-off taken on the pre-test held-out rows (see \"Collapse filter verdict\" "
+            "at the top), as a live filter would. Never a bucket gate. "
             "Collapse = the plain collapse label "
             f"({cf['collapse_label']}), runner = {cf['runner_label']}." + both
             + f" Mean net return: each call capped at +{cap:,.0f} %, as the money simulation. "
@@ -470,14 +578,26 @@ FILTER_ROWS = ["calls", "flagged calls (share)",
                "kept minus all (mean net %)"]
 
 
+def _cutoff_head(at: dict) -> str:
+    """Header of the "test part at the fixed cut-off" column."""
+    c = at.get("cutoff")
+    return ("test part at the fixed cut-off" + (f" {fmt(c)}" if c is not None else "")
+            + " (information)")
+
+
 def collapse_filter_table(cf: dict) -> str:
+    """The collapse filter table; the fixed cut-off column only when the block
+    has "test_at_cutoff" (blocks written before 18 Oct 2026 do not)."""
     p = cf.get("pooled") or {}
     rnd = fmt(cf["random_skip_expected"])
-    cols = [_filter_part(cf.get("test"), False), _filter_part(p, True),
-            ["", "", rnd, "", rnd, "", "", "+0.0"]]
-    head = ["", "test part (saved model)",
-            f"pooled walk-forward ({p.get('weeks', 0)} counted weeks) [95%]",
-            "random skip (expected)"]
+    at = cf.get("test_at_cutoff")
+    fixed = at is not None
+    cols = ([_filter_part(cf.get("test"), False)]
+            + ([_filter_part(at, False)] if fixed else [])
+            + [_filter_part(p, True), ["", "", rnd, "", rnd, "", "", "+0.0"]])
+    head = (["", "test part (saved model)"] + ([_cutoff_head(at)] if fixed else [])
+            + [f"pooled walk-forward ({p.get('weeks', 0)} counted weeks) [95%]",
+               "random skip (expected)"])
     return table(head, [[name] + [c[i] for c in cols] for i, name in enumerate(FILTER_ROWS)])
 
 
@@ -492,12 +612,14 @@ def collapse_filter_weeks(weeks: list) -> str:
 
 
 def collapse_filter_section(cf: dict) -> str:
-    """The bucket's "Collapse filter (report only)" section (train.collapse_filter)."""
+    """The bucket's "Collapse filter" section (train.collapse_filter, with the
+    verdict of train.apply_collapse_filter when there is one)."""
     out = [COLLAPSE_FILTER_TITLE]
     if cf.get("error"):
-        return "\n".join(out + [f"**Not computed: {cf['error']}.** Nothing else in this report "
-                                "is affected.\n"])
-    out += [collapse_filter_intro(cf), collapse_filter_table(cf)]
+        return "\n".join(out + [f"**Not computed: {cf['error']}.** No collapse filter verdict "
+                                "(not validated); nothing else in this report is affected.\n"])
+    verdict = collapse_filter_verdict_line(cf)
+    out += ([verdict] if verdict else []) + [collapse_filter_intro(cf), collapse_filter_table(cf)]
     if cf.get("weeks"):
         out += ["Per counted walk-forward week (each flagged by its own model):\n",
                 collapse_filter_weeks(cf["weeks"])]

@@ -471,6 +471,30 @@ GATES_SET_ON = "13 Oct 2026"
 WF_MIN_TRAIN_ROWS = 1000
 WF_MIN_TRAIN_ROWS_SET_ON = "9 Oct 2026"
 
+# --- Collapse filter verdict (owner decision of 18 Oct 2026) ------------------
+# The model is presented as a risk filter: skip the SKIP_FRAC calls with the
+# highest collapse score. The filter is "validated" in a bucket when it beats
+# random skipping on the pooled expanding walk-forward (the gate's counted
+# weeks, 95% week-block bootstrap; validate.filter_verdict): the lower end of
+# "collapses caught" > min_caught_lower AND the lower end of "kept minus all"
+# (mean capped net %) > min_kept_minus_all_lower. FILTER_BUCKETS only; at least
+# GATE_MIN_POOLED_WEEKS counted weeks; any undefined value: not validated.
+# Never a bucket gate: gates.passed and its rules are unchanged. Computed by
+# every training run (metrics.<bucket>.collapse_filter.verdict), no human step.
+FILTER_BUCKETS = ("3day", "medium")
+# Literal values on purpose (a later change of SKIP_FRAC or GATES must not move
+# these): 0.30 is the share of collapses a random skip of SKIP_FRAC catches.
+FILTER_RULES = {"min_caught_lower": 0.30, "min_kept_minus_all_lower": 0.0}
+FILTER_RULES_SET_ON = "18 Oct 2026"
+FILTER_RULES_SEEN_REPORT = "20261018-2204"
+FILTER_RULES_NOTE = ("The collapse filter rule was set on 18 Oct 2026 after seeing report "
+                     "20261018-2204; every training run since then computes this verdict.")
+# The fixed cut-off of the live filter (meta.json collapse_reference.<bucket>):
+# the (1 - SKIP_FRAC) quantile of the saved collapse model's probabilities on
+# the bucket's pre-test held-out rows (posted after its training rows end and
+# before its test part starts; inputs only). Fewer rows than this: no cut-off.
+FILTER_CUTOFF_MIN_ROWS = 100
+
 # --- Calibration on recent weeks --------------------------------------------
 # The base rates drift week to week, so the Platt calibration is fitted on the
 # most recent held-out rows only: the validation rows (short/3day) or the

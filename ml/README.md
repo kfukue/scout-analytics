@@ -621,13 +621,54 @@ The `model.py`, `validate.py`, `features.py` (`MIN_CATEGORY_COUNT`) and
 runs, not bound at import, so every knob (`C.overrides`, the variants, the
 seeds) takes effect.
 
-### Collapse filter (report only)
+### Collapse filter
 
 Asked by the owner on 15 Oct 2026: the evidence for presenting the model as a
 risk filter ("avoid likely collapses") instead of "top picks". Each trained
-bucket's section of `report.md` has a "Collapse filter (report only)" table
-after its walk-forward table. It never passes or fails anything, is never
-served, and does not change the saved model, the gates or `passed`.
+bucket's section of `report.md` has a "Collapse filter" table after its
+walk-forward table. It is never a bucket gate, is not served, and does
+not change the saved model, the gates or `passed`.
+
+**Verdict (owner decision of 18 Oct 2026).** The model is presented as a risk
+filter. In `3day` and `medium` (`FILTER_BUCKETS`; not `short`) the filter is
+"validated" when it beats random skipping on the pooled walk-forward: the
+lower end of the 95% interval of the pooled "collapses caught" is above 0.30
+(the share a random skip of 30% catches) AND the lower end of the pooled
+"kept minus all (mean net %)" is above 0 (`FILTER_RULES`; literal values).
+Fewer than `GATE_MIN_POOLED_WEEKS` (2) counted weeks, a failed pooled
+walk-forward or any undefined value: not validated, with the reasons. The
+rule was set after seeing report 20261018-2204 (`FILTER_RULES_NOTE`, printed
+in the report); every training run since then computes the verdict, with
+no human step (retraining is weekly and automatic). The report has a
+"Collapse filter verdict (owner rule
+of 18 Oct 2026)" table under the bucket verdict (bucket, validated, the two
+lower ends, counted weeks, cut-off, reference rows, test-part flagged share
+at the cut-off), the reasons of each filter bucket that is not validated, and
+a verdict line in each bucket's "Collapse filter" section. Code:
+`validate.filter_verdict` (pure), `train.apply_collapse_filter`.
+
+**Fixed cut-off.** A live filter needs a score threshold set in advance. Each
+training run takes it as the 70% quantile (`1 - SKIP_FRAC`) of the saved
+collapse model's probabilities (its own `predict`, the scoring service's
+`collapse_prob` unrounded) on the bucket's pre-test held-out rows: the usable
+rows posted after the saved model's training rows end and before its test
+part starts (`3day`, `short`: `[t1 - horizon, t2)`, the validation part with
+both embargo gaps; `medium`, `long`: `[t_train_end, t_test)`, the embargo
+gap). Only inputs are used, never outcomes, never test rows. Fewer than
+`FILTER_CUTOFF_MIN_ROWS` (100) rows, or no collapse model: no cut-off. Code:
+`train.cutoff_rows`, `train.collapse_reference_block`,
+`validate.collapse_cutoff`. For `3day` (and `short`) the reference rows are
+mostly the validation part, whose outcomes chose the early-stopping rounds and
+fitted the Platt calibrator, so the cut-off's probability value is in-sample
+for the calibrator there (only inputs are used; which rows form the top 30% of
+the reference set does not depend on the calibrator); `medium` uses the
+embargo gap, which no fit saw. The check that the cut-off carries over is the
+test part's flagged share at the cut-off (`test_at_cutoff`; near 0.30 = it
+carries over). A recent-window reference is a possible later refinement.
+The section's column "test part at the fixed
+cut-off (information)" flags the test calls whose score is at or above it:
+the share a live filter would flag. Re-measuring the walk-forward at a fixed
+cut-off is a later change.
 
 Flagged = the `SKIP_FRAC` (30%) calls with the highest collapse score, the
 same calls "collapses removed" counts (`top_mask`); kept = the others.
@@ -653,7 +694,8 @@ each week flagged by its own model):
 The 30% cut is taken within each part (the test part, each walk-forward week)
 after its scores are known, as for "collapses removed"; a live filter would
 need a fixed score threshold set in advance, so these rates are likely
-optimistic for such a filter.
+optimistic for such a filter (the fixed cut-off column above is the
+information on that).
 
 Then a per-week table for (b) (week, flagged/calls, collapses caught, runners
 lost, kept vs all mean) to show the trend over time. `short` (1d): the runner
@@ -665,13 +707,16 @@ applies.
 
 Computed in every training, also with `SCOUT_ML_DIAGNOSTICS=0`, from the
 arrays the gates already use (nothing is retrained; well under a second).
-An error in it shows "Not computed: error: ..." with a `WARNING` and changes
-nothing else. Code: `validate.collapse_filter_sums` /
+An error in it shows "Not computed: error: ..." with a `WARNING`, leaves no
+verdict (= not validated) and changes nothing else; an error in the cut-off
+records `collapse_reference.<bucket>` as `{"error": ...}` with a `WARNING`
+and never stops the saved model. Code: `validate.collapse_filter_sums` /
 `collapse_filter_rates` / `collapse_filter_stats` (pure), the filter columns
 of `diagnostics.week_sums` and `diagnostics.pooled(..., with_filter=True)`,
-`train.collapse_filter`. Tests: `tests/test_collapse_filter.py` and
+`train.collapse_filter`. Tests: `tests/test_collapse_filter.py`,
 `test_collapse_filter_pooled_is_the_pooled_collapses_removed` in
-`tests/test_diagnostics.py`.
+`tests/test_diagnostics.py`, and the `collapse_reference` / cut-off tests in
+`tests/test_pipeline.py`.
 
 `meta.json`: `metrics[<bucket>]["collapse_filter"]` (plain numbers; null =
 undefined, e.g. no collapses):
@@ -690,7 +735,29 @@ undefined, e.g. no collapses):
 - `test` is `{"skipped": "no collapse model"}` when the bucket has no
   collapse model (a week likewise), `pooled` is `{"error": ...}` when the
   pooled walk-forward failed, and the whole block is `{"error": ...}` when
-  it failed.
+  it failed (then there is no `verdict`: not validated);
+- `verdict` (`validate.filter_verdict`): `applies` (a `FILTER_BUCKETS`
+  bucket), `validated`, `weeks`, `min_weeks`, `caught_lo`,
+  `min_caught_lower`, `caught_ok`, `kept_minus_all_lo`,
+  `min_kept_minus_all_lower`, `kept_ok`, `reasons`, `set_on`, `seen_report`.
+  Later changes read `verdict.validated`;
+- `test_at_cutoff`: `cutoff` and the counts and rates above on the test part
+  with flagged = score >= the fixed cut-off (information), or
+  `{"skipped": reason}` without a cut-off.
+
+`meta.json` also has (both read by later changes, keep the paths):
+
+- `collapse_reference[<bucket>]` for every trained bucket: `cutoff` (the
+  probability), `quantile` (0.7), `n`, `from`, `to` (posting dates of the
+  reference rows), `rows` ("pre-test held-out"), `calibrated` (bool),
+  `quantiles` (`N_REF_QUANTILES` = 101 quantiles of the same scores, like
+  `runner_reference`); or `{"skipped": reason}` / `{"error": ...}`;
+- `thresholds.filter_rules`: `set_on`, `seen_report`, `note`, `buckets`,
+  `min_caught_lower`, `min_kept_minus_all_lower`, `flag_frac`,
+  `min_pooled_weeks`, `cutoff_min_rows`.
+
+A `meta.json` without these keys (models trained before 18 Oct 2026) still
+loads and scores as before.
 
 ## Read the report
 
@@ -703,7 +770,9 @@ undefined, e.g. no collapses):
    test part; then, as information only, the absolute return (pooled top-10%
    mean net return) and the two old gates ("old gate, information only":
    test-part lift >= 2, beats buy-all in every counted week, with the weeks
-   not counted). Each FAILing bucket gets a line with its reasons. Each
+   not counted). Each FAILing bucket gets a line with its reasons. Under it,
+   the "Collapse filter verdict (owner rule of 18 Oct 2026)" table (see
+   "Collapse filter" above; never a gate). Each
    top-10% lift of the test part and of every walk-forward week also comes
    with an approximate 95% interval (Wilson interval of the runner rate in the
    top 10%, divided by the base rate) and the runner counts in the top 10% and
@@ -714,7 +783,7 @@ undefined, e.g. no collapses):
 3. Per bucket: class balance (with warnings for labels under 10% / over 90%
    and for skipped models), test metrics for LightGBM and the logistic
    baseline (ROC AUC, PR AUC, Brier), the gate values, the money simulation,
-   the walk-forward table, the "Collapse filter (report only)" table (see
+   the walk-forward table, the "Collapse filter" table (see
    "Collapse filter" above), calibration by decile, top features. `medium` and
    `long` also show the purged k-fold (folds used, rounds per fold,
    out-of-fold rows used for calibration). Each bucket also has a "Dead after

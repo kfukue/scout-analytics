@@ -153,7 +153,8 @@ def _block(**over):
 
 def test_section_text_tables_and_the_1d_note():
     text = R.collapse_filter_section(_block())
-    assert text.startswith("### Collapse filter (report only)")
+    assert text.startswith("### Collapse filter\n")
+    assert "(report only)" not in text.splitlines()[0]
     assert ("The 30% cut is taken within each part (the test part, each walk-forward week) "
             "after its scores are known") in text
     assert ("a fixed score threshold set in advance, so these rates are likely optimistic "
@@ -206,14 +207,34 @@ def test_training_writes_the_block_and_a_failure_changes_nothing_else(small_df, 
                                                                      monkeypatch, capsys):
     """Computed in every training (diagnostics off here); an error in it is
     recorded with a WARNING; the saved model files are byte-identical and the
-    gates the same either way."""
+    gates the same either way. The second run also loses the fixed cut-off
+    (collapse_reference_block raises), so it is the run "without this change":
+    gates and `passed` are identical with and without the verdict and the
+    cut-off. `short` is made a filter bucket with rules any number meets, so
+    the first run is validated and the failure visibly turns that off."""
     monkeypatch.setattr(C, "BUCKETS", {"short": C.BUCKETS["short"]})
+    monkeypatch.setattr(C, "FILTER_BUCKETS", ("short",))
+    monkeypatch.setattr(C, "FILTER_RULES", {"min_caught_lower": -1e9,
+                                            "min_kept_minus_all_lower": -1e9})
     ok = train_mod.train(small_df, tmp_path / "ok", "v1", diagnostics=False)
     meta = json.loads((ok / "meta.json").read_text())
     m = meta["metrics"]["short"]
     cf = m["collapse_filter"]
     assert set(cf) == {"flag_frac", "random_skip_expected", "sim_max_ret_pct", "runner_label",
-                       "collapse_label", "can_be_both", "test", "pooled", "weeks"}
+                       "collapse_label", "can_be_both", "test", "pooled", "weeks", "verdict",
+                       "test_at_cutoff"}
+    v = cf["verdict"]
+    assert v["applies"] is True and v["validated"] is True and v["reasons"] == []
+    assert v["weeks"] == cf["pooled"]["weeks"] >= C.GATE_MIN_POOLED_WEEKS
+    assert v["caught_lo"] == cf["pooled"]["collapses_caught_lo"]
+    assert v["kept_minus_all_lo"] == cf["pooled"]["kept_minus_all_lo"]
+    assert (v["set_on"], v["seen_report"]) == ("18 Oct 2026", "20261018-2204")
+    ref = meta["collapse_reference"]["short"]
+    assert ref["n"] >= C.FILTER_CUTOFF_MIN_ROWS and ref["rows"] == "pre-test held-out"
+    at = cf["test_at_cutoff"]
+    assert at["cutoff"] == ref["cutoff"] and at["calls"] == m["split"]["n_test"]
+    assert 0 < at["flagged"] < at["calls"]
+    assert meta["thresholds"]["filter_rules"]["buckets"] == ["short"]
     rates = set(V.FILTER_RATES)
     assert set(cf["test"]) == set(V.FILTER_COUNTS) | rates
     assert cf["test"]["collapses_caught"] == m["trading"]["collapse_removed"]
@@ -228,16 +249,241 @@ def test_training_writes_the_block_and_a_failure_changes_nothing_else(small_df, 
 
     assert "collapse_filter" not in m["gates"] and "collapse_filter" not in m["trading"]
     report = (ok / "report.md").read_text(encoding="utf-8")
-    assert report.count("### Collapse filter (report only)") == 1
+    assert report.count("### Collapse filter\n") == 1
+    assert report.count("### Collapse filter verdict (owner rule of 18 Oct 2026)") == 1
+    assert "**Collapse filter verdict (owner rule of 18 Oct 2026): validated.**" in report
+    assert "test part at the fixed cut-off" in report
+    capsys.readouterr()
 
     def boom(*a, **k):
         raise RuntimeError("boom")
     monkeypatch.setattr(train_mod, "collapse_filter", boom)
+    monkeypatch.setattr(train_mod, "collapse_reference_block", boom)
     bad = train_mod.train(small_df, tmp_path / "bad", "v1", diagnostics=False)
-    assert "WARNING: the collapse filter of short failed" in capsys.readouterr().out
-    m_bad = json.loads((bad / "meta.json").read_text())["metrics"]["short"]
-    assert m_bad["collapse_filter"] == {"error": "error: RuntimeError: boom"}
+    printed = capsys.readouterr().out
+    assert "WARNING: the collapse filter of short failed" in printed
+    assert "WARNING: the collapse cut-off failed (error: RuntimeError: boom)" in printed
+    meta_bad = json.loads((bad / "meta.json").read_text())
+    m_bad = meta_bad["metrics"]["short"]
+    assert m_bad["collapse_filter"] == {"error": "error: RuntimeError: boom"}   # no verdict
+    assert meta_bad["collapse_reference"]["short"] == {"error": "error: RuntimeError: boom"}
     assert m_bad["gates"] == m["gates"] and m_bad["trading"] == m["trading"]
+    assert m_bad["gates"]["passed"] == m["gates"]["passed"]
+    assert m_bad["walk_forward"] == m["walk_forward"] and m_bad["labels"] == m["labels"]
+    assert meta_bad["runner_reference"] == meta["runner_reference"]
     assert _hashes(bad) == _hashes(ok) and len(_hashes(ok)) == 2      # byte-identical models
-    assert "**Not computed: error: RuntimeError: boom.**" in (bad / "report.md").read_text(
-        encoding="utf-8")
+    bad_report = (bad / "report.md").read_text(encoding="utf-8")
+    assert "**Not computed: error: RuntimeError: boom.**" in bad_report
+    assert ("- `short` not validated: the collapse filter was not computed "
+            "(error: RuntimeError: boom)") in bad_report
+
+
+# --- the fixed cut-off and the verdict (owner decision of 18 Oct 2026) ----------------
+
+def test_rule_constants():
+    assert C.FILTER_BUCKETS == ("3day", "medium")
+    assert C.FILTER_RULES == {"min_caught_lower": 0.30, "min_kept_minus_all_lower": 0.0}
+    assert (C.FILTER_RULES_SET_ON, C.FILTER_RULES_SEEN_REPORT) == ("18 Oct 2026", "20261018-2204")
+    assert ("set on 18 Oct 2026 after seeing report 20261018-2204; every training run "
+            "since then computes this verdict") in C.FILTER_RULES_NOTE
+    assert "counts for the site" not in C.FILTER_RULES_NOTE
+    assert C.FILTER_CUTOFF_MIN_ROWS == 100
+    rules = train_mod.filter_rules()
+    assert rules["min_caught_lower"] == 0.30 and rules["buckets"] == ["3day", "medium"]
+    assert rules["flag_frac"] == C.SKIP_FRAC and rules["seen_report"] == "20261018-2204"
+
+
+def test_cutoff_is_the_quantile_of_the_scores(monkeypatch):
+    s = np.random.default_rng(4).random(1000)
+    assert V.collapse_cutoff(s) == np.quantile(s, 1 - C.SKIP_FRAC)
+    assert V.collapse_cutoff(s, 0.1) == np.quantile(s, 0.9)
+    assert (s >= V.collapse_cutoff(s)).mean() == pytest.approx(C.SKIP_FRAC, abs=0.002)
+    assert np.isnan(V.collapse_cutoff([]))
+    monkeypatch.setattr(C, "SKIP_FRAC", 0.5)                      # read at call time
+    assert V.collapse_cutoff(s) == np.quantile(s, 0.5)
+
+
+class _RawModel:
+    """A stand-in LightGBM model: its raw score is the column "x"."""
+
+    def predict(self, X, raw_score=False):
+        assert raw_score
+        return X["x"].to_numpy(dtype=float)
+
+
+def _sigmoid(x):
+    return 1 / (1 + np.exp(-np.asarray(x, dtype=float)))
+
+
+def _hand_rows(n=400):
+    """`n` calls, one every 2 hours from 1 Sep 2026, one token each."""
+    import pandas as pd
+    dates = pd.Series(pd.date_range("2026-09-01", periods=n, freq="2h", tz="UTC"))
+    tokens = pd.Series([f"0x{i:04x}" for i in range(n)])
+    return dates, tokens
+
+
+@pytest.mark.parametrize("forward", [False, True])
+def test_cutoff_comes_from_the_pre_test_rows_not_the_test_rows(forward, monkeypatch):
+    import pandas as pd
+    monkeypatch.setattr(C, "FILTER_CUTOFF_MIN_ROWS", 10)
+    h = 3.0
+    dates, tokens = _hand_rows()
+    split = (V.forward_split(dates, tokens, h, test_days=5) if forward
+             else V.time_split(dates, tokens, h))
+    lo, hi = ((split["t_train_end"], split["t_test"]) if forward
+              else (split["t1"] - pd.Timedelta(days=h), split["t2"]))
+    pre = ((dates >= lo) & (dates < hi)).to_numpy()
+    te = split["test"]
+    assert not (pre & te).any() and (dates[~pre & ~te] < lo).all()
+    # raw collapse score x: -5 on the training side, 5 on the test rows, spread
+    # between on the pre-test held-out rows: a leaked train or test row moves the cut-off
+    x = np.where(te, 5.0, -5.0)
+    x[pre] = np.linspace(-1, 1, pre.sum())
+    X = pd.DataFrame({"x": x})
+    mask = train_mod.cutoff_rows(split, dates, h)
+    np.testing.assert_array_equal(mask, pre)
+    out = train_mod.collapse_reference_block({"model": _RawModel(), "calibrator": None}, X,
+                                             mask, dates)
+    want = _sigmoid(np.linspace(-1, 1, pre.sum()))
+    assert out["cutoff"] == pytest.approx(np.quantile(want, 1 - C.SKIP_FRAC), rel=1e-12)
+    np.testing.assert_allclose(out["quantiles"],
+                               np.quantile(want, np.linspace(0, 1, C.N_REF_QUANTILES)))
+    assert len(out["quantiles"]) == C.N_REF_QUANTILES
+    assert out["n"] == int(pre.sum()) and out["quantile"] == 1 - C.SKIP_FRAC
+    assert out["from"] == dates[pre].min().strftime("%Y-%m-%d %H:%M")
+    assert out["to"] == dates[pre].max().strftime("%Y-%m-%d %H:%M")
+    assert out["rows"] == "pre-test held-out" and out["calibrated"] is False
+    # taken on the test rows instead, the cut-off would be sigmoid(5)
+    assert out["cutoff"] < _sigmoid(0.5) < _sigmoid(5.0)
+
+
+def test_no_cutoff_with_too_few_rows_or_without_a_collapse_model():
+    import pandas as pd
+    dates, _ = _hand_rows(50)
+    X = pd.DataFrame({"x": np.zeros(50)})
+    fitted = {"model": _RawModel(), "calibrator": None}
+    few = train_mod.collapse_reference_block(fitted, X, np.ones(50, bool), dates)
+    assert few == {"skipped": "only 50 pre-test held-out rows (need 100)"}
+    none = train_mod.collapse_reference_block(None, X, np.ones(50, bool), dates)
+    assert none == {"skipped": "no collapse model"}
+
+
+def _keep(scores, ref):
+    n = len(scores)
+    return {"scores": {"collapse": np.asarray(scores, dtype=float)}, "te": np.ones(n, bool),
+            "y_plain": Y_COLL[:n], "Y": {"runner": Y_RUN[:n]}, "net_ret": RET[:n],
+            "collapse_reference": ref}
+
+
+def test_test_part_at_the_fixed_cutoff_flags_scores_at_or_above_it():
+    scores = [0.9, 0.8, 0.7, 0.1, 0.2, 0.3, 0.1, 0.2, 0.3, 0.4]     # >= 0.7: the first 3 (FLAG)
+    out = train_mod.filter_at_cutoff(_keep(scores, {"cutoff": 0.7}))
+    assert out == {"cutoff": 0.7, **V.collapse_filter_stats(Y_COLL, Y_RUN, RET, FLAG)}
+    assert train_mod.filter_at_cutoff(_keep(scores, {"cutoff": 0.95}))["flagged"] == 0
+    assert (train_mod.filter_at_cutoff(_keep(scores, {"skipped": "no collapse model"}))
+            == {"skipped": "no collapse model"})
+    assert train_mod.filter_at_cutoff(_keep(scores, {"error": "x"})) == {"skipped": "x"}
+    k = _keep(scores, {"cutoff": 0.7})
+    k["scores"] = {}
+    assert train_mod.filter_at_cutoff(k) == {"skipped": "no cut-off"}
+
+
+def _pooled_block(**over):
+    return {"weeks": 4, "collapses_caught": 0.5, "collapses_caught_lo": 0.35,
+            "collapses_caught_hi": 0.6, "kept_minus_all": 3.0, "kept_minus_all_lo": 0.5,
+            "kept_minus_all_hi": 6.0, **over}
+
+
+def test_filter_verdict_passes_when_both_lower_ends_beat_random_skipping():
+    v = V.filter_verdict(_pooled_block(), True)
+    assert v == {"applies": True, "validated": True, "weeks": 4, "min_weeks": 2,
+                 "caught_lo": 0.35, "min_caught_lower": 0.30, "caught_ok": True,
+                 "kept_minus_all_lo": 0.5, "min_kept_minus_all_lower": 0.0, "kept_ok": True,
+                 "reasons": [], "set_on": "18 Oct 2026", "seen_report": "20261018-2204"}
+
+
+@pytest.mark.parametrize("over,reason", [
+    ({"collapses_caught_lo": 0.30}, "pooled collapses caught 95% lower end 0.300 <= 0.3"),
+    ({"collapses_caught_lo": 0.2}, "pooled collapses caught 95% lower end 0.200 <= 0.3"),
+    ({"kept_minus_all_lo": 0.0}, "pooled kept minus all (mean net %) 95% lower end 0.000 <= 0"),
+    ({"kept_minus_all_lo": -2.5}, "pooled kept minus all (mean net %) 95% lower end -2.500 <= 0"),
+    ({"collapses_caught_lo": NAN}, "pooled collapses caught 95% interval undefined"),
+    ({"kept_minus_all_lo": None}, "pooled kept minus all (mean net %) 95% interval undefined"),
+    ({"weeks": 1}, "only 1 counted walk-forward week(s); the verdict needs at least 2"),
+])
+def test_filter_verdict_fails_with_a_reason(over, reason):
+    v = V.filter_verdict(_pooled_block(**over), True)
+    assert v["validated"] is False and reason in v["reasons"]
+    if "weeks" in over:                       # too few weeks: neither rule is judged
+        assert v["caught_ok"] is False and v["kept_ok"] is False and len(v["reasons"]) == 1
+
+
+def test_filter_verdict_on_a_failed_or_missing_pooled_block():
+    err = V.filter_verdict({"error": "boom"}, True)
+    assert err["validated"] is False and err["weeks"] == 0
+    assert err["reasons"][0] == "pooled walk-forward not computed (boom)"
+    none = V.filter_verdict(None, True)
+    assert none["validated"] is False and none["reasons"][0] == "pooled walk-forward not computed"
+
+
+def test_filter_verdict_never_validates_a_bucket_outside_the_filter_buckets():
+    v = V.filter_verdict(_pooled_block(), False)
+    assert v["applies"] is False and v["validated"] is False
+    assert v["caught_ok"] is True and v["kept_ok"] is True        # the numbers are still shown
+    assert v["reasons"] == ["not a filter bucket (FILTER_BUCKETS: 3day, medium)"]
+
+
+def test_filter_verdict_reads_the_rules_at_call_time(monkeypatch):
+    monkeypatch.setattr(C, "FILTER_RULES", {"min_caught_lower": 0.4, "min_kept_minus_all_lower": 0})
+    assert V.filter_verdict(_pooled_block(), True)["validated"] is False
+
+
+def _res_for_report():
+    passed = {**_block(), "verdict": V.filter_verdict(_pooled_block(), True),
+              "test_at_cutoff": {"cutoff": 0.7, **V.collapse_filter_stats(Y_COLL, Y_RUN, RET,
+                                                                          FLAG)}}
+    failed = {**_block(), "verdict": V.filter_verdict(_pooled_block(kept_minus_all_lo=-1.0),
+                                                      True)}
+    short = {**_block(), "verdict": V.filter_verdict(_pooled_block(), False)}
+    return {"buckets": {"short": {"collapse_filter": short}, "3day": {"collapse_filter": passed},
+                        "medium": {"collapse_filter": failed}, "long": {"skipped": "too few"}},
+            "collapse_reference": {"short": {"skipped": "no collapse model"},
+                                   "3day": {"cutoff": 0.7, "n": 560},
+                                   "medium": {"cutoff": 0.41234, "n": 133}}}
+
+
+def test_verdict_table_reasons_and_note():
+    text = R.filter_verdict_section(_res_for_report())
+    assert text.startswith("### Collapse filter verdict (owner rule of 18 Oct 2026)\n")
+    assert ("| bucket | collapse filter validated | pooled collapses caught 95% lower end > 0.3 "
+            "| pooled kept minus all (mean net %) 95% lower end > 0 | counted weeks "
+            "| cut-off (probability) | reference rows n "
+            "| test-part flagged share at the cut-off (information) |") in text
+    assert "| 3day | yes | yes: 0.350 | yes: +0.5 | 4 | 0.700 | 560 | 0.300 |" in text
+    assert "| medium | no | yes: 0.350 | no: -1.0 | 4 | 0.412 | 133 | n/a |" in text
+    assert ("| short | n/a (not a filter bucket) | yes: 0.350 | yes: +0.5 | 4 "
+            "| n/a: no collapse model | n/a | n/a |") in text
+    assert "| long | skipped |" in text
+    assert ("- `medium` not validated: pooled kept minus all (mean net %) 95% lower end "
+            "-1.000 <= 0") in text
+    assert "`3day` not validated" not in text and "`short` not validated" not in text
+    assert "Never a bucket gate: the PASS/FAIL above is unchanged." in text
+    assert C.FILTER_RULES_NOTE in text
+
+
+def test_section_verdict_line_and_the_fixed_cutoff_column():
+    res = _res_for_report()
+    ok = R.collapse_filter_section(res["buckets"]["3day"]["collapse_filter"])
+    assert "**Collapse filter verdict (owner rule of 18 Oct 2026): validated.**" in ok
+    assert ("|  | test part (saved model) | test part at the fixed cut-off 0.700 (information) "
+            "| pooled walk-forward (2 counted weeks) [95%] | random skip (expected) |") in ok
+    assert "| calls | 10 | 10 | 10 |" in ok
+    assert "likely optimistic for such a filter." in ok
+    bad = R.collapse_filter_section(res["buckets"]["medium"]["collapse_filter"])
+    assert ("**Collapse filter verdict (owner rule of 18 Oct 2026): not validated (pooled kept "
+            "minus all (mean net %) 95% lower end -1.000 <= 0).**") in bad
+    # a block without "test_at_cutoff" (e.g. written before 18 Oct 2026): no such column
+    assert "|  | test part (saved model) | pooled walk-forward (2 counted weeks) [95%] |" in bad
+    short = R.collapse_filter_section(res["buckets"]["short"]["collapse_filter"])
+    assert "verdict (owner rule of 18 Oct 2026): n/a (not a filter bucket" in short

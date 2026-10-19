@@ -623,6 +623,81 @@ def test_serving_scores_match_training_scores(trained, synthetic_df, bucket):
         assert got == round(float(probs[i]), 4), i
 
 
+def test_meta_has_the_collapse_reference_the_filter_rules_and_a_verdict(trained):
+    """Stable meta paths the serving / site PRs read: collapse_reference[b].cutoff
+    and .quantiles, thresholds.filter_rules, metrics[b].collapse_filter.verdict.validated."""
+    _, vdir = trained
+    meta = json.loads((vdir / "meta.json").read_text())
+    assert meta["thresholds"]["filter_rules"] == json.loads(json.dumps(train_mod.filter_rules()))
+    assert set(meta["collapse_reference"]) == set(meta["runner_reference"]) == set(BUCKET_KEYS)
+    for b in BUCKET_KEYS:
+        ref = meta["collapse_reference"][b]
+        assert ref["n"] >= C.FILTER_CUTOFF_MIN_ROWS and ref["rows"] == "pre-test held-out"
+        assert ref["quantile"] == pytest.approx(1 - C.SKIP_FRAC)
+        assert len(ref["quantiles"]) == C.N_REF_QUANTILES
+        assert ref["quantiles"][0] <= ref["cutoff"] <= ref["quantiles"][-1]
+        assert isinstance(ref["calibrated"], bool)
+        cf = meta["metrics"][b]["collapse_filter"]
+        v = cf["verdict"]
+        assert isinstance(v["validated"], bool) and v["applies"] is (b in C.FILTER_BUCKETS)
+        assert v["weeks"] == meta["metrics"][b]["gates"]["pooled_weeks"]
+        assert cf["test_at_cutoff"]["cutoff"] == ref["cutoff"]
+        assert cf["test_at_cutoff"]["calls"] == meta["metrics"][b]["split"]["n_test"]
+    report = (vdir / "report.md").read_text(encoding="utf-8")
+    assert report.count("### Collapse filter verdict (owner rule of 18 Oct 2026)") == 1
+    assert report.count("### Collapse filter\n") == len(BUCKET_KEYS)
+
+
+@pytest.mark.parametrize("bucket", ["3day", "medium"])
+def test_stored_cutoff_is_the_quantile_of_the_saved_collapse_model_on_pre_test_rows(
+        trained, synthetic_df, bucket):
+    """Recomputed from the saved {bucket}_collapse.joblib (as the scoring service
+    loads it) on the bucket's pre-test held-out rows: the stored cut-off and
+    quantiles; none of those rows is a training or test row."""
+    import pandas as pd
+    from scout_ml import validate as V
+    from scout_ml.labels import build_labels
+    from scout_ml.features import build_features
+    from scout_ml.model import Bundle, predict
+    _, vdir = trained
+    meta = json.loads((vdir / "meta.json").read_text())
+    ref = meta["collapse_reference"][bucket]
+    df = synthetic_df.copy()
+    df["message_date"] = pd.to_datetime(df["message_date"], utc=True, format="ISO8601")
+    df = df.sort_values("message_date").reset_index(drop=True)
+    rows = df[build_labels(df)[f"usable_{bucket}"].to_numpy()].reset_index(drop=True)
+    h = C.BUCKETS[bucket]["horizon_days"]
+    split = (V.forward_split if bucket in C.FORWARD_SPLIT_BUCKETS else V.time_split)(
+        rows["message_date"], rows["contract_address"], h)
+    mask = train_mod.cutoff_rows(split, rows["message_date"], h)
+    assert not (mask & split["test"]).any() and not (mask & split["train"]).any()
+    assert mask.sum() == ref["n"] >= C.FILTER_CUTOFF_MIN_ROWS
+    bundle = Bundle(vdir)
+    X = build_features(rows[mask], bundle.levels(bucket), meta["features"])
+    probs = predict(bundle.models[f"{bucket}_collapse"], X)
+    assert ref["cutoff"] == pytest.approx(V.collapse_cutoff(probs), rel=1e-9, abs=1e-12)
+    np.testing.assert_allclose(ref["quantiles"],
+                               np.quantile(probs, np.linspace(0, 1, C.N_REF_QUANTILES)),
+                               rtol=1e-9, atol=1e-12)
+
+
+def test_bundle_loads_a_meta_without_the_collapse_filter_keys(trained, synthetic_df, tmp_path):
+    """A meta.json written before 18 Oct 2026 (no collapse_reference, no
+    thresholds.filter_rules, no verdict) still loads and scores the same."""
+    from scout_ml.model import Bundle
+    _, vdir = trained
+    old = tmp_path / "old"
+    shutil.copytree(vdir, old)
+    meta = json.loads((old / "meta.json").read_text())
+    meta.pop("collapse_reference")
+    meta["thresholds"].pop("filter_rules")
+    for m in meta["metrics"].values():
+        m.pop("collapse_filter", None)
+    (old / "meta.json").write_text(json.dumps(meta))
+    row = json.loads(synthetic_df.tail(1).to_json(orient="records"))[0]
+    assert Bundle(old).score(row, "all") == Bundle(vdir).score(row, "all")
+
+
 def test_kfold_fallback_when_too_few_folds_are_usable(synthetic_df, tmp_path, monkeypatch):
     """Fewer usable purged folds than KFOLD_MIN_FOLDS: fixed rounds, no calibrator,
     a note, and the report says the model is uncalibrated."""
