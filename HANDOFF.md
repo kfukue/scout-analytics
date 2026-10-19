@@ -1,5 +1,34 @@
 # Scout analytics: handoff to Claude Code
 
+## Session state (19 Oct 2026, 12:25 PDT (19:25 UTC): main 3ff52fa after #31)
+
+This section supersedes the ones below wherever they differ.
+
+**Holder analysis plan approved (owner, 19 Oct):** "1. go with that
+2. ok 3. ok 4. go back like 3 months 5. yes". The plan, the answers and
+the stop rules are in section 4 item 4 ("Plan refreshed ... and
+approved"). The look-back cap is 3 months, not 7 days.
+
+**P0 done (owner ran Q1-Q5b, 19 Oct):** results in section 4 item 4.
+4,761 first calls with a 7d result; 1,481 `dead7`, 883 `held2x7`, so
+ML stays in the plan; none of the 4,752 with a known age was older
+than 90 days at the call (9 unknown); 91 %
+had no Perceptor scan at the call, so the pilot's strata are the posted
+holders and the age at the call; the posted holder count alone already
+separates `dead7` (9 % to 62 % by quintile). The query file is a
+git-ignored scratch file (`.claude/worktrees/_scratch/holder-p0/`);
+Q6 (pilot sample) is run when the pilot is ready.
+
+**In progress:**
+- Code PR 1: pure `Transfer` decode, replay to `entry_block` and holder
+  stats, tests on synthetic transfers only; worktree
+  `.claude/worktrees/holder-replay-20261019`, branch
+  `work/2026-10-19-holder-replay`; implemented, in simplify then review.
+  Follow-ups for the log-reader PR: drop duplicate logs on (block, log
+  index) and logs removed by a reorg.
+- Owner's notes record: the three 18 Oct evening decisions, the 19 Oct
+  stop of the ML work and this approval are added after this PR merges.
+
 ## Session state (19 Oct 2026, 11:50 PDT (18:50 UTC): main 61a39b9 after #27, #29, #30)
 
 This section supersedes the ones below wherever they differ.
@@ -1824,7 +1853,7 @@ owner keeps them in local notes (reviewed and tightened by the owner on
    freshness for all calls. Refresh on view is rejected for now (30–90 s
    latency, the web process would have to write a NOTIFY, no login).
 4. **Early-transaction pattern analysis** (owner request 8 October;
-   planning only, nothing to build yet). For each Scout first call, look at
+   plan approved 19 October, see the last block of this item). For each Scout first call, look at
    the token's early on-chain transactions, from pool creation (or Pons
    curve launch) up to the call and shortly after, and find:
    - (a) whether certain addresses (deployers, funders, early buyers/sellers,
@@ -1870,6 +1899,122 @@ owner keeps them in local notes (reviewed and tightened by the owner on
      - the pilot size and the server folder;
      - the look-back cap for old tokens (7 days?).
    - No coder work until the owner approves.
+
+   **Plan refreshed by `investigate` and approved by the owner (19 Oct
+   2026; supersedes the 8 Oct draft above where they differ).** The
+   8 Oct Q1-Q5 text was not kept anywhere; new P0 queries replace it.
+   - Data: the prod node is a full node, not an archive, so balances at
+     old blocks are rebuilt by replaying the token's `Transfer` logs from
+     launch up to the call's `entry_block`
+     (`scout_call_tracking.onchain->>'entry_block'`). Supply comes from
+     the replay, never `token_supply` (falls back to the latest block).
+     Wallets come from the token `Transfer` in the same transaction, not
+     the router.
+   - Labels (first calls, on-chain entry, 7d row done):
+     - bad `dead7`: 7d late-entry return <= -90 %, excluding
+       `rug_at_kind = 'at_call'`; `drain7` (<= -99.99 %) is shown for
+       description only (about 70 cases);
+     - good `held2x7`: `above_2x_s >= 3600` on the 7d row (the 12 Oct
+       Timing-tab rule "reached 2×"); peak net of tax >= +100 % and 7d return
+       >= +100 % reported alongside;
+     - `rugged` is not used as a label (set long after the call; about
+       seven in ten rugs have only a check time).
+     - ML labels are net of tax, descriptive tables gross.
+   - Features, all from logs at or before `entry_block`:
+     - group (i), per token: holder count; top-1/5/10 share of
+       circulating supply (pools, PoolManager, Pons curve, zero/dead and
+       the token itself excluded); deployer share and whether it sold
+       before the call; snipers and bundled buys at launch; unique buyers
+       and sellers and the sell/buy ratio; v2 LP burned or held by a
+       contract, v3/v4 net liquidity added or removed.
+     - group (ii), across tokens (later, same drift risk as wallet
+       reputation): the deployer's earlier tokens and their outcome;
+       early-buyer overlap with earlier dead tokens; point-in-time with
+       the wallet-reputation lag and embargo.
+     - Names start `pre_hold_` or similar, never `pool_`; anything after
+       the call gets its own forbidden prefix (e.g. `post_`).
+   - Owner's answers (19 Oct): window: features stop at `entry_block`,
+     the pilot also reads 24 h after the call for description only;
+     "good" as above; pilot about 450 calls (150/150/150, spread across
+     weeks, sized from P0), files in a new server folder outside the
+     repo and `scoutanalytics_data/`, never committed; look-back cap
+     **3 months** (tokens up to 90 days old at the call get their full
+     history); 5 "yes" (Blockscout): read by the PM as approval in
+     principle for deployer funders; either way no Blockscout use before
+     the pilot, and the PM asks one explicit question before any key is
+     requested (the owner adds it to `.env` himself).
+   - Plan's handling past the cap: tokens older than 90 days at the call
+     get no concentration features and a `capped` flag.
+   - Node cost (estimate, not measured): one `eth_getLogs` covers up to
+     200k blocks (about 5.5 h); two address-filtered streams per call
+     (token `Transfer`; pool LP events). Young tokens about 10-20 reads
+     per call; a token at the 3-month cap about 800. Q3 (age at the call)
+     shows how many calls are old, so what the pilot and the full run cost.
+   - Phases:
+     - P0: the owner runs read-only queries Q1-Q6 (sizes, labels by week,
+       age at the call, how censored `rugged` is, the baseline from the
+       posted holders and Perceptor verdict, the pilot sample).
+     - Code, small PRs with base `main`, one at a time: (1) pure transfer
+       decode, replay and holder stats (no node, no DB); (2) snipers,
+       bundles, LP events; (3) a read-only, rate-limited Go export flag
+       (call ids in, files out; no DB writes, no schema change; new
+       `SCOUT_*` names in `config.go`); (4) a report-only analysis script
+       in `ml/`.
+     - P1 pilot (description only), P2 full run, then ML: group (i) as a
+       report-only variant in the existing buckets with adoption rules
+       fixed before the run (as `WREP_ADOPTION`, one shot, no tuning),
+       plus a small separate `dead7` classifier, same walk-forward gate.
+     - P3, only if a signal passes: `pre_*` columns on
+       `scout_call_precall` (schema change with run and rollback scripts).
+   - Stop rules, fixed before P1:
+     - after P0: fewer than 300 `dead7` or 150 `held2x7` → no ML,
+       description only;
+     - after P1: no group (i) feature with a bootstrap 95 % lower AUC
+       bound above 0.60, or the separation vanishes within strata of the
+       posted holders and the token's age at the call → stop (Perceptor
+       verdict dropped from the strata after P0: 91 % of calls had no
+       scan at the call);
+     - during any run: the latest-price lag goes over 2 h → pause. The
+       reads per call are reported (median and total), not a stop rule,
+       since the 3-month cap makes old tokens expensive;
+     - after P2: the variant fails its pre-registered rules → stop.
+   - Never: change `onchainStateVersion`, make the tracker redo history,
+     or write to the database before P3.
+
+   **P0 results (owner ran Q1-Q5b in pgAdmin, 19 Oct 2026; first calls,
+   on-chain entry, 7d result, not `repeat`):**
+   - Q1: 4,761 first calls with a 7d result, 28 Jul to mid-Oct: v4 about
+     2,690, Pons about 1,610, v3 about 400, v2 about 60. 2 non-USD, 2
+     outcomes above +100,000 %. 29 `gave_up`, 8 `no_pool`, 1 call
+     without a tracking row.
+   - Q2 (12 weeks): `dead7` 1,481 (31 %), `drain7` 52, `held2x7` 883
+     (19 %), peak >= +100 % 1,840 (net equals gross in every week), 7d
+     return >= +100 % 178, held 2x then dead 121, rug at the call 7.
+     The dead rate moves by week: about 17 % in early August, 42-44 %
+     in the weeks of 31 Aug and 7 Sep, about 17 % in late September.
+     After-P0 stop rule passed: ML stays in the plan.
+   - Q3 (age at the call): < 1 h 3,741 (dead 33.5 %), 1-6 h 611
+     (25.4 %), 6-24 h 192 (21.9 %), 1-3 d 57, 3-7 d 56, 7-30 d 54
+     (3.7 %), 30-90 d 41, > 90 d none, unknown 9. The 3-month cap covers
+     every call with a known age. Rough full-run cost: about 100k `eth_getLogs`
+     (estimate, not measured).
+   - Q4: 904 calls flagged `rugged`; only 58 drained by 7d (51 `event`,
+     7 `at_call`); 190 `detected` more than 30 d later (46 dead at 7d);
+     609 never flagged were dead at 7d; 1,213 have `rugged` NULL
+     (mostly calls still tracking: Q1 has 1,199 tracking). Confirms the 7d return label. Side finding, not
+     looked into: 640 rugged calls have no `rug_at` or `rug_at_kind`
+     (the 9 Oct backfill covered every rugged call then), which affects
+     the Timing tab's rug figures.
+   - Q5a: 4,344 of 4,761 (91 %) had no live Perceptor scan at the call;
+     among the scanned, dead7 is clean 26.9 %, caution 12.3 %,
+     insufficient 12.5 %, red_flags 16.8 % (small groups; PM's reading:
+     live scans began 29 Sep, so these calls are from late September on,
+     when the dead rate was low).
+   - Q5b (posted holders, quintiles): dead7 9.4 % (3-74), 16.8 %
+     (74-101), 27.2 % (101-144), 40.4 % (144-235), 61.7 % (235+);
+     held2x7 flat at 14.5-21.4 %. The posted holder count is the
+     baseline the holder features must beat for `dead7`.
+   - Q6 (pilot sample) is run when the pilot is ready.
 5. **Analytics page**: two sections on a separate page (`/analytics.html`,
    linked from the list's top bar and back).
    - **Section 1, "Call performance": merged (PR #5) and deployed.**

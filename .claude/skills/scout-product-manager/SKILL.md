@@ -644,6 +644,23 @@ Every Go start applies `scoutanalytics.sql` unless `SCOUT_DB_AUTO_MIGRATE=false`
   pattern analysis", 8 Oct), with ML on that data. Its plan is refreshed
   by `investigate` and agreed with the owner first; no coder work until he
   approves it.
+- 19 Oct (owner, "1. go with that 2. ok 3. ok 4. go back like 3 months
+  5. yes", answering the PM's five questions on the holder analysis
+  plan, which counts as approving it; plan in `HANDOFF.md` section 4 item 4):
+  (1) window: features stop at the call's `entry_block`; the pilot also
+  reads 24 h after the call, for description only; (2) "good" = held at
+  or above 2x for at least 1 h within 7 days (`above_2x_s >= 3600` on the
+  7d row), with peak net of tax and the 7d return reported alongside;
+  (3) pilot of about 450 calls (150 bad / 150 good / 150 neither, spread
+  across weeks, sized from the P0 counts), files in a new folder on the
+  server outside the repo and `scoutanalytics_data/`, never committed;
+  (4) look-back cap 3 months, not the PM's 7 days: tokens up to 90 days
+  old at the call get the full transfer history; (5) Blockscout is
+  approved in principle for finding deployer funders, used only after the
+  pilot if deployer links show a signal (PM's reading of "yes", which could also
+  mean "yes to the recommendation"); either way no Blockscout use before
+  the pilot, and the PM asks one explicit question before any key is
+  requested; the key is a secret the owner adds to `.env` himself.
 - 12 Oct: the PM has the `Bash` tool for git only: read-only git, `git fetch`
   and `git worktree add` to create worktrees for `implement`; never stash,
   switch, reset, rebase or merge (add, commit and push of its own `work/...`
