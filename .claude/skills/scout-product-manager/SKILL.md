@@ -612,6 +612,25 @@ Every Go start applies `scoutanalytics.sql` unless `SCOUT_DB_AUTO_MIGRATE=false`
   step exists, a run makes its model live at once (`train.py` writes
   `LATEST`), so the schedule ships only after the candidate/promote
   change; whether promotion is automatic is still the owner's decision.
+- 18 Oct (owner, "go live automatically"; the PM had recommended by
+  hand for the first 3 runs): a scheduled run's model is promoted
+  automatically when all hard checks pass (run completed; loads and
+  scores a sample row with the deployed code; trained from the deployed
+  commit; same features, thresholds and categories as the live model;
+  rows, eligible and last date not lower; no bucket loses its model) and
+  no bucket's median pooled lift drops more than 0.20. Otherwise the
+  old model stays live and the notice says why. Never use "no bucket
+  goes PASS->FAIL" (it holds back runs by noise near 2).
+- 18 Oct (owner, "go with your recommendation"): the model is presented
+  as a risk filter. (1) The collapse filter is validated per bucket when
+  it beats random skipping: lower end of the pooled walk-forward
+  "collapses caught" > 0.30 and lower end of "kept minus all" > 0 (set
+  after seeing report 20261018-2204, so it must hold again on a later
+  retrain before the site relies on it). (2) Site: a "collapse risk:
+  high" flag on the call list; runner scores unchanged. (3) 3d and 7d
+  only. (4) Delivery line later, not now.
+- 18 Oct (owner, "it's ok just leave it"): the website's "not scanned"
+  count stays as it is; no change to `SCOUT_RESCAN_MAX_AGE`.
 - 12 Oct: the PM has the `Bash` tool for git only: read-only git, `git fetch`
   and `git worktree add` to create worktrees for `implement`; never stash,
   switch, reset, rebase or merge (add, commit and push of its own `work/...`

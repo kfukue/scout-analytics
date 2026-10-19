@@ -1,9 +1,9 @@
 # Scout analytics: handoff to Claude Code
 
-## Session state (18 Oct 2026, 22:35 PDT (19 Oct 05:35 UTC): main 09e2293 after #25, #26)
+## Session state (18 Oct 2026, 22:50 PDT (19 Oct 05:50 UTC): main 09e2293 after #25, #26)
 
-This section supersedes the ones below wherever they differ. The owner
-is restarting his PC; any agent running then was stopped.
+This section supersedes the ones below wherever they differ. Written
+before a PC restart; this docs PR is #27.
 
 **Merged since the section below:** #25 docs (node URLs not redacted;
 weekly automated retraining); #26 `write_pointer`: `train.py` writes
@@ -24,30 +24,45 @@ filter section; that model is live):
   each week's scores, so likely optimistic for a fixed threshold.
 - Adversarial AUC 0.88-0.90 (inputs drift).
 
-**Waiting on the owner:**
-1. Risk-filter decisions; PM recommendations sent: (1) validate the
-   filter by "beats random skipping" (lower end of pooled collapses
-   caught > 0.30 and kept-minus-all lower end > 0; all three pass now;
-   set after seeing this report, so it must hold again on the next
-   retrain) instead of the single-run >= 40 %; (2) a "collapse risk:
-   high" flag on the call list, runner scores unchanged; (3) 3d and 7d
-   only (1d loses runners at the random rate); (4) delivery line later.
-   "go with your recommendations" = start A2 (fixed cut-off,
-   `collapse_reference`).
-2. Retraining: automatic promotion or by hand (PM recommends by hand
-   for the first 3 runs, with the summary saying what the auto-check
-   would do; then auto with checks H1-H6 + no bucket's median lift
-   drops more than 0.20; never "no PASS->FAIL", which would have held
-   2 of the last 3 runs). Also: notice to the private delivery group;
-   train from the deployed commit; diagnostics on; Sundays 17:00 UTC.
-3. The two Pons follow-up queries (below).
-4. Deploy of #16-#20 not confirmed.
+**Owner decisions, 18 Oct evening (recorded in the PM skill):**
+1. Risk filter, "go with your recommendation": (1) the filter is
+   validated per bucket when it beats random skipping (lower end of
+   pooled collapses caught > 0.30 and lower end of kept-minus-all > 0;
+   all three pass on 20261018-2204; set after seeing that report, so it
+   must hold again on the next retrain), instead of the single-run
+   >= 40 %; (2) a "collapse risk: high" flag on the call list, runner
+   scores unchanged; (3) 3d and 7d only (1d loses runners at the random
+   rate); (4) delivery line later. `investigate` is drafting step A2
+   (cut-off fixed in advance, `collapse_reference`, filter verdict).
+2. Retraining goes live automatically (the PM had recommended by hand
+   for the first 3 runs). Promotion only when all hard checks pass
+   (H1 run completed; H2 loads and scores a sample row with the deployed
+   code; H3 trained from the deployed commit; H4 same features,
+   thresholds and categories as live; H5 rows, eligible and last date
+   not lower; H6 no bucket loses its model) and no bucket's median
+   pooled lift drops more than 0.20; else the old model stays and the
+   notice says why. Not "no PASS->FAIL": on the three runs before
+   20261018-2204 (0554, 1944, 2148) it would have held two.
+   PM proposals not yet confirmed by the owner: notice to the private
+   delivery group; diagnostics on; Sundays 10:00 PDT (17:00 UTC; 09:00
+   PST after 1 Nov).
+3. The website's "not scanned" count (4,340) stays as it is. It is
+   calls without a real Perceptor verdict: history from before Perceptor
+   scanning, plus the re-scan lane's limits (30 days, 100/day, no
+   rugged/wiped tokens, 2 failures). No change to `SCOUT_RESCAN_MAX_AGE`.
 
-**Owner, 18 Oct: the website's "not scanned" count (4,340) stays as
-it is.** It is calls without a real Perceptor verdict: history from
-before Perceptor scanning, plus the re-scan lane's limits (30 days,
-100/day, no rugged/wiped tokens, 2 failures). No change to
-`SCOUT_RESCAN_MAX_AGE`.
+**Pons question closed (18 Oct).** Follow-up queries: the 37
+`no_pool`/`gave_up` calls all say "no Uniswap v2/v3/v4 pool found" (35)
+or "no trades around the call time" (2), none a node error. By address
+ending, Pons calls have no common ending; 123 calls end in `7777` (0
+Pons, 109 tracked on ordinary pools, 14 of the 37), so those are another
+launchpad's tokens that never reached a Uniswap pool. No misjudged Pons
+tokens found; nothing to repair. Optional idea, not planned: track that
+launchpad's own trading (14 of its 123 calls).
+
+**Deployed (owner, 18 Oct):** after `git pull`, the listener
+(`-listen-only`), `-track` and `-web` were restarted, so #16-#20 run on
+prod.
 
 **Retraining series (plan by `investigate`, 18 Oct; one PR at a time,
 base main):** 1 atomic `LATEST` (#26, merged) → 2 `train.py
@@ -69,15 +84,13 @@ locally. Files: `ml/train.py` (`--candidate` → `set_latest=False`;
 `CANDIDATE` written last; new `version_name()`, `new_version_dir()`
 refusing an existing version dir, also without `--candidate`),
 `ml/README.md`, `ml/RUNBOOK.md`, `ml/tests/test_pipeline.py`,
-`ml/tests/test_variants.py`, new `ml/tests/test_candidate.py`. Not yet
-reviewed. Next session: `review` (point out the changed default: a
-default run into an existing version dir now fails), then commit and
-PR. Notes for later PRs: `run_training.sh` 407-411 still expects
-`LATEST` (PR 5); `CANDIDATE` is never cleared, so `promote.py` must
-check the named dir has `meta.json` and `report.md` (PR 3).
-
-GitHub was briefly unreachable from the PC at 22:35 PDT (push and `gh`
-timed out on port 443); it worked again minutes later.
+`ml/tests/test_variants.py`, new `ml/tests/test_candidate.py`.
+Reviewed PASS; a docs sentence from the review (a failed run leaves
+`CANDIDATE` naming the previous candidate) is being added, then the PM
+commits and opens the PR. Notes for later PRs: `run_training.sh`
+407-411 still expects `LATEST` (PR 5); `CANDIDATE` is never cleared,
+so `promote.py` must check the named dir has `meta.json` and
+`report.md` and was written by the current run (PR 3).
 
 ## Session state (18 Oct 2026 PDT: main c72e6b7 after PRs #18-#20, #22-#24; #21 closed)
 
