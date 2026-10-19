@@ -1,5 +1,108 @@
 # Scout analytics: handoff to Claude Code
 
+## Session state (18 Oct 2026, 22:55 PDT (19 Oct 05:55 UTC): main 939a289 after #25, #26, #28)
+
+This section supersedes the ones below wherever they differ. This docs
+PR is #27.
+
+**Merged since the section below:** #25 docs (node URLs not redacted;
+weekly automated retraining); #26 `write_pointer`: `train.py` writes
+`LATEST` atomically (temp file + `os.replace`), first PR of the
+retraining series. Owner's notes record updated for #24, #25 decisions.
+
+**Prod report 20261018-2204** (plain retrain, first with the collapse
+filter section; that model is live):
+- Gates: 3d PASS 2.02 (seeds 1.80-2.32), 7d FAIL 1.98, 1d FAIL 1.10.
+  3d/7d still sit on the line of 2.
+- Collapse filter (skip the top 30 % by collapse score), pooled
+  walk-forward [95 %]: collapses caught 1d 0.381 [0.358, 0.436], 3d 0.380
+  [0.350, 0.444], 7d 0.395 [0.352, 0.488] (random 0.30); runners lost 1d
+  0.323, 3d 0.143, 7d 0.154 (random 0.30); kept minus all (mean net %)
+  1d +11.0 [+9.9, +12.9], 3d +10.7 [+9.1, +13.2], 7d +9.2 [+6.6, +13.2];
+  every counted week positive. Test part: caught 0.47-0.52. Kept calls
+  still lose on average (3d -33.8 % vs -44.5 %). Cut taken after seeing
+  each week's scores, so likely optimistic for a fixed threshold.
+- Adversarial AUC 0.88-0.90 (inputs drift).
+
+**Owner decisions, 18 Oct evening PDT (19 Oct UTC; recorded in the PM
+skill; the owner's notes record is updated after this PR merges):**
+1. Risk filter, "go with your recommendation": (1) the filter is
+   validated per bucket when it beats random skipping (lower end of
+   pooled collapses caught > 0.30 and lower end of kept-minus-all > 0;
+   all three pass on 20261018-2204; set after seeing that report, so it
+   must hold again on the next retrain), instead of the single-run
+   >= 40 %; (2) a "collapse risk: high" flag on the call list, runner
+   scores unchanged; (3) 3d and 7d only (1d loses runners at the random
+   rate); (4) delivery line later. Step A2a is in progress (below).
+2. Retraining goes live automatically (the PM had recommended by hand
+   for the first 3 runs). Promotion only when all hard checks pass
+   (H1 run completed; H2 loads and scores a sample row with the deployed
+   code; H3 trained from the deployed commit; H4 same features,
+   thresholds and categories as live; H5 rows, eligible and last date
+   not lower; H6 no bucket loses its model) and no bucket's median
+   pooled lift drops more than 0.20; else the old model stays and the
+   notice says why. Not "no PASS->FAIL": on the three runs before
+   20261018-2204 (20261015-0554, -1944, -2148) it would have held two.
+   PM proposals not yet confirmed by the owner: notice to the private
+   delivery group; diagnostics on; Sundays 10:00 PDT (17:00 UTC; 09:00
+   PST after 1 Nov).
+3. The website's "not scanned" count (4,340) stays as it is. It is
+   calls without a real Perceptor verdict: history from before Perceptor
+   scanning, plus the re-scan lane's limits (30 days, 100/day, no
+   rugged/wiped tokens, 2 failures). No change to `SCOUT_RESCAN_MAX_AGE`.
+
+**Pons question closed (18 Oct PDT (19 Oct UTC)).** Follow-up queries: the 37
+`no_pool`/`gave_up` calls all say "no Uniswap v2/v3/v4 pool found" (35)
+or "no trades around the call time" (2), none a node error. By address
+ending, Pons calls have no common ending; 123 calls end in `7777`
+(0 tracked as Pons, 14 `no_pool`/`gave_up`). PM's reading: `7777` is
+another launchpad's vanity ending, and those 14 never reached a Uniswap
+pool. No misjudged Pons tokens found; nothing to repair. Optional idea,
+not planned: track that launchpad's own trading.
+
+**Deployed (owner, 18 Oct):** after `git pull`, the listener
+(`-listen-only`), `-track` and `-web` were restarted, so #16-#20 run on
+prod.
+
+**Retraining series (plan by `investigate`, 18 Oct; one PR at a time,
+base main):** 1 atomic `LATEST` (#26, merged) → 2 `train.py
+--candidate` (writes `CANDIDATE`, never `LATEST`; refuses an existing
+version dir) → 3 `ml/promote.py` promote/rollback/status (loads and
+scores a sample row first; `PREVIOUS`; `promotions.log`) → 4 `flock` in
+`run_training.sh` → 5 `run_training.sh --candidate` → 6 `--src deployed`
++ `meta["source_commit"]` → 7 `promote.py check` + allow-listed
+`summary.txt` (thresholds in `config.py`) → 8 Go `-notify-file PATH`
+(Bot API sender, no DB, no user session; independent) → 9
+`ops/scout-train.sh` wrapper (PAUSE file, skip if `-track` up < 30 min)
+→ 10 systemd service + timer (weekly, owner installs).
+
+**PR 2 merged as #28** (19 Oct UTC): `train.py --candidate` writes
+`CANDIDATE` last and never `LATEST`; any run refuses an existing version
+dir. `run_training.sh` 407-411 still expects `LATEST` (PR 5);
+`CANDIDATE` is never cleared, so `promote.py` must check the named dir
+has `meta.json` and `report.md` and was written by the current run.
+
+**In progress, not committed (agents may have been stopped by a
+restart; check each worktree's `git status` and the agent's report
+first):**
+- Retraining PR 3, `ml/promote.py` promote/rollback/status: worktree
+  `.claude/worktrees/promote-20261019`, branch `work/2026-10-19-promote`
+  (from 939a289).
+- Risk filter step A2a (training only: fixed cut-off from the pre-test
+  held-out rows' collapse scores, `collapse_reference` with quantiles,
+  per-bucket `collapse_filter.verdict` by the owner's rule for `3day`
+  and `medium`, `thresholds.filter_rules`, report table; config
+  `FILTER_BUCKETS`, `FILTER_RULES`, `FILTER_RULES_SEEN_REPORT`,
+  `FILTER_CUTOFF_MIN_ROWS`; gates unchanged): worktree
+  `.claude/worktrees/collapse-cutoff-20261019`, branch
+  `work/2026-10-19-collapse-cutoff` (from 939a289). Then A2b
+  (fixed-cut-off re-measurement of the walk-forward, information only),
+  B serve the flag, C store it (schema; run/rollback scripts), D
+  `/api/calls`, E call list, F live check, H RUNBOOK.
+- Owner questions for B-E (asked, no answer needed yet): does any later
+  validating run count, or two in a row; hide the flag when a bucket is
+  not validated (PM) or show "n.v."; 3d flag in the detail view (PM).
+
 ## Session state (18 Oct 2026 PDT: main c72e6b7 after PRs #18-#20, #22-#24; #21 closed)
 
 This section supersedes the ones below wherever they differ.
@@ -39,8 +142,8 @@ the call) were given to the owner, results pending.
 proposal in the 15 Oct section):** automate it, weekly. `train.py` writes
 `LATEST` on every run and serving re-reads it, so a scheduled run would
 go live unread: first a candidate/promote step with a rollback, then the
-timer. `investigate` is drafting the plan for the PR series; the owner still decides
-automatic vs manual promotion.
+timer. The plan for the PR series is in the section above; the owner
+still decides automatic vs manual promotion.
 
 ## Session state (15 Oct 2026 PDT (15-16 Oct UTC), evening: main 9972b62 after PRs #13-#17)
 
