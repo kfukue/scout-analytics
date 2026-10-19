@@ -76,10 +76,8 @@ PR. Notes for later PRs: `run_training.sh` 407-411 still expects
 `LATEST` (PR 5); `CANDIDATE` is never cleared, so `promote.py` must
 check the named dir has `meta.json` and `report.md` (PR 3).
 
-**GitHub was unreachable from the PC at 22:35 PDT** (push and `gh`
-timed out on port 443), so this HANDOFF branch
-(`work/2026-10-18-handoff-evening`) is committed locally only. Push it
-and open its PR when the connection is back.
+GitHub was briefly unreachable from the PC at 22:35 PDT (push and `gh`
+timed out on port 443); it worked again minutes later.
 
 ## Session state (18 Oct 2026 PDT: main c72e6b7 after PRs #18-#20, #22-#24; #21 closed)
 
