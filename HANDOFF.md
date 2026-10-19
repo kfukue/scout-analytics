@@ -1,6 +1,6 @@
 # Scout analytics: handoff to Claude Code
 
-## Session state (19 Oct 2026, 12:00 PDT (19:00 UTC): main 3ff52fa after #31)
+## Session state (19 Oct 2026, 12:25 PDT (19:25 UTC): main 3ff52fa after #31)
 
 This section supersedes the ones below wherever they differ.
 
@@ -9,13 +9,23 @@ This section supersedes the ones below wherever they differ.
 the stop rules are in section 4 item 4 ("Plan refreshed ... and
 approved"). The look-back cap is 3 months, not 7 days.
 
+**P0 done (owner ran Q1-Q5b, 19 Oct):** results in section 4 item 4.
+4,761 first calls with a 7d result; 1,481 `dead7`, 883 `held2x7`, so
+ML stays in the plan; none of the 4,752 with a known age was older
+than 90 days at the call (9 unknown); 91 %
+had no Perceptor scan at the call, so the pilot's strata are the posted
+holders and the age at the call; the posted holder count alone already
+separates `dead7` (9 % to 62 % by quintile). The query file is a
+git-ignored scratch file (`.claude/worktrees/_scratch/holder-p0/`);
+Q6 (pilot sample) is run when the pilot is ready.
+
 **In progress:**
-- P0: six read-only queries for the owner are being finalised (Q3's age
-  bands to include 30-90 days and over 90 days).
 - Code PR 1: pure `Transfer` decode, replay to `entry_block` and holder
   stats, tests on synthetic transfers only; worktree
   `.claude/worktrees/holder-replay-20261019`, branch
-  `work/2026-10-19-holder-replay`. The node-reading PRs wait for Q3.
+  `work/2026-10-19-holder-replay`; implemented, in simplify then review.
+  Follow-ups for the log-reader PR: drop duplicate logs on (block, log
+  index) and logs removed by a reorg.
 - Owner's notes record: the three 18 Oct evening decisions, the 19 Oct
   stop of the ML work and this approval are added after this PR merges.
 
@@ -1961,13 +1971,50 @@ owner keeps them in local notes (reviewed and tightened by the owner on
        description only;
      - after P1: no group (i) feature with a bootstrap 95 % lower AUC
        bound above 0.60, or the separation vanishes within strata of the
-       posted holders and Perceptor verdict → stop;
+       posted holders and the token's age at the call → stop (Perceptor
+       verdict dropped from the strata after P0: 91 % of calls had no
+       scan at the call);
      - during any run: the latest-price lag goes over 2 h → pause. The
        reads per call are reported (median and total), not a stop rule,
        since the 3-month cap makes old tokens expensive;
      - after P2: the variant fails its pre-registered rules → stop.
    - Never: change `onchainStateVersion`, make the tracker redo history,
      or write to the database before P3.
+
+   **P0 results (owner ran Q1-Q5b in pgAdmin, 19 Oct 2026; first calls,
+   on-chain entry, 7d result, not `repeat`):**
+   - Q1: 4,761 first calls with a 7d result, 28 Jul to mid-Oct: v4 about
+     2,690, Pons about 1,610, v3 about 400, v2 about 60. 2 non-USD, 2
+     outcomes above +100,000 %. 29 `gave_up`, 8 `no_pool`, 1 call
+     without a tracking row.
+   - Q2 (12 weeks): `dead7` 1,481 (31 %), `drain7` 52, `held2x7` 883
+     (19 %), peak >= +100 % 1,840 (net equals gross in every week), 7d
+     return >= +100 % 178, held 2x then dead 121, rug at the call 7.
+     The dead rate moves by week: about 17 % in early August, 42-44 %
+     in the weeks of 31 Aug and 7 Sep, about 17 % in late September.
+     After-P0 stop rule passed: ML stays in the plan.
+   - Q3 (age at the call): < 1 h 3,741 (dead 33.5 %), 1-6 h 611
+     (25.4 %), 6-24 h 192 (21.9 %), 1-3 d 57, 3-7 d 56, 7-30 d 54
+     (3.7 %), 30-90 d 41, > 90 d none, unknown 9. The 3-month cap covers
+     every call with a known age. Rough full-run cost: about 100k `eth_getLogs`
+     (estimate, not measured).
+   - Q4: 904 calls flagged `rugged`; only 58 drained by 7d (51 `event`,
+     7 `at_call`); 190 `detected` more than 30 d later (46 dead at 7d);
+     609 never flagged were dead at 7d; 1,213 have `rugged` NULL
+     (mostly calls still tracking: Q1 has 1,199 tracking). Confirms the 7d return label. Side finding, not
+     looked into: 640 rugged calls have no `rug_at` or `rug_at_kind`
+     (the 9 Oct backfill covered every rugged call then), which affects
+     the Timing tab's rug figures.
+   - Q5a: 4,344 of 4,761 (91 %) had no live Perceptor scan at the call;
+     among the scanned, dead7 is clean 26.9 %, caution 12.3 %,
+     insufficient 12.5 %, red_flags 16.8 % (small groups; PM's reading:
+     live scans began 29 Sep, so these calls are from late September on,
+     when the dead rate was low).
+   - Q5b (posted holders, quintiles): dead7 9.4 % (3-74), 16.8 %
+     (74-101), 27.2 % (101-144), 40.4 % (144-235), 61.7 % (235+);
+     held2x7 flat at 14.5-21.4 %. The posted holder count is the
+     baseline the holder features must beat for `dead7`.
+   - Q6 (pilot sample) is run when the pilot is ready.
 5. **Analytics page**: two sections on a separate page (`/analytics.html`,
    linked from the list's top bar and back).
    - **Section 1, "Call performance": merged (PR #5) and deployed.**
