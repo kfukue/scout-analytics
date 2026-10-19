@@ -1,5 +1,24 @@
 # Scout analytics: handoff to Claude Code
 
+## Session state (19 Oct 2026, 12:00 PDT (19:00 UTC): main 3ff52fa after #31)
+
+This section supersedes the ones below wherever they differ.
+
+**Holder analysis plan approved (owner, 19 Oct):** "1. go with that
+2. ok 3. ok 4. go back like 3 months 5. yes". The plan, the answers and
+the stop rules are in section 4 item 4 ("Plan refreshed ... and
+approved"). The look-back cap is 3 months, not 7 days.
+
+**In progress:**
+- P0: six read-only queries for the owner are being finalised (Q3's age
+  bands to include 30-90 days and over 90 days).
+- Code PR 1: pure `Transfer` decode, replay to `entry_block` and holder
+  stats, tests on synthetic transfers only; worktree
+  `.claude/worktrees/holder-replay-20261019`, branch
+  `work/2026-10-19-holder-replay`. The node-reading PRs wait for Q3.
+- Owner's notes record: the three 18 Oct evening decisions, the 19 Oct
+  stop of the ML work and this approval are added after this PR merges.
+
 ## Session state (19 Oct 2026, 11:50 PDT (18:50 UTC): main 61a39b9 after #27, #29, #30)
 
 This section supersedes the ones below wherever they differ.
@@ -1824,7 +1843,7 @@ owner keeps them in local notes (reviewed and tightened by the owner on
    freshness for all calls. Refresh on view is rejected for now (30–90 s
    latency, the web process would have to write a NOTIFY, no login).
 4. **Early-transaction pattern analysis** (owner request 8 October;
-   planning only, nothing to build yet). For each Scout first call, look at
+   plan approved 19 October, see the last block of this item). For each Scout first call, look at
    the token's early on-chain transactions, from pool creation (or Pons
    curve launch) up to the call and shortly after, and find:
    - (a) whether certain addresses (deployers, funders, early buyers/sellers,
@@ -1870,6 +1889,85 @@ owner keeps them in local notes (reviewed and tightened by the owner on
      - the pilot size and the server folder;
      - the look-back cap for old tokens (7 days?).
    - No coder work until the owner approves.
+
+   **Plan refreshed by `investigate` and approved by the owner (19 Oct
+   2026; supersedes the 8 Oct draft above where they differ).** The
+   8 Oct Q1-Q5 text was not kept anywhere; new P0 queries replace it.
+   - Data: the prod node is a full node, not an archive, so balances at
+     old blocks are rebuilt by replaying the token's `Transfer` logs from
+     launch up to the call's `entry_block`
+     (`scout_call_tracking.onchain->>'entry_block'`). Supply comes from
+     the replay, never `token_supply` (falls back to the latest block).
+     Wallets come from the token `Transfer` in the same transaction, not
+     the router.
+   - Labels (first calls, on-chain entry, 7d row done):
+     - bad `dead7`: 7d late-entry return <= -90 %, excluding
+       `rug_at_kind = 'at_call'`; `drain7` (<= -99.99 %) is shown for
+       description only (about 70 cases);
+     - good `held2x7`: `above_2x_s >= 3600` on the 7d row (the 12 Oct
+       Timing-tab rule "reached 2×"); peak net of tax >= +100 % and 7d return
+       >= +100 % reported alongside;
+     - `rugged` is not used as a label (set long after the call; about
+       seven in ten rugs have only a check time).
+     - ML labels are net of tax, descriptive tables gross.
+   - Features, all from logs at or before `entry_block`:
+     - group (i), per token: holder count; top-1/5/10 share of
+       circulating supply (pools, PoolManager, Pons curve, zero/dead and
+       the token itself excluded); deployer share and whether it sold
+       before the call; snipers and bundled buys at launch; unique buyers
+       and sellers and the sell/buy ratio; v2 LP burned or held by a
+       contract, v3/v4 net liquidity added or removed.
+     - group (ii), across tokens (later, same drift risk as wallet
+       reputation): the deployer's earlier tokens and their outcome;
+       early-buyer overlap with earlier dead tokens; point-in-time with
+       the wallet-reputation lag and embargo.
+     - Names start `pre_hold_` or similar, never `pool_`; anything after
+       the call gets its own forbidden prefix (e.g. `post_`).
+   - Owner's answers (19 Oct): window: features stop at `entry_block`,
+     the pilot also reads 24 h after the call for description only;
+     "good" as above; pilot about 450 calls (150/150/150, spread across
+     weeks, sized from P0), files in a new server folder outside the
+     repo and `scoutanalytics_data/`, never committed; look-back cap
+     **3 months** (tokens up to 90 days old at the call get their full
+     history); 5 "yes" (Blockscout): read by the PM as approval in
+     principle for deployer funders; either way no Blockscout use before
+     the pilot, and the PM asks one explicit question before any key is
+     requested (the owner adds it to `.env` himself).
+   - Plan's handling past the cap: tokens older than 90 days at the call
+     get no concentration features and a `capped` flag.
+   - Node cost (estimate, not measured): one `eth_getLogs` covers up to
+     200k blocks (about 5.5 h); two address-filtered streams per call
+     (token `Transfer`; pool LP events). Young tokens about 10-20 reads
+     per call; a token at the 3-month cap about 800. Q3 (age at the call)
+     shows how many calls are old, so what the pilot and the full run cost.
+   - Phases:
+     - P0: the owner runs read-only queries Q1-Q6 (sizes, labels by week,
+       age at the call, how censored `rugged` is, the baseline from the
+       posted holders and Perceptor verdict, the pilot sample).
+     - Code, small PRs with base `main`, one at a time: (1) pure transfer
+       decode, replay and holder stats (no node, no DB); (2) snipers,
+       bundles, LP events; (3) a read-only, rate-limited Go export flag
+       (call ids in, files out; no DB writes, no schema change; new
+       `SCOUT_*` names in `config.go`); (4) a report-only analysis script
+       in `ml/`.
+     - P1 pilot (description only), P2 full run, then ML: group (i) as a
+       report-only variant in the existing buckets with adoption rules
+       fixed before the run (as `WREP_ADOPTION`, one shot, no tuning),
+       plus a small separate `dead7` classifier, same walk-forward gate.
+     - P3, only if a signal passes: `pre_*` columns on
+       `scout_call_precall` (schema change with run and rollback scripts).
+   - Stop rules, fixed before P1:
+     - after P0: fewer than 300 `dead7` or 150 `held2x7` → no ML,
+       description only;
+     - after P1: no group (i) feature with a bootstrap 95 % lower AUC
+       bound above 0.60, or the separation vanishes within strata of the
+       posted holders and Perceptor verdict → stop;
+     - during any run: the latest-price lag goes over 2 h → pause. The
+       reads per call are reported (median and total), not a stop rule,
+       since the 3-month cap makes old tokens expensive;
+     - after P2: the variant fails its pre-registered rules → stop.
+   - Never: change `onchainStateVersion`, make the tracker redo history,
+     or write to the database before P3.
 5. **Analytics page**: two sections on a separate page (`/analytics.html`,
    linked from the list's top bar and back).
    - **Section 1, "Call performance": merged (PR #5) and deployed.**
