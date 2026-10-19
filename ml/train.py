@@ -24,7 +24,7 @@ from scout_ml import diagnostics as D
 from scout_ml.features import build_features, category, dex_family_rules, learn_cat_levels, num
 from scout_ml.labels import build_labels, dead_policy
 from scout_ml.model import (apply_calibrator, best_rounds, choose_platt, fit_baseline, fit_lgbm,
-                            fit_platt, fit_platt_recent, predict, usable_holdout)
+                            fit_platt, fit_platt_recent, predict, usable_holdout, write_pointer)
 from scout_ml.report import render, variant_error
 from scout_ml import validate as V
 from scout_ml import wallet_rep as W
@@ -1112,7 +1112,7 @@ def train(df: pd.DataFrame, out_root, version: str | None = None, variants: bool
             "data": res["data"], "metrics": res["buckets"]}
     meta = json.loads(json.dumps(_json_safe(meta), allow_nan=False))  # fixed before any variant runs
     _write_version(out_dir, meta, res)
-    (Path(out_root) / "LATEST").write_text(version + "\n")
+    write_pointer(Path(out_root), "LATEST", version)
     # The saved model is complete above; the dead score and the variants only add
     # to meta.json / report.md, and an error in either never fails the run.
     res["dead_score"] = run_dead_score(df, L)
