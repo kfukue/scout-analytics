@@ -42,6 +42,27 @@ NO_POOL_STATUSES = ("no_pool", "gave_up")  # calls we could never have traded
 REPEAT_STATUS = "repeat"  # a later call of a token: the tracker follows the first call only
 UPDATE_KIND = "update"  # post_kind of a "$TOKEN hit 3X ..." post about an earlier call: not a call
 
+# --- Promote / rollback (promote.py) -----------------------------------------
+# Pointer files in the models root, each holding one version name. The scoring
+# service serves LATEST_POINTER (model.resolve_version_dir); train.py
+# --candidate writes CANDIDATE_POINTER; promote.py writes PREVIOUS_POINTER (the
+# version LATEST named before the last promote or rollback), then LATEST, then
+# appends one line to PROMOTIONS_LOG. (C.LATEST is a column list, hence _POINTER.)
+LATEST_POINTER = "LATEST"
+PREVIOUS_POINTER = "PREVIOUS"
+CANDIDATE_POINTER = "CANDIDATE"
+PROMOTIONS_LOG = "promotions.log"
+PROMOTE_BY_DEFAULT = "manual"      # promote.py --by: who promoted (a later automatic path passes "auto")
+STATUS_MAX_VERSIONS = 10           # promote.py status: version directories listed, newest first
+# The fixed made-up row a version must score (finite probabilities) before it is
+# promoted: the sample request of ops/scout-model.md; nulls/missing columns are fine.
+PROMOTE_SAMPLE_ROW = {"mcap_usd": 50000, "liq_usd": 20000, "tax_buy_pct": 0}
+# promote.py exit codes (argparse uses 2 for a usage error).
+PROMOTE_EXIT_OK = 0
+PROMOTE_EXIT_REFUSED = 1           # a check failed: no pointer was changed
+PROMOTE_EXIT_ALREADY_LIVE = 3      # the version is already LATEST: nothing was changed
+PROMOTE_EXIT_ERROR = 4             # OSError reading or writing a pointer: the message says what moved
+
 # --- "Dead after the call" ---------------------------------------------------
 # trades_24h (view column, an OUTCOME): price events in the pool during the 24 h
 # after the call (5-minute candles; on a v2 pool every Sync counts, which includes

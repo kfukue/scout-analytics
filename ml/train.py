@@ -1176,7 +1176,7 @@ def train(df: pd.DataFrame, out_root, version: str | None = None, variants: bool
     meta = json.loads(json.dumps(_json_safe(meta), allow_nan=False))  # fixed before any variant runs
     _write_version(out_dir, meta, res)
     if set_latest:
-        write_pointer(Path(out_root), "LATEST", version)
+        write_pointer(Path(out_root), C.LATEST_POINTER, version)
     # The saved model is complete above; the dead score and the variants only add
     # to meta.json / report.md, and an error in either never fails the run.
     res["dead_score"] = run_dead_score(df, L)
@@ -1215,7 +1215,7 @@ def train(df: pd.DataFrame, out_root, version: str | None = None, variants: bool
             meta["wallet_rep"] = _json_safe(wrep_stats)
         _write_version(out_dir, meta, res)
     if not set_latest:   # last: the directory is complete when the pointer appears
-        write_pointer(Path(out_root), "CANDIDATE", version)
+        write_pointer(Path(out_root), C.CANDIDATE_POINTER, version)
     keeps.clear()
     return out_dir
 

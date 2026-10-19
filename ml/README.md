@@ -101,9 +101,8 @@ anything is written.
 `--candidate` trains exactly the same way but never writes `LATEST`: the
 serving model stays as it was. At the very end of the run, after `meta.json`
 and `report.md` are final, it writes the new version name into
-`models/CANDIDATE`. Promotion will come with a later command; until then a
-candidate goes live only by writing its name into `models/LATEST` by hand,
-as for a rollback (see "Retrain").
+`models/CANDIDATE`. It goes live only with `promote.py` (see "Promote,
+roll back, status").
 
 How it validates (no random splits):
 
@@ -895,14 +894,48 @@ never filter deliveries.
 
 Export again and run `train.py` again (weekly is reasonable, since new
 outcomes arrive as horizons complete). A new version directory is written and
-`LATEST` is updated; the running service picks it up on the next request. To
-roll back, write an older version name into `models/LATEST`. A `--candidate`
-run (see "Train") leaves `LATEST` alone; to serve it, write the name from
-`models/CANDIDATE` into `models/LATEST` the same way. If `train.py` stopped
-with an error, `CANDIDATE` still names the previous candidate (or does not
-exist), so use only the version a successful run printed on its last line
-(`wrote <dir> ...`). Compare the new `report.md` with the previous one before
-trusting it.
+`LATEST` is updated; the running service picks it up on the next request. A
+`--candidate` run (see "Train") leaves `LATEST` alone; serve it with
+`promote.py promote candidate` (below). If `train.py` stopped with an error,
+`CANDIDATE` still names the previous candidate (or does not exist), so check
+that `status` shows the version a successful run printed on its last line
+(`wrote <dir> ...`) as the candidate. Compare the new `report.md` with the
+previous one before trusting it. To roll back, use `promote.py rollback`, or
+`promote.py promote <version>` for an older one.
+
+### Promote, roll back, status
+
+    python promote.py --models models/ status
+    python promote.py --models models/ promote candidate     # or a version name
+    python promote.py --models models/ rollback
+
+`status` prints `LATEST` (live), `PREVIOUS` and `CANDIDATE` (or `none`), then
+the newest version directories (10 by default, `--limit N`), each with
+`data.last_date` and every bucket's gate verdict from `meta.json` (`PASS`,
+`FAIL` or `skipped`, never the reasons; read `report.md` for those), marked
+`[live]`, `[previous]` or `[candidate]`.
+
+`promote` first checks the version: its directory exists, `meta.json` parses
+and names that version, every model file `meta.json` lists is there,
+`report.md` is there, and the serving code loads it and scores a fixed
+made-up row (`PROMOTE_SAMPLE_ROW` in `config.py`) with finite numbers. If any
+check fails it prints `refused: <why>` and changes nothing. Then it writes
+`PREVIOUS` (the old `LATEST`), then `LATEST`, both atomically, and appends one
+line to `models/promotions.log`, e.g.
+`2026-10-19T05:12:03Z promote from=20261012-0702 to=20261019-0500 by=manual`
+(UTC; `--by` names who promoted, default `manual`). The running service
+serves the new version from its next request, with no restart.
+
+`rollback` promotes the version in `PREVIOUS` with the same checks; `PREVIOUS`
+then names the version it rolled away from, so a second `rollback` goes back
+again. `CANDIDATE` is never changed by either command.
+
+Exit codes: `0` done; `1` refused, nothing changed; `2` usage error (also a
+bad `--by`); `3` the version is already `LATEST`, nothing changed; `4` a file
+error while reading or writing the pointers: it prints
+`error: <error type> while moving the pointers; LATEST is X (unchanged), PREVIOUS is Y (was Z)`,
+so you see which pointer moved. Fix the cause, run `status`, then promote or
+roll back again.
 
 ## Layout and tests
 
@@ -914,9 +947,10 @@ trusting it.
     scout_ml/report.py    report.md
     scout_ml/diagnostics.py  pooled walk-forward + bootstrap (gate inputs), seed spreads, adversarial
     scout_ml/wallet_rep.py   live-buy wallet reputation (wrep_* columns; a report-only variant)
-    train.py  serve.py  make_synthetic.py  tests/
+    scout_ml/promote.py   promote / rollback / status checks (promote.py is its command line)
+    train.py  serve.py  promote.py  make_synthetic.py  tests/
 
-    python -m pytest tests -q        # 311 passed, about 7 minutes
+    python -m pytest tests -q        # 399 tests: 399 passed on Linux; on Windows 398 passed, 1 skipped (POSIX-only), about 7 minutes
 
 `scout_ml/wallet_rep.py` (`wrep_frame(df, live_buys)`) scores the wallets in
 each call's live buys (the `-export-live-buys` CSV) by how the earlier first
