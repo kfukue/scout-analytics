@@ -372,6 +372,19 @@ Files written, in `$ML/models/<version>/` (version = UTC time, e.g.
 
 `$ML/models/LATEST` holds the newest version name.
 
+With `--candidate` added to the command, `train.py` trains the same way but
+never writes `LATEST` (the scoring service keeps the current model); at the
+very end it writes the new version name into `$ML/models/CANDIDATE`. A later
+command will promote a candidate; until then it goes live only by writing its
+name into `$ML/models/LATEST` by hand, as for a rollback. If `train.py`
+stopped with an error, `CANDIDATE` still names the previous candidate (or does
+not exist), so use only the version a successful run printed on its last line
+(`wrote <dir> ...`). With or without `--candidate`, a run whose version
+directory already exists (a second run in the same UTC minute, or a stopped
+run's leftover) stops at once with
+`FileExistsError: the version directory ... already exists` and writes
+nothing: wait a minute, or delete that leftover directory, and run again.
+
 ### 5b. Variant comparison (optional, when the product manager asks for it)
 
 Run 5b **instead of** step 5, not after it: it already trains and saves the

@@ -350,16 +350,20 @@ def test_trades_variants_not_applicable_without_trades_24h(small_df, tmp_path, m
 
 def test_cli_passes_variants(monkeypatch, tmp_path):
     seen = {}
-    monkeypatch.setattr(train_mod, "train", lambda df, out, variants=False, live_buys=None:
-                        seen.update(variants=variants, live_buys=live_buys) or tmp_path)
+    monkeypatch.setattr(train_mod, "train",
+                        lambda df, out, variants=False, live_buys=None, set_latest=True:
+                        seen.update(variants=variants, live_buys=live_buys,
+                                    set_latest=set_latest) or tmp_path)
     monkeypatch.setattr(train_mod.pd, "read_csv", lambda *a, **k: pd.DataFrame())
     assert train_mod.main(["--csv", "x.csv", "--out", str(tmp_path), "--variants"]) == 0
-    assert seen == {"variants": True, "live_buys": None}
+    assert seen == {"variants": True, "live_buys": None, "set_latest": True}
     assert train_mod.main(["--csv", "x.csv", "--out", str(tmp_path)]) == 0
-    assert seen == {"variants": False, "live_buys": None}
+    assert seen == {"variants": False, "live_buys": None, "set_latest": True}
     assert train_mod.main(["--csv", "x.csv", "--out", str(tmp_path), "--variants",
                            "--live-buys", "lb.csv"]) == 0
-    assert seen == {"variants": True, "live_buys": "lb.csv"}   # read (as text) inside train
+    assert seen == {"variants": True, "live_buys": "lb.csv", "set_latest": True}  # read inside train
+    assert train_mod.main(["--csv", "x.csv", "--out", str(tmp_path), "--candidate"]) == 0
+    assert seen == {"variants": False, "live_buys": None, "set_latest": False}
 
 
 def _main_with_failing_variants(small_df, tmp_path, monkeypatch, fail_when):

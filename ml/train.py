@@ -5,6 +5,8 @@
     python train.py --csv calls.csv --out models/ --variants   # plus the variant comparison
     python train.py --csv calls.csv --out models/ --variants --live-buys live_buys.csv
                                         # plus the wallet reputation variants (report only)
+    python train.py --csv calls.csv --out models/ --candidate
+                                        # writes CANDIDATE, never LATEST (not served)
 """
 import argparse
 import json
@@ -1010,8 +1012,13 @@ def diagnostics_on(flag: bool | None = None) -> bool:
 
 
 def train(df: pd.DataFrame, out_root, version: str | None = None, variants: bool = False,
-          diagnostics: bool | None = None, live_buys=None) -> Path:
+          diagnostics: bool | None = None, live_buys=None, set_latest: bool = True) -> Path:
     """Run the whole pipeline on raw view rows; returns the version directory.
+    `version` (default `version_name()`) must not exist yet under `out_root`
+    (`new_version_dir`). `set_latest`: point LATEST at the new version as soon
+    as the saved model is complete (the default); False (train.py --candidate):
+    never touch LATEST, and write the CANDIDATE pointer only at the very end,
+    after every meta.json / report.md write.
     `variants`: also train C.VARIANTS for the report (never saved or served).
     `diagnostics`: the report-only stability diagnostics (None: `diagnostics_on`,
     i.e. C.DIAGNOSTICS unless C.DIAGNOSTICS_ENV says otherwise).
@@ -1027,9 +1034,8 @@ def train(df: pd.DataFrame, out_root, version: str | None = None, variants: bool
                          f"wallet reputation columns {leaked}; set WALLET_REP = False (the "
                          "WALLET_REP_VARIANTS test them, report only)")
     diag = diagnostics_on(diagnostics)
-    version = version or datetime.now(timezone.utc).strftime("%Y%m%d-%H%M")
-    out_dir = Path(out_root) / version
-    out_dir.mkdir(parents=True, exist_ok=True)
+    version = version or version_name()
+    out_dir = new_version_dir(out_root, version)
     df = df.copy()
     df["message_date"] = pd.to_datetime(df["message_date"], utc=True, format="ISO8601")
     df = df.sort_values("message_date").reset_index(drop=True)
@@ -1112,7 +1118,8 @@ def train(df: pd.DataFrame, out_root, version: str | None = None, variants: bool
             "data": res["data"], "metrics": res["buckets"]}
     meta = json.loads(json.dumps(_json_safe(meta), allow_nan=False))  # fixed before any variant runs
     _write_version(out_dir, meta, res)
-    write_pointer(Path(out_root), "LATEST", version)
+    if set_latest:
+        write_pointer(Path(out_root), "LATEST", version)
     # The saved model is complete above; the dead score and the variants only add
     # to meta.json / report.md, and an error in either never fails the run.
     res["dead_score"] = run_dead_score(df, L)
@@ -1150,7 +1157,30 @@ def train(df: pd.DataFrame, out_root, version: str | None = None, variants: bool
             res["wallet_rep"] = wrep_stats
             meta["wallet_rep"] = _json_safe(wrep_stats)
         _write_version(out_dir, meta, res)
+    if not set_latest:   # last: the directory is complete when the pointer appears
+        write_pointer(Path(out_root), "CANDIDATE", version)
     keeps.clear()
+    return out_dir
+
+
+def version_name() -> str:
+    """The default version name: the current UTC minute, e.g. 20261018-1530."""
+    return datetime.now(timezone.utc).strftime("%Y%m%d-%H%M")
+
+
+def new_version_dir(out_root, version: str) -> Path:
+    """Create out_root/version (and out_root if needed). An existing version
+    directory (e.g. a second run in the same UTC minute) is refused with
+    FileExistsError and left untouched: nothing is written into it."""
+    out_dir = Path(out_root) / version
+    Path(out_root).mkdir(parents=True, exist_ok=True)
+    try:
+        out_dir.mkdir()
+    except FileExistsError:
+        raise FileExistsError(f"the version directory {out_dir} already exists (a run in the "
+                              "same UTC minute?); nothing was written. Wait for the next minute, "
+                              "or delete that directory if it is a stopped run's leftover, and "
+                              "run again") from None
     return out_dir
 
 
@@ -1536,9 +1566,13 @@ def main(argv=None) -> int:
                          "report-only wallet reputation variants (config WALLET_REP_VARIANTS, "
                          "each with its own WREP_LOOKBACK_DAYS; n/a without it); "
                          "never used by the saved model")
+    ap.add_argument("--candidate", action="store_true",
+                    help="never write LATEST: write the CANDIDATE pointer instead, at the very end "
+                         "of the run (the model is not served until it is promoted)")
     args = ap.parse_args(argv)
     df = pd.read_csv(args.csv, low_memory=False) if args.csv else read_dsn(args.dsn)
-    out_dir = train(df, args.out, variants=args.variants, live_buys=args.live_buys)
+    out_dir = train(df, args.out, variants=args.variants, live_buys=args.live_buys,
+                    set_latest=not args.candidate)
     print(f"wrote {out_dir} (report: {out_dir / 'report.md'})")
     return 0  # gate failures are reported, not errors
 
