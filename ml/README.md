@@ -92,7 +92,18 @@ its metrics mean nothing; `--end` sets the time of the newest call).
 Writes `models/<version>/` (version = UTC time, e.g. `20261002-1530`) with
 `<bucket>_<label>.joblib` (LightGBM model + calibrator), `meta.json`,
 `report.md`, and points `models/LATEST` at it. Exit code is 0 even when the
-quality gates fail; read the report.
+quality gates fail; read the report. A version directory that already exists
+(a second run in the same UTC minute) is refused with an error before
+anything is written.
+
+    python train.py --csv calls.csv --out models/ --candidate
+
+`--candidate` trains exactly the same way but never writes `LATEST`: the
+serving model stays as it was. At the very end of the run, after `meta.json`
+and `report.md` are final, it writes the new version name into
+`models/CANDIDATE`. Promotion will come with a later command; until then a
+candidate goes live only by writing its name into `models/LATEST` by hand,
+as for a rollback (see "Retrain").
 
 How it validates (no random splits):
 
@@ -816,8 +827,13 @@ never filter deliveries.
 Export again and run `train.py` again (weekly is reasonable, since new
 outcomes arrive as horizons complete). A new version directory is written and
 `LATEST` is updated; the running service picks it up on the next request. To
-roll back, write an older version name into `models/LATEST`. Compare the new
-`report.md` with the previous one before trusting it.
+roll back, write an older version name into `models/LATEST`. A `--candidate`
+run (see "Train") leaves `LATEST` alone; to serve it, write the name from
+`models/CANDIDATE` into `models/LATEST` the same way. If `train.py` stopped
+with an error, `CANDIDATE` still names the previous candidate (or does not
+exist), so use only the version a successful run printed on its last line
+(`wrote <dir> ...`). Compare the new `report.md` with the previous one before
+trusting it.
 
 ## Layout and tests
 
