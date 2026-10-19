@@ -24,7 +24,7 @@ const defaultSniperWindowBlocks = 50
 
 // earlyBuyerCount is how many of the first distinct buyers earlyTradeStats
 // follows to the entry block.
-const earlyBuyerCount = 5
+const earlyBuyerCount = 10
 
 // tradeKind says whether a transfer is a buy, a sell or neither.
 type tradeKind int

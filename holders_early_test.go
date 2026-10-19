@@ -80,7 +80,7 @@ func checkLaunch(t *testing.T, e earlyTrading) {
 	wantBig(t, "bought", f.Bought, tokens(155))
 	wantBig(t, "sold", f.Sold, tokens(25))
 	wantShare(t, "sell/buy ratio", f.SellBuyRatio, 25.0/155)
-	if want := []string{lS1, lS2, lS3, lB4, lB5}; !slices.Equal(e.EarlyBuyers, want) {
+	if want := []string{lS1, lS2, lS3, lB4, lB5, lB6}; !slices.Equal(e.EarlyBuyers, want) {
 		t.Errorf("early buyers: got %v, want %v", e.EarlyBuyers, want)
 	}
 	// Pool: 600 - 155 + 25 = 470; circulating = 1000 - 470 = 530.
@@ -88,7 +88,7 @@ func checkLaunch(t *testing.T, e earlyTrading) {
 		t.Errorf("got sniperHeldShareOK %v, earlyBuyersHeldShareOK %v; want true, true", e.SniperHeldShareOK, e.EarlyBuyersHeldShareOK)
 	}
 	wantShare(t, "sniper held share (s1 25 + s2 40 + s3 30)", e.SniperHeldShare, 95.0/530)
-	wantShare(t, "early buyers held share (+ b4 20 + b5 10)", e.EarlyBuyersHeldShare, 125.0/530)
+	wantShare(t, "early buyers held share (+ b4 20 + b5 10 + b6 7 + 5)", e.EarlyBuyersHeldShare, 137.0/530)
 }
 
 func TestEarlyNormalLaunch(t *testing.T) {
@@ -479,29 +479,35 @@ func TestEarlyMixedCaseAddresses(t *testing.T) {
 
 // A transfer to an excluded address (here the token contract itself, before
 // any wallet buys) is not a buy, so it neither sets the first buy block nor
-// takes an early-buyer slot; of six wallet buyers only the first five are
-// followed.
-func TestEarlyBuyersFirstFiveAndExcluded(t *testing.T) {
+// takes an early-buyer slot; of eleven wallet buyers only the first ten are
+// followed. The 10 is written out, not earlyBuyerCount, so the test fails if
+// the cap changes.
+func TestEarlyBuyersFirstTenAndExcluded(t *testing.T) {
 	pool, token := hAddr(50), hAddr(52)
 	trs := []tokenTransfer{
 		xfer(zeroAddr, pool, tokens(1000), 1, 0),
 		xfer(pool, token, tokens(10), 10, 0),
 	}
-	wallets := []string{hAddr(2), hAddr(3), hAddr(4), hAddr(5), hAddr(6), hAddr(7)}
-	for i, w := range wallets {
+	var wallets []string
+	for i := range 11 {
+		w := hAddr(2 + i)
+		wallets = append(wallets, w)
 		trs = append(trs, xfer(pool, w, tokens(10), uint64(11+i), 0))
 	}
-	e := mustEarly(t, trs, set(pool), set(pool, token), 20, 0)
-	if !slices.Equal(e.EarlyBuyers, wallets[:5]) || e.FirstBuyBlock != 11 || e.Snipers != 1 {
-		t.Errorf("got early buyers %v, first buy block %d, snipers %d; want %v, 11, 1", e.EarlyBuyers, e.FirstBuyBlock, e.Snipers, wallets[:5])
+	e := mustEarly(t, trs, set(pool), set(pool, token), 30, 0)
+	if !slices.Equal(e.EarlyBuyers, wallets[:10]) || e.FirstBuyBlock != 11 || e.Snipers != 1 {
+		t.Errorf("got early buyers %v, first buy block %d, snipers %d; want %v, 11, 1", e.EarlyBuyers, e.FirstBuyBlock, e.Snipers, wallets[:10])
 	}
-	if e.Flow.Buys != 6 || e.Flow.Buyers != 6 {
-		t.Errorf("flow: got buys %d, buyers %d; want 6, 6 (the token contract is not a buyer)", e.Flow.Buys, e.Flow.Buyers)
+	if slices.Contains(e.EarlyBuyers, wallets[10]) {
+		t.Errorf("early buyers %v include the eleventh buyer %s; want it left out", e.EarlyBuyers, wallets[10])
 	}
-	wantBig(t, "bought", e.Flow.Bought, tokens(60))
-	// circulating: 60 (six wallets; the token's 10 is excluded); followed: 50.
-	wantShare(t, "early buyers held share", e.EarlyBuyersHeldShare, 50.0/60)
-	wantShare(t, "sniper held share (first wallet only)", e.SniperHeldShare, 10.0/60)
+	if e.Flow.Buys != 11 || e.Flow.Buyers != 11 {
+		t.Errorf("flow: got buys %d, buyers %d; want 11, 11 (the token contract is not a buyer)", e.Flow.Buys, e.Flow.Buyers)
+	}
+	wantBig(t, "bought", e.Flow.Bought, tokens(110))
+	// circulating: 110 (eleven wallets; the token's 10 is excluded); followed: 100.
+	wantShare(t, "early buyers held share", e.EarlyBuyersHeldShare, 100.0/110)
+	wantShare(t, "sniper held share (first wallet only)", e.SniperHeldShare, 10.0/110)
 }
 
 // Everything bought was sold back: circulating is 0, so no held shares.
