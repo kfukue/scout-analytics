@@ -374,12 +374,39 @@ Files written, in `$ML/models/<version>/` (version = UTC time, e.g.
 
 With `--candidate` added to the command, `train.py` trains the same way but
 never writes `LATEST` (the scoring service keeps the current model); at the
-very end it writes the new version name into `$ML/models/CANDIDATE`. A later
-command will promote a candidate; until then it goes live only by writing its
-name into `$ML/models/LATEST` by hand, as for a rollback. If `train.py`
-stopped with an error, `CANDIDATE` still names the previous candidate (or does
-not exist), so use only the version a successful run printed on its last line
-(`wrote <dir> ...`). With or without `--candidate`, a run whose version
+very end it writes the new version name into `$ML/models/CANDIDATE`. It goes
+live only with `promote.py`, run from the deployed checkout's `ml/` with the
+venv the scoring service uses, as the account that owns `$ML/models`:
+
+```bash
+cd "$REPO/ml"
+"$ML/venv/bin/python" promote.py --models "$ML/models" status              # LATEST, PREVIOUS, CANDIDATE, newest versions
+"$ML/venv/bin/python" promote.py --models "$ML/models" promote candidate   # checks first; refuses and changes nothing on any failure
+curl -s http://127.0.0.1:8601/health                                          # the new version (no restart)
+```
+
+To go back to the version that was live before (same checks; run it again to
+undo the rollback):
+
+```bash
+cd "$REPO/ml" && "$ML/venv/bin/python" promote.py --models "$ML/models" rollback
+```
+
+`status` shows each version's gate verdicts (`PASS` / `FAIL` / `skipped`,
+never the reasons: read `report.md`). `promote` checks the version directory,
+`meta.json`, every model file, `report.md` and a score of a fixed made-up row
+by the serving code, then writes `PREVIOUS` (the old `LATEST`), `LATEST` and
+one line in `$ML/models/promotions.log`. Exit codes: `0` done, `1` refused
+(`refused: <why>`, nothing changed), `2` usage error, `3` already `LATEST`
+(nothing changed), `4` a file error on the pointers (`error: ... LATEST is X
+(unchanged), PREVIOUS is Y (was Z)`: it says which pointer moved; fix the
+cause, run `status`, then promote or roll back again).
+`promote <version>` serves any version that passes the checks. `promote.py`
+needs `main` with this command in `$REPO` (`ls "$REPO/ml/promote.py"`). If
+`train.py` stopped with an error, `CANDIDATE` still names the previous
+candidate (or does not exist): check that `status` shows the version a
+successful run printed on its last line (`wrote <dir> ...`) as the candidate
+before promoting it. With or without `--candidate`, a run whose version
 directory already exists (a second run in the same UTC minute, or a stopped
 run's leftover) stops at once with
 `FileExistsError: the version directory ... already exists` and writes

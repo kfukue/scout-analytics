@@ -203,6 +203,30 @@ Restart (`sudo systemctl restart scout-model`) only when the `ml/` code in
 `$REPO` changed (after pulling `main`): Python loads it once at start. Run the
 diff from step 1 after each retrain.
 
+A run with `--candidate` writes `CANDIDATE` instead of `LATEST`, so the
+service keeps the current version until you promote the candidate. Run
+`promote.py` from the deployed checkout's `ml/` with the venv the service
+uses, as the account that owns `$ML/models` (not root):
+
+```bash
+cd "$REPO/ml"
+"$ML/venv/bin/python" promote.py --models "$ML/models" status              # LATEST, PREVIOUS, CANDIDATE, newest versions with PASS/FAIL per bucket
+"$ML/venv/bin/python" promote.py --models "$ML/models" promote candidate   # or a version name
+curl -s http://127.0.0.1:8601/health                                          # shows the new version (no restart)
+```
+
+`promote` first checks the version (directory, `meta.json`, every model file,
+`report.md`, and a score of a fixed made-up row by the same code the service
+uses). On any failure it prints `refused: <why>`, exits `1` and changes
+nothing. Exit `2` is a usage error. Exit `3` means the version is already
+`LATEST` (nothing changed). Exit `4` means a pointer file could not be read
+or written: it prints `error: ... LATEST is X (unchanged), PREVIOUS is Y (was
+Z)`, so you see which pointer moved; fix the cause, run `status`, then
+promote or roll back again.
+On success it writes `PREVIOUS` (the old `LATEST`), then `LATEST`, and one
+line in `$ML/models/promotions.log`. `promote.py` needs `main` with this
+command in `$REPO` (`ls "$REPO/ml/promote.py"`).
+
 Compare the new `report.md` with the previous one. With `all`, a bucket that
 failed its gates is still shown on deliveries, marked `(not validated)`, so a
 failed retrain does not have to be rolled back to keep it off. If the new
@@ -210,14 +234,18 @@ version is worse than the previous one, roll back as below.
 
 ## Rollback
 
-Model (return to a previous version): write its name into `LATEST` (a new
-training run overwrites it again).
+Model (return to the version that was live before the last promote; same
+checks as `promote`):
 
 ```bash
-ls "$ML/models"                                  # version directories
-printf '%s\n' 20261008-1852 > "$ML/models/LATEST"   # EDIT: the version to serve
+cd "$REPO/ml" && "$ML/venv/bin/python" promote.py --models "$ML/models" rollback
 curl -s http://127.0.0.1:8601/health             # shows that version
 ```
+
+`PREVIOUS` then names the version rolled away from, so running `rollback`
+again undoes it. For an older version: `status` lists them, then
+`"$ML/venv/bin/python" promote.py --models "$ML/models" promote <version>`.
+A new training run without `--candidate` moves `LATEST` again.
 
 Delivery line: back to `passed` as in "Delivery line mode".
 

@@ -302,7 +302,7 @@ def resolve_version_dir(model_dir) -> Path:
     model_dir = Path(model_dir)
     if (model_dir / "meta.json").exists():
         return model_dir
-    return model_dir / (model_dir / "LATEST").read_text().strip()
+    return model_dir / (model_dir / C.LATEST_POINTER).read_text().strip()
 
 
 def write_pointer(root, name: str, version: str) -> None:
