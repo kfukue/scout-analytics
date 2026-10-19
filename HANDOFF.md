@@ -1,5 +1,33 @@
 # Scout analytics: handoff to Claude Code
 
+## Session state (19 Oct 2026, 11:50 PDT (18:50 UTC): main 61a39b9 after #27, #29, #30)
+
+This section supersedes the ones below wherever they differ.
+
+**Merged 19 Oct:** #27 docs; #29 risk filter step A2a (collapse filter
+cut-off fixed in advance and a per-bucket verdict, report-only); #30
+retraining PR 3, `ml/promote.py` promote / rollback / status (manual).
+
+**Owner decision (19 Oct): ML work on the call-scoring model stops.**
+Owner: "stop the work on the ML it's not really adding value. Maybe
+focus on the holder analysis that we talked about earlier and use ML on
+those data instead". Recorded in the PM skill.
+- Stopped: retraining series PRs 4-10 (lock, `run_training.sh
+  --candidate`, `--src deployed`, `promote.py check`, `-notify-file`,
+  wrapper, systemd timer) and risk-filter steps A2b-H (below). Nothing
+  of them was started. The owner questions for B-E are withdrawn.
+- Unchanged: the live model, the scoring service, the delivery score
+  line and the site's scores keep running. A manual retrain still works
+  (`run_training.sh` runs `train.py`, which writes `LATEST`); `promote.py rollback` and
+  `status` are there if needed.
+- Next: section 4 item 4, "Early-transaction pattern analysis" (holder
+  concentration, early buyers and sellers, deployers and funders, wallet
+  overlap), with ML on that data. `investigate` is refreshing the 8 Oct
+  plan against current main, with a recommendation for each of the five
+  open owner questions. No coder work until the owner approves the plan.
+- Owner's notes record: the three 18 Oct evening decisions and this one
+  are added after this PR merges.
+
 ## Session state (18 Oct 2026, 22:55 PDT (19 Oct 05:55 UTC): main 939a289 after #25, #26, #28)
 
 This section supersedes the ones below wherever they differ. This docs
