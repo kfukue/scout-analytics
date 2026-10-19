@@ -15,11 +15,17 @@ func inTx(tr tokenTransfer, h string) tokenTransfer {
 	return tr
 }
 
+// mustEarly runs earlyTradeStats without liquidity input (lp nil).
 func mustEarly(t *testing.T, trs []tokenTransfer, venues, excluded map[string]bool, entry, window uint64) earlyTrading {
 	t.Helper()
-	e, err := earlyTradeStats(trs, venues, excluded, entry, window)
+	return mustEarlyLP(t, trs, venues, excluded, nil, entry, window)
+}
+
+func mustEarlyLP(t *testing.T, trs []tokenTransfer, venues, excluded map[string]bool, lp liquidityTxSet, entry, window uint64) earlyTrading {
+	t.Helper()
+	e, err := earlyTradeStats(trs, venues, excluded, lp, entry, window)
 	if err != nil {
-		t.Fatalf("earlyTradeStats(entry %d, window %d): %v", entry, window, err)
+		t.Fatalf("earlyTradeStats(entry %d, window %d, lp %v): %v", entry, window, lp, err)
 	}
 	return e
 }
@@ -127,8 +133,8 @@ func TestEarlyUnsortedInput(t *testing.T) {
 	}
 }
 
-// The window counts from the first buy; a sell (a liquidity add, until the
-// LP-events PR) one block before it does not move the anchor.
+// The window counts from the first buy; a sell (a liquidity add, without
+// liquidity input) one block before it does not move the anchor.
 func TestEarlySniperWindowBoundary(t *testing.T) {
 	pool, lp, a, b, c := hAddr(50), hAddr(1), hAddr(2), hAddr(3), hAddr(4)
 	const first = math.MaxUint64 - 60 // first+window overflows for the largest window
@@ -161,22 +167,35 @@ func TestEarlySniperWindowBoundary(t *testing.T) {
 	}
 }
 
-// A v2 launch: the deployer adds liquidity (wallet -> pool, read as a sell
-// until the LP-events PR) at block 5 and trading opens at block 100. The
-// sniper window and the first-block bundle count from the first buy, so the
-// three buyers within 50 blocks of it are snipers.
-func TestEarlyLiquidityAddBeforeFirstBuy(t *testing.T) {
-	pool, dep := hAddr(50), hAddr(1)
-	s1, s2, s3, b4 := hAddr(11), hAddr(12), hAddr(13), hAddr(14)
-	trs := []tokenTransfer{
-		xfer(zeroAddr, dep, tokens(1000), 1, 0),
-		xfer(dep, pool, tokens(600), 5, 0), // liquidity add
-		inTx(xfer(pool, s1, tokens(50), 100, 0), "0xb1"),
-		inTx(xfer(pool, s2, tokens(40), 100, 1), "0xb1"),
-		xfer(pool, s3, tokens(30), 150, 0),
-		xfer(pool, b4, tokens(20), 151, 0),
+// v2 launch addresses: the pool, the deployer, three snipers, a later buyer.
+var (
+	vPool, vDep        = hAddr(50), hAddr(1)
+	vS1, vS2, vS3, vB4 = hAddr(11), hAddr(12), hAddr(13), hAddr(14)
+	vAddTx             = xfer(vDep, vPool, tokens(600), 5, 0).TxHash // the liquidity add's transaction
+)
+
+const vLaunchEntry = 160
+
+// v2LaunchTransfers: the deployer gets 1000 at block 1 and adds 600 as
+// liquidity (wallet -> pool) at block 5; trading opens at block 100.
+func v2LaunchTransfers() []tokenTransfer {
+	return []tokenTransfer{
+		xfer(zeroAddr, vDep, tokens(1000), 1, 0),
+		xfer(vDep, vPool, tokens(600), 5, 0), // liquidity add
+		inTx(xfer(vPool, vS1, tokens(50), 100, 0), "0xb1"),
+		inTx(xfer(vPool, vS2, tokens(40), 100, 1), "0xb1"),
+		xfer(vPool, vS3, tokens(30), 150, 0),
+		xfer(vPool, vB4, tokens(20), 151, 0),
 	}
-	e := mustEarly(t, trs, set(pool), set(pool), 160, defaultSniperWindowBlocks)
+}
+
+// A v2 launch without liquidity input: the liquidity add reads as a sell.
+// The sniper window and the first-block bundle count from the first buy, so
+// the three buyers within 50 blocks of it are snipers.
+func TestEarlyLiquidityAddBeforeFirstBuy(t *testing.T) {
+	pool, s1, s2, s3, b4 := vPool, vS1, vS2, vS3, vB4
+	trs := v2LaunchTransfers()
+	e := mustEarly(t, trs, set(pool), set(pool), vLaunchEntry, defaultSniperWindowBlocks)
 	if !e.TradesOK || !e.BuysOK || e.FirstBuyBlock != 100 || e.Snipers != 3 || e.FirstBlockBuyers != 2 || e.MaxTxBuyers != 2 {
 		t.Errorf("got tradesOK %v, buysOK %v, first buy block %d, snipers %d, first-block buyers %d, max tx buyers %d; want true, true, 100, 3, 2, 2",
 			e.TradesOK, e.BuysOK, e.FirstBuyBlock, e.Snipers, e.FirstBlockBuyers, e.MaxTxBuyers)
@@ -315,7 +334,7 @@ func TestEarlyClassifyTrade(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			if got := classifyTrade(xfer(c.from, c.to, c.v, 1, 0), venues, ex); got != c.want {
+			if got := classifyTrade(xfer(c.from, c.to, c.v, 1, 0), venues, ex, nil); got != c.want {
 				t.Errorf("classifyTrade(%s -> %s, %v): got %d, want %d", c.from, c.to, c.v, got, c.want)
 			}
 		})
@@ -565,7 +584,7 @@ func TestEarlyIncompleteCarriedThrough(t *testing.T) {
 
 func TestEarlyRejectsUnknownEntryBlock(t *testing.T) {
 	trs := []tokenTransfer{xfer(hAddr(50), hAddr(1), tokens(1), 0, 0)}
-	got, err := earlyTradeStats(trs, set(hAddr(50)), nil, 0, defaultSniperWindowBlocks)
+	got, err := earlyTradeStats(trs, set(hAddr(50)), nil, nil, 0, defaultSniperWindowBlocks)
 	if !errors.Is(err, errUnknownEntryBlock) {
 		t.Errorf("earlyTradeStats(entry 0): got (%+v, %v), want an errUnknownEntryBlock error", got, err)
 	}
@@ -575,7 +594,7 @@ func TestEarlyRejectsBadValue(t *testing.T) {
 	pool := hAddr(50)
 	for _, v := range []*big.Int{nil, big.NewInt(-1)} {
 		trs := []tokenTransfer{xfer(pool, hAddr(1), v, 1, 0)}
-		if _, err := earlyTradeStats(trs, set(pool), set(pool), 1, defaultSniperWindowBlocks); err == nil {
+		if _, err := earlyTradeStats(trs, set(pool), set(pool), nil, 1, defaultSniperWindowBlocks); err == nil {
 			t.Errorf("earlyTradeStats(value %v): got no error, want one", v)
 		}
 	}
