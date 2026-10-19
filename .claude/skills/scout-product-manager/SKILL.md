@@ -493,7 +493,7 @@ From the repo root on the server:
 
 Every Go start applies `scoutanalytics.sql` unless `SCOUT_DB_AUTO_MIGRATE=false`.
 
-## Owner decisions in force (8-18 October 2026)
+## Owner decisions in force (8-19 October 2026)
 
 - The `long` model waits for data (about 25 December) rather than loosening the
   threshold.
@@ -631,6 +631,19 @@ Every Go start applies `scoutanalytics.sql` unless `SCOUT_DB_AUTO_MIGRATE=false`
   only. (4) Delivery line later, not now.
 - 18 Oct PDT (19 Oct UTC) (owner, "actually it's ok just leave it"): the website's "not scanned"
   count stays as it is; no change to `SCOUT_RESCAN_MAX_AGE`.
+- 19 Oct (owner, "stop the work on the ML it's not really adding value.
+  Maybe focus on the holder analysis that we talked about earlier and use
+  ML on those data instead"): no further work on the call-scoring model.
+  Stopped: the retraining automation series after PR 3 (#30, merged:
+  `promote.py` stays as a manual tool) and the risk-filter steps after A2a
+  (#29, merged, report-only). This puts the 18 Oct entries on automated
+  weekly retraining, automatic go-live and the risk filter on hold; they
+  stay above as the record. The live model, the scoring service and the
+  score lines keep running unchanged; a manual retrain stays possible.
+  Next: the early-transaction / holder analysis (`HANDOFF.md`, "Early-transaction
+  pattern analysis", 8 Oct), with ML on that data. Its plan is refreshed
+  by `investigate` and agreed with the owner first; no coder work until he
+  approves it.
 - 12 Oct: the PM has the `Bash` tool for git only: read-only git, `git fetch`
   and `git worktree add` to create worktrees for `implement`; never stash,
   switch, reset, rebase or merge (add, commit and push of its own `work/...`
