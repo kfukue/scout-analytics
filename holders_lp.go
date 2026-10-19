@@ -21,15 +21,6 @@ import (
 	"strings"
 )
 
-var (
-	topicMintV2            = topicOf("Mint(address,uint256,uint256)")
-	topicBurnV2            = topicOf("Burn(address,uint256,uint256,address)")
-	topicMintV3            = topicOf("Mint(address,address,int24,int24,uint128,uint256,uint256)")
-	topicBurnV3            = topicOf("Burn(address,int24,int24,uint128,uint256,uint256)")
-	topicCollectV3         = topicOf("Collect(address,address,int24,int24,uint128,uint128)")
-	topicModifyLiquidityV4 = topicOf("ModifyLiquidity(bytes32,address,int24,int24,int256,bytes32)")
-)
-
 var errBadLiquidityLog = errors.New("malformed liquidity log")
 
 // liquidityKind says what a liquidity event did to the pool's liquidity.

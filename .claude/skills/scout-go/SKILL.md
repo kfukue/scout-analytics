@@ -18,6 +18,8 @@ description: Rules for Go code in scout analytics (conventions, schema, SCOUT_* 
 - Configuration is read from environment variables named `SCOUT_*`; document any
   new one in `README.md`. Its name is a constant in the package's
   `config.go` (rule in `scout-rules`, Hard rules).
+- Event topics: every `topic... = topicOf("Event(...)")` variable lives in
+  `topics.go` (rule in `scout-rules`, Hard rules).
 
 ## Go practices
 

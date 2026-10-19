@@ -226,12 +226,6 @@ func topicOf(sig string) string    { return "0x" + hex.EncodeToString(keccak(sig
 func selectorOf(sig string) string { return "0x" + hex.EncodeToString(keccak(sig)[:4]) }
 
 var (
-	topicTransfer = topicOf("Transfer(address,address,uint256)")
-	topicSyncV2   = topicOf("Sync(uint112,uint112)")
-	topicSwapV3   = topicOf("Swap(address,address,int256,int256,uint160,uint128,int24)")
-	topicSwapV4   = topicOf("Swap(bytes32,address,int128,int128,uint160,uint128,int24,uint24)")
-	topicInitV4   = topicOf("Initialize(bytes32,address,address,uint24,int24,address,uint160,int24)")
-
 	selDecimals    = selectorOf("decimals()")
 	selSymbol      = selectorOf("symbol()")
 	selName        = selectorOf("name()")
@@ -244,7 +238,6 @@ var (
 	selTotalSupply = selectorOf("totalSupply()")
 
 	// Chainlink: proxies don't emit events; the underlying aggregator(s) do.
-	topicAnswerUpdated = topicOf("AnswerUpdated(int256,uint256,uint256)")
 	selAggregator      = selectorOf("aggregator()")
 	selPhaseID         = selectorOf("phaseId()")
 	selPhaseAggregator = selectorOf("phaseAggregators(uint16)")
@@ -2472,12 +2465,6 @@ func (o *onchainSource) mainnetFeed(ctx context.Context, feed string, block uint
 // before the block (on a node without historical state). Not an error of the
 // node: quoteUSD then asks the next source.
 var errFeedNoData = errors.New("no Chainlink update within the look-back")
-
-// topicAggregatorConfirmed: AggregatorConfirmed(address indexed previous,
-// address indexed latest), emitted by AggregatorProxy v0.7+ when it switches
-// to a new aggregator. The v0.6 proxies (EACAggregatorProxy, most Ethereum
-// feeds) emit nothing when they switch.
-var topicAggregatorConfirmed = topicOf("AggregatorConfirmed(address,address)")
 
 // feedInfoTTL: how long a feed's aggregator list is trusted before it is read
 // again (a proxy can switch to a new aggregator at any time).
