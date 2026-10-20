@@ -683,6 +683,22 @@ Every Go start applies `scoutanalytics.sql` unless `SCOUT_DB_AUTO_MIGRATE=false`
   in the website PR). Three PRs: tracker (new calls), website, and a
   one-off fill script for past calls with a backup and a rollback
   script (merge order: the PM's choice, from the spec).
+- 20 Oct (owner, "ok for the four choices", accepting the PM's four
+  recommendations for A2):
+  (1) one kind, `'price'`, for every approximate time. Its time is the
+  end of the first hourly candle that closed under 5 % of the entry
+  price, capped at the last done horizon's due time. If no such candle
+  exists, it is the due time of the earliest done horizon whose price
+  was under 5 %; failing that, the last done horizon's due time;
+  (2) the first close under 5 % counts, even if the price recovered and
+  fell again;
+  (3) the call list shows the real peak for collapsed calls (drained
+  calls keep "no peak", as today: the PM's note);
+  (4) collapsed is split from drained only in the status badge and the
+  Timing tab's rug-kinds table; the Analytics "Rugged" counts and
+  outcome mix stay as they are.
+  PR order chosen by the PM: website, tracker, then the fill script,
+  which the owner runs only after both are live.
 - 12 Oct: the PM has the `Bash` tool for git only: read-only git, `git fetch`
   and `git worktree add` to create worktrees for `implement`; never stash,
   switch, reset, rebase or merge (add, commit and push of its own `work/...`
