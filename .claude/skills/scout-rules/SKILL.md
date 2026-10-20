@@ -84,6 +84,12 @@ root).
     uses it; the old literals stay until their move PR. Existing names
     move to `config.go` only in their own small PRs (one function per
     PR), when the task asks for it.
+- Event topics in one file (owner, 19 Oct 2026): every Go package-level
+  variable for an event topic, such as `topicTransfer = topicOf("Transfer(address,address,uint256)")`,
+  goes in one dedicated file, `topics.go`, so a change to a topic reaches
+  every place that uses it without searching the code. Never declare a topic
+  in the file that uses it. Tests may write the expected hash as a literal
+  (that checks the signature).
 
 ## Database changes: run script and rollback
 

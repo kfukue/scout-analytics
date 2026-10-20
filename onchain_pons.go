@@ -64,13 +64,6 @@ func ponsAddrEnv(key, def string) string {
 }
 
 var (
-	topicCurveBuy       = topicOf("CurveBuy(address,address,uint256,uint256,uint256,uint256)")
-	topicCurveSell      = topicOf("CurveSell(address,address,uint256,uint256,uint256,uint256)")
-	topicCurveCompleted = topicOf("CurveCompleted(address,uint256,uint256)")
-	topicTokenLaunched  = topicOf("TokenLaunched(address,address,address,address,uint256,uint256)")
-	topicPoolGraduated  = topicOf("PoolGraduated(address,uint256,uint256,uint256)")
-	topicLaunchSwept    = topicOf("LaunchSwept(address,uint256,uint256)")
-
 	selPonsCurve     = selectorOf("curve()")
 	selPonsToken     = selectorOf("token()")
 	selPonsFactory   = selectorOf("factory()")

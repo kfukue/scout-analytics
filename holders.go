@@ -205,10 +205,10 @@ func (r *holderReplay) addBalance(a string, delta *big.Int) bool {
 // address. A transfer to a pool counts (that is how a sell shows up), and so
 // does adding liquidity or paying a team wallet: the logs alone cannot tell
 // them apart. A transfer to the token contract itself (a tax or treasury
-// mechanism) also reads as a sell until the LP-events PR can tell real sells
-// apart. Burns are not sells. Zero-value transfers are skipped because
-// anyone can emit them with a forged from (address poisoning). An empty
-// deployer means unknown: false.
+// mechanism) also reads as a sell. Liquidity events (holders_lp.go) are used
+// by earlyTradeStats only, not here yet. Burns are not sells. Zero-value
+// transfers are skipped because anyone can emit them with a forged from
+// (address poisoning). An empty deployer means unknown: false.
 func deployerSoldBefore(transfers []tokenTransfer, deployer string, entryBlock uint64) bool {
 	deployer = strings.ToLower(deployer)
 	if deployer == "" {
