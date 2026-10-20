@@ -1,8 +1,52 @@
 # Scout analytics: handoff to Claude Code
 
-## Session state (20 Oct 2026, 00:45 PDT (07:45 UTC): main 28b6772 after #32, #33, #34, #35)
+## Session state (20 Oct 2026 PDT: main 141e0c8 after #36, #37, #38)
 
 This section supersedes the ones below wherever they differ.
+
+**Update, 20 Oct PDT (later the same day):**
+- Merged: #36 (4a, the log reader), #38 (the deployer's liquidity add
+  is no longer counted as a sale: `holderStats` and
+  `deployerSoldBefore` take the liquidity transaction set), #37 (this
+  section's earlier text).
+- In progress: 4b-1 (venues, columns, row builder) is being re-applied
+  on main 141e0c8 and changed to #38's signatures, uncommitted in
+  worktree `holder-rows-main-20261020` (branch
+  `work/2026-10-20-holder-rows-main`), in review. 4b-2 (writer and run
+  helpers) is still on `work/2026-10-20-holder-rows` (f71ad45) and gets
+  its PR after 4b-1 merges.
+- Owner answers (20 Oct; recorded in the PM skill's "Owner decisions in
+  force"):
+  - output folder: `data/holders/` inside the repo (owner: "create a
+    data folder in the repo and gitignore it"). PR 4b-2 is to add
+    `data/` to `.gitignore` and change its folder check to allow `data/`
+    and still refuse the rest of the repo and `scoutanalytics_data/`;
+  - run time: all day beside `-track`, with the auto-pause (owner: "it
+    shoudl run all day").
+- Rug-time query R1 (owner ran it 20 Oct; causes: 0 has a rug time,
+  a GeckoTerminal-tracked, b the 5 % price rule, c rug block with an old
+  state, d rug block with no time, e other). Result, rugged calls only:
+  0: 267 (calls 28 Jul-17 Oct); b: 751 (28 Jul-20 Sep); e: 29 (30 Jul-
+  5 Aug); a, c, d: none. So about 72 % of "rugged" calls are the price
+  rule (last price under 5 % of entry, a fall of more than 95 %, at the
+  end of 30 days of tracking), and not detected as drained at that point:
+  either the pool's quote side was at or above `SCOUT_RUG_LIQ_USD`
+  (default $500), or its liquidity could not be checked (price unit not
+  USD, v4 and Pons pools, a failed read of the pool's quote balance or
+  of the quote's USD rate). Only 267 are drained pools
+  with a time. b stops at 20 Sep only because later calls
+  have not finished their 30 days yet. Options given to the owner: A2
+  (PM's recommendation) keep `rugged`, give these calls
+  `rug_at_kind = 'price'` with the first hourly candle that closed under
+  5 % of entry as the time (candles already in the DB, no node time;
+  only buckets with trades are stored, so the fill needs a fallback
+  when no such candle exists;
+  three PRs: tracker, website, one-off fill script with backup and
+  rollback); B website wording only; C split them out of `rugged`
+  (changes labels and views; not recommended now). A read-only query
+  on the 29 "other" calls was sent too. Waiting for his choice.
+- Still open with the owner: the pilot's old-token share (explained
+  again on 20 Oct; PM recommends the natural share).
 
 **Merged 19-20 Oct:** #32 docs (holder plan and P0 results, 19 Oct);
 holder analysis code PRs 1-3, pure functions, no node, no DB (#33 and
@@ -24,9 +68,8 @@ in `topics.go` ("Event topics in one file" in `scout-rules`). Done in
   at the first mint, 3-month cap, deployer (launch tx sender, block
   fallback, `lookup_failed` on node errors), token `Transfer` and venue
   liquidity streams up to 24 h after the call, removed/duplicate logs
-  dropped, split at `entry_block`, request counts. Reviewed PASS; open
-  as #36 (branch `work/2026-10-20-holder-log-reader`, the reviewed
-  change re-applied on main 28b6772).
+  dropped, split at `entry_block`, request counts. Merged as #36
+  (20 Oct).
   It also adds `rpcLog.Removed` and a ctx check in the chunked log
   reader (tracker results unchanged).
 - 4b, row builder and writer (pure): venues and one excluded set per
@@ -38,8 +81,8 @@ in `topics.go` ("Event topics in one file" in `scout-rules`). Done in
   (default 4 req/s, one request in flight), node-lag and price-lag pause,
   `-dry-run` estimate, new `SCOUT_HOLDERS_*` names in `config.go`.
 - Then PR 5, the report-only analysis script in `ml/`.
-- Follow-ups: `deployerSoldBefore` still counts the deployer's LP add as
-  a sale; LP-token burn/lock share not yet measured.
+- Follow-ups: LP-token burn/lock share not yet measured. (The
+  deployer's LP add counted as a sale: fixed by #38.)
 
 **Open owner questions (export, needed for 4c / the pilot run):**
 1. old tokens (7-90 d) at their natural share in the pilot (about 10k
@@ -47,10 +90,14 @@ in `topics.go` ("Event topics in one file" in `scout-rules`). Done in
    19 Oct export plan from the Q3 age mix and 200k-block log reads
    (they replace the 8 Oct "about 8k", which predates the 24 h post
    window). PM recommends natural share;
-2. the server output folder (outside the repo and `scoutanalytics_data/`);
+2. the server output folder: answered 20 Oct, `data/holders/` in the
+   repo, to be git-ignored (update above);
 3. daytime run beside `-track` with the auto-pause, or a quiet window?
+   Answered 20 Oct: all day (update above).
 
-**Rugged calls without a rug time (investigated 19 Oct, not changed):**
+**Rugged calls without a rug time (investigated 19 Oct, not changed;
+R1 run 20 Oct: result and options A2/B/C in the update above; the 5 %
+rule is in commits of 1 Oct, not 6 Oct as written below):**
 most likely the tracker's 5 % price rule (`tracker_onchain.go`, last
 price under 5 % of entry at the end of tracking) sets `rugged` with no
 `rug_block` and no `rug_at`, by design; `-backfill-timing` only picks

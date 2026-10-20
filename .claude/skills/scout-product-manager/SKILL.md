@@ -493,7 +493,7 @@ From the repo root on the server:
 
 Every Go start applies `scoutanalytics.sql` unless `SCOUT_DB_AUTO_MIGRATE=false`.
 
-## Owner decisions in force (8-19 October 2026)
+## Owner decisions in force (8-20 October 2026)
 
 - The `long` model waits for data (about 25 December) rather than loosening the
   threshold.
@@ -661,6 +661,17 @@ Every Go start applies `scoutanalytics.sql` unless `SCOUT_DB_AUTO_MIGRATE=false`
   mean "yes to the recommendation"); either way no Blockscout use before
   the pilot, and the PM asks one explicit question before any key is
   requested; the key is a secret the owner adds to `.env` himself.
+- 20 Oct (owner, "create a data folder in the repo and gitignore it";
+  supersedes "outside the repo" in item (3) of the 19 Oct entry above):
+  the holder export writes its files to `data/holders/` under the repo
+  root. `data/` is to be added to `.gitignore` (PR 4b-2), so its files
+  are never committed. In the same PR the export's folder check is to
+  allow `data/` and the folders inside it, and still refuse the rest of
+  the repo and `scoutanalytics_data/`.
+- 20 Oct (owner, "it shoudl run all day"): the holder export runs during
+  the day beside `-track`, not in a quiet window. It pauses itself when
+  the node or the tracker's prices fall behind (rate limit and pauses
+  are part of PR 4c; see the top section of `HANDOFF.md`).
 - 12 Oct: the PM has the `Bash` tool for git only: read-only git, `git fetch`
   and `git worktree add` to create worktrees for `implement`; never stash,
   switch, reset, rebase or merge (add, commit and push of its own `work/...`
