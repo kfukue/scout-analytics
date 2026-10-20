@@ -4,23 +4,48 @@
 
 This section supersedes the ones below wherever they differ.
 
+**Update, 20 Oct PDT (21 Oct UTC), late night: state of the open work.** Every PR
+below has base `main`; all are tested locally only, nothing deployed.
+- Open, waiting for the owner's merge: #42 (this docs PR), #43 (4b-2,
+  writer), #44 (4c-1, pools that count before the call), #45 (A2 PR 1,
+  website), #46 (4c-2, read-only DB reads, a31222b), #47 (4c-3,
+  settings and pauses, 11632f5). #46 and #47 passed review; neither
+  needs a restart (no command uses them until 4c-4).
+- A2 PR 2 (tracker), branch `work/2026-10-20-price-rug-tracker`
+  (35f1a56, pushed, review PASS), worktree
+  `price-rug-tracker-20261020`: no PR yet. It and #45 both add
+  `const rugAtPrice = "price"` to the same const block in `timing.go`.
+  So: merge #45 first; then block C (merge `main` into the tracker
+  branch) and keep one constant; then its PR. It also shares
+  `scout_models.data.go` with #46 (other functions).
+- Notes for 4c-4 from the reviews: pass the tracker's live
+  `LatestRecent`, `LatestOld` and `latestRecentAge` to
+  `LatestPriceLag`; pass both lag functions whenever their limits are
+  above 0 (a nil one would panic); one pauser per goroutine. The price
+  lag leaves out rows never refreshed, so a first-refresh backlog
+  right after a backfill reads as 0.
+- A2 PR 3 (fill script) must copy `priceRugAtSQL` as it is (comment
+  in `scout_models.data.go`). GeckoTerminal-priced calls get no rug
+  time (no stored candles); outside A2.
+- Still open with the owner: (a) and (b) in the next update.
+
 **Update, 20 Oct PDT (night): export 4c plan** (from an `investigate`
 spec, 20 Oct; 4b-2 is open as #43). 4c is split into four PRs, each
 with base `main`:
 - 4c-1, pools that count before the call (pure, plus one node helper;
-  in progress, worktree `holder-pre-pools-20261020`):
+  open as #44):
   - v4 pre ids = pools whose Initialize block is at or before the entry
     block (one `v4PoolsOf` call, 2 `eth_getLogs`);
   - v2/v3: no creation block is stored anywhere, and pool discovery
     looks past the entry block. So the tracker's pool counts before the
     call only if it appears in the pre-call transfers or liquidity
     events (no extra node cost).
-- 4c-2, read-only DB reads: a read-only transaction helper, the call
+- 4c-2, read-only DB reads (open as #46): a read-only transaction helper, the call
   details by id, and a price-lag reading. The lag is the 95th
   percentile of how overdue the latest-price rows are, not the maximum:
   one row whose refresh keeps failing would otherwise hold the pause
   forever.
-- 4c-3, settings and pauses: `SCOUT_HOLDERS_RPS` (4),
+- 4c-3, settings and pauses (open as #47): `SCOUT_HOLDERS_RPS` (4),
   `SCOUT_HOLDERS_MAX_NODE_LAG` (2m), `SCOUT_HOLDERS_MAX_PRICE_LAG` (2h)
   and `SCOUT_HOLDERS_MAX_PAUSE` (30m), in `config.go`. The export's own
   node client is the existing one with RPS set and one request in
