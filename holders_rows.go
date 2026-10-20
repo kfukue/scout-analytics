@@ -23,9 +23,10 @@ package main
 //   - !BuysOK (no buy before the call): first buy, snipers, first-block
 //     buyers, max-tx buyers, early buyers and every held share NULL (post
 //     held shares too: they follow the pre-call buyers);
-//   - LP not applicable at the cut-off (a Pons token still on its curve, or a
-//     v4 venue without pool ids: before the call, without pre ids): every LP
-//     column NULL.
+//   - LP not applicable at the cut-off (a Pons token still on its curve, a
+//     v4 venue without pool ids: before the call, without pre ids, or a v2/v3
+//     pool the pre logs never show, so not a pre venue: holderPoolSeen):
+//     every LP column NULL, pre_hold_lp_applicable false.
 //
 // Buy and sell counts of 0 are real values, never NULL on their own.
 
@@ -65,8 +66,9 @@ type holderRowInput struct {
 	// state's PoolID is added only for a Pons pool created (PonsGrad) at or
 	// before the entry block; a plain v4 state's PoolID is a pre id only when
 	// it is listed here, because the tracker does not check that the pool
-	// existed at the entry block (holderPreIDs). The row records the pre ids
-	// used in v4_pool_ids_pre.
+	// existed at the entry block (holderPreIDs). holderV4PoolIDs gives the
+	// ids split by Initialize block. The row records the pre ids used in
+	// v4_pool_ids_pre.
 	V4PoolIDsPre []string
 	// V4PoolIDsAll: every other known id of the token's v4 pools, including
 	// pools initialised after the entry block; used for the post window and
@@ -121,7 +123,8 @@ func buildHolderRow(in holderRowInput, stamp holderRowStamp) (holderRow, error) 
 		return skippedHolderRow(m, reason, stamp), nil
 	}
 	st, l := *m.State, in.Logs
-	plan := holderVenuePlanFor(st, m.Token, st.EntryBlock, l.PostEndBlock, in.V4PoolIDsPre, in.V4PoolIDsAll, in.Config)
+	poolSeenPre := holderPoolSeen(st.Pool, l.TransfersPre, l.LiquidityPre) // pre logs only: at or before the entry block
+	plan := holderVenuePlanFor(st, m.Token, st.EntryBlock, l.PostEndBlock, in.V4PoolIDsPre, in.V4PoolIDsAll, poolSeenPre, in.Config)
 	row := holderRow{holderProvenance: baseHolderProvenance(m, stamp)}
 	row.setPlan(plan, l.PostEndBlock > 0)
 	row.setLogs(l)

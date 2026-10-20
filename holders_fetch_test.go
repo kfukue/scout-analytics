@@ -775,3 +775,84 @@ func TestHoldersFetchCancel(t *testing.T) {
 		t.Errorf("node requests after the cancel: %v, want at most the one being answered", c.f.counts())
 	}
 }
+
+// holderV4PoolIDs on the fake chain: the token's pools from the PoolManager's
+// Initialize events (token as currency0 or currency1, any case of letters),
+// split by Initialize block: a pool initialised in the entry block is a pre
+// id, one initialised after it is in all only. Exactly 2 eth_getLogs for a
+// state whose PoolManager is a venue at some block, none for the others.
+func TestHolderV4PoolIDs(t *testing.T) {
+	low := "0x0000000000000000000000000000000000000001" // sorts below hfToken: the token is currency1
+	idOld, idAtEntry, idLate := "0x01"+strings.Repeat("00", 31), "0x02"+strings.Repeat("00", 31), "0x03"+strings.Repeat("00", 31)
+	idOther := "0x04" + strings.Repeat("00", 31)
+	cases := []struct {
+		name     string
+		st       func(eb uint64) onchainState
+		wantPre  []string
+		wantAll  []string
+		requests int // eth_getLogs
+	}{
+		{name: "plain v4", st: func(eb uint64) onchainState { return onchainState{Kind: "v4", Pool: tPM, EntryBlock: eb} },
+			wantPre: []string{idOld, idAtEntry}, wantAll: []string{idOld, idAtEntry, idLate}, requests: 2},
+		{name: "plain v4, state PoolID is the late pool", st: func(eb uint64) onchainState {
+			return onchainState{Kind: "v4", Pool: tPM, PoolID: idLate, EntryBlock: eb}
+		}, wantPre: []string{idOld, idAtEntry}, wantAll: []string{idOld, idAtEntry, idLate}, requests: 2},
+		{name: "Pons graduated after the call", st: func(eb uint64) onchainState {
+			return onchainState{Kind: "pons", Pool: hfCurve, Curve: hfCurve, PonsDone: eb + 50, PonsGrad: eb + 50, EntryBlock: eb}
+		}, wantPre: []string{idOld, idAtEntry}, wantAll: []string{idOld, idAtEntry, idLate}, requests: 2},
+		{name: "v2", st: func(eb uint64) onchainState { return onchainState{Kind: "v2", Pool: lqPool, EntryBlock: eb} }},
+		{name: "v3", st: func(eb uint64) onchainState { return onchainState{Kind: "v3", Pool: lqPool, EntryBlock: eb} }},
+		{name: "Pons on the curve", st: func(eb uint64) onchainState {
+			return onchainState{Kind: "pons", Pool: hfCurve, Curve: hfCurve, EntryBlock: eb}
+		}},
+		{name: "Pons closed, pool not found yet", st: func(eb uint64) onchainState {
+			return onchainState{Kind: "pons", Pool: hfCurve, Curve: hfCurve, PonsDone: eb - 10, EntryBlock: eb}
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFakeChain(t, 10*24*time.Hour)
+			eb := f.blockAtTime(time.Now().Add(-24 * time.Hour))
+			f.initV4(idOld, hfToken, tWETH, zeroAddr, 3000, eb-100_000) // token = currency0
+			f.initV4(idAtEntry, low, hfToken, zeroAddr, 500, eb)        // token = currency1, in the entry block
+			f.initV4(idLate, hfToken, tUSDG, zeroAddr, 100, eb+50)      // after the call
+			f.initV4(idOther, tWETH, tUSDG, zeroAddr, 500, eb-10)       // another token's pool
+			o := testOnchain(t, f, map[string]string{"SCOUT_RPC_LOG_CACHE": "0"})
+			upper := "0x" + strings.ToUpper(hfToken[2:])
+			pre, all, err := o.holderV4PoolIDs(context.Background(), upper, tc.st(eb), f.latest)
+			if err != nil {
+				t.Fatalf("holderV4PoolIDs: %v", err)
+			}
+			if !slices.Equal(pre, tc.wantPre) || !slices.Equal(all, tc.wantAll) {
+				t.Errorf("got pre %v all %v, want pre %v all %v", pre, all, tc.wantPre, tc.wantAll)
+			}
+			counts := f.counts()
+			if counts["eth_getLogs"] != tc.requests {
+				t.Errorf("got %d eth_getLogs, want %d (requests %v)", counts["eth_getLogs"], tc.requests, counts)
+			}
+			if n := f.otherRequests(); n != 0 {
+				t.Errorf("got %d other requests, want 0 (requests %v)", n, counts)
+			}
+			if tc.requests > 0 {
+				checkInitLookups(t, f, hfToken, 1, f.latest)
+			}
+		})
+	}
+}
+
+// splitV4PoolIDs: pre holds the pools initialised at or before the entry
+// block, all every pool; both lowercase, sorted and deduplicated.
+func TestSplitV4PoolIDs(t *testing.T) {
+	a, b, c := "0x"+strings.Repeat("aa", 32), "0x"+strings.Repeat("bb", 32), "0x"+strings.Repeat("cc", 32)
+	pools := []v4Pool{{id: c, block: 101}, {id: "0x" + strings.ToUpper(b[2:]), block: 100}, {id: a, block: 5}, {id: a, block: 5}}
+	pre, all := splitV4PoolIDs(pools, 100)
+	if want := []string{a, b}; !slices.Equal(pre, want) {
+		t.Errorf("pre: got %v, want %v", pre, want)
+	}
+	if want := []string{a, b, c}; !slices.Equal(all, want) {
+		t.Errorf("all: got %v, want %v", all, want)
+	}
+	if pre, all := splitV4PoolIDs(nil, 100); len(pre) != 0 || len(all) != 0 {
+		t.Errorf("no pools: got pre %v all %v, want none", pre, all)
+	}
+}
