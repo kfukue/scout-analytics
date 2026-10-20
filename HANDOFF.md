@@ -1,5 +1,66 @@
 # Scout analytics: handoff to Claude Code
 
+## Session state (20 Oct 2026, 00:45 PDT (07:45 UTC): main 28b6772 after #32, #33, #34, #35)
+
+This section supersedes the ones below wherever they differ.
+
+**Merged 19-20 Oct:** #32 docs (holder plan and P0 results, 19 Oct);
+holder analysis code PRs 1-3, pure functions, no node, no DB (#33 and
+#34 on 19 Oct PDT, #35 on 20 Oct 00:05 PDT (07:05 UTC)): #33 transfer decode, replay to `entry_block` and holder stats;
+#34 early trading (snipers within 50 blocks of the first buy, bundles,
+buyer/seller flow, the first 10 early buyers: owner, 19 Oct, "expand the
+earlybuyer count to 10"); #35 liquidity events (v2 `Mint`/`Burn`, v3
+`Mint`/`Burn`/`Collect`, v4 `ModifyLiquidity` filtered by pool id),
+direction-aware: in an add transaction wallet -> pool is liquidity but
+pool -> wallet stays a buy, so snipers bundled into the launch stay
+visible; plus `liquidityStats`.
+
+**Owner rule (19 Oct, review comment on #35):** every event topic lives
+in `topics.go` ("Event topics in one file" in `scout-rules`). Done in
+#35 for all 19 topics; function selectors (`sel...`) were left in place.
+
+**Code PR 4 is split in three (one PR at a time, base `main`):**
+- 4a, log reader (node only, no DB, no flag): launch search that stops
+  at the first mint, 3-month cap, deployer (launch tx sender, block
+  fallback, `lookup_failed` on node errors), token `Transfer` and venue
+  liquidity streams up to 24 h after the call, removed/duplicate logs
+  dropped, split at `entry_block`, request counts. Reviewed PASS; open
+  as #36 (branch `work/2026-10-20-holder-log-reader`, the reviewed
+  change re-applied on main 28b6772).
+  It also adds `rpcLog.Removed` and a ctx check in the chunked log
+  reader (tracker results unchanged).
+- 4b, row builder and writer (pure): venues and one excluded set per
+  kind, `pre_hold_*` and `post24h_*` columns with the NULL rules,
+  JSONL append with resume, CSV rebuild, out-folder guard, cost
+  estimate; a leakage test (post-window logs never change `pre_hold_*`).
+- 4c, the flag `-export-holders` (dispatched before `Migrate` and
+  `registerTools`, reads in a read-only transaction), rate limit
+  (default 4 req/s, one request in flight), node-lag and price-lag pause,
+  `-dry-run` estimate, new `SCOUT_HOLDERS_*` names in `config.go`.
+- Then PR 5, the report-only analysis script in `ml/`.
+- Follow-ups: `deployerSoldBefore` still counts the deployer's LP add as
+  a sale; LP-token burn/lock share not yet measured.
+
+**Open owner questions (export, needed for 4c / the pilot run):**
+1. old tokens (7-90 d) at their natural share in the pilot (about 10k
+   `eth_getLogs`) or oversampled (up to about 32k)? Estimates by the
+   19 Oct export plan from the Q3 age mix and 200k-block log reads
+   (they replace the 8 Oct "about 8k", which predates the 24 h post
+   window). PM recommends natural share;
+2. the server output folder (outside the repo and `scoutanalytics_data/`);
+3. daytime run beside `-track` with the auto-pause, or a quiet window?
+
+**Rugged calls without a rug time (investigated 19 Oct, not changed):**
+most likely the tracker's 5 % price rule (`tracker_onchain.go`, last
+price under 5 % of entry at the end of tracking) sets `rugged` with no
+`rug_block` and no `rug_at`, by design; `-backfill-timing` only picks
+rows with a `rug_block` and state version >= 2. Not yet reconciled: the
+5 % rule dates from 6 Oct, yet on 9 Oct all 245 rugged calls had a rug
+time; query R1 separates the causes. The owner was given one read-only query (R1) to
+confirm, and two options: A, a new `rug_at_kind = 'price'` with an
+approximate time (tracker, website, ops script with backup and rollback,
+three PRs); B, website wording only. Waiting for his answer.
+
 ## Session state (19 Oct 2026, 12:25 PDT (19:25 UTC): main 3ff52fa after #31)
 
 This section supersedes the ones below wherever they differ.
@@ -1250,6 +1311,9 @@ matter are in section 5. Package `main` is at the repo root: `go run .`.
 
 ## Deferred / open
 
+20 Oct 2026: the open owner questions on the holder export and the
+rug-time decision (A or B) are in the top section.
+
 Kept current by the PM whenever an item is deferred or an owner check is
 pending (14 October 2026 UTC). Everything through PR #53 is on `main`
 (e522918). The listener was restarted at 23:15 local on 13 Oct, after the
@@ -1917,8 +1981,9 @@ owner keeps them in local notes (reviewed and tightened by the owner on
      - good `held2x7`: `above_2x_s >= 3600` on the 7d row (the 12 Oct
        Timing-tab rule "reached 2×"); peak net of tax >= +100 % and 7d return
        >= +100 % reported alongside;
-     - `rugged` is not used as a label (set long after the call; about
-       seven in ten rugs have only a check time).
+     - `rugged` is not used as a label (set long after the call; P0 Q4:
+       of 904 rugged, 640 have no rug time at all and 190 were detected
+       more than 30 d after the call, see the top section).
      - ML labels are net of tax, descriptive tables gross.
    - Features, all from logs at or before `entry_block`:
      - group (i), per token: holder count; top-1/5/10 share of
@@ -1955,11 +2020,12 @@ owner keeps them in local notes (reviewed and tightened by the owner on
        age at the call, how censored `rugged` is, the baseline from the
        posted holders and Perceptor verdict, the pilot sample).
      - Code, small PRs with base `main`, one at a time: (1) pure transfer
-       decode, replay and holder stats (no node, no DB); (2) snipers,
-       bundles, LP events; (3) a read-only, rate-limited Go export flag
-       (call ids in, files out; no DB writes, no schema change; new
-       `SCOUT_*` names in `config.go`); (4) a report-only analysis script
-       in `ml/`.
+       decode, replay and holder stats (no node, no DB; #33); (2) snipers,
+       bundles, flow, early buyers (#34); (3) LP events (#35); (4) a
+       read-only, rate-limited Go export flag (call ids in, files out; no
+       DB writes, no schema change; new `SCOUT_*` names in `config.go`),
+       split into 4a log reader, 4b row builder and writer, 4c flag (see
+       the top section); (5) a report-only analysis script in `ml/`.
      - P1 pilot (description only), P2 full run, then ML: group (i) as a
        report-only variant in the existing buckets with adoption rules
        fixed before the run (as `WREP_ADOPTION`, one shot, no tuning),
@@ -2001,10 +2067,10 @@ owner keeps them in local notes (reviewed and tightened by the owner on
    - Q4: 904 calls flagged `rugged`; only 58 drained by 7d (51 `event`,
      7 `at_call`); 190 `detected` more than 30 d later (46 dead at 7d);
      609 never flagged were dead at 7d; 1,213 have `rugged` NULL
-     (mostly calls still tracking: Q1 has 1,199 tracking). Confirms the 7d return label. Side finding, not
-     looked into: 640 rugged calls have no `rug_at` or `rug_at_kind`
+     (mostly calls still tracking: Q1 has 1,199 tracking). Confirms the 7d return label. Side finding: 640 rugged calls have no `rug_at` or `rug_at_kind`
      (the 9 Oct backfill covered every rugged call then), which affects
-     the Timing tab's rug figures.
+     the Timing tab's rug figures; likely cause and options in the top
+     section.
    - Q5a: 4,344 of 4,761 (91 %) had no live Perceptor scan at the call;
      among the scanned, dead7 is clean 26.9 %, caution 12.3 %,
      insufficient 12.5 %, red_flags 16.8 % (small groups; PM's reading:
