@@ -44,7 +44,19 @@ This section supersedes the ones below wherever they differ.
   three PRs: tracker, website, one-off fill script with backup and
   rollback); B website wording only; C split them out of `rugged`
   (changes labels and views; not recommended now). A read-only query
-  on the 29 "other" calls was sent too. Waiting for his choice.
+  on the 29 "other" calls was sent too. Its result (20 Oct): all 29
+  are on-chain v2/v3 calls priced in USD, calls from 30 Jul to 5 Aug,
+  with `current_liquidity_usd` (the pool's depth, 2 x the quote side)
+  at most $407 and mostly about $0, so a quote side under $205, well
+  below the $500 threshold: they are drained pools whose rug block was
+  never stored; their last price (up to 7x entry) is the price of a
+  pool now under the rug threshold, not a sign the token held up. Two (9947, 9948) are now `repeat` rows. Inferred, not
+  yet checked in the code history: the tracker of that time marked them
+  rugged without a rug block and the later re-track kept the flag. They
+  are not price-rule calls and must not get kind 'price'. The owner chose
+  A2 on 20 Oct ("ok go with A2"; recorded in the PM skill's "Owner
+  decisions in force"); next, `investigate` drafts the spec for the
+  three PRs.
 - Still open with the owner: the pilot's old-token share (explained
   again on 20 Oct; PM recommends the natural share).
 
@@ -80,6 +92,13 @@ in `topics.go` ("Event topics in one file" in `scout-rules`). Done in
   `registerTools`, reads in a read-only transaction), rate limit
   (default 4 req/s, one request in flight), node-lag and price-lag pause,
   `-dry-run` estimate, new `SCOUT_HOLDERS_*` names in `config.go`.
+  From the 4b-1 review (20 Oct): `holderVenuesAt` adds the tracker's
+  v2/v3 pool (`st.Pool`) as a pre-call venue with no creation-block
+  check, so a pool created after the call gives
+  `pre_hold_lp_applicable = true` with zero counts instead of NULL
+  (rare: the tracker needs trades around the call for an entry price).
+  4c should carry the creation block for v2/v3 pools too and gate them
+  like v4 pool ids.
 - Then PR 5, the report-only analysis script in `ml/`.
 - Follow-ups: LP-token burn/lock share not yet measured. (The
   deployer's LP add counted as a sale: fixed by #38.)
@@ -106,7 +125,8 @@ rows with a `rug_block` and state version >= 2. Not yet reconciled: the
 time; query R1 separates the causes. The owner was given one read-only query (R1) to
 confirm, and two options: A, a new `rug_at_kind = 'price'` with an
 approximate time (tracker, website, ops script with backup and rollback,
-three PRs); B, website wording only. Waiting for his answer.
+three PRs); B, website wording only. Answered 20 Oct: A2 (update
+above).
 
 ## Session state (19 Oct 2026, 12:25 PDT (19:25 UTC): main 3ff52fa after #31)
 

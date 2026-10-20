@@ -672,6 +672,17 @@ Every Go start applies `scoutanalytics.sql` unless `SCOUT_DB_AUTO_MIGRATE=false`
   the day beside `-track`, not in a quiet window. It pauses itself when
   the node or the tracker's prices fall behind (rate limit and pauses
   are part of PR 4c; see the top section of `HANDOFF.md`).
+- 20 Oct (owner, "ok go with A2", after query R1 showed 751 of 1,047
+  rugged calls come from the 5 % price rule with no rug time): option
+  A2. The `rugged` column keeps its meaning. Calls marked rugged by the
+  price rule get `rug_at_kind = 'price'` and an approximate `rug_at`:
+  the first hourly candle that closed under 5 % of the entry price, with
+  a fallback when no such candle is stored. No node time, and no change
+  to `onchainStateVersion`. The website tells "collapsed (price down
+  more than 95 %)" apart from "rugged (pool drained)" (exact label set
+  in the website PR). Three PRs: tracker (new calls), website, and a
+  one-off fill script for past calls with a backup and a rollback
+  script (merge order: the PM's choice, from the spec).
 - 12 Oct: the PM has the `Bash` tool for git only: read-only git, `git fetch`
   and `git worktree add` to create worktrees for `implement`; never stash,
   switch, reset, rebase or merge (add, commit and push of its own `work/...`
