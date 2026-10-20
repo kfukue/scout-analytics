@@ -202,23 +202,40 @@ func (r *holderReplay) addBalance(a string, delta *big.Int) bool {
 // deployerSoldBefore reports whether deployer sent tokens to someone else at
 // or before entryBlock: a transfer with From == deployer, Block <=
 // entryBlock, Value > 0 and To neither the deployer itself nor a burn
-// address. A transfer to a pool counts (that is how a sell shows up), and so
-// does adding liquidity or paying a team wallet: the logs alone cannot tell
-// them apart. A transfer to the token contract itself (a tax or treasury
-// mechanism) also reads as a sell. Liquidity events (holders_lp.go) are used
-// by earlyTradeStats only, not here yet. Burns are not sells. Zero-value
-// transfers are skipped because anyone can emit them with a forged from
-// (address poisoning). An empty deployer means unknown: false.
-func deployerSoldBefore(transfers []tokenTransfer, deployer string, entryBlock uint64) bool {
+// address, unless the transfer is liquidity. A transfer to a pool counts
+// (that is how a sell shows up), and so does paying a team wallet: "sold"
+// here means "sent away", not only "sold to a venue". A transfer to the token
+// contract itself (a tax or treasury mechanism) also reads as a sell. Burns
+// are not sells. Zero-value transfers are skipped because anyone can emit
+// them with a forged from (address poisoning). An empty deployer means
+// unknown: false.
+//
+// Liquidity uses the same direction-aware rule as earlyTradeStats:
+// classifyTrade with lp (liquidityTxs). A deployer -> venue transfer in a
+// transaction with an add on that venue is tradeLiquidity and not a sale,
+// so the deployer's own liquidity add no longer reads as a sell. As in
+// classifyTrade, a sale to the same venue in the add's transaction is
+// treated as liquidity too; a sale to another venue, or in any other
+// transaction, still counts. The venues are lp's keys: a venue without a
+// liquidity transaction would be a sale either way. Excluded addresses are
+// not passed to classifyTrade (the check never used them), so a deployer in
+// holderStats' excluded set still has its liquidity add recognised. lp nil
+// gives exactly the results without liquidity awareness (an add is a sale).
+func deployerSoldBefore(transfers []tokenTransfer, deployer string, lp liquidityTxSet, entryBlock uint64) bool {
 	deployer = strings.ToLower(deployer)
 	if deployer == "" {
 		return false
 	}
+	venues := lp.venues()
 	for _, tr := range transfers {
 		if tr.Block > entryBlock || tr.Value == nil || tr.Value.Sign() <= 0 || strings.ToLower(tr.From) != deployer {
 			continue
 		}
-		if to := strings.ToLower(tr.To); to != deployer && !isBurnAddr(to) {
+		to := strings.ToLower(tr.To)
+		if to == deployer || isBurnAddr(to) {
+			continue
+		}
+		if classifyTrade(tr, venues, nil, lp) != tradeLiquidity {
 			return true
 		}
 	}
@@ -244,15 +261,18 @@ type holderSummary struct {
 	// DeployerShare is the deployer's balance over circulating, 0..1 (see
 	// DeployerShareOK).
 	DeployerShare float64
-	DeployerSold  bool // see deployerSoldBefore; set whenever DeployerKnown
-	Incomplete    bool // copied from the replay: the figures are unreliable
+	// DeployerSold: see deployerSoldBefore; set whenever DeployerKnown. A
+	// liquidity add is not a sale only when holderStats is given lp.
+	DeployerSold bool
+	Incomplete   bool // copied from the replay: the figures are unreliable
 }
 
 // holderStats summarises a replay. excluded holds the addresses that are not
 // holders (pools, the v4 PoolManager, a Pons curve, zero, dead, the token
 // itself); deployer is "" when unknown. transfers are the same ones that were
-// replayed, for the deployer-sold check.
-func holderStats(r holderReplay, transfers []tokenTransfer, excluded map[string]bool, deployer string) holderSummary {
+// replayed, and lp the token's liquidity transactions (liquidityTxs; nil
+// when unknown), both for the deployer-sold check only (deployerSoldBefore).
+func holderStats(r holderReplay, transfers []tokenTransfer, excluded map[string]bool, deployer string, lp liquidityTxSet) holderSummary {
 	ex := lowerSet(excluded)
 	s := holderSummary{Circulating: new(big.Int).Set(r.Supply), Incomplete: r.Incomplete}
 	var held []*big.Int
@@ -278,7 +298,7 @@ func holderStats(r holderReplay, transfers []tokenTransfer, excluded map[string]
 	deployer = strings.ToLower(deployer)
 	s.DeployerKnown = deployer != ""
 	if s.DeployerKnown {
-		s.DeployerSold = deployerSoldBefore(transfers, deployer, r.EntryBlock)
+		s.DeployerSold = deployerSoldBefore(transfers, deployer, lp, r.EntryBlock)
 		s.DeployerShareOK = !ex[deployer] && s.SharesOK
 		if b := r.Balances[deployer]; b != nil && s.DeployerShareOK {
 			s.DeployerShare = shareOf(b, s.Circulating)
