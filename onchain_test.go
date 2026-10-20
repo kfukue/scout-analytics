@@ -29,6 +29,19 @@ type fakeLog struct {
 	data   string
 	block  uint64
 	tx     string
+	// removed: answered with "removed": true (a log dropped by a reorg).
+	removed bool
+	// index/hasIndex: the logIndex answered (default: the log's position in
+	// f.logs), so two entries can repeat one (block, log index).
+	index    uint64
+	hasIndex bool
+}
+
+// fakeTx is a transaction for eth_getTransactionByHash and for
+// eth_getBlockByNumber with full transactions.
+type fakeTx struct {
+	from  string
+	block uint64
 }
 
 type fakeChain struct {
@@ -62,8 +75,19 @@ type fakeChain struct {
 	dataCalls map[string]func(data string, block uint64) (string, bool)
 	callTags  []string       // block tag of every eth_call received
 	queries   []fakeLogQuery // every eth_getLogs the chain answered (address, topics, range)
-	count     map[string]int
-	srv       *httptest.Server
+	// txs: transactions by lowercase hash; txByHashNull: eth_getTransactionByHash
+	// answers null even for a known one (a node without the tx index);
+	// txByHashErr (optional): eth_getTransactionByHash answers this JSON-RPC
+	// error; fullBlockErr (optional): eth_getBlockByNumber with full
+	// transactions answers this JSON-RPC error (a plain block read does not);
+	// fullBlocks: eth_getBlockByNumber asked with full transactions.
+	txs          map[string]fakeTx
+	txByHashNull bool
+	txByHashErr  string
+	fullBlockErr string
+	fullBlocks   int
+	count        map[string]int
+	srv          *httptest.Server
 }
 
 // fakeLogQuery is one eth_getLogs request as the chain received it.
@@ -89,6 +113,20 @@ func (f *fakeChain) pmSwapScans() int {
 		}
 	}
 	return n
+}
+
+// logQueries returns a copy of every eth_getLogs the chain answered.
+func (f *fakeChain) logQueries() []fakeLogQuery {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]fakeLogQuery(nil), f.queries...)
+}
+
+// fullBlockReads: the eth_getBlockByNumber asked with full transactions.
+func (f *fakeChain) fullBlockReads() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.fullBlocks
 }
 
 // queriesTo counts the eth_getLogs asked of one address.
@@ -173,7 +211,39 @@ func (f *fakeChain) serve(w http.ResponseWriter, r *http.Request) {
 			ok(nil)
 			return
 		}
-		ok(map[string]string{"timestamp": hexU64(uint64(f.timeOf(n)))})
+		var full bool
+		if len(req.Params) > 1 {
+			json.Unmarshal(req.Params[1], &full)
+		}
+		if !full {
+			ok(map[string]string{"timestamp": hexU64(uint64(f.timeOf(n)))})
+			return
+		}
+		f.fullBlocks++
+		if f.fullBlockErr != "" {
+			fail(f.fullBlockErr)
+			return
+		}
+		txs := []map[string]string{}
+		for h, tx := range f.txs {
+			if tx.block == n {
+				txs = append(txs, map[string]string{"hash": h, "from": tx.from})
+			}
+		}
+		ok(map[string]any{"timestamp": hexU64(uint64(f.timeOf(n))), "transactions": txs})
+	case "eth_getTransactionByHash":
+		var h string
+		json.Unmarshal(req.Params[0], &h)
+		if f.txByHashErr != "" {
+			fail(f.txByHashErr)
+			return
+		}
+		tx, known := f.txs[strings.ToLower(h)]
+		if !known || f.txByHashNull {
+			ok(nil)
+			return
+		}
+		ok(map[string]string{"hash": h, "from": tx.from, "blockNumber": hexU64(tx.block)})
 	case "eth_getLogs":
 		var q struct {
 			Address   string `json:"address"`
@@ -213,8 +283,16 @@ func (f *fakeChain) serve(w http.ResponseWriter, r *http.Request) {
 				} // nil: any value
 			}
 			if match {
-				out = append(out, map[string]any{"address": l.addr, "topics": l.topics, "data": l.data,
-					"blockNumber": hexU64(l.block), "transactionHash": l.tx, "logIndex": hexU64(uint64(i))})
+				idx := uint64(i)
+				if l.hasIndex {
+					idx = l.index
+				}
+				m := map[string]any{"address": l.addr, "topics": l.topics, "data": l.data,
+					"blockNumber": hexU64(l.block), "transactionHash": l.tx, "logIndex": hexU64(idx)}
+				if l.removed {
+					m["removed"] = true
+				}
+				out = append(out, m)
 			}
 		}
 		ok(out)
@@ -318,6 +396,35 @@ func sqrtX96(raw float64) *big.Int {
 
 func (f *fakeChain) transfer(token, from, to string, block uint64, tx string) {
 	f.logs = append(f.logs, fakeLog{addr: token, topics: []string{topicTransfer, addrTopic(from), addrTopic(to)}, data: ret(wInt(1)), block: block, tx: tx})
+}
+
+// A scan whose fn cancels its context finishes the range being delivered,
+// plans no further range (no request counted that is never sent) and returns
+// the context's error.
+func TestGetLogsChunkedStopsWhenFnCancels(t *testing.T) {
+	f := newFakeChain(t, 2*time.Hour)
+	token := hAddr(90)
+	for _, b := range []uint64{100, 150, 2500, 4500} {
+		f.transfer(token, zeroAddr, hAddr(91), b, "0x1")
+	}
+	o := testOnchain(t, f, map[string]string{"SCOUT_RPC_LOG_CACHE": "0", "SCOUT_RPC_LOG_CHUNK": "1000", "SCOUT_RPC_PARALLEL": "1"})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cctx, n := withReqCounter(ctx)
+	var got []uint64
+	err := o.rpc.getLogsChunked(cctx, token, []any{topicTransfer}, 1, 5000, func(l rpcLog) {
+		got = append(got, l.block())
+		cancel()
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("err %v, want context.Canceled", err)
+	}
+	if want := []uint64{100, 150}; fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Errorf("delivered blocks %v, want %v (the first range in full)", got, want)
+	}
+	if asked, counted := f.counts()["eth_getLogs"], n.Load(); asked != 1 || counted != 1 {
+		t.Errorf("eth_getLogs: %d answered, %d counted; want 1 and 1", asked, counted)
+	}
 }
 
 // fakeLiq is the in-range liquidity L of the fake v3/v4 swaps: deep enough that

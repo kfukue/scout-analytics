@@ -314,6 +314,9 @@ type rpcLog struct {
 	BlockNumber string   `json:"blockNumber"`
 	TxHash      string   `json:"transactionHash"`
 	LogIndex    string   `json:"logIndex"`
+	// Removed: the node dropped this log in a chain reorganisation. Read by
+	// the holder log reader (holders_fetch.go) only; the tracker ignores it.
+	Removed bool `json:"removed"`
 }
 
 func (l rpcLog) block() uint64 {
@@ -851,7 +854,10 @@ func (c *rpcClient) getLogs(ctx context.Context, address string, topics []any, f
 }
 
 // getLogsChunked walks [from, to] in block ranges and calls fn for each log in
-// block order.
+// block order. fn may cancel ctx to stop the scan: the range being delivered
+// is finished (with SCOUT_RPC_PARALLEL > 1, later ranges of the same batch that
+// were already answered may be delivered too), no new range is planned, and
+// the scan returns ctx's error (nil when the last range was delivered).
 //
 // Each scan starts with ranges of SCOUT_RPC_LOG_CHUNK blocks (the ceiling) and
 // keeps its own size, so one scan's trouble never slows another scan down:
@@ -905,6 +911,11 @@ func (c *rpcClient) getLogsChunkedUpTo(ctx context.Context, address string, topi
 	streak, growAfter, probing, untested := 0, rangeGrowAfter, false, false
 	var timedOutAfter time.Duration
 	for cur := from; cur <= to; {
+		// A scan stopped by its caller (e.g. from fn) plans no further range,
+		// so no request is counted that is never sent.
+		if err := ctx.Err(); err != nil {
+			return fmt.Errorf("eth_getLogs %d-%d: %w", cur, to, err)
+		}
 		// Plan the next few ranges. They end on multiples of the size, so two
 		// scans of the same pool (repeat calls of a token) ask for identical
 		// ranges and the second one is answered from memory.
