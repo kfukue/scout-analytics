@@ -1,8 +1,39 @@
 # Scout analytics: handoff to Claude Code
 
-## Session state (20 Oct 2026 PDT: main 141e0c8 after #36, #37, #38)
+## Session state (20 Oct 2026 PDT: main cc5016e after #39, #40)
 
 This section supersedes the ones below wherever they differ.
+
+**Update, 20 Oct PDT (evening):**
+- Merged: #39 (4b-1, venues, columns and row builder) and #40 (docs:
+  the owner's decisions on the `data/` folder, the all-day run and A2).
+- In progress:
+  - 4b-2 (file writer and run helpers) on branch
+    `work/2026-10-20-holder-writer`, worktree `holder-writer-20261020`.
+    It adds `/data/` to `.gitignore` and changes the folder check to
+    allow `<repo root>/data` and below. In review.
+  - 4c must write to the exact path the folder check judged (the
+    implementer's note: the check cleans `..` as text, while the
+    operating system follows a link first).
+- A2 (rug kind 'price'): the owner accepted the PM's four choices ("ok
+  for the four choices"; details in the PM skill's "Owner decisions in
+  force"). PR order: website, tracker, then the fill script.
+  - Website PR in progress: worktree `price-rug-web-20261020`.
+  - Points from the A2 spec (`investigate`, 20 Oct) that the tracker
+    PR must carry:
+    - README's "PROPOSED repair" SQL clears `rug_at` wherever
+      `rug_block = 0`, so it would erase every 'price' time; add
+      `AND rug_at_kind IS DISTINCT FROM 'price'` to it and to its
+      finder query;
+    - a drained pool must win over 'price': `RugAt` must skip 'price'
+      rows, and `SetRugAtIfMissing` / `RugAtBackfillRows` must also
+      take rows whose kind is 'price' (none of this exists yet);
+    - the time comes from `scout_call_candles` in the DB, using the
+      in-memory entry price (the column may still be NULL on a call's
+      first run).
+  - The fill script is plain SQL (A count, B fill with a backup
+    table, C check, R rollback). It leaves the 29 drained "other"
+    calls alone.
 
 **Update, 20 Oct PDT (later the same day):**
 - Merged: #36 (4a, the log reader), #38 (the deployer's liquidity add
