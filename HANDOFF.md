@@ -1,6 +1,6 @@
 # Scout analytics: handoff to Claude Code
 
-## Session state (20 Oct 2026 PDT: main cc5016e after #39, #40)
+## Session state (20 Oct 2026 PDT: main 9c053c8 after #39, #40, #41)
 
 This section supersedes the ones below wherever they differ.
 
@@ -88,8 +88,11 @@ This section supersedes the ones below wherever they differ.
   A2 on 20 Oct ("ok go with A2"; recorded in the PM skill's "Owner
   decisions in force"); next, `investigate` drafts the spec for the
   three PRs.
-- Still open with the owner: the pilot's old-token share (explained
-  again on 20 Oct; PM recommends the natural share).
+- The pilot's old-token share: answered 20 Oct, natural share, about
+  10k `eth_getLogs` (owner: "go with your recommendation"; in the PM
+  skill's "Owner decisions in force"). No export question is open now.
+- Docs-only PRs: checked by `advisor` instead of `review` from 20 Oct
+  (owner rule; PM skill, "How to work", step 5).
 
 **Merged 19-20 Oct:** #32 docs (holder plan and P0 results, 19 Oct);
 holder analysis code PRs 1-3, pure functions, no node, no DB (#33 and
@@ -139,7 +142,8 @@ in `topics.go` ("Event topics in one file" in `scout-rules`). Done in
    `eth_getLogs`) or oversampled (up to about 32k)? Estimates by the
    19 Oct export plan from the Q3 age mix and 200k-block log reads
    (they replace the 8 Oct "about 8k", which predates the 24 h post
-   window). PM recommends natural share;
+   window). PM recommends natural share. Answered 20 Oct: natural
+   share (update above);
 2. the server output folder: answered 20 Oct, `data/holders/` in the
    repo, to be git-ignored (update above);
 3. daytime run beside `-track` with the auto-pause, or a quiet window?
