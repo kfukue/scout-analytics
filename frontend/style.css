@@ -28,6 +28,7 @@
   --b-red-bg: #fff5f5; --b-red: #c92a2a;
   --b-blue-bg: #e7f5ff; --b-blue: #1864ab;
   --b-rug-bg: #c92a2a; --b-rug: #ffffff;
+  --b-collapse-bg: #f3d9fa; --b-collapse: #862e9c; /* 5.6:1 */
   /* return badges by size (Latest %): background / text, all AA (4.5:1+) */
   --rb-rug-bg: #c92a2a; --rb-rug: #ffffff;
   --rb-bad-bg: #ffe3e3; --rb-bad: #a51d1d;
@@ -62,6 +63,7 @@
     --b-red-bg: #3e2729; --b-red: #ffa8a8;
     --b-blue-bg: #1f3346; --b-blue: #a5d8ff;
     --b-rug-bg: #c92a2a; --b-rug: #ffffff;
+    --b-collapse-bg: #3a2441; --b-collapse: #e599f7; /* 6.8:1 */
     --rb-rug-bg: #c92a2a; --rb-rug: #ffffff;
     --rb-bad-bg: #5c2326; --rb-bad: #ffd8d8;
     --rb-neg-bg: #3e2729; --rb-neg: #ffa8a8;
@@ -341,6 +343,9 @@ a.pv:hover { text-decoration: underline; text-underline-offset: 2px; }
 /* "sA": the token has an sAlpha report (open the row to read it) */
 .sa-badge { margin-left: 6px; padding: 0 6px; font-size: 11px; color: var(--b-blue); background: var(--b-blue-bg); cursor: help; }
 .badge-rug { color: var(--b-rug); background: var(--b-rug-bg); cursor: help; }
+/* "collapsed": rugged by the price rule (down more than 95%, the pool not
+   seen drained); a tinted pill, lighter than the solid red of a drained pool */
+.badge-collapse { color: var(--b-collapse); background: var(--b-collapse-bg); cursor: help; }
 /* "Perceptor today": a re-scan long after the call, never the call-time
    verdict, so it looks different: outlined with a dashed line, square
    corners, no fill, smaller, on a line of its own under the cell's badges. */

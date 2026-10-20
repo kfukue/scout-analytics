@@ -264,7 +264,7 @@ func TestWebAnalyticsRows(t *testing.T) {
 		}
 		checkAnaFactors(t, a, raw)
 		checkAnaTiming(t, a, raw)
-		if !slices.Equal(a.RugKinds, []string{"event", "at_call", "detected", "other"}) {
+		if !slices.Equal(a.RugKinds, []string{"event", "at_call", "detected", "price", "other"}) {
 			t.Errorf("n=%d: rug kinds %v", n, a.RugKinds)
 		}
 		// the dictionaries: most frequent first, no empty or unclean names
@@ -360,7 +360,7 @@ func checkAnaTiming(t *testing.T, a webAnalyticsJSON, raw []ScoutWebRow) {
 	for i, c := range a.Columns {
 		col[c] = i
 	}
-	sawTimed, sawNull, sawCens, sawRug := false, false, false, false
+	sawTimed, sawNull, sawCens, sawRug, sawPrice := false, false, false, false, false
 	for i, row := range a.Rows {
 		r := &raw[i]
 		for h, hz := range ScoutWebHorizons {
@@ -398,7 +398,7 @@ func checkAnaTiming(t *testing.T, a webAnalyticsJSON, raw []ScoutWebRow) {
 		wantKind := "-"
 		if r.RugAtKind != nil || r.RugAfterS != nil {
 			wantKind = "other"
-			if r.RugAtKind != nil && slices.Contains([]string{"event", "at_call", "detected"}, *r.RugAtKind) {
+			if r.RugAtKind != nil && slices.Contains([]string{"event", "at_call", "detected", "price"}, *r.RugAtKind) {
 				wantKind = *r.RugAtKind
 			}
 			sawRug = true
@@ -412,9 +412,11 @@ func checkAnaTiming(t *testing.T, a webAnalyticsJSON, raw []ScoutWebRow) {
 		if gotKind != wantKind {
 			t.Errorf("call %d: rug kind %q, want %q (rug_at_kind %v)", r.CallID, gotKind, wantKind, dumpFactors(r.RugAtKind))
 		}
+		sawPrice = sawPrice || gotKind == rugAtPrice
 	}
-	if len(a.Rows) >= 600 && !(sawTimed && sawNull && sawCens && sawRug) {
-		t.Errorf("test data lacks a case: timed %v, null in a timed window %v, censored %v, rug %v", sawTimed, sawNull, sawCens, sawRug)
+	if len(a.Rows) >= 600 && !(sawTimed && sawNull && sawCens && sawRug && sawPrice) {
+		t.Errorf("test data lacks a case: timed %v, null in a timed window %v, censored %v, rug %v, price rug %v",
+			sawTimed, sawNull, sawCens, sawRug, sawPrice)
 	}
 }
 
@@ -441,8 +443,10 @@ func TestAppendAnaTiming(t *testing.T) {
 		}(), ",900,600,2700,null" + strings.Repeat(",null", 16) + ",1,1,90000,0"},
 		{"rug at the call", ScoutWebRow{RugAfterS: ip(-120), RugAtKind: sp(rugAtAtCall)}, nulls + ",0,0,-120,1"},
 		{"detected", ScoutWebRow{RugAfterS: ip(2600000), RugAtKind: sp(rugAtDetected)}, nulls + ",0,0,2600000,2"},
-		{"unknown kind", ScoutWebRow{RugAfterS: ip(5), RugAtKind: sp("new")}, nulls + ",0,0,5,3"},
-		{"time without kind", ScoutWebRow{RugAfterS: ip(5)}, nulls + ",0,0,5,3"},
+		// collapsed (the price rule): its own kind, not "other"
+		{"price", ScoutWebRow{RugAfterS: ip(2592000), RugAtKind: sp(rugAtPrice)}, nulls + ",0,0,2592000,3"},
+		{"unknown kind", ScoutWebRow{RugAfterS: ip(5), RugAtKind: sp("new")}, nulls + ",0,0,5,4"},
+		{"time without kind", ScoutWebRow{RugAfterS: ip(5)}, nulls + ",0,0,5,4"},
 		{"kind without time", ScoutWebRow{RugAtKind: sp(rugAtEvent)}, nulls + ",0,0,null,0"},
 	} {
 		t.Run(c.name, func(t *testing.T) {
@@ -607,6 +611,8 @@ func TestWebAnalyticsVersion(t *testing.T) {
 		{"rug time", func(r *ScoutWebRow) bool { return r.RugAfterS != nil }, func(r *ScoutWebRow) { r.RugAfterS = ip(*r.RugAfterS + 1) }},
 		{"rug kind", func(r *ScoutWebRow) bool { return r.RugAtKind != nil && *r.RugAtKind == rugAtEvent },
 			func(r *ScoutWebRow) { r.RugAtKind = sp(rugAtDetected) }},
+		{"rug kind to price", func(r *ScoutWebRow) bool { return r.RugAtKind != nil && *r.RugAtKind == rugAtDetected },
+			func(r *ScoutWebRow) { r.RugAtKind = sp(rugAtPrice) }},
 		{"rug stored", func(r *ScoutWebRow) bool { return r.RugAfterS == nil }, func(r *ScoutWebRow) {
 			r.RugAfterS, r.RugAtKind = ip(7200), sp(rugAtEvent)
 		}},
