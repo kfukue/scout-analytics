@@ -26,6 +26,7 @@ const (
 	rugAtEvent    = "event"    // the time of the price event that showed the pool drained
 	rugAtAtCall   = "at_call"  // drained at or before the call (the time can be before entry_at)
 	rugAtDetected = "detected" // found only by the end-of-tracking liquidity check: the time of that check
+	rugAtPrice    = "price"    // not drained, rugged by the price rule (< 5 % of entry): an approximate time (priceRugAtSQL); any drained kind replaces it
 )
 
 // timingTol: relative tolerance when a candle high is compared with the
@@ -267,6 +268,28 @@ func (s *scanner) ensureRugAt(ctx context.Context, callID int, st *onchainState)
 		return nil, fmt.Errorf("save rug time: %w", err)
 	}
 	return &t, nil
+}
+
+// storePriceRugAt stores the approximate time of a rug found only by the price
+// rule (kind 'price', from the stored candles and horizons: priceRugAtSQL; no
+// node request). entry is the call's entry price. It never replaces a drained
+// kind (SetRugAtIfMissing). A failure is only logged (not when the run is
+// being stopped); a call without a done horizon gets no time.
+func (s *scanner) storePriceRugAt(ctx context.Context, callID int, entry float64, tag string) {
+	at, src, err := s.db.PriceRugAt(ctx, callID, entry)
+	wrote := false
+	if err == nil {
+		wrote, err = s.db.SetRugAtIfMissing(ctx, callID, at, rugAtPrice)
+	}
+	if err != nil {
+		if ctx.Err() == nil {
+			log.Printf("%s: price rug time not stored: %v", tag, err)
+		}
+		return
+	}
+	if wrote {
+		log.Printf("%s: rugged by the price rule, rug time %s (from the %s)", tag, at.Format(time.RFC3339), src)
+	}
 }
 
 // fillHorizonTiming adds the timing to an on-chain horizon result before it

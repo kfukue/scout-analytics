@@ -158,6 +158,17 @@ func runTrackerOnchain(t *testing.T, mode string) {
 		t.Fatalf("old, SCOUT_RUG_LIQ_USD=%q: got rug block %d quote side %v, want a rug at $150 only under the $500 default",
 			rugLiqEnv, oos.RugBlock, rugF(oos.RugLiquidityUSD))
 	}
+	// Its rug time: under the $500 default the drained pool wins ('detected',
+	// the check's time); with $100 only the price rule rugs it ('price', the
+	// end of the hourly bucket holding the dump at block eb + 11 days).
+	oldRugAt, oldKind := tmRugAt(t, st, ids[1])
+	if rugLiqEnv == "" {
+		if oldKind == nil || *oldKind != rugAtDetected || oldRugAt == nil {
+			t.Fatalf("old, SCOUT_RUG_LIQ_USD=%q: got rug time %v kind %v, want detected", rugLiqEnv, oldRugAt, strOrNil(oldKind))
+		}
+	} else if want := prHourEnd(f.timeOf(f.blockAtTime(eOld) + 11*day)); oldRugAt == nil || !oldRugAt.Equal(want) || oldKind == nil || *oldKind != rugAtPrice {
+		t.Fatalf("old, SCOUT_RUG_LIQ_USD=%q: got rug time %v kind %v, want %v price", rugLiqEnv, oldRugAt, strOrNil(oldKind), want)
+	}
 	if r := ro["30d"]; !near(r.ReturnPct, -99) || !near(r.MaxGainPct, 300) || !near(r.MaxDDPct, -99) {
 		t.Fatalf("old 30d: %+v", r)
 	}

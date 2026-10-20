@@ -382,6 +382,13 @@ func (s *scanner) trackOneOnchain(ctx context.Context, t *ScoutCallTracking, pos
 			}
 		}
 	}
+	if rug && st.RugBlock == 0 {
+		// timing.go: rugged by the price rule only (a drained pool, found
+		// above or earlier, has a rug block and its own time). The entry is
+		// the one in memory: on a call's first run the column is still NULL
+		// until the deferred save.
+		s.storePriceRugAt(ctx, t.CallID, *t.EntryPriceUSD, tag)
+	}
 	t.Rugged = &rug
 	t.Status = TrackDone
 	t.NextCheckAt = now

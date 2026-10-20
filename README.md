@@ -659,8 +659,8 @@ How it is measured:
 
 | Column (`scout_call_tracking`) | Meaning |
 |---|---|
-| `rug_at` | When the pool was drained: the exact time of the rug block (one node lookup per rugged call). NULL = not rugged, or rugged without a rug block (e.g. the 5%-of-entry rule). |
-| `rug_at_kind` | `event`: a price event in the horizon scan or the latest-price pass showed the pool drained. `at_call`: drained at or before the call (its time can be before `entry_at`). `detected`: found only by the end-of-tracking liquidity check; the time is that check's. Keep the three apart in analyses. |
+| `rug_at` | When the pool was drained: the exact time of the rug block (one node lookup per rugged call). For a call rugged only by the 5%-of-entry rule (kind `price`), an approximate time from the stored candles and horizons (below). NULL = not rugged, or unknown. |
+| `rug_at_kind` | `event`: a price event in the horizon scan or the latest-price pass showed the pool drained. `at_call`: drained at or before the call (its time can be before `entry_at`). `detected`: found only by the end-of-tracking liquidity check; the time is that check's. `price`: the pool was not drained, but the price rule (a price under 5% of the entry price at the end of tracking) marked the call rugged; the time is the end of the first hourly candle whose close is strictly under 5% of the entry price, capped at the last done horizon's due time; without such a candle, the due time of the earliest done horizon whose price is under 5%; failing that, the last done horizon's due time. Only hourly candles that start before the last done horizon's due time are used (`bucket_start` strictly earlier); a candle starting at or after it is ignored, even if its close is under 5%. The first close under 5% counts even if the price recovers later. A drained pool always wins: a drained kind found later (the latest-price pass, the tracker or `-backfill-timing`) replaces a `price` time, and a `price` time never replaces a drained one. Keep the four apart in analyses. |
 
 New calls get all of this from the tracker. For calls tracked before, run once (needs the
 database; the node only for the rug times):
@@ -679,7 +679,7 @@ database; the node only for the rug times):
 > SELECT call_id, horizon, computed_at, timing_at FROM scout_call_returns
 >  WHERE timing_at IS NOT NULL AND computed_at > timing_at + interval '1 minute';
 > SELECT call_id, rug_at, rug_at_kind, onchain->>'rug_block' AS rug_block FROM scout_call_tracking
->  WHERE rug_at IS NOT NULL
+>  WHERE rug_at IS NOT NULL AND rug_at_kind IS DISTINCT FROM 'price'
 >    AND (COALESCE((onchain->>'rug_block')::numeric, 0) = 0
 >         OR call_id IN (SELECT call_id FROM scout_call_returns
 >                         WHERE timing_at IS NOT NULL AND computed_at > timing_at + interval '1 minute'));
@@ -690,7 +690,7 @@ database; the node only for the rug times):
 >
 > ```sql
 > UPDATE scout_call_tracking SET rug_at = NULL, rug_at_kind = NULL
->  WHERE rug_at IS NOT NULL
+>  WHERE rug_at IS NOT NULL AND rug_at_kind IS DISTINCT FROM 'price'
 >    AND (COALESCE((onchain->>'rug_block')::numeric, 0) = 0
 >         OR call_id IN (SELECT call_id FROM scout_call_returns
 >                         WHERE timing_at IS NOT NULL AND computed_at > timing_at + interval '1 minute'));
@@ -720,8 +720,9 @@ backfill-timing (dry run): 290 rugged horizon(s) wait for those lookups; 0 rugge
 
 - It selects horizons with status `done` and `timing_at` NULL, with a late entry and late
   peak, on-chain state version 2 or later, and the horizon marked done in that state.
-- Rug times are looked up first (one `eth_getBlockByNumber` per rugged call without
-  `rug_at`, one at a time, paced by `SCOUT_RPC_RPS`). Then the timing is computed from the
+- Rug times are looked up first (one `eth_getBlockByNumber` per call with a rug block and
+  without `rug_at`, or with only a `price` time, one at a time, paced by `SCOUT_RPC_RPS`;
+  the drained time then replaces the `price` one). Then the timing is computed from the
   candles, 200 calls per batch.
 - Without a node it does not stop. When 3 rug-time lookups in a row fail, at any point of
   the step (node unreachable; each failed lookup is retried for several seconds), the rest
@@ -732,7 +733,7 @@ backfill-timing (dry run): 290 rugged horizon(s) wait for those lookups; 0 rugge
   "no node" means that address (or the one set) does not answer.
 - It writes only the new columns. Status, schedules, on-chain state, returns, candles and
   `updated_at` are not touched, and nothing is tracked again. A row that got its timing or
-  rug time in the meantime (e.g. from a running tracker) is left as it is, so running the
+  a drained rug time in the meantime (e.g. from a running tracker) is left as it is, so running the
   command again is harmless. A second run only tries again the horizons the first one skipped
   (see below); when nothing was skipped, it finds nothing to do.
 - The kind of a past rug is read from the stored state: the rug block at or before the call

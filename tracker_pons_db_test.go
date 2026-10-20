@@ -172,6 +172,17 @@ func TestTrackerPonsCurveRugRules(t *testing.T) {
 	if td.Status != TrackDone || td.Rugged == nil || !*td.Rugged || *td.CurrentPriceUSD >= *td.EntryPriceUSD*0.05 || ltState(t, st, dump.id).RugBlock != 0 {
 		t.Fatalf("dump: got %+v (err %s), want done and rugged by the 5%% rule (not by liquidity)", td, strOrNil(td.Error))
 	}
+	// Rugged by the price rule only: rug kind 'price', a time within its 30
+	// days of tracking; the two calls not rugged get no rug time.
+	if at, kind := tmRugAt(t, st, dump.id); at == nil || kind == nil || *kind != rugAtPrice ||
+		!at.After(td.EntryAt) || at.After(td.EntryAt.Add(30*ltDay)) {
+		t.Fatalf("dump: got rug time %v kind %v, want a price time within 30 days of %v", at, strOrNil(kind), td.EntryAt)
+	}
+	for _, c := range []rugCall{tiny, swept} {
+		if at, kind := tmRugAt(t, st, c.id); at != nil || kind != nil {
+			t.Fatalf("call %d (not rugged): got rug time %v kind %v, want none", c.id, at, strOrNil(kind))
+		}
+	}
 	if os := ltState(t, st, swept.id); os.PonsDone != swept.at(3*ltDay) || os.PoolID != "" || os.PonsSeen == 0 {
 		t.Fatalf("swept: state %+v", os)
 	}

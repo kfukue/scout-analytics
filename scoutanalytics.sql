@@ -302,7 +302,9 @@ ALTER TABLE scout_call_returns ADD COLUMN IF NOT EXISTS above_2x_censored     BO
 ALTER TABLE scout_call_returns ADD COLUMN IF NOT EXISTS timing_at             TIMESTAMPTZ;  -- when the timing was computed
 -- When the pool was drained (exact block time). Kind: event (a price event in a scan),
 -- at_call (drained at or before the call; can be before entry_at), detected (found only by
--- the end-of-tracking liquidity check: the time of that check). NULL = not rugged, or unknown.
+-- the end-of-tracking liquidity check: the time of that check), price (not drained, rugged by
+-- the price rule, < 5% of entry: an approximate time from the hourly candles or horizons; any
+-- drained kind replaces it). NULL = not rugged, or unknown.
 ALTER TABLE scout_call_tracking ADD COLUMN IF NOT EXISTS rug_at      TIMESTAMPTZ;
 ALTER TABLE scout_call_tracking ADD COLUMN IF NOT EXISTS rug_at_kind TEXT;
 
