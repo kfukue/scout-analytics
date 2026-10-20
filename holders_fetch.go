@@ -57,8 +57,8 @@ type holderVenue struct {
 }
 
 // holderFetchInput is what fetchHolderLogs needs for one call. The caller
-// fills it from the call's onchainState; the token's v4 pool ids come from
-// there too (this file does not look for pools).
+// fills it from the call's onchainState, and the token's v4 pool ids from
+// holderV4PoolIDs (all of them: the reader reads the post window too).
 type holderFetchInput struct {
 	Token      string
 	EntryBlock uint64    // 0 = unknown: errUnknownEntryBlock
@@ -162,6 +162,37 @@ type holderLogs struct {
 	// although it may never have been sent. The counts are an upper bound on
 	// the requests the node received.
 	LogRequests, OtherRequests int64
+}
+
+// holderV4PoolIDs lists the token's v4 pool ids from the PoolManager's
+// Initialize events up to block head (v4PoolsOf: 2 eth_getLogs, fewer when
+// already searched, more when the node refuses the range), split by
+// Initialize block: pre holds the pools initialised at or before the
+// state's entry block, all every pool. Both lowercase and sorted. For a
+// state whose PoolManager is never a venue (v2, v3, a Pons token without a
+// known pool: holderV4VenueAt) it returns nil without a request.
+func (o *onchainSource) holderV4PoolIDs(ctx context.Context, token string, st onchainState, head uint64) (pre, all []string, err error) {
+	if !holderV4VenueAt(st, ^uint64(0)) {
+		return nil, nil, nil
+	}
+	pools, err := o.v4PoolsOf(ctx, strings.ToLower(token), head) // v4PoolsOf compares lowercase currencies
+	if err != nil {
+		return nil, nil, fmt.Errorf("holder v4 pool ids: %w", err)
+	}
+	pre, all = splitV4PoolIDs(pools, st.EntryBlock)
+	return pre, all, nil
+}
+
+// splitV4PoolIDs returns the ids of the pools initialised at or before
+// entryBlock (pre) and of every pool (all), lowercase and sorted.
+func splitV4PoolIDs(pools []v4Pool, entryBlock uint64) (pre, all []string) {
+	for _, p := range pools {
+		all = append(all, p.id)
+		if p.block <= entryBlock {
+			pre = append(pre, p.id)
+		}
+	}
+	return normPoolIDs(pre), normPoolIDs(all)
 }
 
 // fetchHolderLogs reads the logs behind the holder analysis of one call (see
