@@ -524,6 +524,10 @@ Only use the feature columns as model inputs; everything about the future is an 
 | `SCOUT_LATEST_REFRESH_RECENT` | `15m` | how often the latest price of a call younger than 30 days is read again (at least `1m`) |
 | `SCOUT_LATEST_REFRESH_OLD` | `24h` | the same for calls 30 days or older (at least `10m`) |
 | `SCOUT_LATEST_BATCH` | `200` | latest prices read per tracker cycle at most (1 – 10000) |
+| `SCOUT_HOLDERS_RPS` | `4` | coming holder export (`-export-holders`, not yet added): requests per second of its own node client, which keeps one request in flight, reads one block range at a time and has no log cache, so it does not slow the tracker (1 – 20; `0` is refused) |
+| `SCOUT_HOLDERS_MAX_NODE_LAG` | `2m` | coming holder export: pause while the node's head block is older than this, or while the node does not answer (asked at most once every 30 s; `0` = check off) |
+| `SCOUT_HOLDERS_MAX_PRICE_LAG` | `2h` | coming holder export: pause while the tracker's latest-price pass is further behind than this (asked at most once a minute; `0` = check off) |
+| `SCOUT_HOLDERS_MAX_PAUSE` | `30m` | coming holder export: stop when one pause would last longer than this (above `0`) |
 
 Other commands: `-track` (tracker only, forever, no Telegram), `-track-once` (process what's due and exit).
 
