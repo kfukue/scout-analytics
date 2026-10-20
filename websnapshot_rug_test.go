@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"io/fs"
+	"os/exec"
 	"strconv"
 	"strings"
 	"testing"
@@ -125,9 +127,10 @@ func TestWebSAlphaDeclinedRow(t *testing.T) {
 	}
 }
 
-// TestWebRuggedRow: a rugged call shows no peak in any window (and sorts with
-// the calls without one), keeps its stored returns and worst drop, carries
-// rugged = true, and its latest market cap is not shown at a price of 0.
+// TestWebRuggedRow: a rugged call whose pool was drained shows no peak in any
+// window (and sorts with the calls without one), keeps its stored returns and
+// worst drop, carries rugged = true, and its latest market cap is not shown at
+// a price of 0. A collapsed one (rug kind price) shows its peak.
 func TestWebRuggedRow(t *testing.T) {
 	rows := syntheticWebRows(80, 3)
 	pos := -1
@@ -143,7 +146,7 @@ func TestWebRuggedRow(t *testing.T) {
 	}
 	r := &rows[pos]
 	yes := true
-	r.Rugged = &yes
+	r.Rugged, r.RugAtKind = &yes, sp(rugAtEvent) // drained (a collapsed call keeps its peak: below)
 	r.HasPerf = 1<<15 - 1
 	for h := range ScoutWebHorizons {
 		r.Perf[h*webPerfPerHorizon+webPerfReturn] = -100
@@ -195,5 +198,77 @@ func TestWebRuggedRow(t *testing.T) {
 	}
 	if other.version == snap.version {
 		t.Error("rugged must change the snapshot version")
+	}
+	// the same row collapsed (rugged by the price rule) shows its peak too
+	collapsed := cloneWebRows(rows)
+	collapsed[pos].RugAtKind = sp(rugAtPrice)
+	coll := mustWebSnapshot(t, collapsed, 0, nil)
+	if c := sentCall(t, coll, pos, 1); c.PeakPct == nil || *c.PeakPct != 251 || c.Rugged == nil || !*c.Rugged || strOrNil(c.RugKind) != rugAtPrice {
+		t.Errorf("collapsed: peak_pct %s rugged %v rug_kind %s, want 251 true price", fnum(c.PeakPct), c.Rugged, strOrNil(c.RugKind))
+	}
+	if coll.version == snap.version {
+		t.Error("a collapsed call must change the snapshot version")
+	}
+}
+
+// runNodeTest runs a testdata/*.test.js file with node (the test is skipped
+// when node is not on the PATH); it must print "ok: …".
+func runNodeTest(t *testing.T, file string) {
+	t.Helper()
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node is not on the PATH")
+	}
+	out, err := exec.Command(node, file).CombinedOutput()
+	if err != nil {
+		t.Fatalf("node %s: %v: %s", file, err, out)
+	}
+	if !strings.HasPrefix(string(out), "ok: ") {
+		t.Fatalf("node %s: got %q, want \"ok: …\"", file, out)
+	}
+}
+
+// TestAppRugNode runs testdata/app-rug.test.js: the list page's "rugged"
+// (pool drained) and "collapsed" (rug kind price) badges in Status, and the
+// peak cell (a dash for a drained call only).
+func TestAppRugNode(t *testing.T) { runNodeTest(t, "testdata/app-rug.test.js") }
+
+// TestAnalyticsRugsNode runs testdata/analytics-rugs.test.js: the Timing
+// tab's rug kinds (rugOf, addTm) and its "Rugs by kind of rug time" table
+// with the collapsed row (fillTmRugs).
+func TestAnalyticsRugsNode(t *testing.T) { runNodeTest(t, "testdata/analytics-rugs.test.js") }
+
+// TestRugCollapsedTexts: the pages explain the collapsed badge apart from
+// the rugged one, with the threshold written out (the model's and the
+// Analytics page's "collapse" is a smaller drop), and the badge has its
+// colours in both colour schemes.
+func TestRugCollapsedTexts(t *testing.T) {
+	read := func(name string) string {
+		t.Helper()
+		b, err := fs.ReadFile(frontendFS, "frontend/"+name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(b)
+	}
+	index, ana, css := read("index.html"), read("analytics.html"), read("style.css")
+	for _, c := range []struct{ file, text, want string }{
+		{"index.html", index, `<span class="badge badge-rug">rugged</span>`},
+		{"index.html", index, `<span class="badge badge-collapse">collapsed</span>`},
+		{"index.html", index, "Collapsed (price down more than 95%)"},
+		{"index.html", index, "A rugged call (pool drained) shows no peak (–); a collapsed one shows its peak."},
+		{"analytics.html", ana, "The flag covers both calls whose pool was drained and collapsed calls (price down more than 95%"},
+		{"analytics.html", ana, `"Collapsed (price down more than 95%)"`},
+		{"style.css", css, ".badge-collapse { color: var(--b-collapse); background: var(--b-collapse-bg);"},
+	} {
+		if !strings.Contains(c.text, c.want) {
+			t.Errorf("%s: missing %q", c.file, c.want)
+		}
+	}
+	if n := strings.Count(css, "--b-collapse-bg: #"); n != 2 {
+		t.Errorf("style.css: --b-collapse-bg set %d times, want 2 (light and dark)", n)
+	}
+	if strings.Contains(index, "after the last window also when the price fell below 5% of entry") {
+		t.Error("index.html: the rugged legend still describes the price rule (now the collapsed badge)")
 	}
 }

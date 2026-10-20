@@ -392,7 +392,7 @@ type ScoutWebRow struct {
 	// when that value is not NULL. Bit h of Censored2x is above_2x_censored.
 	// RugAfterS is scout_call_tracking.rug_at − entry_at in whole seconds
 	// (can be ≤ 0 for a rug at the call), RugAtKind its rug_at_kind (event |
-	// at_call | detected); both nil when not stored. Sent for every row; the
+	// at_call | detected | price); both nil when not stored. Sent for every row; the
 	// page uses them for calls priced in USD only, like every number.
 	Timing     [len(ScoutWebHorizons) * webTimingPerHorizon]int32
 	HasTiming  uint32
@@ -467,6 +467,7 @@ type ScoutWebCall struct {
 	Return7dPct    *float64  `json:"return_7d_pct"`
 	Return30dPct   *float64  `json:"return_30d_pct"`
 	Rugged         *bool     `json:"rugged"`
+	RugKind        *string   `json:"rug_kind"` // rug_at_kind: event | at_call | detected (pool drained) | price (collapsed: down > 95%, not seen drained)
 	TrackingStatus *string   `json:"tracking_status"`
 	PerceptorVerd  *string   `json:"perceptor_verdict"` // clean | caution | red_flags | insufficient | unknown
 	PerceptorURL   *string   `json:"perceptor_url"`     // report link (https only)

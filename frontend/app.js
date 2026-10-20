@@ -292,11 +292,42 @@
     return td;
   }
 
-  // Peak % of a rugged call: none (the pool was drained).
+  // A rugged call is "collapsed" when the tracker flagged it by the price rule
+  // only (rug_kind 'price': under 5% of the entry price at the end of
+  // tracking, i.e. down more than 95%; the pool was not seen drained). Every
+  // other rugged call counts as drained, also one with no rug kind stored.
+  function isCollapsed(c) { return c.rugged === true && c.rug_kind === 'price'; }
+  function isDrained(c) { return c.rugged === true && c.rug_kind !== 'price'; }
+
+  // Peak % of a drained call: none (the pool was drained). A collapsed call
+  // shows its peak like any call.
   function peakCell(c) {
-    if (c.rugged !== true) { return pctCell(c.peak_pct); }
+    if (!isDrained(c)) { return pctCell(c.peak_pct); }
     var td = el('td', 'num', DASH);
     td.title = 'No peak: the pool was rugged';
+    return td;
+  }
+
+  // Status: a "rugged" (pool drained) or "collapsed" badge replaces the
+  // tracking status of a rugged call, which goes in the badge's title.
+  function statusCell(c) {
+    var td = el('td', 'status');
+    var st = c.tracking_status;
+    var stText = st ? (STATUS_TEXT[st] || String(st)) : DASH;
+    if (c.rugged !== true) {
+      td.textContent = stText;
+      return td;
+    }
+    var badge;
+    if (isCollapsed(c)) {
+      badge = el('span', 'badge badge-collapse', 'collapsed');
+      badge.title = 'Collapsed: price down more than 95% (under 5% of the entry price at the end of tracking);' +
+        ' the pool was not seen drained (tracking status: ' + stText + ')';
+    } else {
+      badge = el('span', 'badge badge-rug', 'rugged');
+      badge.title = 'Rugged: the pool was drained (tracking status: ' + stText + ')';
+    }
+    td.appendChild(badge);
     return td;
   }
 
@@ -734,18 +765,7 @@
     // the model's score (any price unit: it does not depend on the USD price)
     if (modelScores) { tr.appendChild(modelCell(c)); }
 
-    // Status: "rugged" replaces the tracking status (which goes in the title).
-    var tdStatus = el('td', 'status');
-    var st = c.tracking_status;
-    var stText = st ? (STATUS_TEXT[st] || String(st)) : DASH;
-    if (c.rugged === true) {
-      var rug = el('span', 'badge badge-rug', 'rugged');
-      rug.title = 'Rugged: the pool was drained (tracking status: ' + stText + ')';
-      tdStatus.appendChild(rug);
-    } else {
-      tdStatus.textContent = stText;
-    }
-    tr.appendChild(tdStatus);
+    tr.appendChild(statusCell(c));
 
     // The list has one row per token (its first call); this marks tokens called again.
     var tdCalls = el('td', 'calls');
@@ -850,6 +870,13 @@
     return n;
   }
 
+  // The row detail's Peak %: a dash with "(rugged)" for a drained call (as
+  // peakCell in the list), the peak for every other call, a collapsed one
+  // included.
+  function detailPeakNode(c) {
+    return isDrained(c) ? el('span', '', DASH + ' (rugged)') : pctNode(c.peak_pct);
+  }
+
   // The performance block of the row detail, from the row as last drawn, and
   // the model and "Perceptor today" blocks (also from the row).
   function drawPerf(key) {
@@ -891,8 +918,7 @@
       perfItem(dl, 'Last trade', [fmtDate(c.latest_trade_at), ' (', agoNode(tradeAt), ')']);
     }
     perfItem(dl, 'Call MC → Latest MC', [fmtMcap(c.call_mcap_usd), ' → ', fmtMcap(c.latest_mcap_usd)]);
-    var peak = c.rugged === true ? el('span', '', DASH + ' (rugged)') : pctNode(c.peak_pct);
-    perfItem(dl, 'Peak % (' + state.horizon + ')', [peak]);
+    perfItem(dl, 'Peak % (' + state.horizon + ')', [detailPeakNode(c)]);
     perfItem(dl, 'Worst drop % (' + state.horizon + ')', [pctNode(c.drawdown_pct)]);
     sec.appendChild(dl);
     box.appendChild(sec);

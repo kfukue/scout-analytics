@@ -1955,12 +1955,17 @@ other sites):
   has an sAlpha report with text (hover for a hint). An empty reply, or one that declines,
   gives no badge. For a report asked again later the hint is "sAlpha (asked again 7h after
   the call)".
-- **Rugged** — a call the tracker flagged `rugged` (`scout_call_tracking.rugged`, also while
-  it is still tracking) shows a red "rugged" badge in Status instead of the tracking status
-  (which is in its tooltip), a dash for **Peak %** in every window (the API sends
-  `peak_pct: null`, and `sort=peak` lists it with the rows without a peak), and a dash for
-  Latest MC (its latest price is 0). The returns are shown as stored (−100% for the windows
-  after the rug).
+- **Rugged / collapsed** — a call the tracker flagged `rugged` (`scout_call_tracking.rugged`,
+  also while it is still tracking) shows a badge in Status instead of the tracking status
+  (which is in its tooltip). A red "rugged" badge = the pool was drained (`rug_at_kind`
+  `event`, `at_call`, `detected`, or none stored): a dash for **Peak %** in every window (the
+  API sends `peak_pct: null`, and `sort=peak` lists it with the rows without a peak), and a
+  dash for Latest MC once the tracker has the rug block (its latest price is then 0; a call
+  flagged by the 5%-of-entry rule with no kind stored has no rug block and keeps its live
+  Latest MC). The returns are shown as stored (−100% for the windows after the rug). A purple
+  "collapsed" badge = `rug_at_kind = 'price'`: flagged by the end-of-tracking price rule
+  (under 5% of entry, down more than 95%), the pool not seen drained; its peak and Latest MC
+  are shown like any call's.
 - **Perceptor** — the column shows the verdict of the token's Perceptor report as words:
   "no red flags", "caution", "red flags" (linked to the report, in a new tab), or "–" when
   there is none. The "Perceptor" button next to the search box filters the list: it opens a
@@ -2163,10 +2168,13 @@ dependencies; `go test` runs it when `node` is on the PATH). Only the visible ta
     `heldHistogram` and `timing2x` in `frontend/analytics-stats.js`).
   - **Rugs by kind of rug time** (a table): event rug times within the window, event rug
     times after it, rugs **at the call** (drained at or before the post), rugs only
-    **detected** at the end of tracking (their time is that check's, an upper bound), any
-    other kind, and calls flagged rugged without a rug time. Only event rug times within the
-    window are in the time-to-rug histogram and the "share rugged by t" curve; at-the-call and
-    detected rugs are always shown **separately**, never in a histogram or curve.
+    **detected** at the end of tracking (their time is that check's, an upper bound),
+    **collapsed** calls ("Collapsed (price down more than 95%)", kind `price`: flagged by the
+    end-of-tracking price rule, the pool not seen drained; their time is approximate, so the
+    median is shown with "≈", and they are never in the charts), any other kind, and calls
+    flagged rugged without a rug time. Only event rug times within the window are in the
+    time-to-rug histogram and the "share rugged by t" curve; at-the-call, detected and
+    collapsed rugs are always shown **separately**, never in a histogram or curve.
   - **Mean and median by group:** a table grouped by the Perceptor verdict at the call, the
     week or month (the Period choice), the pool family, the DEX named in the post, or any
     number factor of the By factor tab in 4, 5 or 10 equal-count groups (the same choice as
@@ -2343,7 +2351,7 @@ Any other value or parameter, or any parameter but `verdict` given twice → HTT
    "gmgn_url": "https://gmgn.ai/robinhood/token/0x…", "price_unit": "usd",
    "entry_price_usd": 0.0045, "return_pct": -20.0, "peak_pct": 100.0, "drawdown_pct": -50.0,
    "return_1h_pct": 12.5, "return_1d_pct": -20.0, "return_3d_pct": 40.1, "return_7d_pct": null,
-   "return_30d_pct": null, "rugged": false, "tracking_status": "done", "perceptor_verdict": "clean",
+   "return_30d_pct": null, "rugged": false, "rug_kind": null, "tracking_status": "done", "perceptor_verdict": "clean",
    "perceptor_url": "https://www.perceptor.info/r/deb9d3118ec1480e985032f9472c87c0",
    "call_count": 3, "last_call_date": "2026-10-02T09:12:00Z",
    "latest_return_pct": 35.2, "latest_price_usd": 0.006084,
@@ -2366,8 +2374,10 @@ return of each window, whatever the `horizon`: each is exactly the `return_pct` 
 has when that window is asked for (`null` until the window is recorded). The page shows these
 five as its 1h … 30d columns; `return_pct` is kept for older clients. `entry_price_usd`,
 `return_pct`, `peak_pct`, `drawdown_pct` and the five window returns are `null` unless
-`price_unit` is `usd`. `peak_pct` is also `null` when `rugged` is `true` (the returns and
-`drawdown_pct` stay as stored). `gmgn_url` is `null` for anything that is not a plain `0x…`
+`price_unit` is `usd`. `peak_pct` is also `null` when `rugged` is `true` and `rug_kind` is not
+`price` (the returns and `drawdown_pct` stay as stored). `rug_kind` =
+`scout_call_tracking.rug_at_kind` (`event`, `at_call`, `detected`: pool drained; `price`:
+collapsed), `null` when none. `gmgn_url` is `null` for anything that is not a plain `0x…`
 address.
 
 `model` is the model's score of the first call (`scout_call_predictions`, for any
@@ -2513,7 +2523,7 @@ clients that take it; `503` before the first snapshot.
 ```json
 {"format": 4, "horizons": ["1h","1d","3d","7d","30d"], "horizon_seconds": [3600,86400,259200,604800,2592000],
  "quiet_below": 50, "verdicts": ["clean","caution","red_flags","unknown","none"],
- "rug_kinds": ["event","at_call","detected","other"],
+ "rug_kinds": ["event","at_call","detected","price","other"],
  "families": ["v4","v2","pons","v3","gecko","untracked"], "dexes": ["Uniswap V4","Pons V2","…"], "quotes": ["WETH","USDG"],
  "columns": ["call_id","t","flags","verdict","family","dex","quote","trades_24h","no_data",
              "ret_1h","peak_1h","dd_1h","ret_1d","peak_1d","dd_1d","…","dd_30d",
@@ -2570,9 +2580,10 @@ clients that take it; `503` before the first snapshot.
     `above_2x_censored` of a timed window *i* (still at 2× at the end, no rug).
   - `rug_s` = `scout_call_tracking.rug_at` − `entry_at` in whole seconds (`0` or negative
     for a rug at or before the post), `null` = no rug time stored. `rug_kind` = an index
-    into `rug_kinds` (`rug_at_kind`: `event`, `at_call`, `detected`; `other` = a kind
-    this version does not know, or a time without a kind), `-1` = none. The page keeps
-    `at_call` and `detected` apart from `event` (see the Timing tab).
+    into `rug_kinds` (`rug_at_kind`: `event`, `at_call`, `detected`, `price` = collapsed:
+    the price rule, time approximate; `other` = a kind this version does not know, or a
+    time without a kind), `-1` = none. The page keeps `at_call`, `detected` and `price`
+    apart from `event` (see the Timing tab).
 - Size: about 158 bytes a row, about 50 compressed (5,600 synthetic rows: 883 KB, 283 KB
   gzipped; without the factor columns the same rows are 640 KB, 209 KB gzipped; the real data
   was 117 / 39 bytes a row before, so expect about 160 / 53 now: about 960 KB, 320 KB gzipped

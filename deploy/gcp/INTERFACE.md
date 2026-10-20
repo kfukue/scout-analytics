@@ -390,6 +390,14 @@ published until it is added to the DTO and to the approved list in the test (7).
 | `LatestReturn`, `LatestPrice`, `LatestAt`, `LatestTradeAt` | **prices** |
 | unexported fields (`usd`, `verdict`, `mcapVals`, `anaHas`, …) | not exported; recomputed by `newWebSnapshot` |
 
+Note (owner decision A2, 20 Oct 2026): `RugAtKind` is not in this list. A
+future export should carry it with `Rugged`, so the read side can tell a
+collapsed call (`rug_at_kind = 'price'`: price down more than 95 %, the pool
+not seen drained) from one whose pool was drained. `newWebSnapshot` keeps the
+peak of a collapsed call (3.1 "hides a rugged call's peak" applies to drained
+ones only) and the page labels it "collapsed"; without the kind, the public
+site would show every rugged call as drained.
+
 | `webReport` field | Export | Note |
 |---|---|---|
 | `id`, `tool`, `at`, `verdict` | yes | |

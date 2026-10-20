@@ -218,8 +218,8 @@ func syntheticModel(r *ScoutWebRow, rng *rand.Rand) {
 // random source, so the other fields stay as they were): most windows with a
 // return have their timing; a few reached 2× (some censored, some touch and
 // drop: held 0); rugged rows mostly have a rug time of one of the kinds (a
-// rug at the call before the post), now and then one of a kind the website
-// does not know.
+// rug at the call before the post; collapsed by the price rule), now and then
+// one of a kind the website does not know.
 func syntheticTiming(r *ScoutWebRow, rng *rand.Rand) {
 	for h, secs := range webHorizonSeconds {
 		if r.HasPerf&(1<<(h*webPerfPerHorizon)) == 0 || rng.Intn(8) == 0 {
@@ -250,7 +250,7 @@ func syntheticTiming(r *ScoutWebRow, rng *rand.Rand) {
 		}
 	}
 	if r.Rugged != nil && *r.Rugged && rng.Intn(5) != 0 {
-		kinds := []string{rugAtEvent, rugAtEvent, rugAtEvent, rugAtDetected, rugAtDetected, rugAtAtCall, "later_kind"}
+		kinds := []string{rugAtEvent, rugAtEvent, rugAtEvent, rugAtDetected, rugAtDetected, rugAtAtCall, rugAtPrice, "later_kind"}
 		k := kinds[rng.Intn(len(kinds))]
 		s := 60 + rng.Intn(40*86400)
 		if k == rugAtAtCall {
@@ -375,8 +375,8 @@ func referencePage(rows []ScoutWebRow, f ScoutWebCallsFilter) (ids []int, total 
 		if r.PriceUnit == nil || *r.PriceUnit != "usd" || r.HasPerf&(1<<i) == 0 {
 			return 0, false
 		}
-		if f.Sort == "peak" && r.Rugged != nil && *r.Rugged {
-			return 0, false // a rugged call shows no peak
+		if f.Sort == "peak" && r.Rugged != nil && *r.Rugged && (r.RugAtKind == nil || *r.RugAtKind != "price") {
+			return 0, false // a rugged call shows no peak, unless it collapsed (price rule)
 		}
 		return r.Perf[i], true
 	}
@@ -540,6 +540,55 @@ func TestWebSnapshotPageMatchesReference(t *testing.T) {
 		if _, _, err := snap.page(bad, webAllAges, nil); err == nil {
 			t.Errorf("%+v: no error", bad)
 		}
+	}
+}
+
+// TestWebSnapshotRugKindPeak: the list sends each call's rug_kind, and hides
+// the peak of a rugged call unless it collapsed (rug_at_kind price: flagged by
+// the price rule, the pool not seen drained); a rugged call without a kind
+// still hides it. The sort by peak follows what is shown.
+func TestWebSnapshotRugKindPeak(t *testing.T) {
+	yes, no := true, false
+	cases := []struct {
+		rugged   *bool
+		kind     *string
+		wantPeak string
+	}{
+		{&yes, sp(rugAtEvent), "null"},
+		{&yes, sp(rugAtAtCall), "null"},
+		{&yes, sp(rugAtDetected), "null"},
+		{&yes, sp(rugAtPrice), "40"},
+		{&yes, nil, "null"},
+		{&yes, sp("later_kind"), "null"},
+		{&no, nil, "40"},
+		{nil, nil, "40"},
+	}
+	rows := make([]ScoutWebRow, len(cases))
+	for i, c := range cases {
+		rows[i] = ScoutWebRow{CallID: i + 1, MessageID: i + 1, ChannelUsername: "scoutrobinhood", ContractAddress: caAlpha,
+			PriceUnit: sp("usd"), Tracked: true, TrackingStatus: sp(TrackDone), CallCount: 1, Rugged: c.rugged, RugAtKind: c.kind,
+			Perf: [15]float64{3: -96, 4: 40, 5: -97}, HasPerf: 1<<3 | 1<<4 | 1<<5}
+	}
+	snap := mustWebSnapshot(t, rows, 0, nil)
+	var withPeak []int
+	for i, c := range cases {
+		got := sentCall(t, snap, i, 1) // the 1d window
+		if fnum(got.PeakPct) != c.wantPeak || fnum(got.ReturnPct) != "-96" || fnum(got.DrawdownPct) != "-97" {
+			t.Errorf("rugged %s kind %s: peak %s return %s drawdown %s, want %s -96 -97", dumpFactors(c.rugged), dumpFactors(c.kind),
+				fnum(got.PeakPct), fnum(got.ReturnPct), fnum(got.DrawdownPct), c.wantPeak)
+		}
+		if dumpFactors(got.RugKind) != dumpFactors(c.kind) {
+			t.Errorf("rugged %s kind %s: rug_kind %s, want %s", dumpFactors(c.rugged), dumpFactors(c.kind), dumpFactors(got.RugKind), dumpFactors(c.kind))
+		}
+		if c.wantPeak != "null" {
+			withPeak = append(withPeak, i+1)
+		}
+	}
+	// by peak: the calls that show one first (ties by call id, descending)
+	ids, total := pageIDs(t, snap, ScoutWebCallsFilter{Sort: "peak", Dir: "desc", Horizon: "1d", Page: 1, Per: 10})
+	slices.Reverse(withPeak)
+	if total != len(cases) || !slices.Equal(ids[:len(withPeak)], withPeak) {
+		t.Errorf("sort=peak: %v (total %d), want %v first", ids, total, withPeak)
 	}
 }
 
@@ -815,6 +864,15 @@ func TestWebSnapshotVersion(t *testing.T) {
 	change("sAlpha report", 5, func(rows []ScoutWebRow) { id := 7777777; rows[6].SAlphaID = &id })
 	change("Perceptor report id", 5, func(rows []ScoutWebRow) { id := 7777778; rows[6].PerceptorID = &id })
 	change("rugged", 5, func(rows []ScoutWebRow) { no := false; rows[0].Rugged = &no })
+	change("rug kind to price", 5, func(rows []ScoutWebRow) {
+		for i := range rows {
+			if r := &rows[i]; r.Rugged != nil && *r.Rugged && (r.RugAtKind == nil || *r.RugAtKind != rugAtPrice) {
+				r.RugAtKind = sp(rugAtPrice) // collapsed: its peak is shown and rug_kind changes
+				return
+			}
+		}
+		t.Fatal("no rugged row without the price kind to change")
+	})
 	change("tracked", 5, func(rows []ScoutWebRow) { rows[0].Tracked = !rows[0].Tracked })
 	// the latest price: row 4 is priced in USD and has one
 	if r := raw[4]; r.PriceUnit == nil || *r.PriceUnit != "usd" || r.LatestAt == nil || finite(r.LatestReturn) == nil || r.LatestTradeAt == nil {

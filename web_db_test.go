@@ -33,6 +33,7 @@ type webSeed struct {
 	Entry   float64 // entry_price_usd (0 = NULL)
 	Late    float64 // entry_late_price_usd (0 = NULL)
 	Rugged  *bool
+	RugKind *string // rug_at_kind, stored with a rug time (nil = NULL)
 	// market caps parsed from the post (scout_call_metrics; nil = NULL)
 	CalledMC *float64 // called_at_mcap_usd
 	MC       *float64 // mcap_usd
@@ -78,6 +79,11 @@ func seedWebCall(t *testing.T, st *ScoutStore, base time.Time, w webSeed) int {
 		entry_late_price_usd = $5, rugged = $6, token_name = $7, token_symbol_onchain = $8 WHERE call_id = $1`,
 		*id, w.Status, strPtr(w.Unit), nz(w.Entry), nz(w.Late), w.Rugged, w.Name, w.ChainSy); err != nil {
 		t.Fatal(err)
+	}
+	if w.RugKind != nil {
+		if err := st.SetRugAt(ctx, *id, at.Add(30*24*time.Hour), *w.RugKind); err != nil {
+			t.Fatal(err)
+		}
 	}
 	for h, v := range w.Returns {
 		d, err := parseHorizon(h)
@@ -202,6 +208,7 @@ type webCallJSON struct {
 	Return7dPct     *float64 `json:"return_7d_pct"`
 	Return30dPct    *float64 `json:"return_30d_pct"`
 	Rugged          *bool    `json:"rugged"`
+	RugKind         *string  `json:"rug_kind"`
 	TrackingStatus  *string  `json:"tracking_status"`
 	Perceptor       *string  `json:"perceptor_verdict"`
 	PerceptorURL    *string  `json:"perceptor_url"`
@@ -526,6 +533,59 @@ func TestWebCallsOrderHorizonsAndFields(t *testing.T) {
 	if strOrNil(x.TokenName) != xssName || strOrNil(x.TokenSymbol) != "<b>X</b>" || fnum(x.ReturnPct) != "null" {
 		t.Fatalf("xss call %+v", x)
 	}
+}
+
+// TestWebCallsRugKind: GET /api/calls sends rug_at_kind as rug_kind; a call
+// flagged rugged by the price rule (rug_at_kind price, "collapsed") keeps its
+// peak, while one whose pool was drained, or with no kind stored, shows none
+// and sorts with the calls without one.
+func TestWebCallsRugKind(t *testing.T) {
+	st := testStore(t)
+	if err := st.Migrate(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	base := time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)
+	yes := true
+	fx := &webFixture{st: st, ids: map[string]int{}}
+	for _, w := range []struct {
+		key string
+		webSeed
+	}{
+		{"drained", webSeed{Msg: 1, CA: caAlpha, Status: TrackDone, Unit: "usd", Entry: 1, Rugged: &yes, RugKind: sp(rugAtEvent),
+			Returns: map[string][3]float64{"1d": {-100, 300, -100}}}},
+		{"collapsed", webSeed{Msg: 2, CA: caBeta, Status: TrackDone, Unit: "usd", Entry: 1, Rugged: &yes, RugKind: sp(rugAtPrice),
+			Returns: map[string][3]float64{"1d": {-96, 200, -97}}}},
+		{"no_kind", webSeed{Msg: 3, CA: caGamma, Status: TrackDone, Unit: "usd", Entry: 1, Rugged: &yes,
+			Returns: map[string][3]float64{"1d": {-98, 250, -99}}}},
+		{"plain", webSeed{Msg: 4, CA: caPct, Status: TrackDone, Unit: "usd", Entry: 1,
+			Returns: map[string][3]float64{"1d": {10, 100, -5}}}},
+	} {
+		fx.ids[w.key] = seedWebCall(t, st, base, w.webSeed)
+	}
+	static, err := fs.Sub(frontendFS, "frontend")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fx.web = mustWebServer(t, st, webConfig{}, static)
+	fx.srv = httptest.NewServer(fx.web)
+	t.Cleanup(fx.srv.Close)
+
+	res := fx.calls(t, "horizon=1d")
+	want := map[string]struct{ kind, peak string }{
+		"drained": {`"event"`, "null"}, "collapsed": {`"price"`, "200"}, "no_kind": {"null", "null"}, "plain": {"null", "100"},
+	}
+	for i, k := range fx.keys(res.Calls) {
+		c := res.Calls[i]
+		if w := want[k]; dumpFactors(c.RugKind) != w.kind || fnum(c.PeakPct) != w.peak {
+			t.Errorf("%s: rug_kind %s peak %s, want %s %s", k, dumpFactors(c.RugKind), fnum(c.PeakPct), w.kind, w.peak)
+		}
+	}
+	if len(res.Calls) != len(want) {
+		t.Fatalf("%d calls, want %d", len(res.Calls), len(want))
+	}
+	// the calls without a peak shown come last, tied by call id
+	fx.wantOrder(t, "sort=peak&horizon=1d", "collapsed", "plain", "no_kind", "drained")
+	fx.wantOrder(t, "sort=peak&horizon=1d&dir=asc", "plain", "collapsed", "drained", "no_kind")
 }
 
 func TestWebCallsSearchAndPaging(t *testing.T) {
