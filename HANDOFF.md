@@ -4,6 +4,55 @@
 
 This section supersedes the ones below wherever they differ.
 
+**Update, 20 Oct PDT (night): export 4c plan** (from an `investigate`
+spec, 20 Oct; 4b-2 is open as #43). 4c is split into four PRs, each
+with base `main`:
+- 4c-1, pools that count before the call (pure, plus one node helper;
+  in progress, worktree `holder-pre-pools-20261020`):
+  - v4 pre ids = pools whose Initialize block is at or before the entry
+    block (one `v4PoolsOf` call, 2 `eth_getLogs`);
+  - v2/v3: no creation block is stored anywhere, and pool discovery
+    looks past the entry block. So the tracker's pool counts before the
+    call only if it appears in the pre-call transfers or liquidity
+    events (no extra node cost).
+- 4c-2, read-only DB reads: a read-only transaction helper, the call
+  details by id, and a price-lag reading. The lag is the 95th
+  percentile of how overdue the latest-price rows are, not the maximum:
+  one row whose refresh keeps failing would otherwise hold the pause
+  forever.
+- 4c-3, settings and pauses: `SCOUT_HOLDERS_RPS` (4),
+  `SCOUT_HOLDERS_MAX_NODE_LAG` (2m), `SCOUT_HOLDERS_MAX_PRICE_LAG` (2h)
+  and `SCOUT_HOLDERS_MAX_PAUSE` (30m), in `config.go`. The export's own
+  node client is the existing one with RPS set and one request in
+  flight. No `SCOUT_HOLDERS_OUT_DIR`: the flag is the only source.
+- 4c-4, the command: `-export-holders <ids file>`,
+  `-export-holders-out` (default `data/holders`),
+  `-export-holders-max`, and `-dry-run` (estimate, no node).
+  - Dispatched before `Migrate` and `registerTools`.
+  - The folder check returns the path it judged, and only that path
+    is written to.
+  - `columns.json` lists the `pre_hold_*` columns for the Python side.
+  - The run record's settings use an allowlist, never URLs.
+  - Pilot steps on the server: build; run once
+    `go test -count=1 -v -run 'TestHoldersOutDirGuard(Data)?Symlink' .`
+    (both must PASS, not SKIP); Q6; `-dry-run` (expect about 10k);
+    `-export-holders-max 10`; then the full run beside `-track`.
+- Q6, the pilot sample query (git-ignored file
+  `.claude/worktrees/_scratch/holder-p0/holder_p0.sql`):
+  - its final SELECT starts with `grp`, while the ids parser takes the
+    first column, so `call_id` must come first;
+  - it samples at random by `md5(call_id)` (natural share);
+  - it leaves out `...7777` tokens. That rule is not in the approved
+    plan; the PM recommends keeping them out, as their launchpad
+    curve is not a known venue.
+- PR 5 (`ml/`) must add `post24h_` to `FORBIDDEN_PREFIXES`; it is not
+  there today.
+- Open with the owner (20 Oct):
+  - (a) keep Q6's random sample (natural share; PM recommends) or
+    stratify by week, as the 19 Oct plan's "spread across weeks" might
+    mean;
+  - (b) keep `...7777` tokens out of the pilot (PM recommends).
+
 **Update, 20 Oct PDT (evening):**
 - Merged: #39 (4b-1, venues, columns and row builder) and #40 (docs:
   the owner's decisions on the `data/` folder, the all-day run and A2).
@@ -11,7 +60,7 @@ This section supersedes the ones below wherever they differ.
   - 4b-2 (file writer and run helpers) on branch
     `work/2026-10-20-holder-writer`, worktree `holder-writer-20261020`.
     It adds `/data/` to `.gitignore` and changes the folder check to
-    allow `<repo root>/data` and below. In review.
+    allow `<repo root>/data` and below. Open as #43 (review PASS).
   - 4c must write to the exact path the folder check judged (the
     implementer's note: the check cleans `..` as text, while the
     operating system follows a link first).
@@ -90,7 +139,8 @@ This section supersedes the ones below wherever they differ.
   three PRs.
 - The pilot's old-token share: answered 20 Oct, natural share, about
   10k `eth_getLogs` (owner: "go with your recommendation"; in the PM
-  skill's "Owner decisions in force"). No export question is open now.
+  skill's "Owner decisions in force"). No export question was open at
+  that point; see the Q6 items in the night update.
 - Docs-only PRs: checked by `advisor` instead of `review` from 20 Oct
   (owner rule; PM skill, "How to work", step 5).
 
