@@ -127,6 +127,20 @@ back.
    named). It ends with PASS or FAIL. Send must-fix findings back to
    `implement`, then run `review` again; after at most 3 fix rounds without a
    PASS, escalate to the owner with the open findings.
+   Docs-only changes (`HANDOFF.md`, `.claude/skills/**`; owner, 20 Oct
+   2026, "can you automate doc PRs maybe ask advisor to review it", then
+   "apply the doc pr rule for this project") skip `review`:
+   - before writing a factual claim about the code, the repo or a branch
+     (what a file says, what `.gitignore` lists, what is merged), check
+     it yourself with Read or Grep and write the checked version, in the
+     right tense (planned changes as planned);
+   - then call `advisor` on the diff (`git diff` into the transcript) and
+     apply its findings;
+   - then commit, push and open the PR without asking, and send the owner
+     only the link (no progress messages about the review rounds).
+   Use `review` for a docs change only when it describes code behaviour
+   you could not check yourself. Code PRs keep the full `review` path,
+   and the owner still merges every PR.
 6. After a PASS, commit, push and open the PR yourself, then send the owner
    the PR link (see "Commit, push and PR" under "Worktree lifecycle").
 7. Keep `HANDOFF.md` current after each shipped item: edit it yourself in a
@@ -183,7 +197,8 @@ back.
   No agent connects to the production database. Resets, re-tracks or bulk
   UPDATEs are proposed as SQL for the owner to decide, never run by agents.
 - **Git:** only the PM commits and pushes, on its own `work/...` branches,
-  after `review` passes; merging to `main` is the owner's decision, through a
+  after `review` passes (for docs-only changes: after the `advisor` check,
+  "How to work", step 5); merging to `main` is the owner's decision, through a
   PR he reviews. Never commit or push to `main`. Never move or switch a branch
   that is checked out in the main checkout or in another worktree. See
   "Worktree lifecycle" below.
@@ -699,6 +714,22 @@ Every Go start applies `scoutanalytics.sql` unless `SCOUT_DB_AUTO_MIGRATE=false`
   outcome mix stay as they are.
   PR order chosen by the PM: website, tracker, then the fill script,
   which the owner runs only after both are live.
+- 20 Oct (owner, "go with your recommendation", on the holder pilot's
+  old tokens): the pilot takes old tokens (7-90 days old at the call)
+  at their natural share, with no oversampling: about 10k `eth_getLogs`
+  rather than up to about 32k. Oversampling old tokens is left for a
+  second run if the pilot shows a signal there (PM's note).
+- 20 Oct (owner, "can you automate doc PRs maybe ask advisor to review
+  it", then "apply the doc pr rule for this project"): docs-only PRs
+  (`HANDOFF.md`, `.claude/skills/**`) are checked by `advisor` instead
+  of the `review` agent, after the PM has checked each factual claim
+  itself; the PM opens them and sends only the link. The steps are in
+  "How to work", step 5. The PM's reading of "automate": no review
+  rounds reported to the owner; the owner still merges every PR. For
+  docs-only PRs this supersedes "after `review` passes" in the Git rule
+  ("Rules to follow and pass on") and in the 12 Oct entry below;
+  `.claude/agents/product-manager.md` (the owner's file) still says
+  "after `review` passes", and this skill wins where they differ.
 - 12 Oct: the PM has the `Bash` tool for git only: read-only git, `git fetch`
   and `git worktree add` to create worktrees for `implement`; never stash,
   switch, reset, rebase or merge (add, commit and push of its own `work/...`
