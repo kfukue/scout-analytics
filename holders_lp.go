@@ -2,7 +2,9 @@ package main
 
 // Liquidity (LP) events on a token's pools, decoded from raw logs, so that
 // earlyTradeStats can tell a liquidity add or removal apart from a sell or a
-// buy. Pure, like holders.go: the caller reads the logs and passes them in.
+// buy, and holderStats' deployer-sold check (deployerSoldBefore) a liquidity
+// add apart from a sale. Pure, like holders.go: the caller reads the logs and
+// passes them in.
 //
 // Events decoded:
 //   - Uniswap v2 pair: Mint (add), Burn (remove);
@@ -213,6 +215,15 @@ func (s liquidityTxSet) kinds(venue, tx string) liquidityTxKinds {
 		return liquidityTxKinds{}
 	}
 	return s[venue][tx]
+}
+
+// venues returns the set's venues (its keys, lowercase); empty for a nil set.
+func (s liquidityTxSet) venues() map[string]bool {
+	out := make(map[string]bool, len(s))
+	for v := range s {
+		out[v] = true
+	}
+	return out
 }
 
 // removalTxs returns the transactions with a removal (lpRemove, not a

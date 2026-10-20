@@ -124,7 +124,8 @@ type earlyTrading struct {
 // (classifyTrade), so a caller that leaves a venue out of excluded still gets
 // correct shares. The exporter (a later PR) should build one excluded set
 // (venues + token + burn addresses) and pass it to both holderStats and
-// earlyTradeStats, so the two agree on circulating.
+// earlyTradeStats, so the two agree on circulating, and the same lp to both,
+// so a liquidity add is neither a sell here nor a deployer sale there.
 //
 // lp are the token's liquidity transactions per venue (liquidityTxs, built
 // from the same venues; keys lowercase): a wallet-venue transfer in one of
@@ -160,7 +161,7 @@ func earlyTradeStats(transfers []tokenTransfer, venues, excluded map[string]bool
 	out.MaxTxBuyers = maxBuyersInOneTx(trades)
 	out.EarlyBuyers = firstBuyers(trades, earlyBuyerCount)
 
-	s := holderStats(r, transfers, ex, "")
+	s := holderStats(r, transfers, ex, "", lp) // no deployer: lp is not used
 	out.SniperHeldShareOK, out.EarlyBuyersHeldShareOK = s.SharesOK, s.SharesOK
 	if s.SharesOK {
 		out.SniperHeldShare = shareOf(heldBy(r, ex, snipers), s.Circulating)

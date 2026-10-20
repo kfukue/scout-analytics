@@ -183,7 +183,7 @@ func TestReplayIncompleteHistoryFlagged(t *testing.T) {
 	}
 	wantBig(t, "deployer (not clamped)", r.Balances[dep], tokens(-90))
 	wantBig(t, "supply", r.Supply, new(big.Int))
-	s := holderStats(r, nil, nil, dep)
+	s := holderStats(r, nil, nil, dep, nil)
 	if !s.Incomplete || s.SharesOK {
 		t.Errorf("stats: got incomplete %v, sharesOK %v; want true, false (circulating is 0)", s.Incomplete, s.SharesOK)
 	}
@@ -293,7 +293,7 @@ func TestHolderStatsExclusionsAndTopShares(t *testing.T) {
 	excluded := map[string]bool{pm: true, token: true, zeroAddr: true, deadAddr: true}
 	excluded["0x"+strings.ToUpper(pool[2:])] = true // case must not matter
 	excluded[h[4]] = false                          // a false entry is not an exclusion
-	s := holderStats(r, trs, excluded, dep)
+	s := holderStats(r, trs, excluded, dep, nil)
 	// supply 950; excluded: pool 200, pm 100, token 50 -> circulating 600
 	wantBig(t, "circulating", s.Circulating, tokens(600))
 	if s.Holders != 6 || !s.SharesOK {
@@ -316,7 +316,7 @@ func TestHolderStatsFewerThanNAndTies(t *testing.T) {
 		xfer(zeroAddr, b, tokens(10), 1, 1),
 		xfer(zeroAddr, c, tokens(10), 1, 2),
 	}
-	s := holderStats(mustReplay(t, trs, 1), trs, nil, "")
+	s := holderStats(mustReplay(t, trs, 1), trs, nil, "", nil)
 	if s.Holders != 3 {
 		t.Errorf("holders: got %d, want 3", s.Holders)
 	}
@@ -362,12 +362,109 @@ func TestHolderStatsDeployer(t *testing.T) {
 			if c.excludeDep {
 				excluded[depUpper] = true // case must not matter
 			}
-			s := holderStats(r, c.trs, excluded, c.deployer)
+			s := holderStats(r, c.trs, excluded, c.deployer, nil)
 			if s.DeployerKnown != c.wantKnown || s.DeployerShareOK != c.wantShareOK || s.DeployerSold != c.wantSold {
 				t.Errorf("deployer %q (excluded %v): got known %v, shareOK %v, sold %v; want %v, %v, %v",
 					c.deployer, c.excludeDep, s.DeployerKnown, s.DeployerShareOK, s.DeployerSold, c.wantKnown, c.wantShareOK, c.wantSold)
 			}
 			wantShare(t, "deployer share", s.DeployerShare, c.wantShare)
+		})
+	}
+}
+
+// upperHex returns a 0x value with its hex digits in upper case (a checksummed
+// address or a node's tx hash, as far as case goes).
+func upperHex(s string) string { return "0x" + strings.ToUpper(s[2:]) }
+
+// The deployer's liquidity add (deployer -> pool in a transaction with an add
+// on that pool) is not a sale once lp is given; the direction rule is
+// classifyTrade's.
+func TestDeployerSoldLiquidity(t *testing.T) {
+	dep, pool, pool2, a := hAddr(1), hAddr(50), hAddr(51), hAddr(2)
+	const addTx, rmTx = "0xadd1", "0xa3e1"
+	mint := xfer(zeroAddr, dep, tokens(100), 1, 0)
+	add := inTx(xfer(dep, pool, tokens(60), 2, 0), addTx)
+	lp := liquidityTxSet{pool: {addTx: lqAddK}}
+	// The add as a node returns it: checksummed addresses, upper-case tx hash.
+	addUpper := inTx(xfer(upperHex(dep), upperHex(pool), tokens(60), 2, 0), upperHex(addTx))
+	// The same set built by liquidityTxs from an event with a checksummed
+	// venue and an upper-case tx hash.
+	lpFromEvents, err := liquidityTxs([]liquidityEvent{lqEv("v2", lpAdd, upperHex(pool), "", upperHex(addTx), 2)},
+		set(upperHex(pool)), nil, 9)
+	if err != nil {
+		t.Fatalf("liquidityTxs: %v", err)
+	}
+	cases := []struct {
+		name     string
+		trs      []tokenTransfer
+		deployer string
+		lp       liquidityTxSet
+		want     bool
+	}{
+		{"only the marked add", []tokenTransfer{mint, add}, dep, lp, false},
+		{"only the add, lp nil (old rule: a sale)", []tokenTransfer{mint, add}, dep, nil, true},
+		{"only the add, empty lp", []tokenTransfer{mint, add}, dep, liquidityTxSet{}, true},
+		{"add on another venue's set", []tokenTransfer{mint, add}, dep, liquidityTxSet{pool2: {addTx: lqAddK}}, true},
+		{"add, then a sale in another tx", []tokenTransfer{mint, add, inTx(xfer(dep, pool, tokens(5), 5, 0), "0x5e11")}, dep, lp, true},
+		// classifyTrade's known edge case: wallet -> venue in a transaction
+		// with an add on that venue is liquidity, so this sale is missed.
+		{"sale to the same pool in the add tx", []tokenTransfer{mint, add, inTx(xfer(dep, pool, tokens(5), 2, 1), addTx)}, dep, lp, false},
+		{"sale to another venue in the add tx", []tokenTransfer{mint, add, inTx(xfer(dep, pool2, tokens(5), 2, 1), addTx)}, dep, lp, true},
+		{"add, then a sale at the entry block", []tokenTransfer{mint, add, xfer(dep, pool, tokens(5), 9, 0)}, dep, lp, true},
+		{"add, then a sale after the entry block", []tokenTransfer{mint, add, xfer(dep, pool, tokens(5), 10, 0)}, dep, lp, false},
+		{"add, then a team wallet", []tokenTransfer{mint, add, xfer(dep, a, tokens(5), 3, 0)}, dep, lp, true},
+		// A removal only makes venue -> wallet transfers liquidity.
+		{"deployer -> pool in a removal tx", []tokenTransfer{mint, inTx(xfer(dep, pool, tokens(5), 3, 0), rmTx)}, dep,
+			liquidityTxSet{pool: {rmTx: lqRemoveK}}, true},
+		{"deployer -> pool in an add and remove tx", []tokenTransfer{mint, inTx(xfer(dep, pool, tokens(5), 3, 0), rmTx)}, dep,
+			liquidityTxSet{pool: {rmTx: lqAddRemoveK}}, false},
+		{"add without a tx hash never matches", []tokenTransfer{mint, inTx(add, "")}, dep, lp, true},
+		{"mixed case: transfer and deployer", []tokenTransfer{mint, addUpper}, upperHex(dep), lp, false},
+		{"mixed case: set from liquidityTxs", []tokenTransfer{mint, addUpper}, upperHex(dep), lpFromEvents, false},
+		{"mixed case, then a sale", []tokenTransfer{mint, addUpper, xfer(upperHex(dep), upperHex(pool), tokens(5), 4, 0)}, upperHex(dep), lpFromEvents, true},
+		{"no deployer", []tokenTransfer{mint, add, xfer(dep, a, tokens(5), 3, 0)}, "", lp, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := deployerSoldBefore(c.trs, c.deployer, c.lp, 9); got != c.want {
+				t.Errorf("deployerSoldBefore(deployer %q, lp %v, entry 9): got %v, want %v", c.deployer, c.lp, got, c.want)
+			}
+		})
+	}
+}
+
+// Through holderStats, with the deployer in or out of the excluded set: the
+// marked add is not a sale either way, and the shares do not change.
+func TestHolderStatsDeployerLiquidity(t *testing.T) {
+	dep, pool := hAddr(1), hAddr(50)
+	trs := []tokenTransfer{
+		xfer(zeroAddr, dep, tokens(100), 1, 0),
+		inTx(xfer(dep, pool, tokens(60), 2, 0), "0xadd1"),
+		xfer(pool, hAddr(2), tokens(10), 3, 0),
+	}
+	lp := liquidityTxSet{pool: {"0xadd1": lqAddK}}
+	cases := []struct {
+		name       string
+		excludeDep bool
+		lp         liquidityTxSet
+		wantSold   bool
+	}{
+		{"lp given", false, lp, false},
+		{"lp nil", false, nil, true},
+		{"deployer excluded, lp given", true, lp, false},
+		{"deployer excluded, lp nil", true, nil, true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			excluded := map[string]bool{pool: true, dep: c.excludeDep}
+			s := holderStats(mustReplay(t, trs, 9), trs, excluded, upperHex(dep), c.lp)
+			if !s.DeployerKnown || s.DeployerSold != c.wantSold || s.DeployerShareOK == c.excludeDep {
+				t.Errorf("excluded %v, lp %v: got known %v, sold %v, shareOK %v; want true, %v, %v",
+					c.excludeDep, c.lp, s.DeployerKnown, s.DeployerSold, s.DeployerShareOK, c.wantSold, !c.excludeDep)
+			}
+			if !c.excludeDep {
+				wantShare(t, "deployer share (40 of 50)", s.DeployerShare, 0.8)
+			}
 		})
 	}
 }
@@ -384,7 +481,7 @@ func TestHolderStatsZeroCirculating(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			s := holderStats(mustReplay(t, c.trs, 5), c.trs, map[string]bool{pool: true}, a)
+			s := holderStats(mustReplay(t, c.trs, 5), c.trs, map[string]bool{pool: true}, a, nil)
 			if s.SharesOK || s.DeployerShareOK || s.Holders != 0 || s.Top1 != 0 || s.Top5 != 0 || s.Top10 != 0 || s.DeployerShare != 0 {
 				t.Errorf("got %+v, want no holders, sharesOK and deployerShareOK false and all shares 0", s)
 			}
@@ -411,7 +508,7 @@ func TestHolderStatsHugeValues(t *testing.T) {
 	r := mustReplay(t, trs, 1)
 	wantSupply := new(big.Int).Add(new(big.Int).Mul(big3e27, big.NewInt(15)), maxWord)
 	wantBig(t, "supply", r.Supply, wantSupply)
-	s := holderStats(r, trs, map[string]bool{hAddr(50): true}, hAddr(5))
+	s := holderStats(r, trs, map[string]bool{hAddr(50): true}, hAddr(5), nil)
 	wantBig(t, "circulating", s.Circulating, new(big.Int).Mul(big3e27, big.NewInt(15)))
 	wantShare(t, "top1", s.Top1, 5.0/15)
 	wantShare(t, "top5", s.Top5, 1)
