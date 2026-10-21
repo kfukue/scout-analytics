@@ -1,8 +1,24 @@
 # Scout analytics: handoff to Claude Code
 
-## Session state (20 Oct 2026 PDT: main 9c053c8 after #39, #40, #41)
+## Session state (20 Oct 2026 PDT (21 Oct UTC): main 71b3967 after #42-#47)
 
 This section supersedes the ones below wherever they differ.
+
+**Update, 20 Oct PDT (21 Oct UTC), after the merges:**
+- Merged by the owner: #42-#47 (main 71b3967). Deploy given to the
+  owner (not confirmed yet): pull on the server and restart `-web`
+  (#45), then check by eye the "collapsed" legend entry in light and
+  dark at 1280 and 390 px; no other restart (no command uses #43, #44,
+  #46, #47 yet). Merged worktrees removed on the PC.
+- Pilot sample answered (owner; PM skill, "Owner decisions in force"):
+  (a) spread across weeks inside each group; (b) `...7777` tokens stay
+  out, kept as a deferred item ("Deferred / open"). Next: Q6 rewritten
+  to match (`call_id` first), and 4c-4 (`-export-holders`) started in
+  worktree `holder-export-cmd-20261020`.
+- A2 PR 2 (tracker): the owner ran block C in
+  `price-rug-tracker-20261020`; it stopped on the expected
+  `timing.go` conflict (both sides add `rugAtPrice`), being resolved;
+  then its PR.
 
 **Update, 20 Oct PDT (21 Oct UTC), late night: state of the open work.** Every PR
 below has base `main`; all are tested locally only, nothing deployed.
@@ -10,7 +26,8 @@ below has base `main`; all are tested locally only, nothing deployed.
   writer), #44 (4c-1, pools that count before the call), #45 (A2 PR 1,
   website), #46 (4c-2, read-only DB reads, a31222b), #47 (4c-3,
   settings and pauses, 11632f5). #46 and #47 passed review; neither
-  needs a restart (no command uses them until 4c-4).
+  needs a restart (no command uses them until 4c-4). All merged since
+  (update above).
 - A2 PR 2 (tracker), branch `work/2026-10-20-price-rug-tracker`
   (35f1a56, pushed, review PASS), worktree
   `price-rug-tracker-20261020`: no PR yet. It and #45 both add
@@ -27,7 +44,8 @@ below has base `main`; all are tested locally only, nothing deployed.
 - A2 PR 3 (fill script) must copy `priceRugAtSQL` as it is (comment
   in `scout_models.data.go`). GeckoTerminal-priced calls get no rug
   time (no stored candles); outside A2.
-- Still open with the owner: (a) and (b) in the next update.
+- Still open with the owner: (a) and (b) in the next update. Answered
+  since (update above).
 
 **Update, 20 Oct PDT (night): export 4c plan** (from an `investigate`
 spec, 20 Oct; 4b-2 is open as #43). 4c is split into four PRs, each
@@ -77,6 +95,9 @@ with base `main`:
     stratify by week, as the 19 Oct plan's "spread across weeks" might
     mean;
   - (b) keep `...7777` tokens out of the pilot (PM recommends).
+  - Answered 20 Oct PDT (21 Oct UTC): (a) spread across weeks (the PM
+    changed its recommendation to this, because the dead rate moves by
+    week); (b) out, deferred (update at the top).
 
 **Update, 20 Oct PDT (evening):**
 - Merged: #39 (4b-1, venues, columns and row builder) and #40 (docs:
@@ -1490,6 +1511,18 @@ matter are in section 5. Package `main` is at the repo root: `go run .`.
 
 20 Oct 2026: the open owner questions on the holder export and the
 rug-time decision (A or B) are in the top section.
+
+- **`...7777` tokens in the holder analysis** (deferred by the owner,
+  20 Oct PDT (21 Oct UTC): "keep them out", then "put in handoff.md to
+  look back at it later"). About 123 calls have a token address ending
+  in `7777` (18 Oct count; 0 tracked as Pons, 14 `no_pool`/`gave_up`).
+  The ending looks like another launchpad's vanity address; those
+  tokens trade on that launchpad's own contract before a Uniswap pool,
+  and the holder export knows only Uniswap v2/v3/v4 pools and the Pons
+  curve as venues. So the pilot leaves them out (Q6: `NOT ends7777`).
+  To look at again after the pilot: if the holder data shows a signal,
+  find that launchpad's contract and events and add it as a venue (its
+  own PR), then include these tokens.
 
 Kept current by the PM whenever an item is deferred or an owner check is
 pending (14 October 2026 UTC). Everything through PR #53 is on `main`
