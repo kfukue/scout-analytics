@@ -47,6 +47,13 @@ The timing and rug outcomes the tracker stores (`peak_late_after_s`,
 added they are outcomes, never features: the guard refuses them and any
 per-horizon variant (`TIMING_RUG_OUTCOMES` and `FORBIDDEN_PREFIXES` in
 `scout_ml/config.py`).
+The holder export (`-export-holders`, columns in `../holders_columns.go`) is
+not in the view either. Its `post24h_*` columns (the 24 h after the call) and
+its post-call provenance and run columns (`HOLD_NOT_FEATURES`, e.g.
+`transfers_post`, `v4_pool_ids`, `rpc_requests_total`) are refused by the
+guard; of its `pre_hold_*` columns (at the call's entry block) only
+`HOLD_FEATURES` may be inputs, the rest are in `HOLD_EXCLUDED` with the reason
+(`tests/test_holder_columns.py` checks both against the Go file).
 An older model whose `meta.json` has one flat set of levels is still served
 with the exact, case-sensitive matching it was trained with, and a model whose
 feature list has raw `dex` (trained before `dex_family`) is still served with it.
@@ -950,7 +957,7 @@ roll back again.
     scout_ml/promote.py   promote / rollback / status checks (promote.py is its command line)
     train.py  serve.py  promote.py  make_synthetic.py  tests/
 
-    python -m pytest tests -q        # 399 tests: 399 passed on Linux; on Windows 398 passed, 1 skipped (POSIX-only), about 7 minutes
+    python -m pytest tests -q        # 432 tests: 432 passed on Linux; on Windows 431 passed, 1 skipped (POSIX-only), about 7 minutes
 
 `scout_ml/wallet_rep.py` (`wrep_frame(df, live_buys)`) scores the wallets in
 each call's live buys (the `-export-live-buys` CSV) by how the earlier first
@@ -1002,5 +1009,5 @@ pre-registered).
 
 `build_features` raises if an outcome or bookkeeping column (anything starting
 with `ret_`, `max_gain_`, `max_dd_`, `trades_`, `peak_late_after_`, `peak_after_`,
-`first_2x_`, `above_2x_`, `fall_below_2x_`, `timing_`, `rug_at`, plus `rugged`,
-`tracking_status`, `trades_24h`, ...) would become a model input.
+`first_2x_`, `above_2x_`, `fall_below_2x_`, `timing_`, `rug_at`, `post24h_`, plus `rugged`,
+`tracking_status`, `trades_24h`, `transfers_post`, ...) would become a model input.
