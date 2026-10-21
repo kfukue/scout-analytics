@@ -173,17 +173,52 @@ TRACKER_DISCOVERY = ["rugged", "current_liquidity_usd", "current_price_usd",
 TIMING_RUG_OUTCOMES = ["peak_late_after_s", "first_2x_after_s", "above_2x_s",
                        "fall_below_2x_after_s", "above_2x_censored", "timing_at",
                        "rug_at", "rug_at_kind"]
+# Holder export (-export-holders, ../holders_columns.go; tests/test_holder_columns.py
+# reads its json tags). pre_hold_* stops at the call's entry block: every one is
+# either a feature (HOLD_FEATURES) or left out with its reason (HOLD_EXCLUDED).
+HOLD_FEATURES = tuple(f"pre_hold_{n}" for n in (
+    "launch_age_s", "transfers", "holders", "buyers", "sellers", "buys", "sells",
+    "sell_buy_ratio", "first_buy_to_entry_blocks", "snipers", "first_block_buyers",
+    "max_tx_buyers", "lp_adds", "lp_removes", "lp_collects", "top1_share", "top5_share",
+    "top10_share", "deployer_share", "sniper_held_share", "early_buyers_held_share",
+    "deployer_sold", "lp_applicable", "lp_removed_before_entry", "deployer_removed_lp"))
+# lp_applicable and the venue-dependent flows (e.g. buys, sells, buyers, sellers, lp_*):
+# for v2/v3 the pre venue is the pool the tracker picked (discovery looks past the
+# entry block), so the analysis reports the ok rows with no pre venue but pre transfers (5b).
+HOLD_EXCLUDED = {
+    "pre_hold_incomplete": "quality flag (the replay was cut off), not signal",
+    "pre_hold_supply_raw": "decimal string in token base units",
+    "pre_hold_circulating_raw": "decimal string in token base units",
+    "pre_hold_first_buy_block": "absolute block number: tracks calendar time",
+    "pre_hold_sniper_window_blocks": "the export's constant setting",
+    "pre_hold_early_buyers": "wallet addresses",
+}
+# The holder export's post-call data columns that lack the post24h_ prefix (a
+# denylist for the guard; analyses still read only HOLD_FEATURES as inputs, an
+# allowlist): the post window's counts, venues and end, every v4 pool id (pools
+# initialised after the call too), the Pons graduation block and the pool id it
+# sets (the tracker records them when it finds them, also when the graduation
+# came after the call), and the log-stream counts and request costs (pre and
+# post reads together). exported_at / code_version / elapsed_s are run stamps
+# (a calendar proxy). None is a column of scout_call_dataset_v.
+HOLD_NOT_FEATURES = ("transfers_post", "lp_events_post", "venues_post", "post_end_block",
+                     "post_end_time", "v4_pool_ids", "pons_grad_block", "venue_pool_id",
+                     "dup_logs_dropped", "removed_logs_dropped",
+                     "bad_lp_logs_skipped", "bad_transfer_logs", "bad_transfer_error",
+                     "rpc_logs_requests", "rpc_other_requests", "rpc_requests_total",
+                     "elapsed_s", "exported_at", "code_version")
 FORBIDDEN_COLUMNS = (set(BOOKKEEPING) - {"quote_asset"} | set(IDENTITY)
                      | {"pre_vol_unit", "token_name", "post_kind"} | set(LATEST)
                      | set(TRACKER_DISCOVERY) | set(AFTER_CALL_VIEW)
-                     | set(TIMING_RUG_OUTCOMES))
+                     | set(TIMING_RUG_OUTCOMES) | set(HOLD_NOT_FEATURES))
 # trades_*: trading counted AFTER the call (trades_24h, any later trades_7d ...).
 # Trading before the call is pre_* and stays allowed (pre_first_trade_age_s too).
 # peak_* / first_2x_* / above_2x_* / fall_below_2x_* / timing_* / rug_at*: the
 # timing and rug outcomes above and any per-horizon or entry ("_late") variant.
+# post24h_*: the holder export's 24 h after the call.
 FORBIDDEN_PREFIXES = ("ret_", "max_gain_", "max_dd_", "latest_", "current_", "pool_", "trades_",
                       "peak_late_after_", "peak_after_", "first_2x_", "above_2x_",
-                      "fall_below_2x_", "timing_", "rug_at")
+                      "fall_below_2x_", "timing_", "rug_at", "post24h_")
 
 # --- Extreme outcomes ------------------------------------------------------
 # A drained or broken pool can give absurd outcomes (e.g. +3.9e47 %). A row
