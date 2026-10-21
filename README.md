@@ -524,12 +524,63 @@ Only use the feature columns as model inputs; everything about the future is an 
 | `SCOUT_LATEST_REFRESH_RECENT` | `15m` | how often the latest price of a call younger than 30 days is read again (at least `1m`) |
 | `SCOUT_LATEST_REFRESH_OLD` | `24h` | the same for calls 30 days or older (at least `10m`) |
 | `SCOUT_LATEST_BATCH` | `200` | latest prices read per tracker cycle at most (1 – 10000) |
-| `SCOUT_HOLDERS_RPS` | `4` | coming holder export (`-export-holders`, not yet added): requests per second of its own node client, which keeps one request in flight, reads one block range at a time and has no log cache, so it does not slow the tracker (1 – 20; `0` is refused) |
-| `SCOUT_HOLDERS_MAX_NODE_LAG` | `2m` | coming holder export: pause while the node's head block is older than this, or while the node does not answer (asked at most once every 30 s; `0` = check off) |
-| `SCOUT_HOLDERS_MAX_PRICE_LAG` | `2h` | coming holder export: pause while the tracker's latest-price pass is further behind than this (asked at most once a minute; `0` = check off) |
-| `SCOUT_HOLDERS_MAX_PAUSE` | `30m` | coming holder export: stop when one pause would last longer than this (above `0`) |
+| `SCOUT_HOLDERS_RPS` | `4` | holder export (`-export-holders`, below): requests per second of its own node client, which keeps one request in flight, reads one block range at a time and has no log cache, so it does not slow the tracker (1 – 20; `0` is refused) |
+| `SCOUT_HOLDERS_MAX_NODE_LAG` | `2m` | holder export: pause while the node's head block is older than this, or while the node does not answer (asked at most once every 30 s; `0` = check off) |
+| `SCOUT_HOLDERS_MAX_PRICE_LAG` | `2h` | holder export: pause while the tracker's latest-price pass is further behind than this (asked at most once a minute; `0` = check off) |
+| `SCOUT_HOLDERS_MAX_PAUSE` | `30m` | holder export: stop when one pause would last longer than this (above `0`) |
 
 Other commands: `-track` (tracker only, forever, no Telegram), `-track-once` (process what's due and exit).
+
+### Export holder features (`-export-holders`)
+
+```bash
+./scoutanalytics -export-holders ids.csv -dry-run                 # estimate only
+./scoutanalytics -export-holders ids.csv -export-holders-max 10   # at most 10 calls this run
+./scoutanalytics -export-holders ids.csv                          # every call not exported yet
+```
+
+For each call id in the file, reads the token's `Transfer` logs and its pools' liquidity
+events from the node, from the token's launch to 24 h after the call, and writes one row:
+`pre_hold_*` columns from the logs at or before the call's entry block (the only columns a
+model may use) and `post24h_*` columns after it (description only).
+
+- **Ids file:** one call id per line, or a CSV whose **first** column is `call_id` (a header,
+  blank lines and `#` comments are skipped; a repeated id counts once).
+- **`-export-holders-out`** (default `data/holders`, relative to the folder the command runs
+  in): outside every checkout, or inside a checkout's git-ignored `data/` folder; any other
+  folder in a checkout, and the state folder (`SCOUT_STATE_DIR`), are refused. A folder that
+  is a link is judged, and written, where the link points.
+- **Files there:** `holders.jsonl` (one row per call, appended as each call finishes),
+  `holders.csv` (rebuilt from it at the end of every run), `columns.json` (every column, and
+  the `pre_hold_*` list for the Python side) and `runs.jsonl` (one line per run: counts,
+  requests per call, time paused, and the export's settings by name; never a URL).
+- **Resume:** a run skips the calls already in `holders.jsonl`, so stop it at any time
+  (Ctrl-C) and start it again. `-export-holders-max N` takes up at most N calls in that run.
+  A call whose node reads fail gets no row and is tried again by the next run; after 5
+  failures in a row the run stops.
+- **`-dry-run`:** reads the call details from the database and prints the estimated
+  `eth_getLogs` count and the time at `SCOUT_HOLDERS_RPS`; no node request, nothing written.
+- **Safe beside `-track`:** reads the database only (read-only transactions; no schema change,
+  it never applies `scoutanalytics.sql`), starts nothing else (no Telegram, tracker or
+  website), and uses its own slow node client. Before each call it waits while the node or
+  the tracker's latest-price pass is behind (`SCOUT_HOLDERS_MAX_NODE_LAG`,
+  `SCOUT_HOLDERS_MAX_PRICE_LAG`; one log line per 30 s pause), and stops after
+  `SCOUT_HOLDERS_MAX_PAUSE`.
+
+**Pilot steps on the server** (`$REPO` is the server checkout):
+
+1. Build: `cd "$REPO" && git pull && go build -o scoutanalytics .`
+2. Check the folder guard's link tests, once:
+   `go test -count=1 -v -run 'TestHoldersOutDirGuard(Data)?Symlink' .` Every test it runs
+   must say PASS, not SKIP.
+3. Run the pilot sample query (Q6) in pgAdmin and save its result as CSV with `call_id` as
+   the first column, e.g. `$REPO/data/holder_pilot_ids.csv`.
+4. Estimate: `./scoutanalytics -export-holders data/holder_pilot_ids.csv -dry-run`
+   (expect about 10k `eth_getLogs`).
+5. Ten calls: `./scoutanalytics -export-holders data/holder_pilot_ids.csv -export-holders-max 10`,
+   then look at `data/holders/holders.csv` and `runs.jsonl`.
+6. The full run, beside the running `-track`:
+   `./scoutanalytics -export-holders data/holder_pilot_ids.csv` (it resumes after the ten).
 
 ### Retry calls without a pool now (`-retry-no-pool`)
 

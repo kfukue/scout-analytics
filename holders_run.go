@@ -120,22 +120,29 @@ var errHolderOutDir = errors.New("holder output folder not allowed")
 // (resolveExisting) before it is judged: a link into a checkout or the state
 // folder is refused like the folder itself, and a data folder that is a link
 // is judged by where it points.
-func checkHolderOutDir(out string, repoRoots []string, stateDir string) error {
+//
+// It returns the path it judged (absolute, links resolved). The caller writes
+// there and only there, never to out joined again: out's ".." is applied as
+// text, while the operating system follows a link first.
+func checkHolderOutDir(out string, repoRoots []string, stateDir string) (string, error) {
 	if strings.TrimSpace(out) == "" {
-		return fmt.Errorf("%w: empty", errHolderOutDir)
+		return "", fmt.Errorf("%w: empty", errHolderOutDir)
 	}
 	resolved, err := resolveExisting(out)
 	if err != nil {
-		return fmt.Errorf("check output folder %s: %w", out, err)
+		return "", fmt.Errorf("check output folder %s: %w", out, err)
 	}
 	roots, err := holderRepoRoots(resolved, repoRoots)
 	if err != nil {
-		return fmt.Errorf("check output folder %s: %w", out, err)
+		return "", fmt.Errorf("check output folder %s: %w", out, err)
 	}
 	if err := checkHolderOutInRepo(out, resolved, roots); err != nil {
-		return err
+		return "", err
 	}
-	return checkHolderOutStateDir(out, resolved, stateDir)
+	if err := checkHolderOutStateDir(out, resolved, stateDir); err != nil {
+		return "", err
+	}
+	return resolved, nil
 }
 
 // holderRepoRoots returns the checkouts found from resolved upwards

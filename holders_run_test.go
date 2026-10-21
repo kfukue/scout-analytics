@@ -112,7 +112,7 @@ func TestHoldersOutDirGuard(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			err := checkHolderOutDir(tc.out, roots, state)
+			_, err := checkHolderOutDir(tc.out, roots, state)
 			if tc.refused != (err != nil) {
 				t.Errorf("checkHolderOutDir(%s): %v, refused want %v", tc.out, err, tc.refused)
 			}
@@ -121,7 +121,7 @@ func TestHoldersOutDirGuard(t *testing.T) {
 			}
 		})
 	}
-	if err := checkHolderOutDir(filepath.Join(state, "x"), roots, ""); err != nil {
+	if _, err := checkHolderOutDir(filepath.Join(state, "x"), roots, ""); err != nil {
 		t.Errorf("no state folder given: %v, want accepted", err)
 	}
 }
@@ -150,7 +150,7 @@ func TestHoldersOutDirGuardInsideData(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			err := checkHolderOutDir(tc.out, []string{repo}, state)
+			_, err := checkHolderOutDir(tc.out, []string{repo}, state)
 			if tc.refused != (err != nil) {
 				t.Errorf("checkHolderOutDir(%s, state %s): %v, refused want %v", tc.out, state, err, tc.refused)
 			}
@@ -209,7 +209,7 @@ func TestHoldersOutDirGuardDataSymlink(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			repo := newRepo(t, fmt.Sprintf("repo%d", i), tc.target)
 			for _, out := range []string{filepath.Join(repo, holderDataDir), filepath.Join(repo, filepath.FromSlash(holderDefaultOutDir))} {
-				err := checkHolderOutDir(out, []string{repo}, state)
+				_, err := checkHolderOutDir(out, []string{repo}, state)
 				if tc.refused != (err != nil) {
 					t.Errorf("checkHolderOutDir(%s), data -> %s: %v, refused want %v", out, tc.target(repo), err, tc.refused)
 				}
@@ -231,7 +231,7 @@ func TestHoldersOutDirGuardDataSymlink(t *testing.T) {
 		if err := os.Symlink(sad, link); err != nil {
 			t.Skipf("cannot make a symbolic link here: %v", err)
 		}
-		if err := checkHolderOutDir(filepath.Join(link, "run1"), []string{repo}, ""); !errors.Is(err, errHolderOutDir) {
+		if _, err := checkHolderOutDir(filepath.Join(link, "run1"), []string{repo}, ""); !errors.Is(err, errHolderOutDir) {
 			t.Errorf("checkHolderOutDir(%s), holders -> %s: %v, want refused (errHolderOutDir)", link, sad, err)
 		}
 	})
@@ -330,12 +330,12 @@ func TestHoldersOutDirGuardFindsOtherCheckout(t *testing.T) {
 		}
 	}
 	for _, out := range []string{other, filepath.Join(other, "out"), filepath.Join(other, "not", "made", "yet")} {
-		err := checkHolderOutDir(out, []string{given}, "")
+		_, err := checkHolderOutDir(out, []string{given}, "")
 		if !errors.Is(err, errHolderOutDir) {
 			t.Errorf("checkHolderOutDir(%s, roots [%s]): %v, want refused (errHolderOutDir)", out, given, err)
 		}
 	}
-	if err := checkHolderOutDir(filepath.Join(base, "free"), []string{given}, ""); err != nil {
+	if _, err := checkHolderOutDir(filepath.Join(base, "free"), []string{given}, ""); err != nil {
 		t.Errorf("a folder outside both checkouts: %v, want accepted", err)
 	}
 }
@@ -360,11 +360,11 @@ func TestHoldersOutDirGuardSymlink(t *testing.T) {
 		t.Skipf("cannot make a symbolic link here: %v", err)
 	}
 	for _, out := range []string{filepath.Join(stateLink, "holders"), filepath.Join(repoLink, "out", "new")} {
-		if err := checkHolderOutDir(out, nil, state); !errors.Is(err, errHolderOutDir) {
+		if _, err := checkHolderOutDir(out, nil, state); !errors.Is(err, errHolderOutDir) {
 			t.Errorf("checkHolderOutDir(%s): %v, want refused (errHolderOutDir)", out, err)
 		}
 	}
-	if err := checkHolderOutDir(filepath.Join(base, "free"), nil, state); err != nil {
+	if _, err := checkHolderOutDir(filepath.Join(base, "free"), nil, state); err != nil {
 		t.Errorf("a folder outside: %v, want accepted", err)
 	}
 }
@@ -484,5 +484,43 @@ func TestHoldersCostEstimateMatchesReader(t *testing.T) {
 				t.Errorf("estimate %d, reader asked %d", est[0], r.LogRequests)
 			}
 		})
+	}
+}
+
+// The guard returns the path it judged: absolute, ".." applied, links
+// resolved; "" when it refuses. The export writes there only.
+func TestHoldersOutDirGuardReturnsJudgedPath(t *testing.T) {
+	repo := filepath.Join(t.TempDir(), "repo")
+	if err := os.MkdirAll(filepath.Join(repo, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	got, err := checkHolderOutDir(rawPath(repo, "x", "..", holderDataDir, "holders"), []string{repo}, "")
+	want, werr := resolveExisting(filepath.Join(repo, holderDataDir, "holders"))
+	if err != nil || werr != nil || got != want {
+		t.Errorf("judged %q, %v; want %q (%v)", got, err, want, werr)
+	}
+	if got, err := checkHolderOutDir(filepath.Join(repo, "sub"), []string{repo}, ""); got != "" || !errors.Is(err, errHolderOutDir) {
+		t.Errorf("refused folder: %q, %v; want \"\" and errHolderOutDir", got, err)
+	}
+}
+
+// A data folder that links outside the checkout: the judged path is where
+// the link points. Skipped where links cannot be made (Windows without
+// Developer Mode or admin rights).
+func TestHoldersOutDirGuardDataSymlinkJudgedPath(t *testing.T) {
+	base := t.TempDir()
+	repo, outside := filepath.Join(base, "repo"), filepath.Join(base, "big-disk")
+	for _, d := range []string{filepath.Join(repo, ".git"), outside} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Symlink(outside, filepath.Join(repo, holderDataDir)); err != nil {
+		t.Skipf("cannot make a symbolic link here: %v", err)
+	}
+	got, err := checkHolderOutDir(filepath.Join(repo, filepath.FromSlash(holderDefaultOutDir)), []string{repo}, "")
+	target, terr := filepath.EvalSymlinks(outside)
+	if err != nil || terr != nil || got != filepath.Join(target, "holders") {
+		t.Errorf("judged %q, %v; want %q (%v)", got, err, filepath.Join(target, "holders"), terr)
 	}
 }
