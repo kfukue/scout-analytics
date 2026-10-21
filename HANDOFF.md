@@ -50,6 +50,38 @@ summary tomorrow morning"):
   `handoff-night-20261021` (remove after their PRs merge); merged, to
   remove with their branches: `holder-export-cmd-20261020`,
   `pilot-choices-20261020`, `price-rug-tracker-20261020`.
+- Owner's steps, in order (sent in the morning summary, 21 Oct PDT; the
+  owner then restarted his PC, so a new session resumes from here):
+  1. Not confirmed yet: after the #49 tracker restart, the log shows a
+     "latest prices on:" line; after the #45 `-web` restart, the
+     "collapsed" legend looks right in light and dark at 1280 and
+     390 px.
+  2. Merge order: #51 before #53 (stacked); #52 and #54 any time.
+  3. Export Q6 again (even if exported before): the six new columns
+     are at the end, `call_id` still first, same calls picked. Save it
+     on the server as `$REPO/data/holder_pilot_ids.csv`. Without the
+     new columns the analysis says NOT JUDGED.
+  4. Pilot run (README, "Export holder features
+     (`-export-holders`)"): the symlink tests must PASS, not SKIP;
+     `-dry-run` (expect about 10k `eth_getLogs`);
+     `-export-holders-max 10`; then the full run beside `-track`.
+  5. After the export and #53's merge: `cd "$REPO" && git pull`, then
+     `cd "$REPO/ml" && "$ML/venv/bin/python" holders_report.py`; the
+     owner pastes `report.md` from `data/holders_analysis/<stamp>/`
+     to the PM (counts only, no addresses).
+  6. #52, only after #49 is live, following its folder README: A
+     first; if "other, total" is not 29, stop and send the whole grid
+     (28 is possible if the tracker has since found one of those pools
+     drained: a new `event` time in the `kinds` rows; send it rather
+     than going on). If 29: B with A's TOTAL on line 62, then C; R
+     undoes B, then C again.
+  7. PC clean-up after the merges: `git pull`; remove the merged
+     worktrees above and `git branch -d` their branches; the four new
+     ones once their PRs merge.
+- Next for the PM: wait for the pilot's `report.md`, then go through it
+  with the owner (CONTINUE / STOP / NOT JUDGED, and whether he accepts
+  the PM's strata reading); the `...7777` launchpad stays deferred
+  until after the pilot.
 - Notes from the reviews, not changed: for v2/v3 the pre-call venue is
   the pool the tracker picked after the call, so `lp_applicable` and
   the flow columns can be wrong when the token traded on another pool
