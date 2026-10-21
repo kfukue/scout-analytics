@@ -1,8 +1,60 @@
 # Scout analytics: handoff to Claude Code
 
-## Session state (20 Oct 2026 PDT (21 Oct UTC): main 71b3967 after #42-#47)
+## Session state (20 Oct 2026 PDT (21 Oct UTC): main d0c78b6 after #42-#50)
 
 This section supersedes the ones below wherever they differ.
+
+**Update, night of 20 Oct PDT (21 Oct UTC), while the owner slept** (owner:
+"start on both", then "continue any work that can be done and give me a
+summary tomorrow morning"):
+- Merged by the owner: #48 (docs), #49 (A2 tracker), #50 (4c-4,
+  `-export-holders`); main d0c78b6. Not confirmed yet: the tracker
+  restart after #49 (check the "latest prices on:" line), the `-web`
+  restart and legend check from #45, and the pilot steps (README,
+  "Export holder features (`-export-holders`)").
+- Q6b (owner ran it 20 Oct): every group exactly 150, 13-14 calls per
+  week over 11 weeks (27 Jul-5 Oct), no week short (fewest available
+  in a week: 19).
+- Q6 (git-ignored scratch file `holder_p0.sql`): its final SELECT now
+  also returns `holders_at_call`, `age_s_at_call` (as posted),
+  `max_gain_late_7d`, `ret_late_7d`, `tax_buy_pct`, `tax_sell_pct`,
+  appended after the old columns (`call_id` stays first; the Go ids
+  parser reads only the first column). The selection is unchanged.
+  The analysis (5b) uses them for the strata, the baseline and the
+  description; it needs no other input.
+- Opened, each base `main`, review PASS, tested locally only:
+  - #51, PR 5a: `ml/` leakage guard for the holder export columns
+    (`post24h_` prefix; `HOLD_FEATURES` allowlist of 25 `pre_hold_*`;
+    `HOLD_EXCLUDED`; `HOLD_NOT_FEATURES` of 19 post-call columns without
+    the prefix, e.g. `pons_grad_block`, `venue_pool_id`). No live model
+    input changes.
+  - #52, A2 PR 3: `ops/2026-10-20-price-rug-fill/` A/B/C/R. The owner
+    runs it only after #49 is live; STOP if A's "other, total" is not
+    29 (two of the 29, 9947 and 9948, are `repeat` rows now, so the
+    gate counts any status; it can drop legitimately if the
+    latest-price pass has since found one of those pools drained).
+  - #53, PR 5b, the report-only analysis (`ml/holders_report.py`,
+    `ml/scout_ml/holders.py`): started from #51's branch, so merge #51
+    first. Per-feature AUC with bootstrap CIs for dead7 vs rest and
+    held2x7 vs rest, within-week and within-strata AUC (posted-holder
+    terciles x age under/over 1 h), a within-week permutation null,
+    after-call columns described only, and a CONTINUE / STOP / NOT
+    JUDGED line. The 0.60 bound is the pre-registered one; the strata,
+    the 0.50 "vanishes" bound and the NOT JUDGED conditions are the
+    PM's reading, for the owner to accept. No model: the walk-forward
+    model is P2. Output in `data/holders_analysis/<UTC stamp>/` (counts
+    only, no addresses). Q6 must be exported again with the new
+    columns, or the report says NOT JUDGED.
+- Worktrees on the PC: new tonight `price-rug-fill-20261020`,
+  `holder-analysis-20261020`, `holder-report-20261021`,
+  `handoff-night-20261021` (remove after their PRs merge); merged, to
+  remove with their branches: `holder-export-cmd-20261020`,
+  `pilot-choices-20261020`, `price-rug-tracker-20261020`.
+- Notes from the reviews, not changed: for v2/v3 the pre-call venue is
+  the pool the tracker picked after the call, so `lp_applicable` and
+  the flow columns can be wrong when the token traded on another pool
+  first. 5b counts the ok rows with no pre-call venue but pre-call
+  transfers, per group.
 
 **Update, 20 Oct PDT (21 Oct UTC), after the merges:**
 - Merged by the owner: #42-#47 (main 71b3967). Deploy given to the
@@ -43,7 +95,7 @@ below has base `main`; all are tested locally only, nothing deployed.
   right after a backfill reads as 0.
 - A2 PR 3 (fill script) must copy `priceRugAtSQL` as it is (comment
   in `scout_models.data.go`). GeckoTerminal-priced calls get no rug
-  time (no stored candles); outside A2.
+  time (no stored candles); outside A2. Open as #52 (update above).
 - Still open with the owner: (a) and (b) in the next update. Answered
   since (update above).
 
@@ -89,7 +141,7 @@ with base `main`:
     plan; the PM recommends keeping them out, as their launchpad
     curve is not a known venue.
 - PR 5 (`ml/`) must add `post24h_` to `FORBIDDEN_PREFIXES`; it is not
-  there today.
+  there today. Open as #51 (update above).
 - Open with the owner (20 Oct):
   - (a) keep Q6's random sample (natural share; PM recommends) or
     stratify by week, as the 19 Oct plan's "spread across weeks" might
