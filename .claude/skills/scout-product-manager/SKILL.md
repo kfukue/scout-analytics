@@ -719,6 +719,22 @@ Every Go start applies `scoutanalytics.sql` unless `SCOUT_DB_AUTO_MIGRATE=false`
   at their natural share, with no oversampling: about 10k `eth_getLogs`
   rather than up to about 32k. Oversampling old tokens is left for a
   second run if the pilot shows a signal there (PM's note).
+- 20 Oct PDT (21 Oct UTC) (owner, "a. ok spread it across weeks b. keep
+  them out", then "b. put in handoff.md to look back at it later"), on
+  the holder pilot sample (Q6):
+  (a) inside each group (`dead7`, `held2x7`, neither), the 150 calls are
+  spread across the weeks before the cut-off, about the same number per
+  week, with weeks that have too few filled from the others; not a plain
+  random pick. Reason: the dead rate moves by week (about 17 % to 44 %),
+  so a plain random pick would put the bad and good groups in different
+  weeks and make anything that changes over time look like a signal.
+  Old tokens stay at their natural share (entry above);
+  (b) tokens whose address ends in `...7777` stay out of the pilot:
+  their trading before the call appears to run on another launchpad's
+  contract (inferred from the vanity ending and the 14 that never
+  reached a pool), which the export does not know as a venue, so their
+  holder numbers would likely be wrong. Adding that launchpad as a venue is a deferred item in
+  `HANDOFF.md` ("Deferred / open"), to look at again after the pilot.
 - 20 Oct (owner, "can you automate doc PRs maybe ask advisor to review
   it", then "apply the doc pr rule for this project"): docs-only PRs
   (`HANDOFF.md`, `.claude/skills/**`) are checked by `advisor` instead
