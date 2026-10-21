@@ -22,3 +22,15 @@ const (
 	// holdersMaxPauseSetting: stop after one pause longer than this.
 	holdersMaxPauseSetting = "SCOUT_HOLDERS_MAX_PAUSE"
 )
+
+// Tracker settings the holder export records in its run record (runs.jsonl,
+// holders_cmd.go). They are still read through literals in onchain.go and
+// tracker_latest.go; those move here in their own PR.
+const (
+	// rpcLogChunkSetting: most blocks per eth_getLogs.
+	rpcLogChunkSetting = "SCOUT_RPC_LOG_CHUNK"
+	// latestRefreshRecentSetting / latestRefreshOldSetting: how often the
+	// latest-price pass reads a call younger / older than 30 days again.
+	latestRefreshRecentSetting = "SCOUT_LATEST_REFRESH_RECENT"
+	latestRefreshOldSetting    = "SCOUT_LATEST_REFRESH_OLD"
+)

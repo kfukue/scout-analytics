@@ -221,7 +221,8 @@ type holderRunRecord struct {
 	// Never put a node URL, a database URL (DSN), a token or any other secret
 	// in it: runs.jsonl is plain text next to the export and travels with it.
 	Settings map[string]string `json:"settings"`
-	Calls    int               `json:"calls"` // rows written in this run
+	Calls    int               `json:"calls"`  // rows written in this run
+	Failed   int               `json:"failed"` // calls whose node reads failed: no row, a later run tries them again
 	ByStatus map[string]int    `json:"by_status"`
 	BySkip   map[string]int    `json:"by_skip_reason"`
 	// Requests: per call, over the calls with request counts (every call

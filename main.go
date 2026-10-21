@@ -1987,7 +1987,7 @@ func main() {
 	oneShot := flag.String("scan", "", "investigate a single CA with every tool, print the reports and deliver them (if allowed), then exit")
 	_ = flag.Bool("deliver", true, "deprecated: -scan now delivers by default (use -no-deliver to only print)")
 	noDeliver := flag.Bool("no-deliver", false, "with -scan / -post: print the reports only, don't send them")
-	dryRun := flag.Bool("dry-run", false, "listen and scan, but never deliver (verdicts are logged); with -rescan-missing or -backfill-timing: only count, write nothing")
+	dryRun := flag.Bool("dry-run", false, "listen and scan, but never deliver (verdicts are logged); with -rescan-missing or -backfill-timing: only count, write nothing; with -export-holders: only estimate the node cost (no node request)")
 	backfillFlag := flag.Bool("backfill", false, "import past calls from the channel history into the DB (no bot scans) so their performance can be tracked, then exit")
 	backfillFrom := flag.Int("backfill-from", 1, "with -backfill: oldest post id to import")
 	backfillTo := flag.Int("backfill-to", 0, "with -backfill: newest post id to import (0 = latest)")
@@ -2010,10 +2010,15 @@ func main() {
 	rescanMissing := flag.Bool("rescan-missing", false, "with -dry-run: list and count the first calls without a Perceptor report that the rescan lane (SCOUT_RESCAN) would re-scan under the current settings, and how long it would take, then exit (DB only; nothing is scanned)")
 	backfillTiming := flag.Bool("backfill-timing", false, "fill in the timing columns of done on-chain horizons from the stored candles, and the rug time of rugged calls (one node lookup each), then exit; with -dry-run: only count (DB only, no Telegram)")
 	reaskMissing := flag.Bool("salpha-reask-missing", false, "with -dry-run: list and count the first calls whose live sAlpha reply was no report (declined, empty, timeout, failed) that the sAlpha re-ask lane (SCOUT_SALPHA_REASK) would ask about again under the current settings, by age, then exit (DB only; nothing is sent)")
+	holderOpts := holderExportFlags(flag.CommandLine)
 	flag.Parse()
 	if !*retryNoPool && (*retryGaveUp || *retryLaunchpad != "" || *retryDryRun) {
 		log.Fatal("-retry-gave-up, -retry-launchpad and -retry-dry-run are used with -retry-no-pool")
 	}
+	if err := holderOpts.check(); err != nil {
+		log.Fatal(err)
+	}
+	holderOpts.DryRun = *dryRun
 
 	cfg, err := loadConfig(*envFile)
 	if err != nil {
@@ -2036,6 +2041,15 @@ func main() {
 	if *priceCheck != "" {
 		if err := runPriceCheck(ctx, cfg, strings.TrimSpace(*priceCheck), *priceAt); err != nil {
 			log.Fatal(err)
+		}
+		return
+	}
+
+	// -export-holders (holders_cmd.go): before newScanner, Migrate and
+	// registerTools, so it never applies the schema and starts nothing else.
+	if holderOpts.IDsFile != "" {
+		if err := runHolderExportCommand(ctx, cfg, *holderOpts, logLineWriter{log.Default()}); err != nil {
+			log.Fatalf("export-holders: %v", err)
 		}
 		return
 	}
