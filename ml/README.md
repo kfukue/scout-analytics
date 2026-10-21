@@ -944,6 +944,63 @@ error while reading or writing the pointers: it prints
 so you see which pointer moved. Fix the cause, run `status`, then promote or
 roll back again.
 
+## Holder pilot analysis (report only)
+
+    python holders_report.py [--holders DIR] [--ids PATH] [--out DIR]
+
+The P1 step of the holder analysis: no model, nothing saved or served; the owner
+decides on the result. It reads the `-export-holders` folder (`holders.jsonl`, the
+source of truth, read up to its last newline like the Go reader; `columns.json`;
+`runs.jsonl` for the failed-call count) and the owner's Q6 pilot ids CSV (`call_id,
+grp, week_utc, rn_week, rn, ca, kind, entry_at, entry_block, pool_address, pool_id,
+holders_at_call, age_s_at_call, max_gain_late_7d, ret_late_7d, tax_buy_pct,
+tax_sell_pct`; `grp` is `dead7`, `held2x7` or `neither`), joined on `call_id`.
+Defaults, from the repo root: `data/holders`, `data/holder_pilot_ids.csv`, and
+`data/holders_analysis` for the output. Each run writes a new folder
+`<out>/<YYYYMMDD-HHMM UTC>/` with `report.md` and `summary.json` (refused if it
+exists). `--out` must be outside every checkout or inside a checkout's git-ignored
+`data/` folder. Exit codes: `0` written; `1` refused, nothing written; `2` usage
+error.
+
+- **Inputs:** exactly `HOLD_FEATURES` (each `pre_hold_*`, past the leakage guard).
+  No ids-file column is ever an input: `holders_at_call` / `age_s_at_call` are the
+  baseline and the strata; peak, 7d return and taxes are description only.
+- **Row classes per group:** no row, skipped (by reason), capped, incomplete, entry
+  block different from the ids file (excluded), analysable. A diagnostic counts the
+  ok rows with an empty pre-call venue list but pre-call transfers (the v2/v3 pre
+  venue is the pool the tracker picked after the call).
+- **Per feature and contrast** (`dead7` vs rest and `held2x7` vs rest are primary;
+  `dead7` vs `held2x7` description only): n, missing share and median / IQR per
+  group (NULL stays NULL, booleans 1/0), AUC, oriented AUC with its direction (fixed
+  on the full sample), 95 % percentile bootstrap within groups
+  (`HOLD_BOOTSTRAP_REPS` 2000, seed 7), and the AUC over the pairs in the same week
+  and in the same stratum (posted-holder terciles from the pilot x age < 1 h /
+  >= 1 h, with its bootstrap). n/a below 30 non-NULL rows per class. AUC only:
+  the sample is about a third per group, so lift and precision would mean nothing.
+- **Baseline and checks:** the AUC of `holders_at_call` and of `age_s_at_call` alone
+  (the Q5b reference); the strata counts; the correlation of
+  `pre_hold_launch_age_s` with `age_s_at_call` and `pre_hold_holders` with
+  `holders_at_call`; a group x week table.
+- **Multiple comparisons:** the number of tests, and the chance level for the best
+  of N: the 95th percentile of the best oriented AUC across features with `grp`
+  shuffled within week (`HOLD_PERM_REPS` 500, seed 7).
+- **Verdict (report only):** CONTINUE if some feature, in a primary contrast, has a
+  bootstrap lower bound above `HOLD_STOP_AUC_LOWER` (0.60, pre-registered 19 Oct
+  2026) and a within-strata lower bound above `HOLD_STRATA_AUC_LOWER` (0.50); else
+  STOP; NOT JUDGED without the strata columns (an older Q6 export) or with fewer
+  than 30 analysable rows in a group. The strata definition, the 0.50 threshold
+  (read as the lower bound of the within-strata 95 % CI) and the NOT JUDGED
+  conditions are the PM's reading of "the separation vanishes within strata", a
+  recommendation for the owner. A STOP reason says how many of the pairs above
+  0.60 pooled have no within-strata AUC (n/a), whose strata clause could not be
+  evaluated.
+- **After the call:** every `post24h_*` column, peak and 7d return (also net of tax
+  when the tax columns are there) per group, description only.
+
+The output holds counts and metrics only (no address, no per-call row; the ids
+without a row are listed by call id in `summary.json` only), plus the sha256 of
+each input file, so it is safe to paste back.
+
 ## Layout and tests
 
     scout_ml/config.py    buckets, thresholds, feature lists, forbidden columns, gates
@@ -955,9 +1012,10 @@ roll back again.
     scout_ml/diagnostics.py  pooled walk-forward + bootstrap (gate inputs), seed spreads, adversarial
     scout_ml/wallet_rep.py   live-buy wallet reputation (wrep_* columns; a report-only variant)
     scout_ml/promote.py   promote / rollback / status checks (promote.py is its command line)
-    train.py  serve.py  promote.py  make_synthetic.py  tests/
+    scout_ml/holders.py   holder pilot analysis, report only (holders_report.py is its command line)
+    train.py  serve.py  promote.py  holders_report.py  make_synthetic.py  tests/
 
-    python -m pytest tests -q        # 432 tests: 432 passed on Linux; on Windows 431 passed, 1 skipped (POSIX-only), about 7 minutes
+    python -m pytest tests -q        # 480 tests: 480 passed on Linux; on Windows 479 passed, 1 skipped (POSIX-only), about 7 minutes
 
 `scout_ml/wallet_rep.py` (`wrep_frame(df, live_buys)`) scores the wallets in
 each call's live buys (the `-export-live-buys` CSV) by how the earlier first

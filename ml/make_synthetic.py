@@ -6,6 +6,8 @@ layout, missingness pattern and CSV conventions mimic the real export.
                                              [--dex-names drifting] [--live-buys live_buys.csv]
 """
 import argparse
+import json
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -251,6 +253,131 @@ def write_csv(d: pd.DataFrame, path) -> None:
         d[c] = pd.to_numeric(d[c]).astype("Int64")
     d["rugged"] = d["rugged"].map({True: "true", False: "false"})
     d.to_csv(path, index=False)
+
+
+# --- Holder pilot (the -export-holders files and the owner's Q6 ids CSV) ----------
+# The holder export's columns in the order of holderRow (../holders_columns.go):
+# provenance, pre_hold_*, post24h_*. tests/test_holders.py checks them against the
+# Go json tags, and the pre_hold_* names against HOLD_FEATURES | HOLD_EXCLUDED.
+HOLDER_PROVENANCE = [
+    "call_id", "token", "chain", "status", "skip_reason", "state_v", "venue_kind", "venue_pool",
+    "venue_pool_id", "venue_curve", "pons_grad_block", "venues_pre", "venues_post", "excluded_pre",
+    "v4_pool_ids", "v4_pool_ids_pre", "entry_at", "entry_block", "launch_block", "launch_time",
+    "launch_tx", "capped", "deployer", "deployer_source", "post_end_block", "post_end_time",
+    "transfers_pre", "transfers_post", "lp_events_pre", "lp_events_post", "dup_logs_dropped",
+    "removed_logs_dropped", "bad_lp_logs_skipped", "bad_transfer_logs", "bad_transfer_error",
+    "rpc_logs_requests", "rpc_other_requests", "rpc_requests_total", "posted_age_s", "exported_at",
+    "code_version", "elapsed_s"]
+HOLDER_PRE = [f"pre_hold_{n}" for n in (
+    "incomplete", "launch_age_s", "transfers", "supply_raw", "circulating_raw", "holders",
+    "top1_share", "top5_share", "top10_share", "deployer_share", "deployer_sold", "buyers", "sellers",
+    "buys", "sells", "sell_buy_ratio", "first_buy_block", "first_buy_to_entry_blocks",
+    "sniper_window_blocks", "snipers", "sniper_held_share", "first_block_buyers", "max_tx_buyers",
+    "early_buyers", "early_buyers_held_share", "lp_applicable", "lp_adds", "lp_removes",
+    "lp_collects", "lp_removed_before_entry", "deployer_removed_lp")]
+HOLDER_POST = [f"post24h_{n}" for n in (
+    "incomplete", "transfers", "holders", "top1_share", "top5_share", "top10_share",
+    "deployer_share", "deployer_sold", "buyers", "sellers", "buys", "sells", "sell_buy_ratio",
+    "presnipers_held_share", "early_buyers_held_share", "lp_adds", "lp_removes", "lp_collects",
+    "deployer_removed_lp")]
+HOLDER_COLUMNS = HOLDER_PROVENANCE + HOLDER_PRE + HOLDER_POST
+HOLDER_IDS_COLUMNS = ["call_id", "grp", "week_utc", "rn_week", "rn", "ca", "kind", "entry_at",
+                      "entry_block", "pool_address", "pool_id", "holders_at_call", "age_s_at_call",
+                      "max_gain_late_7d", "ret_late_7d", "tax_buy_pct", "tax_sell_pct"]
+HOLDER_LP = ["pre_hold_lp_adds", "pre_hold_lp_removes", "pre_hold_lp_collects",
+             "pre_hold_lp_removed_before_entry", "pre_hold_deployer_removed_lp"]
+HOLDER_CODE_VERSION = "5a3142f7" * 5   # a 40-hex commit, no 0x
+
+
+def _addr(rng) -> str:
+    return "0x" + "".join(rng.choice(list("0123456789abcdef"), 40))
+
+
+def make_holder_pilot(n_per_group: int = 150, weeks: int = 6, seed: int = 7, signal: float = 1.0):
+    """Invented pilot: (export rows as dicts in HOLDER_COLUMNS order, ids DataFrame).
+    Per group ~3 % without a row, skipped, capped, incomplete and entry-block
+    mismatch rows each; pre_hold_top10_share is higher for dead7 by `signal`
+    standard deviations, independent of the posted holders and age (so it holds
+    within strata); pre_hold_holders follows holders_at_call and
+    pre_hold_launch_age_s follows age_s_at_call; lp_applicable false leaves the
+    LP columns NULL. Addresses look real (0x + 40 hex), so tests can check that
+    none reaches the report."""
+    rng = np.random.default_rng(seed)
+    grp = np.repeat(["dead7", "held2x7", "neither"], n_per_group)
+    n = len(grp)
+    week = pd.Timestamp("2026-08-03") + pd.to_timedelta(7 * (np.arange(n) % weeks), unit="D")
+    holders = np.round(rng.lognormal(np.log(120), 0.6, n)).astype(int)
+    age = np.where(rng.random(n) < 0.75, rng.uniform(60, 3500, n), rng.uniform(3600, 30 * 86400, n)).round()
+    block = 20_000_000 + np.arange(n) * 500
+    peak = rng.lognormal(np.log(60), 1.0, n) + np.where(grp == "held2x7", 150, 0)
+    ids = pd.DataFrame({
+        "call_id": np.arange(1, n + 1) * 7, "grp": grp, "week_utc": week.strftime("%Y-%m-%d"),
+        "rn_week": np.arange(n) // weeks + 1, "rn": np.arange(1, n + 1), "ca": [_addr(rng) for _ in range(n)],
+        "kind": rng.choice(["v4", "pons", "v3", "v2"], n), "entry_at": "2026-08-05T12:00:00Z",
+        "entry_block": block, "pool_address": [_addr(rng) for _ in range(n)], "pool_id": "",
+        "holders_at_call": holders, "age_s_at_call": age, "max_gain_late_7d": peak.round(2),
+        "ret_late_7d": np.where(grp == "dead7", -95.0, rng.normal(10, 60, n)).round(2),
+        "tax_buy_pct": rng.choice([0.0, 0.0, 5.0], n), "tax_sell_pct": rng.choice([0.0, 0.0, 5.0], n)})
+    kind = rng.choice(["ok"] * 85 + ["no row"] * 3 + ["skipped"] * 3 + ["capped"] * 3
+                      + ["incomplete"] * 3 + ["mismatch"] * 3, n)
+    nul = lambda v: None if rng.random() < 0.08 else v   # noqa: E731
+    rows = []
+    for i in range(n):
+        if kind[i] == "no row":
+            continue
+        r = dict.fromkeys(HOLDER_COLUMNS)
+        r.update(call_id=int(ids.call_id[i]), token=ids.ca[i], chain="evm", status="ok",
+                 venues_pre=[ids.pool_address[i]], venues_post=[ids.pool_address[i]], excluded_pre=[],
+                 v4_pool_ids=[], v4_pool_ids_pre=[], entry_block=int(block[i] + (7 if kind[i] == "mismatch" else 0)),
+                 capped=False, deployer=_addr(rng), exported_at="2026-10-21T03:00:00Z",
+                 code_version=HOLDER_CODE_VERSION)
+        if kind[i] in ("skipped", "capped"):
+            r.update(status=kind[i], skip_reason="no_mint_found" if kind[i] == "skipped" else None,
+                     capped=kind[i] == "capped")
+            rows.append(r)
+            continue
+        transfers = int(rng.integers(5, 2000))
+        r.update(transfers_pre=transfers, pre_hold_incomplete=kind[i] == "incomplete", pre_hold_transfers=transfers)
+        if rng.random() < 0.05:
+            r["venues_pre"] = None if rng.random() < 0.5 else []   # Go: null or []
+        lp = bool(rng.random() < 0.7)
+        r.update({
+            "pre_hold_launch_age_s": int(age[i] + rng.integers(0, 30)), "pre_hold_holders": int(holders[i] * rng.uniform(0.8, 1.2)),
+            "pre_hold_top10_share": float(np.clip(0.4 + 0.1 * (rng.normal() + signal * (grp[i] == "dead7")), 0, 1)),
+            "pre_hold_top1_share": nul(float(rng.uniform(0, 0.3))), "pre_hold_top5_share": nul(float(rng.uniform(0.1, 0.5))),
+            "pre_hold_deployer_share": nul(float(rng.uniform(0, 0.1))), "pre_hold_deployer_sold": nul(bool(rng.random() < 0.3)),
+            "pre_hold_buyers": int(rng.integers(0, 300)), "pre_hold_sellers": int(rng.integers(0, 100)),
+            "pre_hold_buys": int(rng.integers(0, 500)), "pre_hold_sells": int(rng.integers(0, 200)),
+            "pre_hold_sell_buy_ratio": nul(float(rng.uniform(0, 2))), "pre_hold_first_buy_block": int(block[i] - 300),
+            "pre_hold_first_buy_to_entry_blocks": nul(int(rng.integers(1, 5000))), "pre_hold_sniper_window_blocks": 3,
+            "pre_hold_snipers": nul(int(rng.integers(0, 20))), "pre_hold_sniper_held_share": nul(float(rng.uniform(0, 0.5))),
+            "pre_hold_first_block_buyers": nul(int(rng.integers(0, 10))), "pre_hold_max_tx_buyers": nul(int(rng.integers(1, 5))),
+            "pre_hold_early_buyers": [_addr(rng), _addr(rng)], "pre_hold_early_buyers_held_share": nul(float(rng.uniform(0, 0.6))),
+            "pre_hold_supply_raw": "1000000000000000000000000000", "pre_hold_circulating_raw": "900000000000000000000000000",
+            "pre_hold_lp_applicable": lp, "pre_hold_lp_adds": int(rng.integers(1, 4)) if lp else None,
+            "pre_hold_lp_removes": int(rng.integers(0, 2)) if lp else None, "pre_hold_lp_collects": int(rng.integers(0, 3)) if lp else None,
+            "pre_hold_lp_removed_before_entry": bool(rng.random() < 0.1) if lp else None,
+            "pre_hold_deployer_removed_lp": nul(bool(rng.random() < 0.1)) if lp else None})
+        for c in HOLDER_POST:
+            r[c] = bool(rng.random() < 0.2) if c.endswith(("incomplete", "sold", "removed_lp")) else float(rng.uniform(0, 100))
+        rows.append(r)
+    return rows, ids
+
+
+def write_holder_pilot(folder, ids_path, rows, ids, columns=None, failed: int = 2,
+                       partial_line: str = "") -> None:
+    """The export's holders.jsonl, columns.json and runs.jsonl in `folder` (with an
+    optional partial last line), and the ids CSV at `ids_path`."""
+    folder, columns = Path(folder), list(columns or HOLDER_COLUMNS)
+    folder.mkdir(parents=True, exist_ok=True)
+    with open(folder / "holders.jsonl", "w", encoding="utf-8", newline="\n") as f:
+        f.writelines(json.dumps(r) + "\n" for r in rows)
+        f.write(partial_line)
+    (folder / "columns.json").write_text(json.dumps(
+        {"columns": columns, "pre_hold_columns": [c for c in columns if c.startswith("pre_hold_")]}), encoding="utf-8")
+    (folder / "runs.jsonl").write_text(json.dumps(
+        {"code_version": HOLDER_CODE_VERSION, "calls": len(rows), "failed": failed}) + "\n", encoding="utf-8")
+    ids.to_csv(ids_path, index=False)
 
 
 def main(argv=None) -> None:

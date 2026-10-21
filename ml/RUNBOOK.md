@@ -800,6 +800,29 @@ Never paste the CSV, rows of it, or anything from `.env`.
 - After each retrain, send the report's verdict to the product manager
   (step 8).
 
+## 10. Holder pilot analysis (report only)
+
+After the holder pilot export has finished (the root `README.md`, "Export
+holder features (`-export-holders`)", pilot steps), with the Q6 CSV still at
+`$REPO/data/holder_pilot_ids.csv` and the export in `$REPO/data/holders`. Uses
+the venv of step 2; no database, no node, no model.
+
+```bash
+cd "$REPO" && git pull
+cd "$REPO/ml"
+"$ML/venv/bin/python" -m pytest tests/test_holders.py -q -p no:cacheprovider   # optional, about 20 s
+"$ML/venv/bin/python" holders_report.py      # defaults: --holders ../data/holders --ids ../data/holder_pilot_ids.csv --out ../data/holders_analysis
+cat "$REPO/data/holders_analysis/$(ls "$REPO/data/holders_analysis" | tail -1)/report.md"
+```
+
+It prints `wrote <folder> (report.md, summary.json)`; the folder is the run's UTC
+time (`YYYYMMDD-HHMM`), and a second run in the same minute is refused. `refused:
+<why>. Nothing written` (exit 1) means an input did not pass a check, e.g. the
+ids file lacks `call_id`, `grp`, `week_utc` or `entry_block`, a `call_id` or `ca`
+repeats, or the export has a call id the ids file does not. Paste back the whole
+`report.md` (counts and metrics only, no addresses; the ids without a row are in
+`summary.json` only). The verdict is report only: the owner decides.
+
 ## Cleanup (when done with the worktree)
 
 ```bash

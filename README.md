@@ -581,6 +581,10 @@ model may use) and `post24h_*` columns after it (description only).
    then look at `data/holders/holders.csv` and `runs.jsonl`.
 6. The full run, beside the running `-track`:
    `./scoutanalytics -export-holders data/holder_pilot_ids.csv` (it resumes after the ten).
+7. The analysis (report only): `ml/RUNBOOK.md` step 10, `holders_report.py` from `ml/`. It
+   reads the same Q6 CSV, which now also needs `grp`, `week_utc` and `entry_block`, and for
+   the strata and the verdict `holders_at_call` and `age_s_at_call` (the peak, 7d return and
+   tax columns are description only); see `ml/README.md`, "Holder pilot analysis".
 
 ### Retry calls without a pool now (`-retry-no-pool`)
 
