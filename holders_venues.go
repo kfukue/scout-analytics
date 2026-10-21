@@ -30,7 +30,15 @@ package main
 //     state's PoolID is a pre id only for a Pons pool created (PonsGrad) at
 //     or before the entry block: for a plain v4 state the tracker's discovery
 //     (resolveV4) does not check that the pool existed at the entry block, so
-//     its id is a pre id only when the caller lists it.
+//     its id is a pre id only when the caller lists it (holderV4PoolIDs,
+//     holders_fetch.go, splits the ids by Initialize block).
+//   - Pre venues hold nothing created after the entry block: a v2/v3 pool
+//     (the state's Pool) is a pre venue only when the pre logs show it (a
+//     pre transfer from or to it, or a pre liquidity event on it:
+//     holderPoolSeen), because the tracker's discovery also looks past the
+//     entry block; the PoolManager is a pre venue only with at least one pre
+//     pool id (no v4 pool of the token existed before the call otherwise). It
+//     stays excluded either way. Post venues are not gated.
 //   - The only hook the state knows is Hook (set for Pons tokens: the Pons
 //     hook); other v4 pools' hooks are not stored, so they are not excluded.
 
@@ -115,6 +123,45 @@ func holderVenuesAt(st onchainState, cutoff uint64, cfg holderVenueConfig) []hol
 	return out
 }
 
+// holderPreVenues returns the venues at the entry block (holderVenuesAt),
+// without the ones the pre data cannot show existed: the state's v2/v3 pool
+// when poolSeenPre is false (holderPoolSeen), and the PoolManager when there
+// is no pre pool id (preIDs, holderPreIDs). The excluded set still holds the
+// PoolManager (holderExcludedSet).
+func holderPreVenues(st onchainState, entryBlock uint64, poolSeenPre bool, preIDs []string, cfg holderVenueConfig) []holderVenue {
+	drop := map[string]bool{}
+	if (st.Kind == "v2" || st.Kind == "v3") && !poolSeenPre {
+		drop[strings.ToLower(st.Pool)] = true
+	}
+	if holderV4VenueAt(st, entryBlock) && len(preIDs) == 0 {
+		drop[strings.ToLower(cfg.PoolManagerV4)] = true
+	}
+	return slices.DeleteFunc(holderVenuesAt(st, entryBlock, cfg), func(v holderVenue) bool { return drop[v.Address] })
+}
+
+// holderPoolSeen reports whether pool shows in the pre-call logs: the From or
+// To of a transfer, or the Venue of a liquidity event (a Mint counts).
+// Callers pass only logs at or before the entry block (holderLogs'
+// TransfersPre and LiquidityPre), so a pool created after the call is never
+// seen. Compared in lowercase; an empty pool is never seen.
+func holderPoolSeen(pool string, transfers []tokenTransfer, liq []liquidityEvent) bool {
+	pool = strings.ToLower(pool)
+	if pool == "" {
+		return false
+	}
+	for _, t := range transfers {
+		if strings.ToLower(t.From) == pool || strings.ToLower(t.To) == pool {
+			return true
+		}
+	}
+	for _, e := range liq {
+		if strings.ToLower(e.Venue) == pool {
+			return true
+		}
+	}
+	return false
+}
+
 // holderFetchVenues returns the venues to read for a call
 // (holderFetchInput.Venues), before the post window's end is known: every
 // venue up to any block. A pool created after the window's end has no events
@@ -167,9 +214,9 @@ func holderAllPoolIDs(st onchainState, pre, all []string) []string {
 // For a plain v4 state it is never added: the tracker's discovery (resolveV4)
 // picks the top-ranked pool initialised up to after the entry block, without
 // checking that it existed at the entry block, so its id is a pre id only
-// when the caller lists it (4c checks the init block from v4PoolsOf). The
-// PoolManager stays a pre venue either way (holderV4VenueAt); without pre ids
-// it has no liquidity filters, so LP is not applicable before the call.
+// when the caller lists it (holderV4PoolIDs checks the Initialize block).
+// Without pre ids the PoolManager is not a pre venue (holderPreVenues) and has
+// no liquidity filters, so LP is not applicable before the call.
 func holderPreIDs(st onchainState, entryBlock uint64, pre []string) []string {
 	if holderPonsPoolAt(st, entryBlock) {
 		return holderPoolIDs(st, pre)
@@ -204,10 +251,12 @@ func holderLPApplicable(venues []holderVenue, ids []string) bool {
 // venues and excluded set at entryBlock (pre) and at postEndBlock (post), and
 // whether liquidity applies at each. idsPre are the token's v4 pool ids
 // initialised at or before entryBlock (holderPreIDs); idsAll every other known
-// id. Pre never depends on postEndBlock or idsAll.
-func holderVenuePlanFor(st onchainState, token string, entryBlock, postEndBlock uint64, idsPre, idsAll []string, cfg holderVenueConfig) holderVenuePlan {
+// id. poolSeenPre: the state's v2/v3 pool shows in the pre-call logs
+// (holderPoolSeen); without it the pool is not a pre venue (holderPreVenues).
+// Pre never depends on postEndBlock or idsAll.
+func holderVenuePlanFor(st onchainState, token string, entryBlock, postEndBlock uint64, idsPre, idsAll []string, poolSeenPre bool, cfg holderVenueConfig) holderVenuePlan {
 	p := holderVenuePlan{V4PoolIDsPre: holderPreIDs(st, entryBlock, idsPre), V4PoolIDsAll: holderAllPoolIDs(st, idsPre, idsAll)}
-	p.Pre = holderVenuesAt(st, entryBlock, cfg)
+	p.Pre = holderPreVenues(st, entryBlock, poolSeenPre, p.V4PoolIDsPre, cfg)
 	p.Post = holderVenuesAt(st, postEndBlock, cfg)
 	p.ExcludedPre = holderExcludedSet(st, token, p.Pre, cfg)
 	p.ExcludedPost = holderExcludedSet(st, token, p.Post, cfg)

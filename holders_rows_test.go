@@ -545,6 +545,10 @@ func TestHoldersRowLeakage(t *testing.T) {
 		},
 		"deployer not known":   func(in *holderRowInput) { in.Logs.Deployer = "" },
 		"no buys before entry": func(in *holderRowInput) { in.Logs.TransfersPre = hrPre()[:2] },
+		// The tracker's v2/v3 pool created after the call (first log at
+		// entry+1): not a pre venue, and nothing after the call makes it one.
+		"v2, pool first seen after the call": hrPoolAfterEntry("v2"),
+		"v3, pool first seen after the call": hrPoolAfterEntry("v3"),
 	}
 	mutations := map[string]func(in *holderRowInput){
 		"a whale buys after the call": func(in *holderRowInput) {
@@ -592,6 +596,18 @@ func TestHoldersRowLeakage(t *testing.T) {
 		"extra pool id learned later": func(in *holderRowInput) {
 			in.V4PoolIDsAll = append(in.V4PoolIDsAll, lqPoolID)
 			in.Logs.LiquidityPost = append(in.Logs.LiquidityPost, lqEv("v4", lpAdd, hvPM, lqPoolID, "0xd1", 320))
+		},
+		// The state's pool gets its first logs right after the entry block (a
+		// liquidity add and a buy): whether or not the pool showed before the
+		// call, nothing pre changes.
+		"pool's liquidity add and a buy in the block after the entry": func(in *holderRowInput) {
+			in.Logs.TransfersPost = append(in.Logs.TransfersPost, inTx(xfer(hrDep, hrPool, tokens(50), hrEntry+1, 5), "0xe1"),
+				xfer(hrPool, hrB6, tokens(5), hrEntry+1, 6))
+			proto := "v2" // the fixture's pool is a v2 pair, or a v3 pool for a v3 state
+			if in.Meta.State.Kind == "v3" {
+				proto = "v3"
+			}
+			in.Logs.LiquidityPost = append(in.Logs.LiquidityPost, lqEv(proto, lpAdd, hrPool, "", "0xe1", hrEntry+1))
 		},
 		// The tracker's discovery may store a v4 pool initialised after the
 		// entry block as the state's PoolID; the caller does not list it as a
@@ -689,6 +705,83 @@ func TestHoldersRowStatePoolIDPre(t *testing.T) {
 			} else {
 				wantNull(t, m, preLP...)
 			}
+		})
+	}
+}
+
+// hrPoolAfterEntry makes the call a kind ("v2" or "v3") call whose pool first
+// shows in the block after the entry: before the call the deployer only sends
+// to s1; at entry+1 it adds liquidity (a Mint in the same tx), then b6 buys
+// and s1 sells.
+func hrPoolAfterEntry(kind string) func(in *holderRowInput) {
+	return func(in *holderRowInput) {
+		in.Meta.State = &onchainState{Kind: kind, Pool: hrPool, EntryBlock: hrEntry, V: 2}
+		in.Logs.TransfersPre = []tokenTransfer{xfer(zeroAddr, hrDep, tokens(1000), 100, 0), xfer(hrDep, hrS1, tokens(100), 105, 0)}
+		in.Logs.LiquidityPre = nil
+		in.Logs.TransfersPost = []tokenTransfer{inTx(xfer(hrDep, hrPool, tokens(600), hrEntry+1, 0), "0xa9"),
+			xfer(hrPool, hrB6, tokens(100), 300, 0), xfer(hrS1, hrPool, tokens(50), 400, 0)}
+		in.Logs.LiquidityPost = []liquidityEvent{lqEv(kind, lpAdd, hrPool, "", "0xa9", hrEntry+1)}
+	}
+}
+
+// The tracker's v2/v3 pool counts before the call only when the pre logs show
+// it (holderPoolSeen): first seen at entry+1 it is not a pre venue, LP is not
+// applicable before the call (pre_hold_lp_applicable false, LP columns NULL)
+// and the pool is not in excluded_pre; seen in the entry block, or through a
+// pre Mint alone, it is. The post window is not gated.
+func TestHoldersRowPoolSeenGate(t *testing.T) {
+	preLP := []string{"pre_hold_lp_adds", "pre_hold_lp_removes", "pre_hold_lp_collects",
+		"pre_hold_lp_removed_before_entry", "pre_hold_deployer_removed_lp"}
+	postLP := []string{"post24h_lp_adds", "post24h_lp_removes", "post24h_lp_collects", "post24h_deployer_removed_lp"}
+	// atEntry: the pool's only pre log is a transfer into it in the entry block.
+	atEntry := func(kind string) func(in *holderRowInput) {
+		return func(in *holderRowInput) {
+			hrPoolAfterEntry(kind)(in)
+			in.Logs.TransfersPre = append(in.Logs.TransfersPre, xfer(hrS1, hrPool, tokens(10), hrEntry, 0))
+		}
+	}
+	// mintOnly: the pool's only pre log is a Mint (its transfer not read).
+	mintOnly := func(kind string) func(in *holderRowInput) {
+		return func(in *holderRowInput) {
+			hrPoolAfterEntry(kind)(in)
+			in.Logs.LiquidityPre = []liquidityEvent{lqEv(kind, lpAdd, hrPool, "", "0xa8", 150)}
+		}
+	}
+	cases := []struct {
+		name     string
+		mutate   func(in *holderRowInput)
+		preVenue bool // the pool is a pre venue
+		lpAdds   int  // pre_hold_lp_adds when it is
+	}{
+		{name: "v2, first seen at entry+1", mutate: hrPoolAfterEntry("v2")},
+		{name: "v3, first seen at entry+1", mutate: hrPoolAfterEntry("v3")},
+		{name: "v2, seen in the entry block", mutate: atEntry("v2"), preVenue: true},
+		{name: "v3, seen in the entry block", mutate: atEntry("v3"), preVenue: true},
+		{name: "v2, seen through a pre Mint only", mutate: mintOnly("v2"), preVenue: true, lpAdds: 1},
+		{name: "v3, seen through a pre Mint only", mutate: mintOnly("v3"), preVenue: true, lpAdds: 1},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			in := hrInput()
+			tc.mutate(&in)
+			m := rowMap(t, mustRow(t, in))
+			wantValue(t, m, "status", "ok")
+			wantValue(t, m, "pre_hold_incomplete", false)
+			wantValue(t, m, "venues_post", []string{hrPool})
+			wantNotNull(t, m, postLP...)
+			if !tc.preVenue {
+				wantValue(t, m, "venues_pre", []string{})
+				wantValue(t, m, "excluded_pre", sortedStrings(hrToken, zeroAddr, deadAddr, hvPM))
+				wantValue(t, m, "pre_hold_lp_applicable", false)
+				wantNull(t, m, preLP...)
+				wantValue(t, m, "pre_hold_buys", 0)
+				return
+			}
+			wantValue(t, m, "venues_pre", []string{hrPool})
+			wantValue(t, m, "excluded_pre", sortedStrings(hrPool, hrToken, zeroAddr, deadAddr, hvPM))
+			wantValue(t, m, "pre_hold_lp_applicable", true)
+			wantNotNull(t, m, preLP...)
+			wantValue(t, m, "pre_hold_lp_adds", tc.lpAdds)
 		})
 	}
 }

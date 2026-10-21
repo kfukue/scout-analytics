@@ -659,7 +659,7 @@ func (c webConfig) webCall(r *ScoutWebRow) ScoutWebCall {
 		ContractAddress: r.ContractAddress, TokenName: r.TokenName, TokenSymbol: r.TokenSymbol,
 		GMGNURL:   c.gmgnURL(r.ContractAddress),
 		PriceUnit: r.PriceUnit, EntryPriceUSD: r.EntryPrice,
-		Rugged: r.Rugged, TrackingStatus: r.TrackingStatus,
+		Rugged: r.Rugged, RugKind: r.RugAtKind, TrackingStatus: r.TrackingStatus,
 		PerceptorVerd: r.PerceptorVerd, PerceptorURL: r.PerceptorURL,
 		CallCount: r.CallCount, LastCallDate: r.LastCallDate,
 		CallMcapUSD: r.callMcap, LatestMcapUSD: r.latestMcap,
@@ -669,6 +669,18 @@ func (c webConfig) webCall(r *ScoutWebRow) ScoutWebCall {
 		PerceptorLatestVerd: r.latestVerd,
 		Model:               webCallModel(r),
 	}
+}
+
+// webHidesPeak: the list hides the peak of a call flagged rugged, except
+// a collapsed one (rug_at_kind price: flagged by the end-of-tracking price
+// rule, down more than 95%, the pool not seen drained), which shows its
+// peak like any call (owner decision A2, 20 Oct 2026). A rugged call with no
+// kind stored still hides it.
+func webHidesPeak(r *ScoutWebRow) bool {
+	if r.Rugged == nil || !*r.Rugged {
+		return false
+	}
+	return r.RugAtKind == nil || *r.RugAtKind != rugAtPrice
 }
 
 // webRowNumbersJSON is how the three numbers of a window look in an encoded
@@ -738,9 +750,10 @@ func newWebSnapshot(rows []ScoutWebRow, updatePosts int, prev *webSnapshot, cfg 
 		if !r.usd {
 			r.EntryPrice, r.HasPerf = nil, 0
 		}
-		// A rugged call has no peak to show (the page shows a dash, and it
-		// sorts with the calls without one); its returns stay as stored.
-		if r.Rugged != nil && *r.Rugged {
+		// A rugged call whose pool was drained has no peak to show (the page
+		// shows a dash, and it sorts with the calls without one); its returns
+		// stay as stored. A collapsed one keeps its peak (webHidesPeak).
+		if webHidesPeak(r) {
 			r.HasPerf &^= webPeakBits
 		}
 		r.EntryPrice = finite(r.EntryPrice)

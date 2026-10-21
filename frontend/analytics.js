@@ -1438,7 +1438,10 @@
     { key: 'dex', label: 'DEX named in the post', kind: 'dex' }
   ].concat(FACTORS.filter(function (f) { return f.kind !== 'cat'; }));
   var TM_TICKS = [0, 300, 900, 3600, 14400, 86400, 259200, 604800, 2592000];
-  var RUG_EVENT = 'event', RUG_AT_CALL = 'at_call', RUG_DETECTED = 'detected';
+  // RUG_PRICE: "collapsed", flagged rugged by the price rule (under 5% of the
+  // entry price at the end of tracking: down more than 95%), the pool not
+  // seen drained; its time is approximate.
+  var RUG_EVENT = 'event', RUG_AT_CALL = 'at_call', RUG_DETECTED = 'detected', RUG_PRICE = 'price';
   var darkMQ = window.matchMedia ? window.matchMedia('(prefers-color-scheme: dark)') : null;
   var calmMQ = window.matchMedia ? window.matchMedia('(prefers-reduced-motion: reduce)') : null;
   var charts = {};      // box id → ECharts instance
@@ -1474,7 +1477,7 @@
   function newTm() {
     return {
       n: 0, reached: 0, cens: 0, short: 0, peaks: [], t2xs: [], helds: [], heldsShort: [], heldsReached: [], falls: [], holds: [],
-      rugIn: [], rugLater: [], atCall: [], detected: [], other: 0, noTime: 0
+      rugIn: [], rugLater: [], atCall: [], detected: [], price: [], other: 0, noTime: 0
     };
   }
   // Adds a timed call to an accumulator; H = the window in seconds.
@@ -1501,6 +1504,7 @@
         break;
       case RUG_AT_CALL: acc.atCall.push(rug.s); break;
       case RUG_DETECTED: acc.detected.push(rug.s); break;
+      case RUG_PRICE: acc.price.push(rug.s); break;
       case 'none': acc.noTime++; break;
       default: acc.other++;
     }
@@ -1702,7 +1706,7 @@
     stat(dl, 'Touched 2×, under ' + hold, fmtInt(all.short),
       'Touched 2× but held it less than ' + hold + ' in total (also those still at 2× at the window\'s end): counted as not reaching 2×; ' +
       'their real time held is in the time held at 2× figures');
-    stat(dl, 'Rugged in the window', fmtInt(all.rugIn.length), 'Event rug times within the window (at-the-call and detected rugs are counted apart, below)');
+    stat(dl, 'Rugged in the window', fmtInt(all.rugIn.length), 'Event rug times within the window (at-the-call, detected and collapsed rugs are counted apart, below)');
     $('tm-counts-note').textContent = 'n timed = ' + fmtInt(all.n) + ': first calls priced in USD with a ' + hz + ' return whose timing is computed. ' +
       (notTimed ? fmtInt(notTimed) + ' calls with a ' + hz + ' return have no timing yet (tracked before the timing existed, or the candles did not match the stored peak) and are left out. ' : '') +
       'Repeat calls are never counted (first calls only). ' +
@@ -1843,7 +1847,7 @@
       fmtInt(all.heldsShort.filter(function (v) { return v > 0; }).length) + ' calls; they did not reach 2×); grey = 0 held (' +
       fmtInt(all.helds.filter(function (v) { return v === 0; }).length) + ' calls: never touched 2×, or touched it without a close at or above it). ' +
       (na ? '' : 'Time to fall back below 2×: the calls that reached 2× and fell back within the window (' + fmtInt(all.cens) + ' still at 2× at the end are left out). ') +
-      'Time to rug: the event rug times within the window; rugs at the call and rugs only detected at the end of tracking are in the table below, not here. Grey: n under ' + MIN_N + '.';
+      'Time to rug: the event rug times within the window; rugs at the call, rugs only detected at the end of tracking and collapsed calls are in the table below, not here. Grey: n under ' + MIN_N + '.';
   }
 
   function fillTmRugs(all, hz) {
@@ -1852,7 +1856,8 @@
       ['Event, within the window', all.rugIn, 'Exact (rug block). In the histogram and the "share rugged by t" curve.'],
       ['Event, after the window', all.rugLater, 'Exact, but later than ' + hz + ': not in this window\'s charts.'],
       ['At the call (at or before the post)', all.atCall, 'Drained at or before the post: no time after the call. Never in the charts.'],
-      ['Detected at the end of tracking', all.detected, 'Found only by the end-of-tracking check; the time is that check\'s (approximate: an upper bound). Never in the charts.']
+      ['Detected at the end of tracking', all.detected, 'Found only by the end-of-tracking check; the time is that check\'s (approximate: an upper bound). Never in the charts.'],
+      ['Collapsed (price down more than 95%)', all.price, 'Flagged rugged by the price rule: under 5% of the entry price at the end of tracking; the pool was not seen drained. The time is approximate. Never in the charts.']
     ];
     var frag = document.createDocumentFragment();
     frag.appendChild(headRow('Kind of rug time', [
@@ -1873,14 +1878,15 @@
     }
     rows.forEach(function (x) {
       var m = med(x[1]);
-      var txt = isNum(m) ? (x[1] === all.detected ? '≈ ' : '') + A.fmtDur(m) : DASH;
+      var approx = x[1] === all.detected || x[1] === all.price;
+      var txt = isNum(m) ? (approx ? '≈ ' : '') + A.fmtDur(m) : DASH;
       row(x[0], x[1].length, txt, x[2]);
     });
     if (all.other) { row('Other kind', all.other, DASH, 'A kind of rug time this page does not know. Never in the charts.'); }
     row('Rugged, no rug time stored', all.noTime, DASH, 'Flagged rugged by the tracker (as of now) without a rug block time. Never in the charts.');
     frag.appendChild(tbody);
     $('tbl-tm-rugs').replaceChildren(frag);
-    $('cap-tm-rugs').textContent = 'Over the ' + fmtInt(all.n) + ' timed calls. Only event rug times are exact; the three other kinds are kept apart, as the owner decided.';
+    $('cap-tm-rugs').textContent = 'Over the ' + fmtInt(all.n) + ' timed calls. Only event rug times are exact; the four other kinds are kept apart, as the owner decided.';
   }
 
   var TM_HEADS = [
@@ -2043,6 +2049,13 @@
       'Across: log scale of time. Dashed: fewer than ' + MIN_N + ' calls.';
   }
 
+  // The rugs left out of the "share rugged by t" curve, counted by kind (the
+  // caption under it): at the call, only detected, collapsed.
+  function rugsApartText(all) {
+    return fmtInt(all.atCall.length) + ' rugged at the call, ' + fmtInt(all.detected.length) +
+      ' only detected at the end of tracking and ' + fmtInt(all.price.length) + ' collapsed';
+  }
+
   function drawTmRug(all, gr, H, hz) {
     var series = curveSeries(all, gr, function (a) {
       var pts = A.cumulativeShare(a.rugIn, a.n);
@@ -2057,7 +2070,7 @@
       })) / 10) * 10)));
     $('h-tm-rug').textContent = 'Share rugged by t (from the post, ' + hz + ' window)';
     $('cap-tm-rug').textContent = 'Of the timed calls, the share whose pool was drained within t of the post (event rug times only, exact to the block). ' +
-      fmtInt(all.atCall.length) + ' rugged at the call and ' + fmtInt(all.detected.length) + ' only detected at the end of tracking are not in this curve (see the table above). ' +
+      rugsApartText(all) + ' are not in this curve (see the table above). ' +
       'Every timed call was followed for the whole window, so nothing is censored here. Across: log scale of time.';
   }
 

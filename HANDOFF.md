@@ -1,8 +1,82 @@
 # Scout analytics: handoff to Claude Code
 
-## Session state (20 Oct 2026 PDT: main cc5016e after #39, #40)
+## Session state (20 Oct 2026 PDT: main 9c053c8 after #39, #40, #41)
 
 This section supersedes the ones below wherever they differ.
+
+**Update, 20 Oct PDT (21 Oct UTC), late night: state of the open work.** Every PR
+below has base `main`; all are tested locally only, nothing deployed.
+- Open, waiting for the owner's merge: #42 (this docs PR), #43 (4b-2,
+  writer), #44 (4c-1, pools that count before the call), #45 (A2 PR 1,
+  website), #46 (4c-2, read-only DB reads, a31222b), #47 (4c-3,
+  settings and pauses, 11632f5). #46 and #47 passed review; neither
+  needs a restart (no command uses them until 4c-4).
+- A2 PR 2 (tracker), branch `work/2026-10-20-price-rug-tracker`
+  (35f1a56, pushed, review PASS), worktree
+  `price-rug-tracker-20261020`: no PR yet. It and #45 both add
+  `const rugAtPrice = "price"` to the same const block in `timing.go`.
+  So: merge #45 first; then block C (merge `main` into the tracker
+  branch) and keep one constant; then its PR. It also shares
+  `scout_models.data.go` with #46 (other functions).
+- Notes for 4c-4 from the reviews: pass the tracker's live
+  `LatestRecent`, `LatestOld` and `latestRecentAge` to
+  `LatestPriceLag`; pass both lag functions whenever their limits are
+  above 0 (a nil one would panic); one pauser per goroutine. The price
+  lag leaves out rows never refreshed, so a first-refresh backlog
+  right after a backfill reads as 0.
+- A2 PR 3 (fill script) must copy `priceRugAtSQL` as it is (comment
+  in `scout_models.data.go`). GeckoTerminal-priced calls get no rug
+  time (no stored candles); outside A2.
+- Still open with the owner: (a) and (b) in the next update.
+
+**Update, 20 Oct PDT (night): export 4c plan** (from an `investigate`
+spec, 20 Oct; 4b-2 is open as #43). 4c is split into four PRs, each
+with base `main`:
+- 4c-1, pools that count before the call (pure, plus one node helper;
+  open as #44):
+  - v4 pre ids = pools whose Initialize block is at or before the entry
+    block (one `v4PoolsOf` call, 2 `eth_getLogs`);
+  - v2/v3: no creation block is stored anywhere, and pool discovery
+    looks past the entry block. So the tracker's pool counts before the
+    call only if it appears in the pre-call transfers or liquidity
+    events (no extra node cost).
+- 4c-2, read-only DB reads (open as #46): a read-only transaction helper, the call
+  details by id, and a price-lag reading. The lag is the 95th
+  percentile of how overdue the latest-price rows are, not the maximum:
+  one row whose refresh keeps failing would otherwise hold the pause
+  forever.
+- 4c-3, settings and pauses (open as #47): `SCOUT_HOLDERS_RPS` (4),
+  `SCOUT_HOLDERS_MAX_NODE_LAG` (2m), `SCOUT_HOLDERS_MAX_PRICE_LAG` (2h)
+  and `SCOUT_HOLDERS_MAX_PAUSE` (30m), in `config.go`. The export's own
+  node client is the existing one with RPS set and one request in
+  flight. No `SCOUT_HOLDERS_OUT_DIR`: the flag is the only source.
+- 4c-4, the command: `-export-holders <ids file>`,
+  `-export-holders-out` (default `data/holders`),
+  `-export-holders-max`, and `-dry-run` (estimate, no node).
+  - Dispatched before `Migrate` and `registerTools`.
+  - The folder check returns the path it judged, and only that path
+    is written to.
+  - `columns.json` lists the `pre_hold_*` columns for the Python side.
+  - The run record's settings use an allowlist, never URLs.
+  - Pilot steps on the server: build; run once
+    `go test -count=1 -v -run 'TestHoldersOutDirGuard(Data)?Symlink' .`
+    (both must PASS, not SKIP); Q6; `-dry-run` (expect about 10k);
+    `-export-holders-max 10`; then the full run beside `-track`.
+- Q6, the pilot sample query (git-ignored file
+  `.claude/worktrees/_scratch/holder-p0/holder_p0.sql`):
+  - its final SELECT starts with `grp`, while the ids parser takes the
+    first column, so `call_id` must come first;
+  - it samples at random by `md5(call_id)` (natural share);
+  - it leaves out `...7777` tokens. That rule is not in the approved
+    plan; the PM recommends keeping them out, as their launchpad
+    curve is not a known venue.
+- PR 5 (`ml/`) must add `post24h_` to `FORBIDDEN_PREFIXES`; it is not
+  there today.
+- Open with the owner (20 Oct):
+  - (a) keep Q6's random sample (natural share; PM recommends) or
+    stratify by week, as the 19 Oct plan's "spread across weeks" might
+    mean;
+  - (b) keep `...7777` tokens out of the pilot (PM recommends).
 
 **Update, 20 Oct PDT (evening):**
 - Merged: #39 (4b-1, venues, columns and row builder) and #40 (docs:
@@ -11,7 +85,7 @@ This section supersedes the ones below wherever they differ.
   - 4b-2 (file writer and run helpers) on branch
     `work/2026-10-20-holder-writer`, worktree `holder-writer-20261020`.
     It adds `/data/` to `.gitignore` and changes the folder check to
-    allow `<repo root>/data` and below. In review.
+    allow `<repo root>/data` and below. Open as #43 (review PASS).
   - 4c must write to the exact path the folder check judged (the
     implementer's note: the check cleans `..` as text, while the
     operating system follows a link first).
@@ -88,8 +162,12 @@ This section supersedes the ones below wherever they differ.
   A2 on 20 Oct ("ok go with A2"; recorded in the PM skill's "Owner
   decisions in force"); next, `investigate` drafts the spec for the
   three PRs.
-- Still open with the owner: the pilot's old-token share (explained
-  again on 20 Oct; PM recommends the natural share).
+- The pilot's old-token share: answered 20 Oct, natural share, about
+  10k `eth_getLogs` (owner: "go with your recommendation"; in the PM
+  skill's "Owner decisions in force"). No export question was open at
+  that point; see the Q6 items in the night update.
+- Docs-only PRs: checked by `advisor` instead of `review` from 20 Oct
+  (owner rule; PM skill, "How to work", step 5).
 
 **Merged 19-20 Oct:** #32 docs (holder plan and P0 results, 19 Oct);
 holder analysis code PRs 1-3, pure functions, no node, no DB (#33 and
@@ -139,7 +217,8 @@ in `topics.go` ("Event topics in one file" in `scout-rules`). Done in
    `eth_getLogs`) or oversampled (up to about 32k)? Estimates by the
    19 Oct export plan from the Q3 age mix and 200k-block log reads
    (they replace the 8 Oct "about 8k", which predates the 24 h post
-   window). PM recommends natural share;
+   window). PM recommends natural share. Answered 20 Oct: natural
+   share (update above);
 2. the server output folder: answered 20 Oct, `data/holders/` in the
    repo, to be git-ignored (update above);
 3. daytime run beside `-track` with the auto-pause, or a quiet window?

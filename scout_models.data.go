@@ -1326,13 +1326,20 @@ func (st *ScoutStore) SaveTracking(ctx context.Context, t *ScoutCallTracking) er
 // or before its cut-off: $2 for calls posted after $1 (younger than 30 days),
 // $3 for older ones and for rugged calls (rug_block in the state: their latest
 // return is -100% for good, so they are re-stamped at most at the old pace).
-var latestDueSQL = ` FROM scout_call_tracking t JOIN ` + webFirstCallsSQL + ` fc ON fc.id = t.call_id
+// It is built from latestRowsSQL (the rows that qualify) and latestCutoffSQL
+// (each row's cut-off), which LatestPriceLag (holders_db.go) reads too.
+var latestDueSQL = latestRowsSQL + `
+	  AND (t.latest_checked_at IS NULL OR t.latest_checked_at <= ` + latestCutoffSQL + `)`
+
+// latestRowsSQL: the FROM and WHERE of latestDueSQL without the due test.
+var latestRowsSQL = ` FROM scout_call_tracking t JOIN ` + webFirstCallsSQL + ` fc ON fc.id = t.call_id
 	WHERE t.status IN ('tracking','done') AND t.entry_price_usd IS NOT NULL AND t.onchain IS NOT NULL
 	  AND COALESCE(t.onchain->>'pool', '') <> '' AND COALESCE((t.onchain->>'entry_price_q')::float8, 0) > 0
-	  AND COALESCE((t.onchain->>'v')::int, 0) >= ` + strconv.Itoa(onchainStateVersion) + `
-	  AND (t.latest_checked_at IS NULL OR t.latest_checked_at <=
-	       CASE WHEN t.entry_at > $1::timestamptz AND COALESCE((t.onchain->>'rug_block')::numeric, 0) = 0
-	            THEN $2::timestamptz ELSE $3::timestamptz END)`
+	  AND COALESCE((t.onchain->>'v')::int, 0) >= ` + strconv.Itoa(onchainStateVersion)
+
+// latestCutoffSQL: a row's due cut-off in latestDueSQL ($1, $2, $3 as there).
+const latestCutoffSQL = `CASE WHEN t.entry_at > $1::timestamptz AND COALESCE((t.onchain->>'rug_block')::numeric, 0) = 0
+	            THEN $2::timestamptz ELSE $3::timestamptz END`
 
 // DueLatest returns up to limit rows whose latest price is due: calls younger
 // than recentAge first, then the ones not refreshed for the longest (never

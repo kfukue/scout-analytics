@@ -26,7 +26,13 @@ const (
 	rugAtEvent    = "event"    // the time of the price event that showed the pool drained
 	rugAtAtCall   = "at_call"  // drained at or before the call (the time can be before entry_at)
 	rugAtDetected = "detected" // found only by the end-of-tracking liquidity check: the time of that check
-	rugAtPrice    = "price"    // not drained, rugged by the price rule (< 5 % of entry): an approximate time (priceRugAtSQL); any drained kind replaces it
+	// collapsed: the pool was not seen drained, but the tracker's
+	// end-of-tracking price rule (last price under 5% of entry, i.e. down more
+	// than 95%) flagged the call rugged. The tracker writes this kind with an
+	// approximate time (priceRugAtSQL); any drained kind found later replaces
+	// it, and it never replaces a drained one. The website keeps its peak and
+	// labels it "collapsed" (owner decision A2, 20 Oct 2026).
+	rugAtPrice = "price"
 )
 
 // timingTol: relative tolerance when a candle high is compared with the

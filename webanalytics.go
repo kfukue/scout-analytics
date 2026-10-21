@@ -90,8 +90,9 @@ var webAnalyticsTimingColumns = func() []string {
 
 // webAnalyticsRugKinds: the values of the "rug_kind" column (an index into
 // this list): scout_call_tracking.rug_at_kind; "other" = a rug time with a
-// kind this website does not know (or none).
-var webAnalyticsRugKinds = []string{rugAtEvent, rugAtAtCall, rugAtDetected, "other"}
+// kind this website does not know (or none). "other" must stay last
+// (webAnalyticsRugKindIndex); the page reads the kinds by name.
+var webAnalyticsRugKinds = []string{rugAtEvent, rugAtAtCall, rugAtDetected, rugAtPrice, "other"}
 
 // webAnalyticsColumns names the values of each row of GET /api/analytics, in
 // order; after the first nine come, per window of ScoutWebHorizons, its
