@@ -1,10 +1,12 @@
 # One-off ops scripts (pgAdmin)
 
-> **Each folder's B may only be run once. No folder is pending now (7 Oct
-> 2026): every B below has been run. Never run any of them again.**
+> **Each folder's B may only be run once. Every folder marked DONE below has
+> had its B run: never run that B again. One folder is pending (20 Oct
+> 2026): `2026-10-20-price-rug-fill`, to run only after #49 is live.**
 
 Each folder holds hand-run SQL scripts for pgAdmin (A = read-only count, B =
-the write, C = check, D/E = optional follow-ups); its own `README.md` has the
+the write, C = check, D/E = optional follow-ups, R = rollback: undoes a B
+that finished, from the backup table B saved); its own `README.md` has the
 steps. The program never executes anything under `ops/`. Every new folder gets
 a distinct name and a row with its status in this table.
 
@@ -20,6 +22,7 @@ the database.
 | `2026-10-asset-chains-feeds`    | DONE (33 feeds)           | 7 Oct    | Seeds the Robinhood Chain stock tokens and Chainlink feeds into the main API database          | No (B again inserts nothing) |
 | `2026-10-usd-repair`            | DONE (50 calls + 1 nudge) | 7 Oct    | Re-tracks calls hurt by the old USD lookup (stuck in quote units or lost candle segments)      | No, never run B again |
 | `2026-10-07-liquidity-retrack`  | DONE (649 calls; 52 found rugged) | 7 Oct | Re-tracks the old Uniswap v4 calls (no v4 liquidity check, old USD lookup, old call-time block); cutoff 2026-10-06 12:53:00-07, `reset_at` 2026-10-07 12:18:38.004137-07 | No, never run B again |
+| `2026-10-20-price-rug-fill`     | pending: run only after #49 is live | -- | Gives past price-rule rugged calls `rug_at_kind = 'price'` and the tracker's approximate `rug_at` (owner decision A2); B saves a backup table, R restores from it | Yes, once (A first; STOP if A's "other, total" is not 29: rugged on-chain calls of any status, no rug block, last price at or above 5 % of the entry; 2 of them are `repeat` rows) |
 
 Not to be confused: `2026-10-pons-v4-retrack` (DONE, Pons V2 calls only) and
 `2026-10-07-liquidity-retrack` (DONE, the old Uniswap v4 calls).
