@@ -2217,10 +2217,13 @@ func (st *ScoutStore) SelectWebReports(ctx context.Context, ids []int) (map[int]
 // Timing and rug time (timing.go, timing_backfill.go)
 // ---------------------------------------------------------------------------
 
-// RugAt returns a call's stored rug time (nil = none stored).
+// RugAt returns a call's stored time of a drained pool (nil = none stored).
+// A 'price' time does not count: a drained pool always wins over the price
+// rule, so ensureRugAt looks the rug block's time up and replaces it.
 func (st *ScoutStore) RugAt(ctx context.Context, callID int) (*time.Time, error) {
 	var at *time.Time
-	err := st.Pool.QueryRow(ctx, `SELECT rug_at FROM scout_call_tracking WHERE call_id = $1`, callID).Scan(&at)
+	err := st.Pool.QueryRow(ctx, `SELECT rug_at FROM scout_call_tracking WHERE call_id = $1
+		AND rug_at_kind IS DISTINCT FROM 'price'`, callID).Scan(&at)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil
 	}
@@ -2230,8 +2233,9 @@ func (st *ScoutStore) RugAt(ctx context.Context, callID int) (*time.Time, error)
 	return at, nil
 }
 
-// SetRugAt stores a call's rug time and its kind (event | at_call | detected).
-// Only these two columns change (not updated_at, status or the state).
+// SetRugAt stores a call's rug time and its kind (event | at_call | detected),
+// replacing any stored one (a 'price' time too). Only these two columns change
+// (not updated_at, status or the state). Never called with kind 'price'.
 func (st *ScoutStore) SetRugAt(ctx context.Context, callID int, at time.Time, kind string) error {
 	if _, err := st.Pool.Exec(ctx, `UPDATE scout_call_tracking SET rug_at = $2, rug_at_kind = $3 WHERE call_id = $1`,
 		callID, at.UTC(), kind); err != nil {
@@ -2240,12 +2244,13 @@ func (st *ScoutStore) SetRugAt(ctx context.Context, callID int, at time.Time, ki
 	return nil
 }
 
-// SetRugAtIfMissing is SetRugAt for a row without a rug time only (the
-// backfill: a rug time stored meanwhile by the tracker wins). Reports whether
-// the row was written.
+// SetRugAtIfMissing is SetRugAt for a row without a rug time, or with only a
+// 'price' one (the backfill: a drained time stored meanwhile by the tracker
+// wins; a drained time always replaces a 'price' one, and a 'price' write never
+// replaces a drained one). Reports whether the row was written.
 func (st *ScoutStore) SetRugAtIfMissing(ctx context.Context, callID int, at time.Time, kind string) (bool, error) {
 	tag, err := st.Pool.Exec(ctx, `UPDATE scout_call_tracking SET rug_at = $2, rug_at_kind = $3
-		WHERE call_id = $1 AND rug_at IS NULL`, callID, at.UTC(), kind)
+		WHERE call_id = $1 AND (rug_at IS NULL OR rug_at_kind = 'price')`, callID, at.UTC(), kind)
 	if err != nil {
 		return false, fmt.Errorf("set rug_at of call %d: %w", callID, err)
 	}
@@ -2259,6 +2264,59 @@ func (st *ScoutStore) ClearRugAt(ctx context.Context, callID int) error {
 		return fmt.Errorf("clear rug_at of call %d: %w", callID, err)
 	}
 	return nil
+}
+
+// errNoDoneHorizon: the call has no done horizon, so a price-rule rug has no
+// time (PriceRugAt); nothing is stored.
+var errNoDoneHorizon = errors.New("no done horizon")
+
+// priceRugAtSQL gives the time of a rug found only by the price rule (a price
+// strictly under 5 % of the entry price; rug_at_kind 'price', owner decision
+// A2 of 20 Oct 2026). $1 = call_id, $2 = the entry price (entry_price_usd, in
+// the call's price unit). In order:
+//  1. candle: the end of the first hourly candle whose close is under 5 % of
+//     the entry, capped at the last done horizon's due time (the first close
+//     under 5 % counts, even if the price recovers later);
+//  2. horizon: else the due time of the earliest done horizon whose price is
+//     under 5 % of the entry;
+//  3. last_due: else the last done horizon's due time.
+//
+// It returns the time, its source and whether the call has no done horizon
+// (then the time is NULL). The ops fill script for calls rugged before this
+// change MUST use this same expression (copy it; only $1 and $2 change).
+const priceRugAtSQL = `WITH last AS (
+	SELECT max(due_at) AS due FROM scout_call_returns WHERE call_id = $1 AND status = 'done'
+), candle AS (
+	SELECT LEAST(c.bucket_start + c.interval_seconds * interval '1 second', last.due) AS at
+	  FROM scout_call_candles c, last
+	 WHERE c.call_id = $1 AND c.interval_seconds = 3600 AND c.bucket_start < last.due
+	   AND c.close < $2::numeric * 0.05
+	 ORDER BY c.bucket_start LIMIT 1
+), horizon AS (
+	SELECT min(r.due_at) AS at FROM scout_call_returns r
+	 WHERE r.call_id = $1 AND r.status = 'done' AND r.price_usd < $2::numeric * 0.05
+)
+SELECT COALESCE((SELECT at FROM candle), horizon.at, last.due),
+       CASE WHEN EXISTS (SELECT 1 FROM candle) THEN 'candle'
+            WHEN horizon.at IS NOT NULL THEN 'horizon'
+            ELSE 'last_due' END,
+       last.due IS NULL
+  FROM last, horizon`
+
+// PriceRugAt returns the time of a call's price-rule rug (priceRugAtSQL) and
+// its source (candle | horizon | last_due). entry is the call's entry price;
+// errNoDoneHorizon when the call has no done horizon.
+func (st *ScoutStore) PriceRugAt(ctx context.Context, callID int, entry float64) (time.Time, string, error) {
+	var at *time.Time
+	var src string
+	var noDone bool
+	if err := st.Pool.QueryRow(ctx, priceRugAtSQL, callID, entry).Scan(&at, &src, &noDone); err != nil {
+		return time.Time{}, "", fmt.Errorf("price rug time of call %d: %w", callID, err)
+	}
+	if noDone || at == nil {
+		return time.Time{}, "", fmt.Errorf("price rug time of call %d: %w", callID, errNoDoneHorizon)
+	}
+	return at.UTC(), src, nil
 }
 
 // timingBackfillWhereSQL: horizons -backfill-timing fills in: done, no timing
@@ -2305,10 +2363,12 @@ type timingBackfillRow struct {
 }
 
 // TimingBackfillHorizons returns the horizons to fill in of the given calls,
-// by call and horizon length.
+// by call and horizon length. RugAt is the time of a drained pool only: a
+// 'price' time is approximate and never cuts a horizon's window.
 func (st *ScoutStore) TimingBackfillHorizons(ctx context.Context, ids []int) ([]timingBackfillRow, error) {
 	rows, err := st.Pool.Query(ctx, `SELECT r.call_id, r.horizon, r.due_at, r.price_usd::float8, r.max_gain_late_pct::float8,
-		t.entry_at, t.entry_late_price_usd::float8, t.rug_at`+timingBackfillWhereSQL+` AND r.call_id = ANY($1::int[])
+		t.entry_at, t.entry_late_price_usd::float8,
+		CASE WHEN t.rug_at_kind = 'price' THEN NULL ELSE t.rug_at END`+timingBackfillWhereSQL+` AND r.call_id = ANY($1::int[])
 		ORDER BY r.call_id, r.horizon_seconds`, ids)
 	if err != nil {
 		return nil, fmt.Errorf("timing backfill horizons: %w", err)
@@ -2365,17 +2425,19 @@ func (st *ScoutStore) SetHorizonTimings(ctx context.Context, ws []timingWrite) (
 	return n, nil
 }
 
-// rugAtBackfillRow is a rugged call without a rug time, with its state.
+// rugAtBackfillRow is a rugged call without a rug time (or with only a 'price'
+// one), with its state.
 type rugAtBackfillRow struct {
 	CallID int
 	State  onchainState
 }
 
 // RugAtBackfillRows returns the calls whose on-chain state (version 2 or
-// later) has a rug block but that have no rug time stored.
+// later) has a rug block but that have no rug time stored, or only a 'price'
+// one (a drained pool wins over the price rule).
 func (st *ScoutStore) RugAtBackfillRows(ctx context.Context) ([]rugAtBackfillRow, error) {
 	rows, err := st.Pool.Query(ctx, `SELECT call_id, onchain FROM scout_call_tracking
-		WHERE rug_at IS NULL AND onchain IS NOT NULL AND COALESCE((onchain->>'v')::int, 0) >= 2
+		WHERE (rug_at IS NULL OR rug_at_kind = 'price') AND onchain IS NOT NULL AND COALESCE((onchain->>'v')::int, 0) >= 2
 		  AND COALESCE((onchain->>'rug_block')::numeric, 0) > 0
 		ORDER BY call_id`)
 	if err != nil {

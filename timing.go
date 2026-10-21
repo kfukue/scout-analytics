@@ -26,11 +26,12 @@ const (
 	rugAtEvent    = "event"    // the time of the price event that showed the pool drained
 	rugAtAtCall   = "at_call"  // drained at or before the call (the time can be before entry_at)
 	rugAtDetected = "detected" // found only by the end-of-tracking liquidity check: the time of that check
-	// collapsed: flagged rugged by the end-of-tracking price rule (last price
-	// under 5% of entry, i.e. down more than 95%), the pool not seen drained;
-	// the time is approximate. The website keeps its peak and labels it
-	// "collapsed" (owner decision A2, 20 Oct 2026).
-	// Written by the tracker's end-of-tracking price rule (tracker PR, merged after this one).
+	// collapsed: the pool was not seen drained, but the tracker's
+	// end-of-tracking price rule (last price under 5% of entry, i.e. down more
+	// than 95%) flagged the call rugged. The tracker writes this kind with an
+	// approximate time (priceRugAtSQL); any drained kind found later replaces
+	// it, and it never replaces a drained one. The website keeps its peak and
+	// labels it "collapsed" (owner decision A2, 20 Oct 2026).
 	rugAtPrice = "price"
 )
 
@@ -273,6 +274,28 @@ func (s *scanner) ensureRugAt(ctx context.Context, callID int, st *onchainState)
 		return nil, fmt.Errorf("save rug time: %w", err)
 	}
 	return &t, nil
+}
+
+// storePriceRugAt stores the approximate time of a rug found only by the price
+// rule (kind 'price', from the stored candles and horizons: priceRugAtSQL; no
+// node request). entry is the call's entry price. It never replaces a drained
+// kind (SetRugAtIfMissing). A failure is only logged (not when the run is
+// being stopped); a call without a done horizon gets no time.
+func (s *scanner) storePriceRugAt(ctx context.Context, callID int, entry float64, tag string) {
+	at, src, err := s.db.PriceRugAt(ctx, callID, entry)
+	wrote := false
+	if err == nil {
+		wrote, err = s.db.SetRugAtIfMissing(ctx, callID, at, rugAtPrice)
+	}
+	if err != nil {
+		if ctx.Err() == nil {
+			log.Printf("%s: price rug time not stored: %v", tag, err)
+		}
+		return
+	}
+	if wrote {
+		log.Printf("%s: rugged by the price rule, rug time %s (from the %s)", tag, at.Format(time.RFC3339), src)
+	}
 }
 
 // fillHorizonTiming adds the timing to an on-chain horizon result before it
