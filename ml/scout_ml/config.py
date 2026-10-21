@@ -207,6 +207,18 @@ HOLD_NOT_FEATURES = ("transfers_post", "lp_events_post", "venues_post", "post_en
                      "bad_lp_logs_skipped", "bad_transfer_logs", "bad_transfer_error",
                      "rpc_logs_requests", "rpc_other_requests", "rpc_requests_total",
                      "elapsed_s", "exported_at", "code_version")
+# Holder pilot analysis (holders_report.py, scout_ml/holders.py; report only, no model).
+# The pilot sample is about 1/3 per group, not the natural base rates: AUC only.
+HOLD_GROUPS = ("dead7", "held2x7", "neither")
+HOLD_STOP_AUC_LOWER = 0.60     # pre-registered 19 Oct 2026 (HANDOFF.md, "Stop rules, fixed before P1")
+HOLD_STRATA_AUC_LOWER = 0.50   # the PM's reading of "the separation vanishes within strata"
+HOLD_MIN_CLASS_N = 30          # non-NULL rows per class for an AUC; analysable rows per group for a verdict
+HOLD_AGE_BAND_S = 3600         # age band of the strata: < 1 h vs >= 1 h at the call
+HOLD_BOOTSTRAP_REPS = 2000     # percentile bootstrap, resampled within each group
+HOLD_BOOTSTRAP_SEED = 7
+HOLD_CI = (2.5, 97.5)
+HOLD_PERM_REPS = 500           # grp shuffled within week: chance level of the best of N
+HOLD_PERM_SEED = 7
 FORBIDDEN_COLUMNS = (set(BOOKKEEPING) - {"quote_asset"} | set(IDENTITY)
                      | {"pre_vol_unit", "token_name", "post_kind"} | set(LATEST)
                      | set(TRACKER_DISCOVERY) | set(AFTER_CALL_VIEW)
