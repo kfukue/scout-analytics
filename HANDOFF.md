@@ -1,8 +1,43 @@
 # Scout analytics: handoff to Claude Code
 
-## Session state (20 Oct 2026 PDT (21 Oct UTC): main d0c78b6 after #42-#50)
+## Session state (21 Oct 2026 PDT (21-22 Oct UTC): main d3b5daa after #42-#54)
 
 This section supersedes the ones below wherever they differ.
+
+**Update, 21 Oct PDT (21-22 Oct UTC): #51-#54 merged; A2 done.**
+- Merged by the owner: #51 (5a), #52 (A2 fill), #53 (5b), #54 (docs);
+  main d3b5daa. Commands given: server pull and build, `-track` and
+  `-web` restart if not done since #49, the fill, the pilot, PC
+  clean-up. The two restart checks (the "latest prices on:" line; the
+  "collapsed" legend) are still not confirmed.
+- A2 fill run by the owner in pgAdmin, 21 Oct:
+  - A: TOTAL 719 (candle 707, horizon 12, last_due 0); "other" 27 + 2
+    = 29 (the STOP gate passed); base 791 = 719 + 29 + 43.
+  - B: 719 filled at 21 Oct 16:05 PDT (23:05 UTC). (A first try
+    stopped on the count guard with `-1` still in place, as designed,
+    and changed nothing.)
+  - C: all 719 as B left it; drained 0; sanity rows 0; selection 0;
+    kinds: price 719, detected 204, event 67, at_call 7, no rug time
+    72 (the 29 drained "other" plus the 43 below).
+  - The backup table `scout_call_tracking_bak_price_rug_fill_20261020`
+    is kept for a few days; the owner drops it once the website looks
+    right (the PM's advice). Not dropped yet.
+- The 43 left out as "state version under 2" (A expected 0): the owner
+  ran a read-only query. All 43 are `repeat` rows (not the token's
+  first call), backfilled, calls 28-30 Jul, no `v` value in `onchain`
+  (16 v2, 19 v3, 8 v4), last checked 2 Oct, no error. Repeat rows are
+  never tracked again by design (`MarkRepeatTracking`; the start-up
+  re-queue leaves out `repeat`), so their v1 results stay frozen. They
+  are outside the website's first-call list and the pilot's Q6; the
+  dataset view (`scout_call_dataset_v`) still carries their v1
+  `rugged = true`, an outcome label only (the call-scoring model is
+  stopped). PM's advice: leave them alone; no node cost, no action. (From an `investigate` pass: a v<2 state that is re-tracked
+  but whose pool discovery fails is saved back unchanged, because the
+  deferred save rebuilds `onchain` only when the state is set,
+  `tracker_onchain.go` ~37-41 and ~72-74; for `gave_up` rows that
+  costs one discovery per start. None of the 43 is in that case.)
+- Next: the pilot (export the updated Q6, symlink tests, `-dry-run`,
+  `-export-holders-max 10`, the full run, then `holders_report.py`).
 
 **Update, night of 20 Oct PDT (21 Oct UTC), while the owner slept** (owner:
 "start on both", then "continue any work that can be done and give me a
