@@ -5,9 +5,10 @@ package main
 // this file reads. Node reads only: no database, no writes.
 //
 //  1. Launch: the token's first mint (a Transfer from the zero address), in
-//     one eth_getLogs over [1, entry block] (split automatically if the node
-//     refuses the range or times out; the split search stops after the range
-//     holding the first mint). Its block time gives the token's age at the
+//     [1, entry block], in SCOUT_RPC_HISTORY_CHUNK ranges from block 1 (one
+//     eth_getLogs over the whole span when that is 0; split automatically if
+//     the node refuses a range or times out), stopping after the range
+//     holding the first mint. Its block time gives the token's age at the
 //     call; past holderLookbackCap the call is capped and nothing more is
 //     read.
 //  2. Deployer: the sender of the launch transaction.
@@ -17,10 +18,12 @@ package main
 //     of its venues. Each is split at the entry block into pre and post.
 //
 // Node cost, with no range refused and no chunk answered from the log cache:
-// 1 + (1 + F) × (⌊postEnd/S⌋ − ⌊launch/S⌋ + 1) eth_getLogs, where S is the
-// chunk size (SCOUT_RPC_LOG_CHUNK) and F the number of liquidity filters (see
-// liquidityFilters). The other requests (block times, the block search, the
-// deployer) are counted apart; see holderLogs.
+// L + (1 + F) × (⌊postEnd/S⌋ − ⌊launch/S⌋ + 1) eth_getLogs, where L is the
+// launch search's ⌊launch/H⌋ + 1 (H = SCOUT_RPC_HISTORY_CHUNK; L = 1 when H is
+// 0), S the chunk size (SCOUT_RPC_LOG_CHUNK, bounded by H when H is on) and F
+// the number of liquidity filters (see liquidityFilters; holderLogRequests).
+// The other requests (block times, the block search, the deployer) are
+// counted apart; see holderLogs.
 
 import (
 	"cmp"
@@ -165,8 +168,9 @@ type holderLogs struct {
 }
 
 // holderV4PoolIDs lists the token's v4 pool ids from the PoolManager's
-// Initialize events up to block head (v4PoolsOf: 2 eth_getLogs, fewer when
-// already searched, more when the node refuses the range), split by
+// Initialize events up to block head (v4PoolsOf: 2 searches in
+// SCOUT_RPC_HISTORY_CHUNK ranges, holderV4SearchRequests eth_getLogs; fewer
+// when already searched, more when the node refuses a range), split by
 // Initialize block: pre holds the pools initialised at or before the
 // state's entry block, all every pool. Both lowercase and sorted. For a
 // state whose PoolManager is never a venue (v2, v3, a Pons token without a
@@ -313,10 +317,11 @@ func (o *onchainSource) readHolderLogs(logCtx, otherCtx context.Context, in hold
 }
 
 // findLaunch finds the token's first mint (a Transfer from the zero address)
-// in blocks [1, entryBlock]: one range for the whole span (a ceiling above
-// entryBlock), split automatically if the node refuses it or it times out,
-// like v4PoolsOf. Logs marked removed are skipped. found is false when there
-// is no mint.
+// in blocks [1, entryBlock]: no ceiling of its own (one above entryBlock), so
+// ranges of up to SCOUT_RPC_HISTORY_CHUNK blocks, one at a time (one range for
+// the whole span when that is 0), split automatically if the node refuses one
+// or it times out, like v4PoolsOf. Logs marked removed are skipped. found is
+// false when there is no mint.
 //
 // The chunked reader delivers logs in block order (ranges left to right, each
 // sorted by block and log index, a refused range asked again from its start),

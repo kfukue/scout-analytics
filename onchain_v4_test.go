@@ -61,21 +61,24 @@ func (f *fakeChain) swapIDsAsked() []string {
 	return slices.Compact(ids)
 }
 
-// checkInitLookups: exactly the two whole-history Initialize queries (token as
-// currency0, as currency1) and no Initialize lookup by pool id (the old
-// backward walk).
+// checkInitLookups: exactly the two whole-history Initialize searches (token as
+// currency0, then as currency1), each over [from, to] in the ranges of the
+// default SCOUT_RPC_HISTORY_CHUNK, and no Initialize lookup by pool id (the
+// old backward walk).
 func checkInitLookups(t *testing.T, f *fakeChain, token string, from, to uint64) {
 	t.Helper()
 	qs := f.pmQueries(topicInitV4)
-	if len(qs) != 2 {
-		t.Fatalf("got %d Initialize queries, want 2: %+v", len(qs), qs)
+	spans := historySpans(from, to, defaultHistoryChunk)
+	if len(qs) != 2*len(spans) {
+		t.Fatalf("got %d Initialize queries, want 2 × %d (ranges %v): %+v", len(qs), len(spans), spans, qs)
 	}
 	for i, q := range qs {
-		if q.from != from || q.to != to {
-			t.Errorf("Initialize query %d: got blocks %d-%d, want %d-%d", i, q.from, q.to, from, to)
+		side, sp := i/len(spans), spans[i%len(spans)]
+		if q.from != sp[0] || q.to != sp[1] {
+			t.Errorf("Initialize query %d: got blocks %d-%d, want %d-%d", i, q.from, q.to, sp[0], sp[1])
 		}
-		if len(q.topics) != 3+i || q.topics[1] != nil || !strings.EqualFold(q.topics[2+i].(string), addrTopic(token)) {
-			t.Errorf("Initialize query %d: got topics %v, want the token as topic %d", i, q.topics, 2+i)
+		if len(q.topics) != 3+side || q.topics[1] != nil || !strings.EqualFold(q.topics[2+side].(string), addrTopic(token)) {
+			t.Errorf("Initialize query %d: got topics %v, want the token as topic %d", i, q.topics, 2+side)
 		}
 	}
 }
@@ -149,10 +152,11 @@ func TestDiscoverV4ViaInitialize(t *testing.T) {
 		t.Fatalf("second discover(%s, %d): got %+v %v, want pool %s", token, eb2, st, err, id)
 	}
 	qs := f.pmQueries(topicInitV4)
-	if len(qs) != 4 {
-		t.Fatalf("got %d Initialize queries after two discoveries, want 4", len(qs))
+	first := 2 * len(historySpans(1, to, defaultHistoryChunk)) // the first search, in capped ranges
+	if len(qs) != first+2 {
+		t.Fatalf("got %d Initialize queries after two discoveries, want %d + 2", len(qs), first)
 	}
-	for _, q := range qs[2:] {
+	for _, q := range qs[first:] {
 		if q.from != to+1 || q.to != eb2+o.cfg.DiscoveryBlocks {
 			t.Errorf("second Initialize search: got blocks %d-%d, want %d-%d", q.from, q.to, to+1, eb2+o.cfg.DiscoveryBlocks)
 		}
@@ -387,7 +391,13 @@ func TestV4PoolsOfNearTip(t *testing.T) {
 		t.Fatalf("second v4PoolsOf(%s, %d): got %v %v, want pool %s", token, head, pools, err, id)
 	}
 	qs := f.pmQueries(topicInitV4)
-	if len(qs) != 4 || qs[2].from != head-999 || qs[2].to != head {
-		t.Fatalf("got Initialize queries %+v, want the second pair over blocks %d-%d", qs, head-999, head)
+	first := 2 * len(historySpans(1, head, defaultHistoryChunk)) // the first search, in capped ranges
+	if len(qs) != first+2 {
+		t.Fatalf("got %d Initialize queries, want %d + 2: %+v", len(qs), first, qs)
+	}
+	for _, q := range qs[first:] {
+		if q.from != head-999 || q.to != head {
+			t.Fatalf("got Initialize queries %+v, want the second pair over blocks %d-%d", qs[first:], head-999, head)
+		}
 	}
 }

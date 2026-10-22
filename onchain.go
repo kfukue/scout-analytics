@@ -50,6 +50,7 @@ type onchainConfig struct {
 	LogCache        int    // eth_getLogs results kept in memory, in logs (0 = off); repeat calls of a token reuse them
 	LogChunk        uint64 // max blocks per eth_getLogs (halved automatically when the node refuses)
 	MinLogChunk     uint64
+	HistoryChunk    uint64 // max blocks per eth_getLogs of any scan, so of the whole-history and Pons searches (0 = no cap)
 	DiscoveryBlocks uint64 // look this many blocks either side of the call for the token's transfers
 	PoolManagerV4   string
 	WETH            string
@@ -100,7 +101,8 @@ func loadOnchainConfig() (onchainConfig, error) {
 		RPS:             0, // no limit: the node is our own; MaxInflight bounds the load
 		MaxInflight:     64,
 		LogChunk:        200_000,
-		MinLogChunk:     200,
+		MinLogChunk:     minRangeBlocks,
+		HistoryChunk:    defaultHistoryChunk,
 		LogCache:        300_000,
 		Parallel:        8,
 		DiscoveryBlocks: 18_000,    // ≈ 30 min at ~10 blocks/s
@@ -152,6 +154,13 @@ func loadOnchainConfig() (onchainConfig, error) {
 	if err := num("SCOUT_RPC_LOG_CHUNK", &oc.LogChunk); err != nil {
 		return oc, err
 	}
+	if v := env(rpcHistoryChunkSetting, ""); v != "" {
+		n, err := parseHistoryChunk(v)
+		if err != nil {
+			return oc, err
+		}
+		oc.HistoryChunk = n
+	}
 	if v := env("SCOUT_RPC_PARALLEL", ""); v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil || n < 1 || n > 64 {
@@ -194,6 +203,27 @@ func loadOnchainConfig() (onchainConfig, error) {
 		return oc, err
 	}
 	return oc, nil
+}
+
+// defaultHistoryChunk: the most blocks per eth_getLogs in the whole-history
+// searches unless SCOUT_RPC_HISTORY_CHUNK says otherwise. A local Nitro node
+// answers a 2M-block topic-filtered range quickly; tens of millions of blocks
+// in one request clogged it (21 Oct 2026).
+const defaultHistoryChunk = 2_000_000
+
+// minRangeBlocks: the smallest eth_getLogs range a scan splits down to
+// (onchainConfig.MinLogChunk's default), and so the smallest
+// SCOUT_RPC_HISTORY_CHUNK other than 0.
+const minRangeBlocks = 200
+
+// parseHistoryChunk parses SCOUT_RPC_HISTORY_CHUNK: 0 (no cap) or a whole
+// number of at least minRangeBlocks.
+func parseHistoryChunk(v string) (uint64, error) {
+	n, err := strconv.ParseUint(v, 10, 64)
+	if err != nil || (n > 0 && n < minRangeBlocks) {
+		return 0, fmt.Errorf("%s=%q: want 0 (no cap) or a whole number >= %d (the smallest range)", rpcHistoryChunkSetting, v, minRangeBlocks)
+	}
+	return n, nil
 }
 
 // parseFeedMap parses "token=feed,token=feed" into dst (keys and values lower-cased).
@@ -360,9 +390,12 @@ type rpcClient struct {
 	// Timeouts and other passing errors are retried at the same size.
 	maxChunk uint64
 	minChunk uint64
-	splits   atomic.Int64 // ranges split after a refusal (whole run, for -check output)
-	notes    rangeNotes   // rate-limited log lines about range size changes
-	logs     *logCache    // finished eth_getLogs chunks (nil = off)
+	// histChunk caps every scan's ceiling (SCOUT_RPC_HISTORY_CHUNK; 0 = no
+	// cap): the whole-history searches ask for at most this many blocks at once.
+	histChunk uint64
+	splits    atomic.Int64 // ranges split after a refusal (whole run, for -check output)
+	notes     rangeNotes   // rate-limited log lines about range size changes
+	logs      *logCache    // finished eth_getLogs chunks (nil = off)
 
 	mu   sync.Mutex
 	next time.Time
@@ -637,7 +670,7 @@ func newRPCClient(oc onchainConfig) *rpcClient {
 		oc.LogChunk = 200_000
 	}
 	if oc.MinLogChunk == 0 {
-		oc.MinLogChunk = 200
+		oc.MinLogChunk = minRangeBlocks
 	}
 	c := &rpcClient{url: oc.RPCURL, http: &http.Client{Timeout: 60 * time.Second, Transport: tr},
 		gap: gap, minChunk: oc.MinLogChunk, slots: make(chan struct{}, oc.MaxInflight),
@@ -646,6 +679,7 @@ func newRPCClient(oc onchainConfig) *rpcClient {
 	if c.minChunk > c.maxChunk {
 		c.minChunk = c.maxChunk // a configured maximum below the default minimum is respected
 	}
+	c.histChunk = oc.HistoryChunk // 0 (also an onchainConfig built by hand) = no cap
 	c.parallel = oc.Parallel
 	if oc.LogCache > 0 {
 		c.logs = newLogCache(oc.LogCache)
@@ -882,10 +916,11 @@ func (c *rpcClient) getLogsChunked(ctx context.Context, address string, topics [
 // getLogsChunkedUpTo is getLogsChunked with ranges of up to ceiling blocks
 // instead of SCOUT_RPC_LOG_CHUNK (searches for one rare, topic-filtered event
 // over a long history: a node with a full log index answers them quickly).
+// The ceiling is capped by SCOUT_RPC_HISTORY_CHUNK, and with that cap on, a
+// scan whose ceiling is above SCOUT_RPC_LOG_CHUNK fetches one range at a time
+// (see scanLimits).
 func (c *rpcClient) getLogsChunkedUpTo(ctx context.Context, address string, topics []any, from, to, ceiling uint64, fn func(rpcLog)) error {
-	if ceiling < 1 {
-		ceiling = c.maxChunk
-	}
+	ceiling, par := c.scanLimits(ceiling)
 	progress := progressFrom(ctx)
 	label := scanLabelFrom(ctx)
 	events := 0
@@ -895,10 +930,6 @@ func (c *rpcClient) getLogsChunkedUpTo(ctx context.Context, address string, topi
 		err   error
 		took  time.Duration // the last request for this range
 		asked bool          // the node was asked (false: answered from memory or by another scan's request)
-	}
-	par := c.parallel
-	if par < 1 {
-		par = 1
 	}
 	minSize := c.minChunk
 	if minSize < 1 {
@@ -1033,6 +1064,29 @@ func (c *rpcClient) getLogsChunkedUpTo(ctx context.Context, address string, topi
 		}
 	}
 	return nil
+}
+
+// scanLimits returns a scan's largest range and how many of its ranges are
+// fetched at once, for a scan asked with ceiling (< 1: SCOUT_RPC_LOG_CHUNK).
+// With SCOUT_RPC_HISTORY_CHUNK on, every scan's ceiling is capped at it (so a
+// whole-history search never asks for tens of millions of blocks, nor grows
+// back to that after a split), and a scan whose capped ceiling is still above
+// SCOUT_RPC_LOG_CHUNK (a whole-history or Pons search) fetches one range at a
+// time. With it off (0), every scan keeps its ceiling and fetches
+// SCOUT_RPC_PARALLEL ranges at once, as before the cap existed.
+func (c *rpcClient) scanLimits(ceiling uint64) (uint64, int) {
+	if ceiling < 1 {
+		ceiling = c.maxChunk
+	}
+	par := max(c.parallel, 1)
+	if c.histChunk == 0 {
+		return ceiling, par
+	}
+	ceiling = min(ceiling, c.histChunk)
+	if ceiling > c.maxChunk {
+		par = 1
+	}
+	return ceiling, par
 }
 
 // rangeGrowAfter: answered ranges in a row after which a scan that had to go
@@ -1916,9 +1970,10 @@ func v4PoolOfInit(l rpcLog) (v4Pool, bool) {
 
 // v4PoolsOf lists the token's v4 pools created in blocks [1, to]: the
 // PoolManager's Initialize events with the token as currency0 (topic 2) or as
-// currency1 (topic 3). Two requests over the whole history, filtered by address
+// currency1 (topic 3). Two searches over the whole history, filtered by address
 // and indexed topics, which a node with a full log index answers quickly over
-// any range (split automatically if the node refuses the range or times out).
+// long ranges: each in ranges of up to SCOUT_RPC_HISTORY_CHUNK blocks, one at
+// a time (split automatically if the node refuses a range or times out).
 // What was searched is kept per token, so a later search only reads the new
 // blocks.
 func (o *onchainSource) v4PoolsOf(ctx context.Context, token string, to uint64) ([]v4Pool, error) {
@@ -1940,7 +1995,8 @@ func (o *onchainSource) v4PoolsOf(ctx context.Context, token string, to uint64) 
 			{topicInitV4, nil, addrTopic(token)},      // token = currency0
 			{topicInitV4, nil, nil, addrTopic(token)}, // token = currency1
 		} {
-			// One range for the whole span (a ceiling above to: no split at a multiple).
+			// No ceiling of its own (above to): ranges of SCOUT_RPC_HISTORY_CHUNK
+			// (one range for the whole span when that is 0).
 			err := o.rpc.getLogsChunkedUpTo(ctx, o.cfg.PoolManagerV4, topics, from, to, to+1, func(l rpcLog) {
 				if p, ok := v4PoolOfInit(l); ok && !seen[p.id] && (p.c0 == token || p.c1 == token) {
 					seen[p.id] = true
@@ -2647,8 +2703,9 @@ func (o *onchainSource) feedAggregators(ctx context.Context, feed string) (*feed
 	for i := len(desc) - 1; i >= 0; i-- {
 		fi.aggs = append(fi.aggs, desc[i])
 	}
-	// The proxy's own switch events: a handful over its whole life, one
-	// request (split only if the node refuses), then only the new blocks.
+	// The proxy's own switch events: a handful over its whole life, in ranges
+	// of SCOUT_RPC_HISTORY_CHUNK blocks (one request when that is 0; split if
+	// the node refuses), then only the new blocks.
 	head, err := o.rpc.blockNumber(ctx)
 	if err != nil {
 		return nil, err
@@ -2838,12 +2895,25 @@ func (o *onchainSource) describe() string {
 	}
 	fm := o.feedMaps()
 	s := fmt.Sprintf("eth_getLogs ranges of up to %d blocks, %d ranges per scan, up to %d requests in flight, %s; ", o.rpc.maxChunk, o.cfg.Parallel, cap(o.rpc.slots), limit) +
+		o.rpc.historyChunkNote() + "; " +
 		fmt.Sprintf("on-chain pools via %s (v4 PoolManager %s, %d Chainlink feed(s) on Robinhood Chain, %d of them from the asset database)",
 			o.cfg.RPCURL, o.cfg.PoolManagerV4, len(fm.rh), fm.dbRH)
 	if o.mainnet != nil {
 		s += fmt.Sprintf("; ETH/USD + %d other feed(s) from Ethereum mainnet via %s", len(fm.mainnet)-1, o.cfg.MainnetRPCURL)
 	}
 	return s
+}
+
+// historyChunkNote describes SCOUT_RPC_HISTORY_CHUNK for the start-up line.
+func (c *rpcClient) historyChunkNote() string {
+	_, par := c.scanLimits(c.histChunk)
+	if c.histChunk == 0 {
+		return fmt.Sprintf("whole-history searches not capped (%s=0: one range for the whole span, %d ranges per scan as before)", rpcHistoryChunkSetting, par)
+	}
+	if par > 1 {
+		return fmt.Sprintf("whole-history searches in ranges of up to %d blocks, %d at a time (%s; %s is not below it)", c.histChunk, par, rpcHistoryChunkSetting, rpcLogChunkSetting)
+	}
+	return fmt.Sprintf("whole-history searches one range at a time, of up to %d blocks (%s)", c.histChunk, rpcHistoryChunkSetting)
 }
 
 // hasStateAt asks the node for state at a past block (eth_getBalance of the

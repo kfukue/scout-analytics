@@ -265,15 +265,73 @@ func TestHolderExportDryRunNoNode(t *testing.T) {
 		t.Errorf("dry run made the output folder (stat: %v)", err)
 	}
 	cost := holderCostCall{EntryBlock: c.entryBlock, Age: time.Hour, Filters: 1}
-	_, want, err := holderCostEstimate([]holderCostCall{cost, cost}, x.oc.LogChunk)
+	if x.oc.HistoryChunk != defaultHistoryChunk {
+		t.Fatalf("export history cap %d, want the default %d", x.oc.HistoryChunk, defaultHistoryChunk)
+	}
+	// The dry run counts the launch search in SCOUT_RPC_HISTORY_CHUNK ranges
+	// (the entry is near block 26M: 13 ranges, not 1).
+	_, want, err := holderCostEstimate([]holderCostCall{cost, cost}, x.oc.LogChunk, x.oc.HistoryChunk)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if _, uncapped, _ := holderCostEstimate([]holderCostCall{cost, cost}, x.oc.LogChunk, 0); want <= uncapped {
+		t.Fatalf("capped estimate %d, uncapped %d: the test does not test the cap", want, uncapped)
 	}
 	if line := fmt.Sprintf("about %d eth_getLogs for 3 calls (1 skipped", want); !strings.Contains(logw.String(), line) {
 		t.Errorf("log %q, want %q", logw.String(), line)
 	}
 	if db.lagAsks != 0 {
 		t.Errorf("dry run asked the price lag %d times", db.lagAsks)
+	}
+}
+
+// The dry run counts each v4 call's pool-id search in SCOUT_RPC_HISTORY_CHUNK
+// ranges up to the largest entry block of the run (the head is not asked),
+// says that part is a lower bound, and counts 2 per call with no cap.
+func TestHolderExportDryRunV4Search(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		value string // SCOUT_RPC_HISTORY_CHUNK ("" = the default)
+		perV4 func(head uint64) int64
+	}{
+		{"default history cap", "", func(head uint64) int64 { return 2 * int64(head/2_000_000+1) }},
+		{"no history cap", "0", func(uint64) int64 { return 2 }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := newCmdChain(t)
+			t.Setenv("SCOUT_RPC_HISTORY_CHUNK", tc.value)
+			v4Meta := func(id int64, entry uint64) holderCallMeta {
+				st := onchainState{V: onchainStateVersion, Kind: "v4", Pool: lqPM, PoolID: lqPoolID, EntryBlock: entry}
+				return holderCallMeta{CallID: id, Token: hfToken, Chain: "evm", TrackingRow: true, State: &st, EntryAt: c.entryAt, PostedAgeS: ip(3600)}
+			}
+			metas := []holderCallMeta{cmdMeta(c, 1), v4Meta(2, c.entryBlock-4_000_000), v4Meta(3, c.entryBlock)}
+			db := newCmdFakeDB(metas...)
+			var logw bytes.Buffer
+			x := newCmdExport(t, db, holderExportOptions{IDsFile: writeIDs(t, "1\n2\n3\n"), OutDir: filepath.Join(t.TempDir(), "out"), DryRun: true}, &logw)
+			if err := x.run(context.Background()); err != nil {
+				t.Fatalf("dry run: %v", err)
+			}
+			if n := c.f.counts(); len(n) != 0 {
+				t.Errorf("dry run asked the node: %v", n)
+			}
+			calls, _, _, v4 := holderCostCalls(metas, x.venues)
+			if v4 != 2 {
+				t.Fatalf("%d v4 calls, want 2", v4)
+			}
+			_, base, err := holderCostEstimate(calls, x.oc.LogChunk, x.oc.HistoryChunk)
+			if err != nil {
+				t.Fatal(err)
+			}
+			v4Logs := 2 * tc.perV4(c.entryBlock) // the largest entry block, not the older call's
+			for _, line := range []string{
+				fmt.Sprintf("about %d eth_getLogs for 3 calls (0 skipped", base+v4Logs),
+				fmt.Sprintf("the v4 pool searches of 2 calls: at least %d, counted up to block %d, the largest entry block", v4Logs, c.entryBlock),
+			} {
+				if !strings.Contains(logw.String(), line) {
+					t.Errorf("SCOUT_RPC_HISTORY_CHUNK=%q: log %q, want %q", tc.value, logw.String(), line)
+				}
+			}
+		})
 	}
 }
 
@@ -405,7 +463,7 @@ func checkExportFiles(t *testing.T, c *hfCall, dir string, n int) {
 // a visible change here.
 func holderRunSettingNames() []string {
 	return slices.Sorted(slices.Values([]string{"SCOUT_HOLDERS_RPS", "SCOUT_HOLDERS_MAX_NODE_LAG", "SCOUT_HOLDERS_MAX_PRICE_LAG",
-		"SCOUT_HOLDERS_MAX_PAUSE", "SCOUT_RPC_LOG_CHUNK", "SCOUT_LATEST_REFRESH_RECENT", "SCOUT_LATEST_REFRESH_OLD",
+		"SCOUT_HOLDERS_MAX_PAUSE", "SCOUT_RPC_LOG_CHUNK", "SCOUT_RPC_HISTORY_CHUNK", "SCOUT_LATEST_REFRESH_RECENT", "SCOUT_LATEST_REFRESH_OLD",
 		"export_holders_max", "sniper_window_blocks"}))
 }
 
@@ -426,7 +484,7 @@ func TestHolderExportRunResume(t *testing.T) {
 // The run-record settings are the allowlist, with values from the parsed
 // settings: a node URL with a password never reaches them.
 func TestHolderRunSettingsAllowlist(t *testing.T) {
-	oc := onchainConfig{RPCURL: "http://user:secret@node:8545", MainnetRPCURL: "https://key@mainnet", LogChunk: 5000}
+	oc := onchainConfig{RPCURL: "http://user:secret@node:8545", MainnetRPCURL: "https://key@mainnet", LogChunk: 5000, HistoryChunk: 1_500_000}
 	s := holderRunSettings(holderExportConfig{RPS: 4, MaxNodeLag: time.Minute}, oc, priceConfig{LatestRecent: time.Minute}, holderExportOptions{Max: 3, IDsFile: "secret.csv"})
 	if got := slices.Sorted(maps.Keys(s)); !slices.Equal(got, holderRunSettingNames()) {
 		t.Errorf("settings %v, want the names %v", got, holderRunSettingNames())
@@ -436,7 +494,7 @@ func TestHolderRunSettingsAllowlist(t *testing.T) {
 			t.Errorf("setting %s = %q", k, v)
 		}
 	}
-	if s["SCOUT_RPC_LOG_CHUNK"] != "5000" || s["export_holders_max"] != "3" {
+	if s["SCOUT_RPC_LOG_CHUNK"] != "5000" || s["SCOUT_RPC_HISTORY_CHUNK"] != "1500000" || s["export_holders_max"] != "3" {
 		t.Errorf("values %v", s)
 	}
 }

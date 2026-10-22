@@ -107,6 +107,11 @@ func (f *fakeChain) otherRequests() int64 {
 // multiples of s).
 func chunks(from, to, s uint64) int64 { return int64(to/s - from/s + 1) }
 
+// launchSearchRequests: the eth_getLogs of a launch search that stops in the
+// range holding block (the launch, or the entry when there is no mint): the
+// ranges of the default SCOUT_RPC_HISTORY_CHUNK over [1, block].
+func launchSearchRequests(block uint64) int64 { return chunks(1, block, defaultHistoryChunk) }
+
 // checkRequestCounts: the result's counters equal what the chain answered.
 func checkRequestCounts(t *testing.T, f *fakeChain, r holderLogs) {
 	t.Helper()
@@ -180,17 +185,20 @@ func TestHoldersFetchRequestCounts(t *testing.T) {
 			if want := c.entryAt.Add(holderPostWindow).Unix(); r.PostEndAt.Unix() != want {
 				t.Errorf("post end time %d, want %d", r.PostEndAt.Unix(), want)
 			}
-			want := 1 + (1+tc.filters)*chunks(c.launchBlock, c.postEnd, chunk)
+			launch := launchSearchRequests(c.launchBlock)
+			want := launch + (1+tc.filters)*chunks(c.launchBlock, c.postEnd, chunk)
 			if r.LogRequests != want {
-				t.Errorf("LogRequests = %d, want 1 + (1+%d) × chunks(%d, %d, %d) = %d",
-					r.LogRequests, tc.filters, c.launchBlock, c.postEnd, chunk, want)
+				t.Errorf("LogRequests = %d, want %d + (1+%d) × chunks(%d, %d, %d) = %d",
+					r.LogRequests, launch, tc.filters, c.launchBlock, c.postEnd, chunk, want)
 			}
 			checkRequestCounts(t, c.f, r)
-			// The launch search: one range over [1, entry] on the token, mints only.
+			// The launch search: ranges of SCOUT_RPC_HISTORY_CHUNK from block 1 on
+			// the token, mints only, up to the one holding the launch.
 			q := c.f.logQueries()[0]
 			wantTopics := fmt.Sprint([]any{topicTransfer, addrTopic(zeroAddr)})
-			if q.addr != hfToken || fmt.Sprint(q.topics) != wantTopics || q.from != 1 || q.to != c.entryBlock {
-				t.Errorf("first query %s %v %d-%d, want %s %s 1-%d", q.addr, q.topics, q.from, q.to, hfToken, wantTopics, c.entryBlock)
+			firstTo := min(defaultHistoryChunk-1, c.entryBlock)
+			if q.addr != hfToken || fmt.Sprint(q.topics) != wantTopics || q.from != 1 || q.to != firstTo {
+				t.Errorf("first query %s %v %d-%d, want %s %s 1-%d", q.addr, q.topics, q.from, q.to, hfToken, wantTopics, firstTo)
 			}
 			if got := transferBlocks(r.TransfersPre); !slices.Equal(got, []uint64{c.launchBlock}) {
 				t.Errorf("pre transfers at %v, want the mint at %d", got, c.launchBlock)
@@ -370,7 +378,9 @@ func TestHoldersFetchLaunchSearchStops(t *testing.T) {
 	t.Run("parallel ranges", func(t *testing.T) {
 		// Siblings of the launch chunk may be answered and delivered too:
 		// the earliest mint still wins and the search ends without error.
-		c := setup(t, map[string]string{"SCOUT_RPC_PARALLEL": "8"})
+		// A history cap equal to SCOUT_RPC_LOG_CHUNK (1M here) keeps the
+		// search parallel; a cap above it would make it one range at a time.
+		c := setup(t, map[string]string{"SCOUT_RPC_PARALLEL": "8", "SCOUT_RPC_HISTORY_CHUNK": "1000000"})
 		check(t, c, c.mustFetch(t, c.input([]holderVenue{{lqPool, "v2"}})))
 	})
 }
@@ -506,8 +516,8 @@ func TestHoldersFetchNoMint(t *testing.T) {
 	if r.Status != holderFetchNoMint || r.LaunchBlock != 0 {
 		t.Errorf("status %v launch %d, want no_mint 0", r.Status, r.LaunchBlock)
 	}
-	if r.LogRequests != 1 || r.OtherRequests != 0 {
-		t.Errorf("requests: %d log, %d other; want 1 and 0", r.LogRequests, r.OtherRequests)
+	if want := launchSearchRequests(entry); r.LogRequests != want || r.OtherRequests != 0 {
+		t.Errorf("requests: %d log, %d other; want %d (the launch search over 1-%d) and 0", r.LogRequests, r.OtherRequests, want, entry)
 	}
 	checkRequestCounts(t, f, r)
 }
@@ -534,8 +544,8 @@ func TestHoldersFetchLookbackCap(t *testing.T) {
 			if tc.want != holderFetchCapped {
 				return
 			}
-			if r.LogRequests != 1 || r.OtherRequests != 1 {
-				t.Errorf("requests: %d log, %d other; want 1 (launch search) and 1 (launch block time)", r.LogRequests, r.OtherRequests)
+			if want := launchSearchRequests(c.launchBlock); r.LogRequests != want || r.OtherRequests != 1 {
+				t.Errorf("requests: %d log, %d other; want %d (launch search) and 1 (launch block time)", r.LogRequests, r.OtherRequests, want)
 			}
 			if r.Deployer != "" || r.PostEndBlock != 0 || r.TransfersPre != nil || r.Venues != nil {
 				t.Errorf("capped result read on: %+v", r)
@@ -596,7 +606,7 @@ func TestHoldersFetchPonsNoLiquidity(t *testing.T) {
 	if got, want := transferBlocks(r.TransfersPre), []uint64{c.launchBlock, c.launchBlock + 3}; !slices.Equal(got, want) {
 		t.Errorf("pre transfers at %v, want %v", got, want)
 	}
-	want := 1 + chunks(c.launchBlock, c.postEnd, 1_000_000)
+	want := launchSearchRequests(c.launchBlock) + chunks(c.launchBlock, c.postEnd, 1_000_000)
 	if r.LogRequests != want {
 		t.Errorf("LogRequests = %d, want %d (launch search + transfers only)", r.LogRequests, want)
 	}
@@ -779,8 +789,10 @@ func TestHoldersFetchCancel(t *testing.T) {
 // holderV4PoolIDs on the fake chain: the token's pools from the PoolManager's
 // Initialize events (token as currency0 or currency1, any case of letters),
 // split by Initialize block: a pool initialised in the entry block is a pre
-// id, one initialised after it is in all only. Exactly 2 eth_getLogs for a
-// state whose PoolManager is a venue at some block, none for the others.
+// id, one initialised after it is in all only. 2 searches in
+// SCOUT_RPC_HISTORY_CHUNK ranges up to the head (2 × the ranges eth_getLogs,
+// what holderV4SearchRequests counts) for a state whose PoolManager is a
+// venue at some block, none for the others.
 func TestHolderV4PoolIDs(t *testing.T) {
 	low := "0x0000000000000000000000000000000000000001" // sorts below hfToken: the token is currency1
 	idOld, idAtEntry, idLate := "0x01"+strings.Repeat("00", 31), "0x02"+strings.Repeat("00", 31), "0x03"+strings.Repeat("00", 31)
@@ -827,8 +839,16 @@ func TestHolderV4PoolIDs(t *testing.T) {
 				t.Errorf("got pre %v all %v, want pre %v all %v", pre, all, tc.wantPre, tc.wantAll)
 			}
 			counts := f.counts()
-			if counts["eth_getLogs"] != tc.requests {
-				t.Errorf("got %d eth_getLogs, want %d (requests %v)", counts["eth_getLogs"], tc.requests, counts)
+			// requests: Initialize searches, each in ranges of SCOUT_RPC_HISTORY_CHUNK.
+			if want := tc.requests * len(historySpans(1, f.latest, defaultHistoryChunk)); counts["eth_getLogs"] != want {
+				t.Errorf("got %d eth_getLogs, want %d (requests %v)", counts["eth_getLogs"], want, counts)
+			}
+			// The dry run's count of the same search (holderV4SearchRequests) is
+			// what the reader asked.
+			if tc.requests > 0 {
+				if est := holderV4SearchRequests(f.latest, defaultHistoryChunk); int64(counts["eth_getLogs"]) != est {
+					t.Errorf("reader asked %d eth_getLogs up to head %d, the estimate counts %d", counts["eth_getLogs"], f.latest, est)
+				}
 			}
 			if n := f.otherRequests(); n != 0 {
 				t.Errorf("got %d other requests, want 0 (requests %v)", n, counts)

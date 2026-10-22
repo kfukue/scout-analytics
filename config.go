@@ -34,3 +34,8 @@ const (
 	latestRefreshRecentSetting = "SCOUT_LATEST_REFRESH_RECENT"
 	latestRefreshOldSetting    = "SCOUT_LATEST_REFRESH_OLD"
 )
+
+// rpcHistoryChunkSetting: the most blocks per eth_getLogs in the long
+// searches over a token's or feed's whole history (onchain.go,
+// getLogsChunkedUpTo); 0 = no cap.
+const rpcHistoryChunkSetting = "SCOUT_RPC_HISTORY_CHUNK"

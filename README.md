@@ -184,8 +184,9 @@ that last block, so the answer does not depend on what earlier lookups cached.
    **v4** pool on the PoolManager. No indexer or factory address needed.
    - **v4** (when the PoolManager is among those addresses): the token's pools come from the
      PoolManager's `Initialize` events, which index both currencies: two `eth_getLogs` over the
-     whole history (token as currency0, token as currency1), each one request on a node with a
-     full log index (split automatically if the node refuses the range or times out). Then
+     whole history (token as currency0, token as currency1), each in ranges of up to
+     `SCOUT_RPC_HISTORY_CHUNK` blocks, one at a time (`0`: one request over the whole history,
+     as before; split automatically if the node refuses a range or times out). Then
      those pools' `Swap`s around the call, filtered by pool id (indexed; up to 32 ids per
      request). The pool with the most swaps in the same transactions as the token's transfers
      wins (ties: the lowest pool id); for an asset's own USD pools (step 3) only pools against
@@ -323,7 +324,9 @@ bonding curve first and move to a Uniswap v4 pool when they graduate.
   (`SCOUT_PRICE_LOOKBACK_BLOCKS` does not apply): the curve's `CurveCompleted` and the
   factory's `PoolGraduated` for the token (token = topic 1), in windows around the call block
   that double in size on both sides (starting at `SCOUT_DISCOVERY_BLOCKS`) until one of them
-  shows up or the whole chain has been searched, in ranges of up to 4M blocks (split
+  shows up or the whole chain has been searched, in ranges of up to 4M blocks, capped by
+  `SCOUT_RPC_HISTORY_CHUNK` (default 2M), one at a time (with `0`: 4M ranges,
+  `SCOUT_RPC_PARALLEL` at a time, as before; split
   automatically if the node refuses them or times out). Both are filtered by address and
   topic, which a node with a full log index (`--execution.rpc.log-history=0`) answers
   quickly over any range: about 4 `eth_getLogs` per doubling, a few dozen for a graduation
@@ -505,6 +508,7 @@ Only use the feature columns as model inputs; everything about the future is an 
 | `SCOUT_PRICE_LOOKBACK_BLOCKS` | `8640000` | how far back (~10 days) to look for the last feed update, ETH swap, or trade in an asset's own USD pool (a pool with no trade that recent is not used for that block) |
 | `SCOUT_RPC_RPS` | `0` | max RPC requests per second (`0` = no limit, for your own node; set a number for a shared or public endpoint) |
 | `SCOUT_RPC_LOG_CHUNK` | `200000` | most blocks per `eth_getLogs`. Every scan starts at this size. When the node refuses a range as too large (too many blocks or results, or an answer over 64 MB), or the range times out twice, that range is asked again in halves, for that scan only (not below 200 blocks); the scan grows back to this size after 3 answered ranges. Rate limits and busy answers are retried at the same size and never make ranges smaller |
+| `SCOUT_RPC_HISTORY_CHUNK` | `2000000` | most blocks per `eth_getLogs` in the searches over a whole history: a token's v4 pools (`Initialize`), a Chainlink proxy's aggregator switches, an asset's transfers in the USD-pool search, the holder export's launch (first mint) search and the Pons graduation searches (otherwise up to 4M blocks). Without it one of these asks for every block from 1 to the head at once (tens of millions of blocks) and grows back to that after a split. These searches also fetch one range at a time, whatever `SCOUT_RPC_PARALLEL` says (when `SCOUT_RPC_LOG_CHUNK` is below the cap, as by default). It trades more requests for no giant reads; the results are the same. `0` = no cap, exactly as before the setting existed (the rollback without a deploy): one range for the whole span, and the Pons searches in 4M ranges, `SCOUT_RPC_PARALLEL` at a time. A `SCOUT_RPC_LOG_CHUNK` above it is bounded by it too in the chunked scans; the backward search for the last feed update, ETH swap or trade before a block still uses `SCOUT_RPC_LOG_CHUNK`. Values from 1 to 199 (below the 200-block smallest range), negative or non-numeric values are refused at start |
 | `SCOUT_MAINNET_RPC_URL` | none | Ethereum mainnet **archive** node; enables ETH/USD from mainnet Chainlink |
 | `SCOUT_MAINNET_CHAINLINK_FEEDS` | `eth=` ETH/USD feed | extra `token=feedOnEthereum` mappings; the asset database's mainnet feeds are added (these win on a conflict) |
 | `SCOUT_MAINNET_RPC_RPS` | `0` | max requests per second to the Ethereum node (`0` = no limit) |
@@ -576,7 +580,12 @@ model may use) and `post24h_*` columns after it (description only).
 3. Run the pilot sample query (Q6) in pgAdmin and save its result as CSV with `call_id` as
    the first column, e.g. `$REPO/data/holder_pilot_ids.csv`.
 4. Estimate: `./scoutanalytics -export-holders data/holder_pilot_ids.csv -dry-run`
-   (expect about 10k `eth_getLogs`).
+   (expect about 10k `eth_getLogs` with `SCOUT_RPC_HISTORY_CHUNK=0`; with the default 2M cap
+   each call's launch search costs ⌊launch block / 2M⌋ + 1 requests instead of 1: about 31
+   for a token launched near block 60M, 46 near 90M; and each call with a v4 venue costs
+   2 × (⌊head / 2M⌋ + 1) for its pool search instead of 2: 96 at head 95M). The dry run does
+   not ask the node for the head, so it counts the v4 pool searches up to the largest entry
+   block of the run's calls; its line says that part is "at least" that many.
 5. Ten calls: `./scoutanalytics -export-holders data/holder_pilot_ids.csv -export-holders-max 10`,
    then look at `data/holders/holders.csv` and `runs.jsonl`.
 6. The full run, beside the running `-track`:
