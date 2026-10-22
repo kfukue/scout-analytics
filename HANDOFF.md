@@ -4,6 +4,75 @@
 
 This section supersedes the ones below wherever they differ.
 
+**Update, 21 Oct 23:40 PDT (22 Oct 06:40 UTC): pilot blocked by a slow
+tracker / overloaded node. Work on hold until 22 Oct 07:00 PDT (14:00
+UTC)** (owner: "hold off any work until 7:00AM PDT 10/22 since i am
+hittting my limit"). Resume by reading this update first.
+- Pilot so far (server): Q6 re-exported with `call_id` first and the
+  six new columns (the first CSV was the old Q6, refused at line 1:
+  `"grp" is not a call id`); symlink tests: all PASS (3 tests, 6
+  sub-tests); `-dry-run`: 450 calls, about 9,108 `eth_getLogs`, at
+  least 38 min at 4 req/s. The 10-call run (`-export-holders-max 10`)
+  paused before any node read: "latest-price pass 6h43m21s behind
+  (SCOUT_HOLDERS_MAX_PRICE_LAG is 2h0m0s)". It writes nothing and
+  stops after 30 min. Owner chose (A): wait and fix the tracker lag
+  first; not (B), running the export with a higher
+  `SCOUT_HOLDERS_MAX_PRICE_LAG`.
+- Read-only freshness query (owner, about 23:00 PDT), rows the
+  latest-price pass refreshes (4,836): young calls (1,068, < 30 d)
+  median 2h37m since their last refresh (due every 15 min by default),
+  383 refreshed in the last hour; older or rug-block calls (3,768)
+  none since about 20:17, median 7h27m, p95 7h47m. The `price` rows
+  (the fill's 719) look like the other old rows. The fill is ruled out
+  (the pass and the lag query never read `rug_at`, `rug_at_kind` or
+  `rugged`; `investigate`, 21 Oct). Inferred: 6h43m fits only an
+  old-call pace of 1 h (p95 7h47m minus 1 h), so the server's
+  `SCOUT_LATEST_REFRESH_OLD` is probably 1h (not confirmed; the
+  tracker's start-up line `latest prices on: refreshed every A ...,
+  every B for older ones; at most C call(s) per cycle` shows it).
+- `-track` (started 21 Oct 15:59 PDT, `go run . -track` in a terminal
+  on the server, about 43 s CPU in 7 h) log at 23:32-23:33 PDT, pasted
+  by the owner:
+  - The node (local Nitro, `localhost:8540`) times out even on small
+    reads: a 1,444-block `eth_getLogs` waits about 60 s; errors `rpc
+    error -32002: request timed out` and `Client.Timeout exceeded while
+    awaiting headers`.
+  - Huge reads: call 2935 "scanning blocks 1 → 94867687" for 2h32m
+    (204,800- then 409,600-block ranges); call 5400 one `eth_getLogs`
+    of 47,452,341 blocks (timed out, split to 23.7M-block ranges);
+    calls 3220 and 3214 also running 1h10m-1h22m.
+  - Three "latest prices: N of 400 call(s) so far" counters at once:
+    125 of 400 after 7h21m (started about 16:12, when the stall
+    began), 35 of 400 after 3h37m, 106 of 400 after 19m.
+  - Inferred: the giant reads saturate the node, so every other read
+    (including the latest-price pass) waits. Not known yet: why these
+    older calls are scanned since the 15:59 restart, and why one from
+    block 1; whether overlapping latest-price passes are by design;
+    whether the adaptive range growth ("grow-back" up to 47M blocks)
+    is intended; whether the log looked like this before 21 Oct (asked
+    the owner, no answer yet).
+- An `investigate` pass on exactly these questions (what the three
+  counters are, which path scans from block 1 and why, the range
+  growth, settings the owner can change at restart without code,
+  whether a code fix is warranted, a read-only SQL to confirm) was
+  running when work stopped. If its result is not recorded below,
+  run it again with the log lines above.
+- Owner's instructions in force: leave `-track` running (a restart
+  would start the same scans again) until the cause is known; the
+  pilot export waits until the young calls are back to about 15 min
+  and old calls within their pace; no setting change before the PM
+  shows the exact line. Never change `onchainStateVersion` or make
+  the tracker redo history.
+- Also open: the fill's backup table
+  `scout_call_tracking_bak_price_rug_fill_20261020` (owner drops it
+  after checking the website); the `-web` "collapsed" legend check;
+  the line `in base : D:\keys\gcp-sql` printed at the start of every
+  `scoutanalytics` run on the Linux server (a Windows path; source not
+  looked at yet).
+- The owner asked for a scheduled resume at 22 Oct 07:01 PDT; the PM
+  has no scheduling tool (its Bash is git only), so the owner resumes
+  by hand ("read handoff and resume").
+
 **Update, 21 Oct PDT (21-22 Oct UTC): #51-#54 merged; A2 done.**
 - Merged by the owner: #51 (5a), #52 (A2 fill), #53 (5b), #54 (docs);
   main d3b5daa. Commands given: server pull and build, `-track` and
