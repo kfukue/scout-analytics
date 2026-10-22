@@ -4,6 +4,122 @@
 
 This section supersedes the ones below wherever they differ.
 
+**Update, 21 Oct 23:40 PDT (22 Oct 06:40 UTC): pilot blocked by a slow
+tracker / overloaded node. Work on hold until 22 Oct 07:00 PDT (14:00
+UTC)** (owner: "hold off any work until 7:00AM PDT 10/22 since i am
+hittting my limit"). Resume by reading this update first.
+- Pilot so far (server): Q6 re-exported with `call_id` first and the
+  six new columns (the first CSV was the old Q6, refused at line 1:
+  `"grp" is not a call id`); symlink tests: all PASS (3 tests, 6
+  sub-tests); `-dry-run`: 450 calls, about 9,108 `eth_getLogs`, at
+  least 38 min at 4 req/s. The 10-call run (`-export-holders-max 10`)
+  paused before any node read: "latest-price pass 6h43m21s behind
+  (SCOUT_HOLDERS_MAX_PRICE_LAG is 2h0m0s)". It writes nothing and
+  stops after 30 min. Owner chose (A): wait and fix the tracker lag
+  first; not (B), running the export with a higher
+  `SCOUT_HOLDERS_MAX_PRICE_LAG`.
+- Read-only freshness query (owner, about 23:00 PDT), rows the
+  latest-price pass refreshes (4,836): young calls (1,068, < 30 d)
+  median 2h37m since their last refresh (due every 15 min by default),
+  383 refreshed in the last hour; older or rug-block calls (3,768)
+  none since about 20:17, median 7h27m, p95 7h47m. The `price` rows
+  (the fill's 719) look like the other old rows. The fill is ruled out
+  (the pass and the lag query never read `rug_at`, `rug_at_kind` or
+  `rugged`; `investigate`, 21 Oct). Inferred: 6h43m fits only an
+  old-call pace of 1 h (p95 7h47m minus 1 h), so the server's
+  `SCOUT_LATEST_REFRESH_OLD` is probably 1h (not confirmed; the
+  tracker's start-up line `latest prices on: refreshed every A ...,
+  every B for older ones; at most C call(s) per cycle` shows it).
+- `-track` (started 21 Oct 15:59 PDT, `go run . -track` in a terminal
+  on the server, about 43 s CPU in 7 h) log at 23:32-23:33 PDT, pasted
+  by the owner:
+  - The node (local Nitro, `localhost:8540`) times out even on small
+    reads: a 1,444-block `eth_getLogs` waits about 60 s; errors `rpc
+    error -32002: request timed out` and `Client.Timeout exceeded while
+    awaiting headers`.
+  - Huge reads: call 2935 "scanning blocks 1 → 94867687" for 2h32m
+    (204,800- then 409,600-block ranges); call 5400 one `eth_getLogs`
+    of 47,452,341 blocks (timed out, split to 23.7M-block ranges);
+    calls 3220 and 3214 also running 1h10m-1h22m.
+  - Three "latest prices: N of 400 call(s) so far" counters at once:
+    125 of 400 after 7h21m (started about 16:12, when the stall
+    began), 35 of 400 after 3h37m, 106 of 400 after 19m.
+  - Inferred: the giant reads saturate the node, so every other read
+    (including the latest-price pass) waits. Not known yet: why these
+    older calls are scanned since the 15:59 restart, and why one from
+    block 1; whether overlapping latest-price passes are by design;
+    whether the adaptive range growth ("grow-back" up to 47M blocks)
+    is intended; whether the log looked like this before 21 Oct (asked
+    the owner, no answer yet).
+- `investigate` result (21 Oct, read-only, code at d3b5daa; file:line
+  in its report, summarised here; not yet sent to the owner):
+  - The three counters are three overlapping latest-price passes:
+    `cycle()` starts `r.latest` every cycle (tracker.go ~107) with no
+    guard; a pass hands out rows for `SCOUT_TRACK_INTERVAL` (1m) and
+    then waits for its stuck rows, logging until the last one ends.
+    400 = prod `SCOUT_LATEST_BATCH=400` (default 200); prod also sets
+    `SCOUT_LATEST_REFRESH_OLD=1h` (default 24h), which explains the
+    6h43m lag (every old row is always due). Horizon checks and latest
+    rows share the `SCOUT_TRACK_WORKERS` workers, so stuck latest rows
+    starve horizon checks.
+  - "scanning blocks 1 → head" are whole-history searches with a
+    head+1 ceiling: v4 Initialize search (`v4PoolsOf`), a quote
+    asset's USD-pool history sweep (`usdPoolsInHistory`) and Chainlink
+    feed history. Their progress is kept only in memory, so the 15:59
+    restart reset them to block 1. Range growth is capped only by
+    head+1 (hence 47M-block `eth_getLogs`); no setting caps it
+    (`SCOUT_RPC_LOG_CHUNK` does not apply). Inferred: calls 2935, 3214
+    and 3220 are `error` rows waiting on a USD sweep (retried every
+    5 min); the giant reads saturate the node. Not caused by the fill,
+    #49, `ClearRugAt` or `-retry-no-pool`.
+  - The export was not a cause: before 22:51 it only refused the old
+    CSV and ran dry runs (no node reads), and its 10-call run paused
+    before any read.
+  - Levers without code (owner decides; one restart with all of them,
+    since every restart resets the in-memory sweeps again):
+    (a) `SCOUT_RPC_MAX_INFLIGHT=8-12` and `SCOUT_RPC_PARALLEL=1`
+    (limits giant queries in flight); (b) drop
+    `SCOUT_LATEST_REFRESH_OLD=1h` (back to 24h) and
+    `SCOUT_LATEST_BATCH` to 100-200, or `SCOUT_LATEST_REFRESH=off` for
+    a few hours (the export's price-lag pause then trips); (c)
+    `SCOUT_TRACK_WORKERS=4-6`. `SCOUT_RPC_RPS` and
+    `SCOUT_RPC_LOG_CHUNK` do not help. Also check the node itself
+    (sync, CPU, disk).
+  - Code fix warranted, small PRs in order: (a) a `config.go` setting
+    capping the whole-history ceilings (onchain.go ~1944, ~2661;
+    onchain_extra.go ~389), parallel 1 for those searches; (b) one
+    latest pass at a time, a cap on latest rows' share of workers, and
+    the handed-out count in the progress line; (c) a label and
+    heartbeat for latest rows; (d) keep whole-history USD sweeps out
+    of the latest pass; (e) later, if wanted: store sweep progress in
+    the DB (schema change, needs `ops/` with rollback). None touches
+    `onchainStateVersion` or the dataset view.
+  - Read-only SQL in the report (to send the owner): the four calls'
+    rows and error text (`call_id IN (2935, 3214, 3220, 5400)`), what
+    fills the horizon queue (status, priority, error kind), quote
+    assets behind USD errors, latest staleness by quote asset, and
+    open transactions in `pg_stat_activity`. Its suggested
+    `journalctl -u scout-track` grep does not apply: the tracker runs
+    in a terminal, not as a service.
+  - Next for the PM after the hold: give the owner the SQL and the
+    lever choice (PM's leaning: (a) + (b) with 24h for old calls, then
+    code fix (a) and (b)); the owner decides before any restart.
+- Owner's instructions in force: leave `-track` running (a restart
+  would start the same scans again) until the cause is known; the
+  pilot export waits until the young calls are back to about 15 min
+  and old calls within their pace; no setting change before the PM
+  shows the exact line. Never change `onchainStateVersion` or make
+  the tracker redo history.
+- Also open: the fill's backup table
+  `scout_call_tracking_bak_price_rug_fill_20261020` (owner drops it
+  after checking the website); the `-web` "collapsed" legend check;
+  the line `in base : D:\keys\gcp-sql` printed at the start of every
+  `scoutanalytics` run on the Linux server (a Windows path; source not
+  looked at yet).
+- The owner asked for a scheduled resume at 22 Oct 07:01 PDT; the PM
+  has no scheduling tool (its Bash is git only), so the owner resumes
+  by hand ("read handoff and resume").
+
 **Update, 21 Oct PDT (21-22 Oct UTC): #51-#54 merged; A2 done.**
 - Merged by the owner: #51 (5a), #52 (A2 fill), #53 (5b), #54 (docs);
   main d3b5daa. Commands given: server pull and build, `-track` and
