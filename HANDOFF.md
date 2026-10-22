@@ -51,12 +51,59 @@ hittting my limit"). Resume by reading this update first.
     whether the adaptive range growth ("grow-back" up to 47M blocks)
     is intended; whether the log looked like this before 21 Oct (asked
     the owner, no answer yet).
-- An `investigate` pass on exactly these questions (what the three
-  counters are, which path scans from block 1 and why, the range
-  growth, settings the owner can change at restart without code,
-  whether a code fix is warranted, a read-only SQL to confirm) was
-  running when work stopped. If its result is not recorded below,
-  run it again with the log lines above.
+- `investigate` result (21 Oct, read-only, code at d3b5daa; file:line
+  in its report, summarised here; not yet sent to the owner):
+  - The three counters are three overlapping latest-price passes:
+    `cycle()` starts `r.latest` every cycle (tracker.go ~107) with no
+    guard; a pass hands out rows for `SCOUT_TRACK_INTERVAL` (1m) and
+    then waits for its stuck rows, logging until the last one ends.
+    400 = prod `SCOUT_LATEST_BATCH=400` (default 200); prod also sets
+    `SCOUT_LATEST_REFRESH_OLD=1h` (default 24h), which explains the
+    6h43m lag (every old row is always due). Horizon checks and latest
+    rows share the `SCOUT_TRACK_WORKERS` workers, so stuck latest rows
+    starve horizon checks.
+  - "scanning blocks 1 → head" are whole-history searches with a
+    head+1 ceiling: v4 Initialize search (`v4PoolsOf`), a quote
+    asset's USD-pool history sweep (`usdPoolsInHistory`) and Chainlink
+    feed history. Their progress is kept only in memory, so the 15:59
+    restart reset them to block 1. Range growth is capped only by
+    head+1 (hence 47M-block `eth_getLogs`); no setting caps it
+    (`SCOUT_RPC_LOG_CHUNK` does not apply). Inferred: calls 2935, 3214
+    and 3220 are `error` rows waiting on a USD sweep (retried every
+    5 min); the giant reads saturate the node. Not caused by the fill,
+    #49, `ClearRugAt` or `-retry-no-pool`.
+  - The export was not a cause: before 22:51 it only refused the old
+    CSV and ran dry runs (no node reads), and its 10-call run paused
+    before any read.
+  - Levers without code (owner decides; one restart with all of them,
+    since every restart resets the in-memory sweeps again):
+    (a) `SCOUT_RPC_MAX_INFLIGHT=8-12` and `SCOUT_RPC_PARALLEL=1`
+    (limits giant queries in flight); (b) drop
+    `SCOUT_LATEST_REFRESH_OLD=1h` (back to 24h) and
+    `SCOUT_LATEST_BATCH` to 100-200, or `SCOUT_LATEST_REFRESH=off` for
+    a few hours (the export's price-lag pause then trips); (c)
+    `SCOUT_TRACK_WORKERS=4-6`. `SCOUT_RPC_RPS` and
+    `SCOUT_RPC_LOG_CHUNK` do not help. Also check the node itself
+    (sync, CPU, disk).
+  - Code fix warranted, small PRs in order: (a) a `config.go` setting
+    capping the whole-history ceilings (onchain.go ~1944, ~2661;
+    onchain_extra.go ~389), parallel 1 for those searches; (b) one
+    latest pass at a time, a cap on latest rows' share of workers, and
+    the handed-out count in the progress line; (c) a label and
+    heartbeat for latest rows; (d) keep whole-history USD sweeps out
+    of the latest pass; (e) later, if wanted: store sweep progress in
+    the DB (schema change, needs `ops/` with rollback). None touches
+    `onchainStateVersion` or the dataset view.
+  - Read-only SQL in the report (to send the owner): the four calls'
+    rows and error text (`call_id IN (2935, 3214, 3220, 5400)`), what
+    fills the horizon queue (status, priority, error kind), quote
+    assets behind USD errors, latest staleness by quote asset, and
+    open transactions in `pg_stat_activity`. Its suggested
+    `journalctl -u scout-track` grep does not apply: the tracker runs
+    in a terminal, not as a service.
+  - Next for the PM after the hold: give the owner the SQL and the
+    lever choice (PM's leaning: (a) + (b) with 24h for old calls, then
+    code fix (a) and (b)); the owner decides before any restart.
 - Owner's instructions in force: leave `-track` running (a restart
   would start the same scans again) until the cause is known; the
   pilot export waits until the young calls are back to about 15 min
