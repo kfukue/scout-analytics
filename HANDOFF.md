@@ -1,8 +1,66 @@
 # Scout analytics: handoff to Claude Code
 
-## Session state (21 Oct 2026 PDT (21-22 Oct UTC): main d3b5daa after #42-#54)
+## Session state (22 Oct 2026 PDT (22 Oct UTC): main f5f1412 after #42-#57)
 
 This section supersedes the ones below wherever they differ.
+
+**Update, 22 Oct 11:45 PDT (18:45 UTC): node unclogged, part 1.**
+- Morning checks (owner, read-only): latest prices worse than overnight
+  (old calls median 18h since refresh, young 1h30m, 79 refreshed in an
+  hour). The node is in sync (head 41 s old at 09:35 PDT), so the load
+  is ours. The 4 calls in the log (2935, 3214, 3220, 5400) and all 20
+  priority-1 `error` rows are old backfilled calls (28 Jul-14 Sep)
+  retried 43-717 times: (a) "no price yet" for an unusual quote token
+  (fxTHB, KET, HG, RB, COKE, RSGP, fxEUR, fxINR, WEED, SHIB, SKYCAT,
+  DOGGYCOIN), each retry starting a whole-chain USD-pool sweep from
+  block 1; (b) the same small range timing out every time (CRCL 717,
+  INTISMERAN 463, ILSp, GPRO, SPCXx3L; 96-200 blocks): possibly blocks
+  the node cannot answer; to check on the node later (`investigate`
+  listed the checks: the exact `eth_getLogs` by hand with the tracker
+  stopped, then `eth_getBlockReceipts`, the node's log and version).
+- Owner: "go" (22 Oct) on parking the 20 and capping whole-history
+  reads; the give-up rule was then put to him with four conditions and
+  is NOT answered yet (below).
+- #57 merged and run (owner, pgAdmin, `-track` stopped): A TOTAL 20,
+  all checks 0 (14 had a late entry price, i.e. leave the ML data); B
+  parked 20 as `gave_up` at 22 Oct 11:39 PDT (18:39 UTC); backup table
+  `scout_call_tracking_bak_park_stuck_20261022` kept until the owner
+  drops it. C was skipped: the restarted tracker's due list (8 calls)
+  had none of the 20.
+- `-track` restarted 22 Oct 11:40 PDT with `SCOUT_RPC_RPS=300
+  SCOUT_TRACK_WORKERS=12 SCOUT_RPC_PARALLEL=1 SCOUT_RPC_MAX_INFLIGHT=12
+  SCOUT_LATEST_REFRESH_OLD=24h SCOUT_LATEST_BATCH=200`, log also in
+  `~/scout-track.log` (`tee -a`). Start-up lines confirm 1 range per
+  scan, 12 in flight, latest 15m / 24h, 200 per cycle. The server
+  `.env` still has `SCOUT_LATEST_REFRESH_OLD=1h` and
+  `SCOUT_LATEST_BATCH=400` (per the earlier diagnosis); the command line
+  overrides them, so a restart without these variables brings back
+  the old load.
+- #58 open (review PASS): `SCOUT_RPC_HISTORY_CHUNK` (default 2,000,000
+  blocks; 0 = exactly the old behaviour; 1-199 refused) caps every
+  whole-history `eth_getLogs` and runs such searches one range at a
+  time; the holder `-dry-run` counts the capped ranges. Pilot estimate
+  with the cap: about 45k `eth_getLogs`, about 3 h at 4 req/s (was
+  about 10k / 40 min uncapped). Needs one more `-track` restart after
+  merge; check the start-up line shows `whole-history searches one
+  range at a time, of up to 2000000 blocks`.
+- Open with the owner: the give-up rule (PR A of the diagnosis). Spec:
+  park a call as `gave_up` only when attempts >= 10 AND past its
+  give-up deadline (entry + longest horizon + 48 h, about 32 days)
+  AND the error is not "USD pool search not finished" AND the run made
+  no progress; `SCOUT_TRACK_MAX_ATTEMPTS` (default 10, 0 = off);
+  reason prefix `gave up after`; also keep `attempts` unchanged on
+  sweep-pending retries. Reason for the extra conditions: `attempts`
+  counts every run, including successes and 5-minute sweep retries, so
+  "10 tries" alone would park live calls. Side effects: website status
+  "gave up"; ML treats gave_up as no-pool (model stopped).
+- Later (PM's recommendation, not asked yet): keep a failed USD-pool
+  sweep's progress instead of restarting from block 1 (`onchain_extra.go`
+  ~409-411); one latest-price pass at a time; a label for latest rows.
+- Next: about an hour after the restart, the owner re-runs the
+  freshness query; when young calls are back near 15-30 min, merge
+  #58 + restart, then the pilot again (`-dry-run`, then
+  `-export-holders-max 10`).
 
 **Update, 21 Oct 23:40 PDT (22 Oct 06:40 UTC): pilot blocked by a slow
 tracker / overloaded node. Work on hold until 22 Oct 07:00 PDT (14:00
