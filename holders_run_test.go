@@ -386,20 +386,49 @@ func TestHoldersPathInsideCase(t *testing.T) {
 
 func TestHoldersLogRequestsFormula(t *testing.T) {
 	cases := []struct {
-		launch, postEnd, chunk uint64
-		filters                int
-		want                   int64
+		launch, postEnd, chunk, hist uint64
+		filters                      int
+		want                         int64
 	}{
-		{100_000, 300_000, 200_000, 1, 1 + 2*2},       // chunks 0 and 1
-		{199_999, 200_000, 200_000, 0, 1 + 1*2},       // two blocks straddling a boundary: two chunks
-		{200_000, 399_999, 200_000, 2, 1 + 3*1},       // aligned: one chunk
-		{1, 1_000_000, 200_000, 1, 1 + 2*6},           // chunks 0..5
-		{5_000_000, 5_864_000, 1_000_000, 3, 1 + 4*1}, // one chunk
-		{5_900_000, 6_764_000, 1_000_000, 3, 1 + 4*2}, // two chunks
+		// No history cap: the launch search is one request.
+		{100_000, 300_000, 200_000, 0, 1, 1 + 2*2},       // chunks 0 and 1
+		{199_999, 200_000, 200_000, 0, 0, 1 + 1*2},       // two blocks straddling a boundary: two chunks
+		{200_000, 399_999, 200_000, 0, 2, 1 + 3*1},       // aligned: one chunk
+		{1, 1_000_000, 200_000, 0, 1, 1 + 2*6},           // chunks 0..5
+		{5_000_000, 5_864_000, 1_000_000, 0, 3, 1 + 4*1}, // one chunk
+		{5_900_000, 6_764_000, 1_000_000, 0, 3, 1 + 4*2}, // two chunks
+		// The default 2M cap: the launch search is ⌊launch/2M⌋ + 1 ranges.
+		{100_000, 300_000, 200_000, 2_000_000, 1, 1 + 2*2},
+		{1_999_999, 2_000_000, 200_000, 2_000_000, 0, 1 + 1*2},    // the launch in the first range
+		{2_000_000, 2_199_999, 200_000, 2_000_000, 0, 2 + 1*1},    // the launch opens the second range
+		{61_000_000, 61_864_000, 200_000, 2_000_000, 1, 31 + 2*5}, // near block 60M: 31
+		{90_000_000, 90_864_000, 200_000, 2_000_000, 1, 46 + 2*5}, // near block 90M: 46
+		// A log chunk above the cap is bounded by it in the streams too.
+		{5_900_000, 6_764_000, 5_000_000, 2_000_000, 1, 3 + 2*2},
 	}
 	for _, tc := range cases {
-		if got := holderLogRequests(tc.launch, tc.postEnd, tc.chunk, tc.filters); got != tc.want {
-			t.Errorf("holderLogRequests(%d, %d, S=%d, F=%d) = %d, want %d", tc.launch, tc.postEnd, tc.chunk, tc.filters, got, tc.want)
+		if got := holderLogRequests(tc.launch, tc.postEnd, tc.chunk, tc.hist, tc.filters); got != tc.want {
+			t.Errorf("holderLogRequests(%d, %d, S=%d, H=%d, F=%d) = %d, want %d", tc.launch, tc.postEnd, tc.chunk, tc.hist, tc.filters, got, tc.want)
+		}
+	}
+}
+
+func TestHolderLaunchRequests(t *testing.T) {
+	cases := []struct {
+		launch, hist uint64
+		want         int64
+	}{
+		{90_000_000, 0, 1}, // no cap: one range over [1, entry]
+		{1, 2_000_000, 1},
+		{1_999_999, 2_000_000, 1},
+		{2_000_000, 2_000_000, 2},
+		{60_000_000, 2_000_000, 31},
+		{90_000_000, 2_000_000, 46},
+		{5_000_123, 1_000_000, 6},
+	}
+	for _, tc := range cases {
+		if got := holderLaunchRequests(tc.launch, tc.hist); got != tc.want {
+			t.Errorf("holderLaunchRequests(%d, H=%d) = %d, want %d", tc.launch, tc.hist, got, tc.want)
 		}
 	}
 }
@@ -438,16 +467,61 @@ func TestHoldersCostEstimate(t *testing.T) {
 		// Past the look-back cap: the launch search only.
 		{EntryBlock: 900_000_000, Age: holderLookbackCap + time.Second, Filters: 2},
 	}
-	want := []int64{1 + 2*6, 1 + 1*(914_000/chunk-1/chunk+1), 1}
-	per, total, err := holderCostEstimate(calls, chunk)
-	if err != nil {
-		t.Fatalf("holderCostEstimate: %v", err)
+	for _, tc := range []struct {
+		name string
+		hist uint64
+		want []int64
+	}{
+		{"no history cap", 0, []int64{1 + 2*6, 1 + 1*(914_000/chunk-1/chunk+1), 1}},
+		// The 2M cap: launches below 2M are in the first range; the old token
+		// launched at 900M − 90 d × 10/s = 822,240,000 (minus 10, the extra
+		// second) costs ⌊822,239,990/2M⌋ + 1 = 412 ranges.
+		{"default history cap", defaultHistoryChunk, []int64{1 + 2*6, 1 + 1*(914_000/chunk-1/chunk+1), 412}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			per, total, err := holderCostEstimate(calls, chunk, tc.hist)
+			if err != nil {
+				t.Fatalf("holderCostEstimate: %v", err)
+			}
+			if !slices.Equal(per, tc.want) || total != tc.want[0]+tc.want[1]+tc.want[2] {
+				t.Errorf("H=%d: per call %v total %d, want %v total %d", tc.hist, per, total, tc.want, tc.want[0]+tc.want[1]+tc.want[2])
+			}
+			if _, _, err := holderCostEstimate(calls, 0, tc.hist); err == nil {
+				t.Errorf("chunk 0: no error")
+			}
+		})
 	}
-	if !slices.Equal(per, want) || total != want[0]+want[1]+want[2] {
-		t.Errorf("per call %v total %d, want %v total %d", per, total, want, want[0]+want[1]+want[2])
+}
+
+// holderV4SearchRequests: 2 searches, each ⌊head/H⌋ + 1 ranges of
+// SCOUT_RPC_HISTORY_CHUNK = H; 2 with no cap.
+func TestHolderV4SearchRequests(t *testing.T) {
+	for _, tc := range []struct {
+		head, hist uint64
+		want       int64
+	}{
+		{95_000_000, 0, 2},
+		{95_000_000, defaultHistoryChunk, 96}, // 2 × (47 + 1)
+		{90_000_000, defaultHistoryChunk, 92}, // 2 × (45 + 1): a range starts at 90M
+		{defaultHistoryChunk - 1, defaultHistoryChunk, 2},
+		{defaultHistoryChunk, defaultHistoryChunk, 4},
+		{0, defaultHistoryChunk, 2},
+		{0, 0, 2},
+	} {
+		if got := holderV4SearchRequests(tc.head, tc.hist); got != tc.want {
+			t.Errorf("holderV4SearchRequests(head %d, H %d) = %d, want %d", tc.head, tc.hist, got, tc.want)
+		}
 	}
-	if _, _, err := holderCostEstimate(calls, 0); err == nil {
-		t.Errorf("chunk 0: no error")
+}
+
+// holderMaxEntryBlock: the largest entry block, 0 for no calls.
+func TestHolderMaxEntryBlock(t *testing.T) {
+	calls := []holderCostCall{{EntryBlock: 60_000_000}, {EntryBlock: 90_000_000}, {EntryBlock: 75_000_000}}
+	if got := holderMaxEntryBlock(calls); got != 90_000_000 {
+		t.Errorf("holderMaxEntryBlock(%v) = %d, want 90000000", calls, got)
+	}
+	if got := holderMaxEntryBlock(nil); got != 0 {
+		t.Errorf("holderMaxEntryBlock(nil) = %d, want 0", got)
 	}
 }
 
@@ -465,25 +539,40 @@ func TestHoldersCostEstimateMatchesReader(t *testing.T) {
 		{"5d old, v3 and a Pons curve", 5 * 24 * time.Hour, []holderVenue{{lqPool, "v3"}, {hfCurve, "pons"}}, nil},
 		{"20d old, v4 with two ids", 20 * 24 * time.Hour, []holderVenue{{lqPM, "v4"}}, []string{lqPoolID, lqOtherPoolID}},
 	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			c := newHFCall(t, 40*24*time.Hour, 10*24*time.Hour, tc.launchAge, chunk)
-			r := c.mustFetch(t, c.input(tc.venues, tc.ids...))
-			if r.Status != holderFetchOK {
-				t.Fatalf("status %v, want ok", r.Status)
-			}
-			f := holderLiquidityFilterCount(tc.venues, tc.ids)
-			if got := holderLogRequests(r.LaunchBlock, r.PostEndBlock, chunk, f); got != r.LogRequests {
-				t.Errorf("formula %d, reader asked %d", got, r.LogRequests)
-			}
-			est, _, err := holderCostEstimate([]holderCostCall{{EntryBlock: c.entryBlock, Age: tc.launchAge, Filters: f}}, chunk)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if est[0] != r.LogRequests {
-				t.Errorf("estimate %d, reader asked %d", est[0], r.LogRequests)
-			}
-		})
+	hists := []struct {
+		name  string
+		value string // SCOUT_RPC_HISTORY_CHUNK ("" = the default)
+		hist  uint64
+	}{
+		{"default history cap", "", defaultHistoryChunk},
+		{"no history cap", "0", 0},
+	}
+	for _, h := range hists {
+		for _, tc := range cases {
+			t.Run(h.name+"/"+tc.name, func(t *testing.T) {
+				// 40 d of chain (34.56M blocks): with the 2M cap the launch
+				// search is several ranges, all counted by the estimate.
+				c := newHFCallEnv(t, 40*24*time.Hour, 10*24*time.Hour, tc.launchAge, chunk, map[string]string{"SCOUT_RPC_HISTORY_CHUNK": h.value})
+				if h.hist > 0 && c.launchBlock < 2*h.hist {
+					t.Fatalf("launch at %d: below 2 capped ranges, the test does not test the cap", c.launchBlock)
+				}
+				r := c.mustFetch(t, c.input(tc.venues, tc.ids...))
+				if r.Status != holderFetchOK {
+					t.Fatalf("status %v, want ok", r.Status)
+				}
+				f := holderLiquidityFilterCount(tc.venues, tc.ids)
+				if got := holderLogRequests(r.LaunchBlock, r.PostEndBlock, chunk, h.hist, f); got != r.LogRequests {
+					t.Errorf("formula %d, reader asked %d", got, r.LogRequests)
+				}
+				est, _, err := holderCostEstimate([]holderCostCall{{EntryBlock: c.entryBlock, Age: tc.launchAge, Filters: f}}, chunk, h.hist)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if est[0] != r.LogRequests {
+					t.Errorf("estimate %d, reader asked %d", est[0], r.LogRequests)
+				}
+			})
+		}
 	}
 }
 

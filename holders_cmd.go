@@ -40,9 +40,11 @@ const (
 	// holderMaxFailsInARow: the run stops after this many calls in a row whose
 	// node reads failed (the node is likely down).
 	holderMaxFailsInARow = 5
-	// holderV4SearchLogs: the eth_getLogs of a v4 pool-id search
-	// (holderV4PoolIDs) on a token not searched yet.
-	holderV4SearchLogs = 2
+	// holderV4SearchStreams: the Initialize searches of a v4 pool-id search
+	// (holderV4PoolIDs) on a token not searched yet, token as currency0 and as
+	// currency1. Each reads blocks 1 to the head in SCOUT_RPC_HISTORY_CHUNK
+	// ranges, one eth_getLogs per range (holderV4SearchRequests).
+	holderV4SearchStreams = 2
 )
 
 // holderExportOptions: the command's flags.
@@ -243,17 +245,22 @@ func holderCostCalls(metas []holderCallMeta, cfg holderVenueConfig) (calls []hol
 }
 
 // dryRun logs the eth_getLogs estimate of this run's calls and the time it
-// takes at the export's rate. No node request, nothing written.
+// takes at the export's rate. No node request, nothing written. The v4
+// pool-id searches read up to the head, which the dry run does not ask: it
+// counts them up to the largest entry block of the calls instead, a lower
+// bound (the log line says "at least").
 func (x *holderExport) dryRun(p holderPlan) error {
 	calls, skipped, unknownAge, v4 := holderCostCalls(p.ThisRun, x.venues)
-	_, total, err := holderCostEstimate(calls, x.oc.LogChunk)
+	_, total, err := holderCostEstimate(calls, x.oc.LogChunk, x.oc.HistoryChunk)
 	if err != nil {
 		return err
 	}
-	total += int64(v4 * holderV4SearchLogs)
+	headAtLeast := holderMaxEntryBlock(calls)
+	v4Logs := int64(v4) * holderV4SearchRequests(headAtLeast, x.oc.HistoryChunk)
+	total += v4Logs
 	at := time.Duration(float64(total) / float64(x.hc.RPS) * float64(time.Second))
-	fmt.Fprintf(x.log, "holder export (dry run): about %d eth_getLogs for %d calls (%d skipped before any read; %d without a posted age, estimated as new tokens), at least %s at %d requests/s (the other requests come on top); nothing read from the node, nothing written\n",
-		total, len(p.ThisRun), skipped, unknownAge, at.Round(time.Second), x.hc.RPS)
+	fmt.Fprintf(x.log, "holder export (dry run): about %d eth_getLogs for %d calls (%d skipped before any read; %d without a posted age, estimated as new tokens; the v4 pool searches of %d calls: at least %d, counted up to block %d, the largest entry block, as the head is not asked), at least %s at %d requests/s (the other requests come on top); nothing read from the node, nothing written\n",
+		total, len(p.ThisRun), skipped, unknownAge, v4, v4Logs, headAtLeast, at.Round(time.Second), x.hc.RPS)
 	return nil
 }
 
@@ -314,6 +321,7 @@ func holderRunSettings(hc holderExportConfig, oc onchainConfig, pc priceConfig, 
 		holdersMaxPriceLagSetting:  hc.MaxPriceLag.String(),
 		holdersMaxPauseSetting:     hc.MaxPause.String(),
 		rpcLogChunkSetting:         strconv.FormatUint(oc.LogChunk, 10),
+		rpcHistoryChunkSetting:     strconv.FormatUint(oc.HistoryChunk, 10),
 		latestRefreshRecentSetting: pc.LatestRecent.String(),
 		latestRefreshOldSetting:    pc.LatestOld.String(),
 		"export_holders_max":       strconv.Itoa(o.Max),

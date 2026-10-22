@@ -269,6 +269,9 @@ func (o *onchainSource) ponsGraduatedAt(ctx context.Context, curve string, block
 // for (split automatically, like any scan, when the node refuses a range or it
 // times out). They look for one rare event filtered by address and topics,
 // which a node with a full log index answers quickly over any range.
+// SCOUT_RPC_HISTORY_CHUNK, when lower (default 2M), caps it, and with that
+// cap on the searches fetch one range at a time; with it at 0 they fetch
+// SCOUT_RPC_PARALLEL ranges at once, as before (rpcClient.scanLimits).
 const ponsSearchChunk = 4_000_000
 
 // ponsSearchProgressEvery: a graduation search under a progress context (the

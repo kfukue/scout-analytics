@@ -257,11 +257,53 @@ func resolveExisting(p string) (string, error) {
 const holderBlocksPerSecond = 10
 
 // holderLogRequests is the reader's eth_getLogs count for one call (see the
-// top of holders_fetch.go): 1 + (1 + F) × (⌊postEnd/S⌋ − ⌊launch/S⌋ + 1),
-// with S the chunk size (> 0) and F the number of liquidity filters.
-func holderLogRequests(launch, postEnd, chunk uint64, filters int) int64 {
-	chunks := int64(postEnd/chunk-launch/chunk) + 1
-	return 1 + int64(1+filters)*chunks
+// top of holders_fetch.go): L + (1 + F) × (⌊postEnd/S⌋ − ⌊launch/S⌋ + 1),
+// with L the launch search's count (holderLaunchRequests), S the streams'
+// range size (holderStreamChunk, > 0) and F the number of liquidity filters.
+func holderLogRequests(launch, postEnd, chunk, histChunk uint64, filters int) int64 {
+	s := holderStreamChunk(chunk, histChunk)
+	chunks := int64(postEnd/s-launch/s) + 1
+	return holderLaunchRequests(launch, histChunk) + int64(1+filters)*chunks
+}
+
+// holderLaunchRequests is the launch search's eth_getLogs count when the
+// first mint is at block launch: the SCOUT_RPC_HISTORY_CHUNK ranges (ending on
+// multiples of histChunk) from block 1 up to the one holding the launch,
+// ⌊launch/histChunk⌋ + 1; histChunk 0 (no cap) = 1, one range over [1, entry].
+func holderLaunchRequests(launch, histChunk uint64) int64 {
+	if histChunk == 0 {
+		return 1
+	}
+	return int64(launch/histChunk) + 1
+}
+
+// holderV4SearchRequests is the eth_getLogs count of one v4 pool-id search
+// (holderV4PoolIDs) up to block head on a token not searched yet: each of the
+// holderV4SearchStreams searches reads blocks 1 to head in
+// SCOUT_RPC_HISTORY_CHUNK ranges (ending on multiples of histChunk), so
+// 2 × (⌊head/histChunk⌋ + 1); histChunk 0 (no cap) = 2, one range each.
+func holderV4SearchRequests(head, histChunk uint64) int64 {
+	return holderV4SearchStreams * holderLaunchRequests(head, histChunk)
+}
+
+// holderMaxEntryBlock is the largest entry block of calls (0 for none). Every
+// entry block is a block the chain had, so it is a lower bound for the head
+// the dry run does not ask.
+func holderMaxEntryBlock(calls []holderCostCall) uint64 {
+	var m uint64
+	for _, c := range calls {
+		m = max(m, c.EntryBlock)
+	}
+	return m
+}
+
+// holderStreamChunk is the streams' range size: SCOUT_RPC_LOG_CHUNK, bounded
+// by SCOUT_RPC_HISTORY_CHUNK when that is on and lower (rpcClient.scanLimits).
+func holderStreamChunk(chunk, histChunk uint64) uint64 {
+	if histChunk > 0 {
+		return min(chunk, histChunk)
+	}
+	return chunk
 }
 
 // holderLiquidityFilterCount is F for a call: the liquidity filters the
@@ -284,29 +326,30 @@ type holderCostCall struct {
 // holderCallCost estimates eth_getLogs for one call: launch = entry − age ×
 // holderBlocksPerSecond (at least block 1), postEnd = entry + holderPostWindow
 // × holderBlocksPerSecond. A token older than holderLookbackCap costs the
-// launch search only (1).
-func holderCallCost(c holderCostCall, chunk uint64) int64 {
-	if c.Age > holderLookbackCap {
-		return 1
-	}
+// launch search only (holderLaunchRequests: 1 with no history cap).
+func holderCallCost(c holderCostCall, chunk, histChunk uint64) int64 {
 	back := uint64(max(c.Age, 0).Seconds() * holderBlocksPerSecond)
 	launch := uint64(1)
 	if c.EntryBlock > back+1 {
 		launch = c.EntryBlock - back
 	}
+	if c.Age > holderLookbackCap {
+		return holderLaunchRequests(launch, histChunk)
+	}
 	postEnd := c.EntryBlock + uint64(holderPostWindow.Seconds()*holderBlocksPerSecond)
-	return holderLogRequests(launch, postEnd, chunk, c.Filters)
+	return holderLogRequests(launch, postEnd, chunk, histChunk, c.Filters)
 }
 
 // holderCostEstimate returns the estimate per call and the total. chunk is
-// the log chunk size (SCOUT_RPC_LOG_CHUNK); 0 is an error.
-func holderCostEstimate(calls []holderCostCall, chunk uint64) (perCall []int64, total int64, err error) {
+// the log chunk size (SCOUT_RPC_LOG_CHUNK; 0 is an error), histChunk the
+// history cap (SCOUT_RPC_HISTORY_CHUNK; 0 = no cap).
+func holderCostEstimate(calls []holderCostCall, chunk, histChunk uint64) (perCall []int64, total int64, err error) {
 	if chunk == 0 {
 		return nil, 0, errors.New("holder cost estimate: chunk size is 0")
 	}
 	perCall = make([]int64, len(calls))
 	for i, c := range calls {
-		perCall[i] = holderCallCost(c, chunk)
+		perCall[i] = holderCallCost(c, chunk, histChunk)
 		total += perCall[i]
 	}
 	return perCall, total, nil
