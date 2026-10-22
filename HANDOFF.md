@@ -1,8 +1,44 @@
 # Scout analytics: handoff to Claude Code
 
-## Session state (22 Oct 2026 PDT (22 Oct UTC): main f5f1412 after #42-#57)
+## Session state (22 Oct 2026 PDT (22 Oct UTC): main c0a3d5e after #42-#59)
 
 This section supersedes the ones below wherever they differ.
+
+**Update, 22 Oct 14:20 PDT (21:20 UTC): history cap live, tracker
+restarted; pilot next.**
+- Freshness query at 12:45 PDT (19:45 UTC) (owner): never refreshed 0. Young calls
+  (1,038, under 30 days): 442 refreshed in the last hour (about 7 a
+  minute; a 15 min pace needs about 70), median age 1h55m, p95 2h02m,
+  i.e. about 1h47m overdue at p95, just under the pilot's 2h
+  `SCOUT_HOLDERS_MAX_PRICE_LAG`. Old calls (about 3,800): median age
+  21h21m, p95 21h42m, not overdue under the 24h pace; so about half
+  were stamped 21 Oct 15:03-15:24 PDT (22:03-22:24 UTC) and come due
+  in the 20 minutes after about 22 Oct 15:03 PDT (22:03 UTC), the rest
+  over the following hours. At about 7 a minute that wave takes hours (the
+  pass takes young calls first), so the lag may pass 2h a few hours
+  later: run the 10-call pilot before it; the full run after it clears
+  (or the owner raises `SCOUT_HOLDERS_MAX_PRICE_LAG` for that run).
+- #58 merged 22 Oct 13:54 PDT (20:54 UTC); #59 merged. `-track`
+  restarted 14:12 PDT (21:12 UTC), same command as at 11:40. Start-up
+  lines confirm "whole-history searches one range at a time, of up to
+  2000000 blocks (SCOUT_RPC_HISTORY_CHUNK)", 1 range per scan, 12 in
+  flight, 300 req/s, latest 15m / 24h, 200 per cycle; 4 calls due (three
+  30-day checks of 22 Sep calls, one new call), none of the 20 parked.
+  Counts then: pending 1, tracking 1037, done 4166, no_pool 7, error 3,
+  gave_up 50, repeat 5486.
+- The server `.env` now has `SCOUT_LATEST_REFRESH_OLD=24h` and
+  `SCOUT_LATEST_BATCH=200` (owner, 22 Oct). This matters for the pilot:
+  `-export-holders` measures the price lag with its own settings, and
+  with the old 1h it would count every old call as about 20 h overdue
+  (the earlier 6h43m pause is consistent with this).
+- Next: the owner pastes the holder `-dry-run` output (check
+  `SCOUT_LATEST_REFRESH_OLD` 24h0m0s, `SCOUT_RPC_HISTORY_CHUNK` 2000000,
+  the capped estimate) and `grep -E "latest prices:|scanning blocks"
+  ~/scout-track.log | tail -20` (are passes faster with the cap); if
+  fine, `-export-holders-max 10` before 15:00 PDT (22:00 UTC). Give-up
+  rule still not answered. The stray start-up line `in base : <keys
+  folder>` (printed just before the database set-up line; source not
+  yet traced) is still to look into.
 
 **Update, 22 Oct 11:45 PDT (18:45 UTC): node unclogged, part 1.**
 - Morning checks (owner, read-only): latest prices worse than overnight
