@@ -1,8 +1,9 @@
 # One-off ops scripts (pgAdmin)
 
 > **Each folder's B may only be run once. Every folder marked DONE below has
-> had its B run: never run that B again. One folder is pending (20 Oct
-> 2026): `2026-10-20-price-rug-fill`, to run only after #49 is live.**
+> had its B run: never run that B again. One folder is pending (22 Oct
+> 2026): `2026-10-22-park-stuck-calls`, to run only with the tracker
+> stopped.**
 
 Each folder holds hand-run SQL scripts for pgAdmin (A = read-only count, B =
 the write, C = check, D/E = optional follow-ups, R = rollback: undoes a B
@@ -22,7 +23,8 @@ the database.
 | `2026-10-asset-chains-feeds`    | DONE (33 feeds)           | 7 Oct    | Seeds the Robinhood Chain stock tokens and Chainlink feeds into the main API database          | No (B again inserts nothing) |
 | `2026-10-usd-repair`            | DONE (50 calls + 1 nudge) | 7 Oct    | Re-tracks calls hurt by the old USD lookup (stuck in quote units or lost candle segments)      | No, never run B again |
 | `2026-10-07-liquidity-retrack`  | DONE (649 calls; 52 found rugged) | 7 Oct | Re-tracks the old Uniswap v4 calls (no v4 liquidity check, old USD lookup, old call-time block); cutoff 2026-10-06 12:53:00-07, `reset_at` 2026-10-07 12:18:38.004137-07 | No, never run B again |
-| `2026-10-20-price-rug-fill`     | pending: run only after #49 is live | -- | Gives past price-rule rugged calls `rug_at_kind = 'price'` and the tracker's approximate `rug_at` (owner decision A2); B saves a backup table, R restores from it | Yes, once (A first; STOP if A's "other, total" is not 29: rugged on-chain calls of any status, no rug block, last price at or above 5 % of the entry; 2 of them are `repeat` rows) |
+| `2026-10-20-price-rug-fill`     | DONE (719 calls filled; backup table kept until the owner drops it) | 21 Oct | Gives past price-rule rugged calls `rug_at_kind = 'price'` and the tracker's approximate `rug_at` (owner decision A2); B saves a backup table, R restores from it | No, never run B again |
+| `2026-10-22-park-stuck-calls`   | pending: run only with the tracker stopped | -- | Parks 20 stuck backfilled calls (status `error`, priority 1, retried forever) as `gave_up` so the tracker stops retrying them; B saves a backup table, R restores from it | Yes, once (A first; STOP if A's TOTAL is not 20 or a `check` row is not 0) |
 
 Not to be confused: `2026-10-pons-v4-retrack` (DONE, Pons V2 calls only) and
 `2026-10-07-liquidity-retrack` (DONE, the old Uniswap v4 calls).

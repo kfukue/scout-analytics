@@ -1,7 +1,6 @@
 # Rug times for past price-rule rugs (pgAdmin version)
 
-**Status: pending. Run only after #49 is live** (step 1). B runs once; R
-exists to undo it.
+**Status: DONE, 21 Oct 2026, 16:05 PDT (23:05 UTC): 719 calls filled; the backup table `scout_call_tracking_bak_price_rug_fill_20261020` stays until the owner drops it.** B ran once; R exists to undo it.
 
 > **One-off, October 2026.** Owner decision A2 (20 Oct 2026): a call the
 > tracker marked rugged only by the price rule (its last price strictly under
