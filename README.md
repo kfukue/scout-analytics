@@ -528,7 +528,7 @@ Only use the feature columns as model inputs; everything about the future is an 
 | `SCOUT_LATEST_REFRESH_RECENT` | `15m` | how often the latest price of a call younger than 30 days is read again (at least `1m`) |
 | `SCOUT_LATEST_REFRESH_OLD` | `24h` | the same for calls 30 days or older (at least `10m`) |
 | `SCOUT_LATEST_BATCH` | `200` | latest prices read per tracker cycle at most (1 – 10000) |
-| `SCOUT_LATEST_ROW_TIMEOUT` | `5m` | the longest the latest-price pass works on one call (at least `30s`; `0` = no limit). A call stopped there is left as it was, counts as failed in the `latest prices:` line ("stopped after the 5m0s row time limit") and is tried again after 30 minutes, so its worker goes on with other calls. The USD price of a quote asset is looked up for the whole pass and is not cut off by one call's limit |
+| `SCOUT_LATEST_ROW_TIMEOUT` | `5m` | the longest the latest-price pass works on one call (at least `30s`; `0` = no limit). A call stopped there is left as it was, counts as failed in the `latest prices:` line ("stopped after the 5m0s row time limit") and is tried again after 30 minutes, so its worker goes on with other calls. The USD price of a quote asset is looked up for the whole pass and is not cut off by one call's limit, so the end of a pass still waits for a lookup that is running (bounded only by the node client's own time-outs and retries) |
 | `SCOUT_HOLDERS_RPS` | `4` | holder export (`-export-holders`, below): requests per second of its own node client, which keeps one request in flight, reads one block range at a time and has no log cache, so it does not slow the tracker (1 – 20; `0` is refused) |
 | `SCOUT_HOLDERS_MAX_NODE_LAG` | `2m` | holder export: pause while the node's head block is older than this, or while the node does not answer (asked at most once every 30 s; `0` = check off) |
 | `SCOUT_HOLDERS_MAX_PRICE_LAG` | `2h` | holder export: pause while the tracker's latest-price pass is further behind than this (asked at most once a minute; `0` = check off) |
@@ -973,7 +973,11 @@ latest prices: 180 refreshed (12 changed) in 4.2s, 1,930 RPC requests, 5,430 wai
 The `latest prices:` line is printed once per pass that had something to do: `changed` =
 calls with a trade since their price before, `waiting` = calls still due. Failed calls are
 counted on the same line with the first error (`; 3 failed, tried again after 30m0s (first:
-call 812: …)`), not one line each. A pass that takes long says every 30 seconds how far it is.
+call 812: …)`), not one line each. A pass that takes long says every 30 seconds how far it is
+(`latest prices: 16 finished, 2 running (call 1234 for 21m30s, call 5678 for 9m), 18 handed
+out of 200 due, 22m30s elapsed, 606 RPC requests`): `due` = calls read for the pass, `handed
+out` = calls given to a worker so far (hand-out stops after `SCOUT_TRACK_INTERVAL`, at least a
+minute), and in brackets the (at most 3) calls running for a minute or more, oldest first.
 `repeat` = later calls of a token already called, which are not tracked (see above); tracking
 rows of update posts stored by an earlier version are in this number too. The `posts:` line
 appears only when rows without a `post_kind` were classified (once, after upgrading).
@@ -1005,6 +1009,10 @@ call 9163 [#137]: eth_getLogs blocks 52000000-52199999 (200000 blocks) refused a
 call 8120 [#112]: eth_getLogs blocks 31000000-31199999 (200000 blocks) timed out on the node (2 tries) (rpc error -32000: request timed out); this scan continues with 100000-block ranges (max 200000)
 call 9163 [#137]: eth_getLogs ranges back up to 200000 blocks (max 200000) after 3 answered ranges [also 4 range split(s) and 2 grow-back(s) in all scans since the last such line]
 ```
+
+In the latest-price pass these lines start with `latest call N:` (the call being refreshed)
+or, for the quote asset's USD lookup that the whole pass shares (Chainlink feed history,
+USD-pool searches), `latest quote <address> hour <YYYY-MM-DD HH:00 UTC>:`.
 
 The smaller size belongs to that one scan; other calls keep theirs and every new scan
 starts at the maximum. A node that rate limits or says it is busy gets the same range
