@@ -121,6 +121,11 @@ def check_export(ex: dict, features) -> None:
         raise Refused(f"{len(ids) - len(set(ids))} duplicate call_id value(s) in {ROWS_FILE}")
 
 
+def plain_groups(grp: pd.Series) -> pd.Series:
+    """The Q6 sort-prefixed labels ('1 dead7', ...) as the plain group; any other value unchanged."""
+    return grp.map(lambda g: C.HOLD_GROUP_LABELS.get(g, g))
+
+
 def load_ids(path) -> pd.DataFrame:
     p = Path(path)
     if not p.is_file():
@@ -134,9 +139,10 @@ def load_ids(path) -> pd.DataFrame:
     if missing:
         raise Refused(f"ids file lacks column(s) {missing}")
     ids = ids.apply(lambda s: s.str.strip())
+    ids["grp"] = plain_groups(ids["grp"])
     bad = int((~ids["grp"].isin(C.HOLD_GROUPS)).sum())
     if bad:
-        raise Refused(f"{bad} ids row(s) with grp outside {list(C.HOLD_GROUPS)}")
+        raise Refused(f"{bad} ids row(s) with grp outside {list(C.HOLD_GROUPS) + list(C.HOLD_GROUP_LABELS)}")
     cid = pd.to_numeric(ids["call_id"], errors="coerce")
     bad = cid.isna() | (cid % 1 != 0)
     if bad.any():

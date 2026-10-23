@@ -954,7 +954,9 @@ source of truth, read up to its last newline like the Go reader; `columns.json`;
 `runs.jsonl` for the failed-call count) and the owner's Q6 pilot ids CSV (`call_id,
 grp, week_utc, rn_week, rn, ca, kind, entry_at, entry_block, pool_address, pool_id,
 holders_at_call, age_s_at_call, max_gain_late_7d, ret_late_7d, tax_buy_pct,
-tax_sell_pct`; `grp` is `dead7`, `held2x7` or `neither`), joined on `call_id`.
+tax_sell_pct`; `grp` is `dead7`, `held2x7` or `neither`, or the Q6 query's sort-prefixed
+`1 dead7`, `2 held2x7` or `3 neither`, read as the plain group; quoted or not, surrounding
+spaces ignored; any other value, such as `2 dead7` or `Dead7`, is refused), joined on `call_id`.
 Defaults, from the repo root: `data/holders`, `data/holder_pilot_ids.csv`, and
 `data/holders_analysis` for the output. Each run writes a new folder
 `<out>/<YYYYMMDD-HHMM UTC>/` with `report.md` and `summary.json` (refused if it

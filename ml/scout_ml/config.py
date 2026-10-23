@@ -210,6 +210,9 @@ HOLD_NOT_FEATURES = ("transfers_post", "lp_events_post", "venues_post", "post_en
 # Holder pilot analysis (holders_report.py, scout_ml/holders.py; report only, no model).
 # The pilot sample is about 1/3 per group, not the natural base rates: AUC only.
 HOLD_GROUPS = ("dead7", "held2x7", "neither")
+# The Q6 query's sort-prefixed grp labels, also accepted in the ids file (exact forms only,
+# after trimming; owner, 23 Oct 2026) and read as the plain group.
+HOLD_GROUP_LABELS = {"1 dead7": "dead7", "2 held2x7": "held2x7", "3 neither": "neither"}
 HOLD_STOP_AUC_LOWER = 0.60     # pre-registered 19 Oct 2026 (HANDOFF.md, "Stop rules, fixed before P1")
 HOLD_STRATA_AUC_LOWER = 0.50   # the PM's reading of "the separation vanishes within strata"
 HOLD_MIN_CLASS_N = 30          # non-NULL rows per class for an AUC; analysable rows per group for a verdict

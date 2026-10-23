@@ -1,5 +1,6 @@
 """Holder pilot analysis (scout_ml/holders.py, holders_report.py): synthetic
 export and ids files only (make_synthetic.make_holder_pilot)."""
+import csv
 import json
 import re
 from datetime import datetime, timezone
@@ -121,6 +122,22 @@ def test_refuses_bad_ids(pilot, capsys, change, text):
     refused(pilot.write(), capsys, text)
 
 
+# Only the three exact Q6 forms are read as a group: a wrong number ('2 dead7' is held2x7's
+# number), another case, extra or missing spaces inside, or a prefix on an unknown name.
+@pytest.mark.parametrize("label", ["4 dead7", "Dead7", "2 dead7", "1 Dead7", "1  dead7", "1dead7",
+                                   "01 dead7", "1 dead7x", "4 other"])
+def test_refuses_grp_labels_other_than_the_accepted_forms(pilot, capsys, label):
+    first_value("grp", lambda ids: label)(pilot)
+    refused(pilot.write(), capsys, "1 ids row(s) with grp outside "
+            "['dead7', 'held2x7', 'neither', '1 dead7', '2 held2x7', '3 neither']")
+
+
+def test_q6_prefixed_labels_map_to_the_plain_groups():
+    assert C.HOLD_GROUP_LABELS == {"1 dead7": "dead7", "2 held2x7": "held2x7", "3 neither": "neither"}
+    got = H.plain_groups(pd.Series(["1 dead7", "2 held2x7", "3 neither", "dead7", "2 dead7", "Dead7"]))
+    assert got.tolist() == ["dead7", "held2x7", "neither", "dead7", "2 dead7", "Dead7"]
+
+
 @pytest.mark.parametrize("name", [H.ROWS_FILE, H.COLUMNS_FILE])
 def test_refuses_missing_export_file(pilot, capsys, name):
     (pilot.write().dir / name).unlink()
@@ -231,6 +248,37 @@ def test_end_to_end_writes_both_files_without_addresses(pilot, capsys):
     for text in ("NOT JUDGED conditions", "strata columns missing", f"fewer than {C.HOLD_MIN_CLASS_N} analysable rows",
                  "lower bound of the within-strata 95 % CI", "are the PM's reading"):
         assert text in header, text
+
+
+PREFIXED = {g: f"{n} {g}" for n, g in enumerate(C.HOLD_GROUPS, 1)}   # the Q6 query's labels
+
+
+def run_with_labels(tmp_path, made, name, label, quoted=False):
+    """report.md and summary.json (minus the ids file's hash) of a run whose ids grp values are
+    label(i, grp); quoted writes every ids value in double quotes, as a pgAdmin export may."""
+    p = Pilot(tmp_path / name, made).write()
+    p.ids = p.ids.assign(grp=[label(i, g) for i, g in enumerate(p.ids.grp)])
+    p.ids.to_csv(p.csv, index=False, quoting=csv.QUOTE_ALL if quoted else csv.QUOTE_MINIMAL)
+    assert p.main() == H.EXIT_OK
+    run = p.out / "20261021-0315"
+    s = json.loads((run / "summary.json").read_text(encoding="utf-8"))
+    del s["inputs"]["sha256"]["ids (ids.csv)"]
+    return (run / "report.md").read_text(encoding="utf-8"), s
+
+
+@pytest.mark.parametrize("name, label, quoted", [
+    ("prefixed", lambda i, g: PREFIXED[g], False),
+    ("prefixed_quoted", lambda i, g: PREFIXED[g], True),
+    ("padded_quoted", lambda i, g: f"  {PREFIXED[g]} ", True),
+    ("mixed", lambda i, g: PREFIXED[g] if i % 2 else g, False),
+])
+def test_q6_prefixed_labels_give_the_same_report_as_plain_labels(tmp_path, made, name, label, quoted):
+    assert PREFIXED == {"dead7": "1 dead7", "held2x7": "2 held2x7", "neither": "3 neither"}
+    plain = run_with_labels(tmp_path, made, "plain", lambda i, g: g)
+    got = run_with_labels(tmp_path, made, name, label, quoted)
+    assert got[0] == plain[0]
+    assert got[1] == plain[1]
+    assert got[1]["inputs"]["analysable_rows"] > 0
 
 
 def test_row_classes_counted_per_group(pilot):
