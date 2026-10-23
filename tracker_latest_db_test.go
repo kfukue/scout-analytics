@@ -843,7 +843,7 @@ func TestLatestPriceScheduling(t *testing.T) {
 }
 
 func TestLatestPriceConfig(t *testing.T) {
-	keys := []string{"SCOUT_LATEST_REFRESH", "SCOUT_LATEST_REFRESH_RECENT", "SCOUT_LATEST_REFRESH_OLD", "SCOUT_LATEST_BATCH"}
+	keys := []string{"SCOUT_LATEST_REFRESH", "SCOUT_LATEST_REFRESH_RECENT", "SCOUT_LATEST_REFRESH_OLD", "SCOUT_LATEST_BATCH", "SCOUT_LATEST_ROW_TIMEOUT"}
 	load := func(env map[string]string) (priceConfig, error) {
 		for _, k := range keys {
 			t.Setenv(k, env[k])
@@ -851,8 +851,15 @@ func TestLatestPriceConfig(t *testing.T) {
 		return loadPriceConfig()
 	}
 	pc, err := load(nil)
-	if err != nil || !pc.LatestOn || pc.LatestRecent != 15*time.Minute || pc.LatestOld != 24*time.Hour || pc.LatestBatch != 200 {
+	if err != nil || !pc.LatestOn || pc.LatestRecent != 15*time.Minute || pc.LatestOld != 24*time.Hour || pc.LatestBatch != 200 ||
+		pc.LatestRowTimeout != 5*time.Minute {
 		t.Fatalf("defaults: %+v %v", pc, err)
+	}
+	// SCOUT_LATEST_ROW_TIMEOUT: any duration of zero = no limit; otherwise at least 30s.
+	for v, want := range map[string]time.Duration{"0": 0, " 0 ": 0, "0s": 0, "0m": 0, "30s": 30 * time.Second, "2m": 2 * time.Minute, "1h": time.Hour} {
+		if pc, err := load(map[string]string{"SCOUT_LATEST_ROW_TIMEOUT": v}); err != nil || pc.LatestRowTimeout != want {
+			t.Errorf("SCOUT_LATEST_ROW_TIMEOUT=%q: got %s, %v; want %s, nil", v, pc.LatestRowTimeout, err, want)
+		}
 	}
 	pc, err = load(map[string]string{"SCOUT_LATEST_REFRESH": "on", "SCOUT_LATEST_REFRESH_RECENT": "1m", "SCOUT_LATEST_REFRESH_OLD": "10m", "SCOUT_LATEST_BATCH": "50"})
 	if err != nil || !pc.LatestOn || pc.LatestRecent != time.Minute || pc.LatestOld != 10*time.Minute || pc.LatestBatch != 50 {
@@ -875,6 +882,10 @@ func TestLatestPriceConfig(t *testing.T) {
 		{"SCOUT_LATEST_BATCH": "-5"},
 		{"SCOUT_LATEST_BATCH": "many"},
 		{"SCOUT_LATEST_BATCH": "10001"},
+		{"SCOUT_LATEST_ROW_TIMEOUT": "29s"},
+		{"SCOUT_LATEST_ROW_TIMEOUT": "-1m"},
+		{"SCOUT_LATEST_ROW_TIMEOUT": "soon"},
+		{"SCOUT_LATEST_ROW_TIMEOUT": "300"},
 	} {
 		if _, err := load(bad); err == nil {
 			t.Errorf("%v: no error", bad)
@@ -882,6 +893,9 @@ func TestLatestPriceConfig(t *testing.T) {
 			for k := range bad {
 				if !strings.Contains(err.Error(), k) {
 					t.Errorf("%v: the error does not name the setting: %v", bad, err)
+				}
+				if k == "SCOUT_LATEST_ROW_TIMEOUT" && !strings.Contains(err.Error(), "0 = no limit") {
+					t.Errorf("%v: the error does not say how to turn the limit off (0 = no limit): %v", bad, err)
 				}
 			}
 		}
@@ -968,10 +982,12 @@ func TestLatestPriceInterruptedLeavesRowUntouched(t *testing.T) {
 	if err != nil || len(rows) != 1 {
 		t.Fatalf("due: %d %v", len(rows), err)
 	}
-	quotes := &latestQuotes{o: s.onchain, hour: time.Now().Unix() / 3600 * 3600, m: map[string]*latestQuote{}}
+	var lookups sync.WaitGroup
+	quotes := newLatestQuotes(cctx, s.onchain, time.Now().Unix()/3600*3600, &lookups)
 	if _, err := s.latestOne(cctx, &rows[0], f.head(), time.Now(), quotes); err == nil || whole() != before {
 		t.Fatalf("one row on a stopped run: err %v", err)
 	}
+	lookups.Wait()
 	// the next run picks it up
 	if res := s.refreshLatest(ctx, false); res.Refreshed != 1 || res.Changed != 1 {
 		t.Fatalf("pass after the restart: %+v", res)

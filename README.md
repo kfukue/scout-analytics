@@ -528,6 +528,7 @@ Only use the feature columns as model inputs; everything about the future is an 
 | `SCOUT_LATEST_REFRESH_RECENT` | `15m` | how often the latest price of a call younger than 30 days is read again (at least `1m`) |
 | `SCOUT_LATEST_REFRESH_OLD` | `24h` | the same for calls 30 days or older (at least `10m`) |
 | `SCOUT_LATEST_BATCH` | `200` | latest prices read per tracker cycle at most (1 – 10000) |
+| `SCOUT_LATEST_ROW_TIMEOUT` | `5m` | the longest the latest-price pass works on one call (at least `30s`; `0` = no limit). A call stopped there is left as it was, counts as failed in the `latest prices:` line ("stopped after the 5m0s row time limit") and is tried again after 30 minutes, so its worker goes on with other calls. The USD price of a quote asset is looked up for the whole pass and is not cut off by one call's limit |
 | `SCOUT_HOLDERS_RPS` | `4` | holder export (`-export-holders`, below): requests per second of its own node client, which keeps one request in flight, reads one block range at a time and has no log cache, so it does not slow the tracker (1 – 20; `0` is refused) |
 | `SCOUT_HOLDERS_MAX_NODE_LAG` | `2m` | holder export: pause while the node's head block is older than this, or while the node does not answer (asked at most once every 30 s; `0` = check off) |
 | `SCOUT_HOLDERS_MAX_PRICE_LAG` | `2h` | holder export: pause while the tracker's latest-price pass is further behind than this (asked at most once a minute; `0` = check off) |
@@ -931,8 +932,9 @@ not refreshed for the longest. Horizon work always goes first:
   stays due and follows after the next horizon check;
 - `-track-once` runs one pass after the horizon checks.
 
-A call whose refresh fails (node error, no USD price for its quote asset) is left as it was
-and tried again after 30 minutes. Ctrl+C in the middle leaves the calls it was working on
+A call whose refresh fails (node error, no USD price for its quote asset, or more than
+`SCOUT_LATEST_ROW_TIMEOUT`, 5 minutes, spent on it) is left as it was and tried again after
+30 minutes. Ctrl+C in the middle leaves the calls it was working on
 untouched. `SCOUT_LATEST_REFRESH=off` turns the whole pass off; the columns then keep their
 last values.
 

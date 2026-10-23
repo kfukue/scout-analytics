@@ -1317,8 +1317,8 @@ func (c *rpcClient) fetchLogs(ctx context.Context, address string, topics []any,
 			case <-ctx.Done():
 				return nil, false, ctx.Err()
 			}
-			if fl.err != nil && isCanceled(fl.err) && ctx.Err() == nil {
-				continue // the asker was interrupted, we were not: ask ourselves
+			if fl.err != nil && fl.askerStopped && ctx.Err() == nil {
+				continue // the asker's own context ended (Ctrl+C, a row's time limit), ours did not: ask ourselves
 			}
 			return fl.logs, false, fl.err
 		}
@@ -1335,7 +1335,7 @@ func (c *rpcClient) fetchLogs(ctx context.Context, address string, topics []any,
 				c.logs.put(key, logs)
 			}
 		}
-		fl.logs, fl.err = logs, err
+		fl.logs, fl.err, fl.askerStopped = logs, err, ctx.Err() != nil
 		c.sfMu.Lock()
 		delete(c.sf, fkey)
 		c.sfMu.Unlock()
@@ -1344,15 +1344,21 @@ func (c *rpcClient) fetchLogs(ctx context.Context, address string, topics []any,
 	}
 }
 
-// logFlight is one eth_getLogs request that other scans are waiting on too.
+// logFlight is one eth_getLogs request that other scans are waiting on too;
+// done is closed once logs, err and askerStopped are set.
+//
+// askerStopped: the context of the scan that sent the request had ended
+// (cancelled, or past its own deadline, such as a latest-price row's time
+// limit) when the request finished. Its error is then that scan's, not the
+// node's, and a waiting scan whose context is still alive asks again itself.
+// It is read from the asker's context, not from the error: the client's own
+// time limit (http.Client.Timeout) also reports context.DeadlineExceeded, and
+// that one is shared with the waiters as the node's answer.
 type logFlight struct {
-	done chan struct{}
-	logs []rpcLog
-	err  error
-}
-
-func isCanceled(err error) bool {
-	return errors.Is(err, context.Canceled)
+	done         chan struct{}
+	logs         []rpcLog
+	err          error
+	askerStopped bool
 }
 
 // Progress reporting for long log scans (a 30-day window is ~26M blocks).

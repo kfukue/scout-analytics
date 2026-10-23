@@ -52,6 +52,12 @@ const (
 	latestStateKeyRugLiq = "rug_liq_usd" // onchainState.RugLiquidityUSD
 )
 
+// The time limit of one row of the pass (SCOUT_LATEST_ROW_TIMEOUT; 0 = no limit).
+const (
+	defaultLatestRowTimeout = 5 * time.Minute
+	minLatestRowTimeout     = 30 * time.Second
+)
+
 // A Pons V2 graduation the pass finds is stored as well (onchainState fields),
 // so the horizon scan and later passes follow the token to its v4 pool.
 const (
@@ -96,6 +102,7 @@ var latestRetryAfter = 30 * time.Minute
 // loadLatestConfig reads the settings of the latest-price pass.
 func (pc *priceConfig) loadLatestConfig() error {
 	pc.LatestOn, pc.LatestRecent, pc.LatestOld, pc.LatestBatch = true, defaultLatestRecent, defaultLatestOld, defaultLatestBatch
+	pc.LatestRowTimeout = defaultLatestRowTimeout
 	switch v := strings.ToLower(strings.TrimSpace(os.Getenv("SCOUT_LATEST_REFRESH"))); v {
 	case "", "on", "1", "true", "yes", "y":
 	case "off", "0", "false", "no", "n":
@@ -124,6 +131,11 @@ func (pc *priceConfig) loadLatestConfig() error {
 	if err := dur("SCOUT_LATEST_REFRESH_OLD", &pc.LatestOld, minLatestOld); err != nil {
 		return err
 	}
+	rowLimit, err := loadLatestRowTimeout()
+	if err != nil {
+		return err
+	}
+	pc.LatestRowTimeout = rowLimit
 	if v := env("SCOUT_LATEST_BATCH", ""); v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil || n < 1 || n > maxLatestBatch {
@@ -132,6 +144,27 @@ func (pc *priceConfig) loadLatestConfig() error {
 		pc.LatestBatch = n
 	}
 	return nil
+}
+
+// loadLatestRowTimeout reads SCOUT_LATEST_ROW_TIMEOUT: unset = the default;
+// any duration of zero ("0", "0s", "0m") = no limit; otherwise at least
+// minLatestRowTimeout.
+func loadLatestRowTimeout() (time.Duration, error) {
+	v := env(latestRowTimeoutSetting, "")
+	if v == "" {
+		return defaultLatestRowTimeout, nil
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil {
+		return 0, fmt.Errorf("%s=%q is not a duration (for example 5m; 0 = no limit)", latestRowTimeoutSetting, v)
+	}
+	if d == 0 {
+		return 0, nil
+	}
+	if d < minLatestRowTimeout {
+		return 0, fmt.Errorf("%s=%s is below the minimum of %s (0 = no limit)", latestRowTimeoutSetting, v, minLatestRowTimeout)
+	}
+	return d, nil
 }
 
 // latestStats is the outcome of one pass.
@@ -148,31 +181,75 @@ type latestStats struct {
 
 // latestQuotes gives the USD price of a quote asset for one pass: the cached
 // price at the start of the current hour, looked up once however many rows and
-// workers ask for it.
+// workers ask for it. The lookup runs under the pass's context, so one row's
+// time limit never cuts it off; a row waits for it only as long as its own
+// context allows. Prices and errors are kept for the pass, so the other rows
+// of a quote whose lookup failed fail fast instead of each asking again. The
+// one exception: a lookup that returns while the pass's context is done
+// (Ctrl+C, shutdown) is not kept, and the next row starts it again. That is
+// read from the pass's context, not from the error: the HTTP client's own time
+// limit (http.Client.Timeout) also reports context.DeadlineExceeded, and that
+// one is the node not answering, kept like any other error.
 type latestQuotes struct {
-	o    *onchainSource
-	hour int64
-	mu   sync.Mutex
-	m    map[string]*latestQuote
+	lookup    func(quote string) (float64, error) // runs under the pass's context
+	passEnded func() bool                         // reports whether the pass's context is done
+	wg        *sync.WaitGroup                     // owns the lookups in flight (the run's aux group)
+	mu        sync.Mutex
+	m         map[string]*latestQuote
 }
 
+// latestQuote is one quote asset's lookup: done is closed once q and err are set.
 type latestQuote struct {
-	once sync.Once
+	done chan struct{}
 	q    float64
 	err  error
 }
 
+// newLatestQuotes: the quote prices of one pass, as of hour, looked up under
+// the pass's context ctx; wg is told about every lookup in flight.
+func newLatestQuotes(ctx context.Context, o *onchainSource, hour int64, wg *sync.WaitGroup) *latestQuotes {
+	return &latestQuotes{
+		lookup:    func(quote string) (float64, error) { return o.quoteUSDHour(ctx, quote, hour) },
+		passEnded: func() bool { return ctx.Err() != nil },
+		wg:        wg,
+		m:         map[string]*latestQuote{},
+	}
+}
+
+// usd waits for the quote's price, or until ctx (the row's) is done.
 func (lq *latestQuotes) usd(ctx context.Context, quote string) (float64, error) {
+	e := lq.flight(quote)
+	select {
+	case <-e.done:
+		return e.q, e.err
+	case <-ctx.Done():
+		return 0, ctx.Err()
+	}
+}
+
+// flight returns the quote's lookup, kept or in flight, and starts one when
+// there is none.
+func (lq *latestQuotes) flight(quote string) *latestQuote {
 	key := strings.ToLower(quote)
 	lq.mu.Lock()
-	e := lq.m[key]
-	if e == nil {
-		e = &latestQuote{}
-		lq.m[key] = e
+	defer lq.mu.Unlock()
+	if e := lq.m[key]; e != nil {
+		return e
 	}
-	lq.mu.Unlock()
-	e.once.Do(func() { e.q, e.err = lq.o.quoteUSDHour(ctx, quote, lq.hour) })
-	return e.q, e.err
+	e := &latestQuote{done: make(chan struct{})}
+	lq.m[key] = e
+	lq.wg.Add(1)
+	go func() {
+		defer lq.wg.Done()
+		e.q, e.err = lq.lookup(quote)
+		if e.err != nil && lq.passEnded() {
+			lq.mu.Lock()
+			delete(lq.m, key) // stopped by the pass's end, not the node: the next row asks again
+			lq.mu.Unlock()
+		}
+		close(e.done)
+	}()
+	return e
 }
 
 // latestSkip returns the call ids that failed less than latestRetryAfter ago
@@ -198,6 +275,33 @@ func (s *scanner) latestFailed(id int, now time.Time) {
 		s.latestRetry = map[int]time.Time{}
 	}
 	s.latestRetry[id] = now.Add(latestRetryAfter)
+}
+
+// latestRowContext is the context one row of the pass runs under: the pass's
+// ctx, ended after limit (SCOUT_LATEST_ROW_TIMEOUT) when limit is above 0.
+func latestRowContext(ctx context.Context, limit time.Duration) (context.Context, context.CancelFunc) {
+	if limit <= 0 {
+		return ctx, func() {}
+	}
+	return context.WithTimeout(ctx, limit)
+}
+
+// latestRowError says so in err when the row's time limit stopped the row
+// (rowCtx from latestRowContext with limit). Other errors, and nil, are
+// returned as they are.
+func latestRowError(rowCtx context.Context, limit time.Duration, err error) error {
+	if err == nil || limit <= 0 || !errors.Is(rowCtx.Err(), context.DeadlineExceeded) {
+		return err
+	}
+	return fmt.Errorf("latest price: stopped after the %s row time limit (%s): %w", limit, latestRowTimeoutSetting, err)
+}
+
+// latestRowLimitText describes the row time limit for the start-up line.
+func latestRowLimitText(limit time.Duration) string {
+	if limit <= 0 {
+		return fmt.Sprintf("no time limit per call (%s=0)", latestRowTimeoutSetting)
+	}
+	return fmt.Sprintf("each call stopped after %s (%s)", limit, latestRowTimeoutSetting)
 }
 
 // refreshLatest runs one latest-price pass on its own (see trackRun.latest)
@@ -283,7 +387,8 @@ func (r *trackRun) latest(ctx context.Context, recentOnly bool) <-chan latestSta
 		return out
 	}
 	readAt := time.Now().UTC()
-	quotes := &latestQuotes{o: o, hour: readAt.Unix() - readAt.Unix()%3600, m: map[string]*latestQuote{}}
+	quotes := newLatestQuotes(ctx, o, readAt.Unix()-readAt.Unix()%3600, &r.aux)
+	rowLimit := s.pc.LatestRowTimeout
 
 	// Horizon tracking comes first: a pass that runs long (the first one reads
 	// weeks of blocks per token) hands out no new rows once a tracker interval
@@ -327,7 +432,10 @@ func (r *trackRun) latest(ctx context.Context, recentOnly bool) <-chan latestSta
 		pass.Add(1)
 		r.jobs <- trackJob{id: t.CallID, run: func() {
 			defer pass.Done()
-			ch, err := s.latestOne(ctx, t, head, readAt, quotes)
+			rowCtx, cancel := latestRowContext(ctx, rowLimit)
+			ch, err := s.latestOne(rowCtx, t, head, readAt, quotes)
+			err = latestRowError(rowCtx, rowLimit, err)
+			cancel()
 			done.Add(1)
 			switch {
 			case err == nil:
@@ -335,7 +443,7 @@ func (r *trackRun) latest(ctx context.Context, recentOnly bool) <-chan latestSta
 				if ch {
 					changed.Add(1)
 				}
-			case ctx.Err() != nil:
+			case ctx.Err() != nil: // the pass's context, not rowCtx: a row stopped by its time limit is a failure
 				// Ctrl+C / shutdown: the row is as it was; not a failure
 			default:
 				failed.Add(1)
