@@ -193,7 +193,9 @@ that last block, so the answer does not depend on what earlier lookups cached.
      WETH/ETH or a stablecoin count. No `Initialize` = no v4 pool: nothing else is asked.
      The PoolManager's swaps are never read unfiltered (that is every v4 trade on the chain,
      tens of thousands of logs per window). The pools found are kept in memory per token, so
-     a later lookup only reads the new blocks.
+     a later lookup only reads the new blocks. A search that fails part-way keeps, for each of
+     its two searches, the ranges the node answered in full (not the last 1,000 blocks) and the
+     pools found there, and the next lookup goes on from there.
    - **Node load per discovery:** the token's `Transfer`s around the call (widened ×4, ×16, ×64
      while there are none; only these are widened), a few `eth_call`s per v2/v3 candidate,
      and for v4 the 2 `Initialize` requests plus about 1 `Swap` request per 32 candidate pools
