@@ -1982,10 +1982,14 @@ type v4Pool struct {
 	block       uint64 // the Initialize block: the pool's creation
 }
 
-// v4TokenPools: every v4 pool of one token initialised in blocks [1, through].
+// v4TokenPools: the v4 pools of one token found so far, in the order found.
+// through[s]: the last block search s of v4PoolsOf (0: the token as
+// currency0, 1: as currency1) has read in full (0 = none): every pool
+// initialised in blocks [1, through[s]] with the token on that side is in
+// pools.
 type v4TokenPools struct {
 	pools   []v4Pool
-	through uint64
+	through [2]uint64
 }
 
 // v4PoolOfInit decodes an Initialize log (false when it is not one).
@@ -2014,50 +2018,17 @@ func v4PoolOfInit(l rpcLog) (v4Pool, bool) {
 // and indexed topics, which a node with a full log index answers quickly over
 // long ranges: each in ranges of up to SCOUT_RPC_HISTORY_CHUNK blocks, one at
 // a time (split automatically if the node refuses a range or times out).
-// What was searched is kept per token, so a later search only reads the new
-// blocks.
+// What was searched is kept per token and per search, so a later search only
+// reads the new blocks, and a failed one goes on from where it stopped.
 func (o *onchainSource) v4PoolsOf(ctx context.Context, token string, to uint64) ([]v4Pool, error) {
-	o.mu.Lock()
-	known := o.v4Pools[token]
-	var pools []v4Pool
-	from := uint64(1)
-	if known != nil {
-		pools = slices.Clone(known.pools)
-		from = known.through + 1
-	}
-	o.mu.Unlock()
-	if from <= to {
-		seen := map[string]bool{}
-		for _, p := range pools {
-			seen[p.id] = true
+	pools, through := o.v4PoolsKnown(token)
+	if through[0] < to || through[1] < to {
+		var err error
+		pools, through, err = o.searchV4Pools(ctx, token, to, pools, through)
+		o.saveV4Pools(token, pools, through)
+		if err != nil {
+			return nil, err
 		}
-		for _, topics := range [][]any{
-			{topicInitV4, nil, addrTopic(token)},      // token = currency0
-			{topicInitV4, nil, nil, addrTopic(token)}, // token = currency1
-		} {
-			// No ceiling of its own (above to): ranges of SCOUT_RPC_HISTORY_CHUNK
-			// (one range for the whole span when that is 0).
-			err := o.rpc.getLogsChunkedUpTo(ctx, o.cfg.PoolManagerV4, topics, from, to, to+1, func(l rpcLog) {
-				if p, ok := v4PoolOfInit(l); ok && !seen[p.id] && (p.c0 == token || p.c1 == token) {
-					seen[p.id] = true
-					pools = append(pools, p)
-				}
-			})
-			if err != nil {
-				return nil, fmt.Errorf("v4 pools of %s (Initialize in blocks %d-%d): %w", token, from, to, err)
-			}
-		}
-		// Only settled history counts as searched: blocks near the chain's tip are
-		// read again next time (a pool found there twice is kept once).
-		through := to
-		if h := o.rpc.head.Load(); h > 1000 && through > h-1000 {
-			through = h - 1000
-		}
-		o.mu.Lock()
-		if cur := o.v4Pools[token]; cur == nil || cur.through < through {
-			o.v4Pools[token] = &v4TokenPools{pools: pools, through: through}
-		}
-		o.mu.Unlock()
 	}
 	out := make([]v4Pool, 0, len(pools))
 	for _, p := range pools {
@@ -2066,6 +2037,96 @@ func (o *onchainSource) v4PoolsOf(ctx context.Context, token string, to uint64) 
 		}
 	}
 	return out, nil
+}
+
+// v4PoolsKnown: a copy of the token's pools found so far and how far each
+// Initialize search has read (zero: none).
+func (o *onchainSource) v4PoolsKnown(token string) ([]v4Pool, [2]uint64) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	known := o.v4Pools[token]
+	if known == nil {
+		return nil, [2]uint64{}
+	}
+	return slices.Clone(known.pools), known.through
+}
+
+// searchV4Pools runs the Initialize search of each side not read through to
+// yet, from the block after its through, and stops at the first that fails.
+// It returns pools with the new ones appended and how far each side is read
+// now: to for a search that ended, the last range answered in full for one
+// that failed (withScanReached), unchanged for one not run.
+func (o *onchainSource) searchV4Pools(ctx context.Context, token string, to uint64, pools []v4Pool, through [2]uint64) ([]v4Pool, [2]uint64, error) {
+	seen := map[string]bool{}
+	for _, p := range pools {
+		seen[p.id] = true
+	}
+	var reached [2]uint64 // how far each search of this try got (0: no range)
+	var err error
+	for s, topics := range [][]any{
+		{topicInitV4, nil, addrTopic(token)},      // token = currency0
+		{topicInitV4, nil, nil, addrTopic(token)}, // token = currency1
+	} {
+		from := through[s] + 1
+		if from > to {
+			continue
+		}
+		sctx, got := withScanReached(ctx)
+		// No ceiling of its own (above to): ranges of SCOUT_RPC_HISTORY_CHUNK
+		// (one range for the whole span when that is 0).
+		err = o.rpc.getLogsChunkedUpTo(sctx, o.cfg.PoolManagerV4, topics, from, to, to+1, func(l rpcLog) {
+			if p, ok := v4PoolOfInit(l); ok && !seen[p.id] && (p.c0 == token || p.c1 == token) {
+				seen[p.id] = true
+				pools = append(pools, p)
+			}
+		})
+		if err != nil {
+			reached[s] = *got
+			err = fmt.Errorf("v4 pools of %s (Initialize in blocks %d-%d): %w", token, from, to, err)
+			break
+		}
+		reached[s] = to
+	}
+	// Only settled history counts as searched: blocks near the chain's tip are
+	// read again next time (a pool found there twice is kept once).
+	settled := to
+	if h := o.rpc.head.Load(); h > 1000 && settled > h-1000 {
+		settled = h - 1000
+	}
+	for s := range through {
+		through[s] = max(through[s], min(reached[s], settled))
+	}
+	return pools, through, err
+}
+
+// saveV4Pools merges one try's pools and progress into the token's record
+// (the furthest through of each side; the record's pools, then this try's new
+// ones), so concurrent tries of one token each keep what they found. A try
+// that read no block (through zero) keeps nothing.
+func (o *onchainSource) saveV4Pools(token string, pools []v4Pool, through [2]uint64) {
+	if through == [2]uint64{} {
+		return
+	}
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	cur := o.v4Pools[token]
+	if cur == nil {
+		o.v4Pools[token] = &v4TokenPools{pools: pools, through: through}
+		return
+	}
+	merged := slices.Clone(cur.pools)
+	have := make(map[string]bool, len(merged))
+	for _, p := range merged {
+		have[p.id] = true
+	}
+	for _, p := range pools {
+		if !have[p.id] {
+			have[p.id] = true
+			merged = append(merged, p)
+		}
+	}
+	o.v4Pools[token] = &v4TokenPools{pools: merged,
+		through: [2]uint64{max(cur.through[0], through[0]), max(cur.through[1], through[1])}}
 }
 
 // v4SwapIDBatch: pool ids asked for in one Swap filter (topic 1 as a list).

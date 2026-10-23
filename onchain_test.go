@@ -57,6 +57,9 @@ type fakeChain struct {
 	// f.mu held, possibly from several requests at once.
 	logsHook func(addr string, from, to uint64) string
 	fullNode bool // no historical state: eth_call at old blocks fails
+	// logsQueryHook (optional): logsHook with the request's topics too, asked
+	// after it (setLogsQueryHook).
+	logsQueryHook func(q fakeLogQuery) string
 	// stateFrom (with fullNode): the oldest block whose state the node still
 	// keeps for eth_call and eth_getBalance (0 = none but latest), like a full node holding
 	// recent state; balanceErr (optional): eth_getBalance answers this error.
@@ -157,6 +160,12 @@ func (f *fakeChain) setLogsHook(h func(addr string, from, to uint64) string) {
 	f.mu.Unlock()
 }
 
+func (f *fakeChain) setLogsQueryHook(h func(q fakeLogQuery) string) {
+	f.mu.Lock()
+	f.logsQueryHook = h
+	f.mu.Unlock()
+}
+
 // blockAtTime: the last block with timestamp <= ts.
 func (f *fakeChain) blockAtTime(ts time.Time) uint64 { return uint64(ts.Unix()-f.t0)*10 + 10 }
 
@@ -168,14 +177,24 @@ func (f *fakeChain) serve(w http.ResponseWriter, r *http.Request) {
 	}
 	json.NewDecoder(r.Body).Decode(&req)
 	f.mu.Lock()
-	hook := f.logsHook
+	hook, qhook := f.logsHook, f.logsQueryHook
 	f.mu.Unlock()
-	if req.Method == "eth_getLogs" && hook != nil && len(req.Params) == 1 {
-		var q struct{ Address, FromBlock, ToBlock string }
+	if req.Method == "eth_getLogs" && (hook != nil || qhook != nil) && len(req.Params) == 1 {
+		var q struct {
+			Address, FromBlock, ToBlock string
+			Topics                      []any
+		}
 		json.Unmarshal(req.Params[0], &q)
 		from, _ := strconv.ParseUint(strings.TrimPrefix(q.FromBlock, "0x"), 16, 64)
 		to, _ := strconv.ParseUint(strings.TrimPrefix(q.ToBlock, "0x"), 16, 64)
-		if msg := hook(strings.ToLower(q.Address), from, to); msg != "" {
+		msg := ""
+		if hook != nil {
+			msg = hook(strings.ToLower(q.Address), from, to)
+		}
+		if msg == "" && qhook != nil {
+			msg = qhook(fakeLogQuery{addr: strings.ToLower(q.Address), topics: q.Topics, from: from, to: to})
+		}
+		if msg != "" {
 			json.NewEncoder(w).Encode(map[string]any{"jsonrpc": "2.0", "id": req.ID, "error": map[string]any{"code": -32000, "message": msg}})
 			return
 		}
