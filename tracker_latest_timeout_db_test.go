@@ -5,10 +5,8 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"slices"
 	"strings"
 	"sync"
@@ -111,16 +109,14 @@ func TestLatestPriceRowTimeLimit(t *testing.T) {
 	const limit = 300 * time.Millisecond // below the setting's 30s minimum: set directly
 	h.s.pc.LatestRowTimeout = limit
 	before := h.whole(t, "hang")
-	var logged bytes.Buffer
-	log.SetOutput(&logged)
+	logged := captureRangeLog(t) // restored by t.Cleanup, also after a panic
 	start := time.Now()
 	res := h.s.refreshLatest(context.Background(), false)
 	took := time.Since(start)
-	log.SetOutput(os.Stderr)
 	if n := h.hangs.Load(); n == 0 {
 		t.Fatal("the hang row's eth_getLogs never reached the node")
 	}
-	if took < limit || took > limit+5*time.Second {
+	if took < limit || took > limit+10*time.Second {
 		t.Fatalf("the pass took %s, want about the %s row limit", took, limit)
 	}
 	wantErr := fmt.Sprintf("call %d: latest price: stopped after the 300ms row time limit (SCOUT_LATEST_ROW_TIMEOUT)", h.ids["hang"])

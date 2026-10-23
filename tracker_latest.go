@@ -1,12 +1,14 @@
 package main
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -41,7 +43,6 @@ const (
 	minLatestOld         = 10 * time.Minute
 	defaultLatestBatch   = 200
 	maxLatestBatch       = 10000
-	latestProgressEvery  = 30 * time.Second // a pass still running says so this often
 	latestSaveTimeout    = 10 * time.Second
 	latestMaxErrTextLen  = 300
 	latestMinPassBudget  = time.Minute
@@ -51,6 +52,16 @@ const (
 	latestStateKeyRug    = "rug_block"   // onchainState.RugBlock, when the pass finds the rug
 	latestStateKeyRugLiq = "rug_liq_usd" // onchainState.RugLiquidityUSD
 )
+
+// The progress line of a pass still running (latestProgressLine) is printed
+// every latestProgressEvery; rows running for latestSlowRowAfter or longer are
+// named on it, the oldest latestProgressMaxIDs of them. Variables for the tests.
+var (
+	latestProgressEvery = 30 * time.Second
+	latestSlowRowAfter  = time.Minute
+)
+
+const latestProgressMaxIDs = 3
 
 // The time limit of one row of the pass (SCOUT_LATEST_ROW_TIMEOUT; 0 = no limit).
 const (
@@ -206,10 +217,13 @@ type latestQuote struct {
 }
 
 // newLatestQuotes: the quote prices of one pass, as of hour, looked up under
-// the pass's context ctx; wg is told about every lookup in flight.
+// the pass's context ctx (with the lookup's own scan label, latestQuoteLabel);
+// wg is told about every lookup in flight.
 func newLatestQuotes(ctx context.Context, o *onchainSource, hour int64, wg *sync.WaitGroup) *latestQuotes {
 	return &latestQuotes{
-		lookup:    func(quote string) (float64, error) { return o.quoteUSDHour(ctx, quote, hour) },
+		lookup: func(quote string) (float64, error) {
+			return o.quoteUSDHour(withScanLabel(ctx, latestQuoteLabel(quote, hour)), quote, hour)
+		},
 		passEnded: func() bool { return ctx.Err() != nil },
 		wg:        wg,
 		m:         map[string]*latestQuote{},
@@ -250,6 +264,112 @@ func (lq *latestQuotes) flight(quote string) *latestQuote {
 		close(e.done)
 	}()
 	return e
+}
+
+// latestRowLabel names one row of the pass in the log lines of its scans
+// (range splits, time-outs, grow-backs).
+func latestRowLabel(callID int) string {
+	return fmt.Sprintf("latest call %d", callID)
+}
+
+// latestQuoteLabel names a quote asset's USD lookup (latestQuotes) in the log
+// lines of its scans. The lookup runs for the whole pass, not for one row, so
+// it is named after the quote and the hour (hour: unix seconds, printed as
+// the UTC time), not after a call.
+func latestQuoteLabel(quote string, hour int64) string {
+	return fmt.Sprintf("latest quote %s hour %s", strings.ToLower(quote), time.Unix(hour, 0).UTC().Format("2006-01-02 15:04 UTC"))
+}
+
+// latestRunning counts the rows of one pass for its progress line: how many
+// finished, and when each row not finished yet was handed out (a row is
+// handed out only once a worker is free, so that is when it started).
+type latestRunning struct {
+	mu       sync.Mutex
+	finished int
+	since    map[int]time.Time // call id → handed out at, for the rows not finished
+}
+
+// latestRunningRow is a row still running and how long it has run.
+type latestRunningRow struct {
+	id  int
+	age time.Duration
+}
+
+func newLatestRunning() *latestRunning {
+	return &latestRunning{since: map[int]time.Time{}}
+}
+
+// start records that the row of call id was handed out at at.
+func (lr *latestRunning) start(id int, at time.Time) {
+	lr.mu.Lock()
+	defer lr.mu.Unlock()
+	lr.since[id] = at
+}
+
+// finish records that the row of call id is finished.
+func (lr *latestRunning) finish(id int) {
+	lr.mu.Lock()
+	defer lr.mu.Unlock()
+	lr.finished++
+	delete(lr.since, id)
+}
+
+// snapshot returns the rows finished, and the rows still running as of now,
+// the oldest first (by call id when two started at the same time).
+func (lr *latestRunning) snapshot(now time.Time) (finished int, running []latestRunningRow) {
+	lr.mu.Lock()
+	defer lr.mu.Unlock()
+	for id, at := range lr.since {
+		running = append(running, latestRunningRow{id: id, age: now.Sub(at)})
+	}
+	slices.SortFunc(running, func(a, b latestRunningRow) int {
+		if c := cmp.Compare(b.age, a.age); c != 0 {
+			return c
+		}
+		return cmp.Compare(a.id, b.id)
+	})
+	return lr.finished, running
+}
+
+// latestProgressLine is the line of a pass still running, e.g. "latest
+// prices: 16 finished, 2 running (call 1234 for 21m30s, call 5678 for 9m), 18
+// handed out of 200 due, 22m30s elapsed, 606 RPC requests". running is oldest
+// first (snapshot); handed out = finished + running; due is the rows read for
+// the pass (latestStats.Due).
+func latestProgressLine(finished int, running []latestRunningRow, due int, elapsed time.Duration, reqs int64) string {
+	handed := finished + len(running)
+	line := fmt.Sprintf("latest prices: %s finished, %s running", commas(finished), commas(len(running)))
+	if slow := latestSlowRowsText(running); slow != "" {
+		line += " (" + slow + ")"
+	}
+	return line + fmt.Sprintf(", %s handed out of %s due, %s elapsed, %s RPC requests",
+		commas(handed), commas(due), elapsed.Round(time.Second), commas(int(reqs)))
+}
+
+// latestSlowRowsText names the rows running for at least latestSlowRowAfter,
+// at most latestProgressMaxIDs of them (running is oldest first): "call 1234
+// for 21m30s, call 5678 for 9m"; "" when there are none.
+func latestSlowRowsText(running []latestRunningRow) string {
+	var parts []string
+	for _, r := range running {
+		if r.age < latestSlowRowAfter || len(parts) == latestProgressMaxIDs {
+			break
+		}
+		parts = append(parts, fmt.Sprintf("call %d for %s", r.id, shortAge(r.age)))
+	}
+	return strings.Join(parts, ", ")
+}
+
+// shortAge is d to the second, without zero units at the end: 21m30s, 9m, 1h.
+func shortAge(d time.Duration) string {
+	s := d.Round(time.Second).String()
+	if strings.HasSuffix(s, "m0s") {
+		s = strings.TrimSuffix(s, "0s")
+	}
+	if strings.HasSuffix(s, "h0m") {
+		s = strings.TrimSuffix(s, "0m")
+	}
+	return s
 }
 
 // latestSkip returns the call ids that failed less than latestRetryAfter ago
@@ -397,9 +517,10 @@ func (r *trackRun) latest(ctx context.Context, recentOnly bool) <-chan latestSta
 	if budget < latestMinPassBudget {
 		budget = latestMinPassBudget
 	}
-	var refreshed, changed, failed, done atomic.Int64
+	var refreshed, changed, failed atomic.Int64
 	var errMu sync.Mutex
 	var pass sync.WaitGroup // the rows of this pass
+	running := newLatestRunning()
 	stopBeat := make(chan struct{})
 	r.aux.Add(1)
 	go func() {
@@ -412,9 +533,9 @@ func (r *trackRun) latest(ctx context.Context, recentOnly bool) <-chan latestSta
 				return
 			case <-ctx.Done():
 				return
-			case <-t.C:
-				log.Printf("latest prices: %s of %s call(s) so far, %s elapsed, %s RPC requests",
-					commas(int(done.Load())), commas(len(rows)), time.Since(start).Round(time.Second), commas(int(reqs.Load())))
+			case now := <-t.C:
+				finished, busy := running.snapshot(now)
+				log.Print(latestProgressLine(finished, busy, len(rows), now.Sub(start), reqs.Load()))
 			}
 		}
 	}()
@@ -430,13 +551,14 @@ func (r *trackRun) latest(ctx context.Context, recentOnly bool) <-chan latestSta
 		t := &rows[handed]
 		handed++
 		pass.Add(1)
+		running.start(t.CallID, time.Now())
 		r.jobs <- trackJob{id: t.CallID, run: func() {
 			defer pass.Done()
 			rowCtx, cancel := latestRowContext(ctx, rowLimit)
-			ch, err := s.latestOne(rowCtx, t, head, readAt, quotes)
+			ch, err := s.latestOne(withScanLabel(rowCtx, latestRowLabel(t.CallID)), t, head, readAt, quotes)
 			err = latestRowError(rowCtx, rowLimit, err)
 			cancel()
-			done.Add(1)
+			running.finish(t.CallID)
 			switch {
 			case err == nil:
 				refreshed.Add(1)

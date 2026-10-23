@@ -1381,11 +1381,17 @@ func scanLabelFrom(ctx context.Context) string {
 	return s
 }
 
+// withScanLabel returns a context under which the log lines of scans (range
+// splits, time-outs, grow-backs) start with label; no progress lines.
+func withScanLabel(ctx context.Context, label string) context.Context {
+	return context.WithValue(ctx, scanLabelKey{}, label)
+}
+
 // withScanProgress returns a context under which log scans print a progress
 // line at most every `every` (and never for scans that finish sooner).
 func withScanProgress(ctx context.Context, label string, every time.Duration) context.Context {
 	last := time.Now()
-	ctx = context.WithValue(ctx, scanLabelKey{}, label)
+	ctx = withScanLabel(ctx, label)
 	return context.WithValue(ctx, progressKey{}, progressFunc(func(from, done, to uint64, events int, size uint64) {
 		if time.Since(last) < every || done >= to {
 			return
