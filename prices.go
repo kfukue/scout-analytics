@@ -42,6 +42,9 @@ type priceConfig struct {
 	Enabled   bool
 	Interval  time.Duration // tracker loop interval
 	Workers   int           // calls tracked at the same time (on-chain source)
+	// SCOUT_TRACK_MAX_ATTEMPTS: give up on a call in error after this many
+	// attempts past its deadline, in a run without progress (0 = never)
+	MaxAttempts int
 
 	// Latest-price pass (on-chain source; tracker_latest.go)
 	LatestOn     bool          // SCOUT_LATEST_REFRESH (off = no pass)
@@ -99,6 +102,10 @@ func loadPriceConfig() (priceConfig, error) {
 		}
 		pc.Workers = n
 	}
+	var err error
+	if pc.MaxAttempts, err = loadTrackMaxAttempts(); err != nil {
+		return pc, err
+	}
 	if err := pc.loadLatestConfig(); err != nil {
 		return pc, err
 	}
@@ -120,7 +127,6 @@ func loadPriceConfig() (priceConfig, error) {
 	if pc.Source != "onchain" && pc.Source != "gecko" {
 		return pc, fmt.Errorf("SCOUT_PRICE_SOURCE=%q: use onchain or gecko", pc.Source)
 	}
-	var err error
 	if pc.Onchain, err = loadOnchainConfig(); err != nil {
 		return pc, err
 	}

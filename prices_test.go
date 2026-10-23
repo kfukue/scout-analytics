@@ -106,6 +106,8 @@ type fakeGecko struct {
 	candles  map[string][]candle         // "pool|minute" / "pool|hour" → ascending candles
 	requests []string
 	fail429  int // respond 429 this many times first
+	// ohlcvStatus (optional): candle requests answer with this HTTP status
+	ohlcvStatus int
 }
 
 func (f *fakeGecko) handler(t *testing.T) http.Handler {
@@ -134,6 +136,10 @@ func (f *fakeGecko) handler(t *testing.T) http.Handler {
 		}
 		// networks/<net>/pools/<pool>/ohlcv/<tf>
 		if len(parts) == 6 && parts[2] == "pools" && parts[4] == "ohlcv" {
+			if f.ohlcvStatus != 0 {
+				w.WriteHeader(f.ohlcvStatus)
+				return
+			}
 			q := r.URL.Query()
 			before, _ := strconv.ParseInt(q.Get("before_timestamp"), 10, 64)
 			limit, _ := strconv.Atoi(q.Get("limit"))

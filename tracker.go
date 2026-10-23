@@ -41,7 +41,8 @@ func (s *scanner) trackLoop(ctx context.Context) {
 	}
 	if s.pc.Source == "onchain" {
 		s.reloadFeeds(ctx) // the asset database's Chainlink feeds, before the first line names them
-		log.Printf("performance tracking on: %s via %s; %d call(s) at a time", horizonNames(s.pc.Horizons), s.onchain.describe(), max(s.pc.Workers, 1))
+		log.Printf("performance tracking on: %s via %s; %d call(s) at a time; %s", horizonNames(s.pc.Horizons), s.onchain.describe(), max(s.pc.Workers, 1),
+			maxAttemptsText(s.pc.MaxAttempts))
 		if s.pc.LatestOn {
 			log.Printf("latest prices on: refreshed every %s for calls under 30 days old, every %s for older ones; at most %s call(s) per cycle (SCOUT_LATEST_REFRESH=off turns this off); %s",
 				s.pc.LatestRecent, s.pc.LatestOld, commas(s.pc.LatestBatch), latestRowLimitText(s.pc.LatestRowTimeout))
@@ -49,8 +50,8 @@ func (s *scanner) trackLoop(ctx context.Context) {
 			log.Printf("latest prices off (SCOUT_LATEST_REFRESH=off)")
 		}
 	} else {
-		log.Printf("performance tracking on: %s via %s (network %q, %d req/min)",
-			horizonNames(s.pc.Horizons), s.pc.BaseURL, s.pc.Network, s.pc.RPM)
+		log.Printf("performance tracking on: %s via %s (network %q, %d req/min); %s",
+			horizonNames(s.pc.Horizons), s.pc.BaseURL, s.pc.Network, s.pc.RPM, maxAttemptsText(s.pc.MaxAttempts))
 	}
 	// One pool of workers for the whole run: a call still running when a cycle
 	// ends keeps its worker, and the other workers go on with the next cycle.
@@ -757,6 +758,7 @@ func (s *scanner) trackOne(ctx context.Context, t *ScoutCallTracking) {
 	deadline := t.EntryAt.Add(s.pc.maxHorizon() + 48*time.Hour)
 	prev := *t
 	interrupted := false
+	stored := 0 // horizons stored in this run (the give-up rule's progress check)
 	fail := func(status string, err error, retryIn time.Duration) {
 		if ctx.Err() != nil { // Ctrl+C / shutdown: not a failure of this call
 			interrupted = true
@@ -765,11 +767,16 @@ func (s *scanner) trackOne(ctx context.Context, t *ScoutCallTracking) {
 		msg := err.Error()
 		t.Error = &msg
 		t.Status = status
-		// Give up only when waiting can't help (no pool / no trades), never on transient errors.
+		// Give up when waiting can't help (no pool / no trades), and on other
+		// errors only through the give-up rule below.
 		if now.After(deadline) && (status == TrackNoPool || strings.Contains(msg, "no trades")) {
 			t.Status = TrackGaveUp
 		}
 		t.NextCheckAt = now.Add(retryIn)
+		if giveUpStuck(t, s.pc.MaxAttempts, now, deadline, err, geckoProgressed(&prev, t, stored)) {
+			log.Printf("tracking call %d (%s): %s (no progress in this run; %s)", t.CallID, t.ContractAddress, *t.Error, trackMaxAttemptsSetting)
+			return
+		}
 		log.Printf("tracking call %d (%s): %s: %v", t.CallID, t.ContractAddress, t.Status, err)
 	}
 	defer func() {
@@ -852,6 +859,7 @@ func (s *scanner) trackOne(ctx context.Context, t *ScoutCallTracking) {
 			fail(TrackError, fmt.Errorf("save %s: %w", h.Name, err), backoff(t.Attempts))
 			return
 		}
+		stored++
 	}
 	if n := len(hourly); n > 0 {
 		c := hourly[n-1].C

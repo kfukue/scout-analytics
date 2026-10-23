@@ -44,3 +44,8 @@ const rpcHistoryChunkSetting = "SCOUT_RPC_HISTORY_CHUNK"
 // take (tracker_latest.go); a call stopped there counts as failed. 0 = no
 // limit.
 const latestRowTimeoutSetting = "SCOUT_LATEST_ROW_TIMEOUT"
+
+// trackMaxAttemptsSetting: a call in error is given up after this many
+// attempts once past its deadline, when a run makes no progress
+// (tracker_giveup.go). 0 = never.
+const trackMaxAttemptsSetting = "SCOUT_TRACK_MAX_ATTEMPTS"

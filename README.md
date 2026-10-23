@@ -403,7 +403,8 @@ a definitive absence and the call is tracked in the quote asset's units, with on
 ```
 call 123 [1/5]: entry price 0.01 QT (no USD price of QT at the call block 6048010 after the last horizon + 48 h: … no price yet … — giving up on USD, tracked in QT)
 ```
-A node error is never capped: it is retried for ever.
+A node error is never capped this way: it is retried until the give-up rule below
+(`SCOUT_TRACK_MAX_ATTEMPTS`) stops a call that makes no progress.
 
 **Chainlink feeds from the asset database.** When the database also holds the asset
 tracker's tables, the tracker reads feeds from them (read-only, no schema change):
@@ -521,6 +522,7 @@ Only use the feature columns as model inputs; everything about the future is an 
 | `SCOUT_RUG_LIQ_USD` | `500` | rugged when the USD value of the pool's **quote side** (ETH/WETH, USDG, stock token …) is below this; settable in `.env`. `0` = USD check off, but an empty pool still counts. Negative values are rejected |
 | `SCOUT_TRACK_INTERVAL` | `1m` | how often due checks are processed |
 | `SCOUT_TRACK_WORKERS` | `8` | calls tracked at the same time (on-chain source); a free worker takes the next due call at once (see "What the tracker logs"); also sizes the database pool (the tracker's worker count + 4, between 4 and 32; see "Recording to a SQL database (Postgres)") |
+| `SCOUT_TRACK_MAX_ATTEMPTS` | `10` | a call in `error` becomes `gave_up` (never tried again) once it has this many attempts, is past its last horizon + 48 h and a run fails with no progress; a still-running USD pool search never counts (see "Giving up on calls that keep failing"). `0` = never, as before the setting existed (the rollback without a deploy). Negative or non-numeric values are refused at start |
 | `SCOUT_RPC_PARALLEL` | `8` | block ranges of one scan fetched from the node at the same time |
 | `SCOUT_RPC_MAX_INFLIGHT` | `64` | most requests in flight to the node at once (workers × ranges, capped here) |
 | `SCOUT_RPC_LOG_CACHE` | `300000` | swap logs kept in memory so repeat calls of a token are not scanned twice (`0` = off) |
@@ -1037,8 +1039,24 @@ An error the node does not explain is asked once more and, if it comes back, tre
 
 **Ctrl+C is safe.** A call that is interrupted mid-scan is left exactly as it was
 and picked up again on the next start. `gave_up` is only used when a call is past
-its last horizon and still has no pool or no trades. Calls an older version
+its last horizon + 48 h and still has no pool or no trades, or keeps failing (below).
+Calls an older version
 marked `gave_up`/`error` with `context canceled` are reset automatically at startup.
+
+**Giving up on calls that keep failing (`SCOUT_TRACK_MAX_ATTEMPTS`, default 10).** A run
+that ends in `error` (whatever status the call had) makes the call `gave_up` instead when
+all of these hold: the call's `attempts` (every run counts, successful ones too, this one
+included) reached the setting; the call is past its last horizon + 48 h (the deadline
+above); the error is not "USD pool search not finished" (that search moves on with every
+try, and such a retry leaves `attempts` as it was); and the run made no progress: it found
+no pool, no entry price, stored no pre-call trades, no new piece of a horizon scan (the scan
+cursor did not move), no new horizon and no rug (GeckoTerminal source: no pool, no entry
+price, no horizon). The error then reads `gave up after 12 attempts, past the deadline
+2026-09-01 14:30 UTC: <the last error>`, with one log line
+`call 123 [#4]: gave up after 12 attempts, … (no progress in this run; SCOUT_TRACK_MAX_ATTEMPTS)`;
+nothing else on the call changes (returns, candles and the on-chain state stay). The
+start-up line `performance tracking on: …` names the limit. `0` turns the rule off.
+`-retry-no-pool -retry-gave-up` brings such calls back.
 
 **Ops scripts.** `ops/` holds one-off SQL scripts run by hand (see each folder's README).
 
