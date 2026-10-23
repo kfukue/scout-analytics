@@ -1,8 +1,29 @@
 # Scout analytics: handoff to Claude Code
 
-## Session state (23 Oct 2026 PDT (23 Oct UTC): main a96bb78 after #42-#68)
+## Session state (23 Oct 2026 PDT (23 Oct UTC): main bca6e91 after #42-#73)
 
 This section supersedes the ones below wherever they differ.
+
+**Update, 23 Oct 15:57 PDT (22:57 UTC): pilot check done; full-run
+(P2) rule fixed; P2 at 274 of 4,310.**
+- Merged 23 Oct: #69 (docs), #70 (report accepts `1 dead7` labels),
+  #71 (v4 search keeps progress), #72 (unanswered pool check is an
+  error), #73 (report-only check beyond posted holders and age).
+  Tracker restart for #71/#72: not confirmed yet.
+- Pilot check (run 20261023-2249 UTC, on `data/holders_pilot_20261023`),
+  dead7 vs rest, baseline posted holders + age AUC 0.701:
+  `pre_hold_sellers` model 0.740, delta +0.039 (95 % 0.009-0.066),
+  residual AUC 0.621 (0.568-0.673), decile strata 0.599 (0.529-0.668):
+  "adds". `pre_hold_holders`: delta -0.000 (-0.003 to 0.002), residual
+  0.503: no addition. held2x7 vs rest: no addition for either.
+- Owner approved the P2 rule (PM skill, 23 Oct "approve"): sellers
+  passes if the delta lower bound > 0, the decile-strata lower bound >
+  0.50 and a forward (70/30 by entry time, 7-day embargo) delta lower
+  bound > 0. The forward check and an automatic rule line are being
+  built (report-only PR).
+- P2 progress (owner, 23 Oct about 15:55 PDT (22:55 UTC)): 274 of
+  4,310, about 41 s per call since the start (after 12:49 PDT), so
+  done about 25 Oct 13:30 PDT (20:30 UTC) if the pace holds.
 
 **Update, 23 Oct 12:52 PDT (19:52 UTC): holder pilot CONTINUE; full
 export (P2) running.**

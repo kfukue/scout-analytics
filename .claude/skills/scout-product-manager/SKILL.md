@@ -735,6 +735,19 @@ Every Go start applies `scoutanalytics.sql` unless `SCOUT_DB_AUTO_MIGRATE=false`
   reached a pool), which the export does not know as a venue, so their
   holder numbers would likely be wrong. Adding that launchpad as a venue is a deferred item in
   `HANDOFF.md` ("Deferred / open"), to look at again after the pilot.
+- 23 Oct (owner, "approve"), on the PM's proposal after the pilot's
+  check beyond posted holders and age (`pre_hold_sellers` added +0.039
+  AUC, 95 % interval 0.009-0.066, for `dead7` vs rest;
+  `pre_hold_holders` added nothing), fixed before the full run's (P2)
+  data is seen: `pre_hold_sellers` passes for `dead7` vs rest if
+  (a) the delta AUC's 95 % lower bound beyond posted holders and age
+  is above 0, (b) the decile-strata 95 % lower bound is above 0.50,
+  and (c) a forward (time-based) check's delta 95 % lower bound is
+  above 0. The forward check's design (PM's, same day): train on the
+  earliest 70 % of calls by entry time, test on the latest 30 %, with
+  a 7-day embargo before the first test call. Pass: a `dead7` model
+  trial with `pre_hold_sellers` through the walk-forward gate, its
+  adoption rules fixed before that run. Fail: the holder work stops.
 - 23 Oct (owner, "check both. sure perform cheap check. p2. yea we can
   run the full run. we have our own node so we can just run it"), on
   the holder pilot's CONTINUE (450 calls; `pre_hold_holders` and
