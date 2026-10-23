@@ -40,6 +40,10 @@ func (s *scanner) trackOneOnchain(ctx context.Context, t *ScoutCallTracking, pos
 			st = nil // unreadable, or tracked by an older version: start this call again
 		}
 	}
+	var start *onchainState // the state at the run's start, for the give-up rule's progress check
+	if st != nil {
+		start = st.clone()
+	}
 	fail := func(status string, err error, retryIn time.Duration) {
 		if ctx.Err() != nil { // Ctrl+C / shutdown: not a failure of this call
 			interrupted = true
@@ -50,11 +54,19 @@ func (s *scanner) trackOneOnchain(ctx context.Context, t *ScoutCallTracking, pos
 		t.Error = &msg
 		t.Status = status
 		// Give up only when waiting can't help: no pool / no trades, well after the last horizon.
-		// RPC or database errors are always retried.
+		// RPC or database errors are retried, until the give-up rule below.
 		if now.After(deadline) && (status == TrackNoPool || errors.Is(err, errNoTrades)) {
 			t.Status = TrackGaveUp
 		}
+		if errors.Is(err, errUSDSearchPending) {
+			t.Attempts = prev.Attempts // a USD pool search that moves on never counts towards the limit
+		}
 		t.NextCheckAt = now.Add(retryIn)
+		progressed := onchainProgressed(start, st, prev.EntryPriceUSD == nil && t.EntryPriceUSD != nil)
+		if giveUpStuck(t, s.pc.MaxAttempts, now, deadline, err, progressed) {
+			log.Printf("%s: %s (no progress in this run; %s)", tag, *t.Error, trackMaxAttemptsSetting)
+			return
+		}
 		log.Printf("%s: %s: %v (retry in %s)", tag, t.Status, err, retryIn.Round(time.Minute))
 	}
 	defer func() {
