@@ -977,8 +977,9 @@ error.
   on the full sample), 95 % percentile bootstrap within groups
   (`HOLD_BOOTSTRAP_REPS` 2000, seed 7), and the AUC over the pairs in the same week
   and in the same stratum (posted-holder terciles from the pilot x age < 1 h /
-  >= 1 h, with its bootstrap). n/a below 30 non-NULL rows per class. AUC only:
-  the sample is about a third per group, so lift and precision would mean nothing.
+  >= 1 h, with its bootstrap). n/a below 30 non-NULL rows per class. Group shares
+  come from the sample, not necessarily the natural base rates, so AUC only; lift
+  and precision would mean nothing.
 - **Baseline and checks:** the AUC of `holders_at_call` and of `age_s_at_call` alone
   (the Q5b reference); the strata counts; the correlation of
   `pre_hold_launch_age_s` with `age_s_at_call` and `pre_hold_holders` with
@@ -998,6 +999,44 @@ error.
   evaluated.
 - **After the call:** every `post24h_*` column, peak and 7d return (also net of tax
   when the tax columns are there) per group, description only.
+- **Beyond posted holders and age (report only, never in the verdict):** the last
+  section, added 23 Oct 2026 after the pilot (not pre-registered; a PM reading for
+  the owner). For `dead7` vs rest and `held2x7` vs rest and each of
+  `HOLD_INCR_FEATURES` (default `pre_hold_holders`, `pre_hold_sellers`) alone, then
+  together: a logistic regression (L2, `HOLD_INCR_LOGIT_C` 1.0) on
+  log1p(`holders_at_call`) + log1p(`age_s_at_call`) (the baseline) with and without
+  log1p(feature). Per model, rows with a baseline value or the feature NULL or
+  negative are dropped and counted, and baseline and model use the same rows.
+  Stratified `HOLD_INCR_FOLDS` (5) fold cross-validation on the contrast label,
+  repeated `HOLD_INCR_REPEATS` (20) times (shuffle seed `HOLD_INCR_SEED` 7 + repeat),
+  with the same folds for baseline and model and the scaler fitted in each training
+  part. AUC and the point delta are of each row's out-of-fold score averaged over
+  the repeats. The delta AUC 95 % CI is a paired percentile bootstrap (the
+  `HOLD_BOOTSTRAP_*` settings, within groups): each rep uses the out-of-fold scores
+  of one repeat drawn at random (seed `HOLD_INCR_SEED`), the same repeat and
+  resample for baseline and model, so it covers the sampling of calls and the fold
+  assignment. Each rep's delta is one repeat's delta, so the CI is centred on the
+  repeat-delta mean (shown in the table), not necessarily on the point delta of the
+  averaged scores. No model is refitted per rep, so the refit variance is not in it: it
+  is a floor on the uncertainty. The min / mean / max delta over the repeats shows
+  the fold noise; a delta whose repeat range spans 0, or that is no larger than that
+  range, is no evidence either way. These are random stratified folds, not the
+  project's time-based validation, so the delta is a within-sample contrast, not a
+  forward estimate. One call per token (the duplicate-`ca` refusal in `load_ids`)
+  holds only when the ids file has a `ca` column; without it, calls of one token can
+  sit in different folds. Also shown: the feature's standardised coefficient on all
+  rows (its direction given the baseline); the AUC of the residual of log1p(feature)
+  after a least-squares fit on the baseline (fitted on all rows: it never sees the
+  group), with its bootstrap CI; and the within-strata AUC with posted-holder
+  terciles (the strata above) and with up to `HOLD_INCR_DECILES` (10) posted-holder
+  quantile bins, each x the age band, with bootstrap CIs. The within-strata AUCs are
+  oriented by the feature's pooled direction while the coefficient is conditional on
+  the baseline, so the two can disagree; a † after the coefficient (with a footnote)
+  marks a single feature whose coefficient sign disagrees with its pooled direction.
+  The suggested reading per single feature: "adds" if the delta lower bound > 0 and
+  the decile-strata lower bound > 0.50, otherwise "no addition shown beyond posted
+  holders and age"; the joint model has no reading. NOT JUDGED with the verdict's
+  strata reasons. Its settings are appended to the report's Settings line.
 
 The output holds counts and metrics only (no address, no per-call row; the ids
 without a row are listed by call id in `summary.json` only), plus the sha256 of
