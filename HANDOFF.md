@@ -1,8 +1,64 @@
 # Scout analytics: handoff to Claude Code
 
-## Session state (22 Oct 2026 PDT (22 Oct UTC): main c0a3d5e after #42-#59)
+## Session state (22 Oct 2026 PDT (23 Oct UTC): main d6f51eb after #42-#62)
 
 This section supersedes the ones below wherever they differ.
+
+**Update, 22 Oct 22:45 PDT (23 Oct 05:45 UTC): row time limit and
+log labels live; 10-call holder pilot done; full pilot next.**
+- After the 14:12 PDT (21:12 UTC) restart the latest pass still jammed: about 8 passes
+  at once, several stuck for minutes (e.g. "16 of 200 call(s) so far,
+  22m30s elapsed, 606 RPC requests", not moving). `investigate`: no
+  deadline on a latest row (60 s HTTP timeout x 4 tries, range halving
+  down to 200 blocks: 4-17 min per stuck row); each pass hands out rows
+  for about 1 min and only to free workers, so stuck rows starve later
+  passes and horizon checks; failed rows get a 30 min in-memory skip,
+  lost on restart. Overlapping passes never duplicate work; a
+  one-pass-at-a-time guard alone would make it worse (dropped).
+- Node checks (owner, curl, tracker running): one block at 81,025,186
+  unfiltered 3.1 s; 1,000 blocks filtered on the v4 PoolManager Swap
+  topic only: timed out (30 s) at 81.02M and at 90M; 1,000 blocks
+  filtered on Swap + one pool id: 3.1 s and 2.6 s. So the node's log
+  index works; what fails is reads returning many logs, or reads queued
+  behind them. The node gives up on any request after about 30 s.
+- #61 (merged 22 Oct 17:47 PDT (23 Oct 00:47 UTC)): `SCOUT_LATEST_ROW_TIMEOUT`
+  (default 5m, minimum 30s, 0 = off). A row stopped by it counts as
+  failed (30 min skip, named in the summary), nothing written. Quote
+  USD lookups: one per quote per pass, under the pass context, failure
+  shared for the pass. Shared `eth_getLogs`: a waiter re-asks when the
+  asker stopped on its own limit (no false halving). Start-up line ends
+  `each call stopped after 5m0s (SCOUT_LATEST_ROW_TIMEOUT)`.
+- #62 (merged 22 Oct 22:38 PDT (23 Oct 05:38 UTC)): log text only.
+  Latest-row lines start `latest call <id>:`, quote lookup lines
+  `latest quote <addr> hour <YYYY-MM-DD HH:00 UTC>:`; progress line
+  `latest prices: N finished, M running (call X for 21m30s, ...), K
+  handed out of D due, ...`. Owner restarted `-track` after #62 ("i
+  reran the tracker"), presumably with the command given (not
+  confirmed): `SCOUT_RPC_RPS=300 SCOUT_TRACK_WORKERS=12
+  SCOUT_RPC_PARALLEL=1 SCOUT_RPC_MAX_INFLIGHT=12` (the latest settings
+  are now in `.env`).
+  Not checked yet: the log after this restart.
+- Holder pilot, 10 calls (14:45-16:21 PDT (21:45-23:21 UTC), beside the
+  pre-#61 tracker): 10 ok, 0 failed, 1,432 `eth_getLogs`, paused 3 s
+  (inferred: the `.env` change to 24h took effect, as the lag check
+  passed); 440 still to do. Call 1 took 3 min; calls 2-4 took 19-37
+  min each (node time-outs at 46M, 51M, 81M, ranges halved down to as
+  little as 200 blocks, then recovered); calls 5-10 took 0.5-4 min each
+  from about 16:10 PDT (23:10 UTC) (cause not known: #61 was not merged
+  yet). About 143 requests per call, so the
+  440 left need about 63k (dry run said about 49k for 450), at least
+  4.5 h at 4 req/s. The holder dry run printed two lines and does not
+  check the lag; the real run's log showed no settings line either
+  (they go to the run record under `data/holders`, per
+  `holderRunSettings`; not checked on the server).
+- Next: owner pastes `grep -E "latest prices:|row time limit|^.{20}latest
+  (call|quote)" ~/scout-track.log | tail -25` about 15 min after the
+  restart; if passes finish within about 5 min, the full pilot overnight
+  (`go run . -export-holders data/holder_pilot_ids.csv 2>&1 | tee -a
+  ~/holders-pilot.log`; resumes after the 10; pauses over 2h price lag,
+  stops after 30 min paused; rerun resumes), then `holders_report.py`.
+  Give-up rule still not answered. Untracked `temp.env` in the PC's
+  main checkout: origin not known, not read; must not be committed.
 
 **Update, 22 Oct 14:20 PDT (21:20 UTC): history cap live, tracker
 restarted; pilot next.**
