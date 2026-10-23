@@ -1,8 +1,57 @@
 # Scout analytics: handoff to Claude Code
 
-## Session state (22 Oct 2026 PDT (23 Oct UTC): main d6f51eb after #42-#62)
+## Session state (23 Oct 2026 PDT (23 Oct UTC): main 9527073 after #42-#63)
 
 This section supersedes the ones below wherever they differ.
+
+**Update, 23 Oct 01:35 PDT (08:35 UTC): overnight PRs open; full
+holder pilot running.**
+- Tracker after the #62 restart (owner's log, 22 Oct 22:50-23:33 PDT
+  (23 Oct 05:50-06:33 UTC)): healthy (start-up line not in the paste;
+  build not confirmed, inferred from the owner's restart after #62). Rounds of 200 latest prices in
+  1-5 s; "waiting" falls from about 200 to 2 each cycle. 2 calls fail
+  every 30 min: "call 9774: USD price of flETH ... USD pool search not
+  finished" (a bounded sweep that hit its per-try limit, not a failure;
+  it resumes each try).
+- Full holder pilot started 22 Oct 23:36 PDT (23 Oct 06:36 UTC) in a
+  terminal on the server (`go run . -export-holders
+  data/holder_pilot_ids.csv 2>&1 | tee -a ~/holders-pilot.log`), 440
+  calls to do; first call ok in 43 s. Not checked since.
+- Owner, 22 Oct PDT: "please do all ..." on four items. PRs opened
+  overnight (each reviewed PASS; not merged):
+  - #64: the stray start-up line `in base : <keys folder>` was ours:
+    `internal/database/database.go` printed `SSL_CERT_FILE_PATH`
+    (used only on the Cloud SQL path; the server runs
+    `APP_ENV=LOCAL_GETH`). Print removed; the setting is read only
+    where used.
+  - #65: a genuine `eth_blockNumber` time-out is shared with waiting
+    workers (one round of retries, not one per worker), as #61 did for
+    `eth_getLogs`.
+  - #66: the give-up rule, `SCOUT_TRACK_MAX_ATTEMPTS` (default 10, 0 =
+    off). A call whose failed run would leave it in `error` becomes
+    `gave_up` only when attempts >= the limit, past its deadline
+    (entry + longest horizon + 48 h), the error is not "USD pool search
+    not finished", and the run made no progress. Sweep-pending retries
+    no longer count as attempts. Known limit: `attempts` counts every
+    run, so a past-deadline call with 10+ runs can be given up on one
+    failed run without progress; a "10 in a row" counter would need a
+    new column (possible follow-up).
+  - #67: the whole-history USD-pool search keeps its progress after a
+    node error, a time-out or a shutdown and resumes (in memory; the
+    last 1,000 blocks are read again; no answer kept from a failed
+    try). The flETH line above is a search at its per-try limit, whose
+    progress was already kept; #67 covers the failure exits.
+  - The four PRs touch separate code (checked hunk by hunk: #65 and #67
+    both change `onchain.go`, #66 and #67 both change `README.md`, in
+    different places), so they can be merged in any order.
+- Restart order after merging (owner): `-track` once, when the holder
+  export is not running (#64 needs no restart of its own).
+- Follow-ups found overnight (not started): `v4PoolsOf` redoes its
+  Initialize scans after a failure (same pattern as the USD search);
+  `resolveV2V3` treats any node error on `getReserves`/`slot0` as "not
+  a pool", which the USD search then remembers for good.
+- The owner's 22 Oct decisions are recorded in the PM skill ("Owner
+  decisions in force").
 
 **Update, 22 Oct 22:45 PDT (23 Oct 05:45 UTC): row time limit and
 log labels live; 10-call holder pilot done; full pilot next.**
@@ -263,9 +312,9 @@ hittting my limit"). Resume by reading this update first.
 - Also open: the fill's backup table
   `scout_call_tracking_bak_price_rug_fill_20261020` (owner drops it
   after checking the website); the `-web` "collapsed" legend check;
-  the line `in base : D:\keys\gcp-sql` printed at the start of every
-  `scoutanalytics` run on the Linux server (a Windows path; source not
-  looked at yet).
+  the line `in base : <keys folder>` printed at the start of every
+  `scoutanalytics` run on the Linux server (a Windows path; traced 23
+  Oct, removal in #64, open).
 - The owner asked for a scheduled resume at 22 Oct 07:01 PDT; the PM
   has no scheduling tool (its Bash is git only), so the owner resumes
   by hand ("read handoff and resume").

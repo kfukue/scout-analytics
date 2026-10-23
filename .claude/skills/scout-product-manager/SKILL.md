@@ -508,7 +508,7 @@ From the repo root on the server:
 
 Every Go start applies `scoutanalytics.sql` unless `SCOUT_DB_AUTO_MIGRATE=false`.
 
-## Owner decisions in force (8-20 October 2026)
+## Owner decisions in force (8-22 October 2026)
 
 - The `long` model waits for data (about 25 December) rather than loosening the
   threshold.
@@ -735,6 +735,25 @@ Every Go start applies `scoutanalytics.sql` unless `SCOUT_DB_AUTO_MIGRATE=false`
   reached a pool), which the export does not know as a venue, so their
   holder numbers would likely be wrong. Adding that launchpad as a venue is a deferred item in
   `HANDOFF.md` ("Deferred / open"), to look at again after the pilot.
+- 22 Oct (owner, "go"): the 20 calls stuck in error retries were parked
+  as `gave_up` by a one-off ops script (#57), and whole-history
+  `eth_getLogs` searches are capped by `SCOUT_RPC_HISTORY_CHUNK`
+  (default 2,000,000 blocks, one range at a time; #58).
+- 22 Oct (owner, "implemen"): each latest-price row has a time limit,
+  `SCOUT_LATEST_ROW_TIMEOUT` (default 5m, 0 = off; #61), and the
+  latest pass's log lines name the call (#62). A one-latest-pass-at-a-time
+  guard was dropped (the PM's call, on `investigate`'s finding that it
+  would make stalls worse).
+- 22 Oct PDT (23 Oct UTC) (owner, "please do all", on the PM's list of
+  four items): the give-up rule. A call whose failed run would leave it
+  in `error` is set to `gave_up` only when all four hold: `attempts` is
+  at least `SCOUT_TRACK_MAX_ATTEMPTS` (default 10, 0 = never); it is
+  past its give-up deadline (entry + longest horizon + 48 h); the error
+  is not "USD pool search not finished"; the run made no progress.
+  Sweep-pending retries do not count as attempts. Also approved in the
+  same answer: a failed USD-pool search keeps its progress; a genuine
+  `eth_blockNumber` time-out is shared with waiting workers; the stray
+  `in base : <path>` start-up line is removed.
 - 20 Oct (owner, "can you automate doc PRs maybe ask advisor to review
   it", then "apply the doc pr rule for this project"): docs-only PRs
   (`HANDOFF.md`, `.claude/skills/**`) are checked by `advisor` instead
