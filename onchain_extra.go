@@ -55,14 +55,20 @@ type usdPoolSet struct {
 	// whole-history search; histSeen: the counterparties of those transfers
 	// already checked (pool or not: a contract's token0/token1 never change);
 	// histPending: counterparties read but not checked yet (the per-sweep cap),
-	// with their transfer counts; histBusy: a sweep is running (closed when it
+	// with their transfer counts (and the pools a failed try found: see
+	// saveUSDSweep); histBusy: a sweep is running (closed when it
 	// ends), so concurrent callers wait for it instead of repeating it.
 	histThrough uint64
 	histSeen    map[string]bool
 	histPending map[string]int
 	histBusy    chan struct{}
-	source      string // the pool used last (quoteSource, and the change log)
-	sourceRef   string // … with its address / id
+	// histLogs, histChecks: what the failed tries of the sweep in progress
+	// used of its bounds (usdHistMaxLogs, usdHistMaxChecks; saveUSDSweep);
+	// 0 once a sweep finishes.
+	histLogs   int
+	histChecks int
+	source     string // the pool used last (quoteSource, and the change log)
+	sourceRef  string // … with its address / id
 }
 
 // Bounds of one whole-history sweep (usdPoolsInHistory). A sweep that hits
@@ -306,31 +312,17 @@ type usdHistory struct {
 // requests (the new blocks only). One sweep per asset at a time: a caller
 // that finds one running waits for it, then sweeps what is still left
 // (usually nothing). The pools found are merged into the asset's set before
-// the sweep ends. An error is the node's; nothing of a failed sweep is kept.
+// the sweep ends.
+//
+// An error is the node's (or the end of ctx). A sweep that stops on one
+// returns it and decides nothing (no pool merged, no "no pool"), but keeps
+// its progress (saveUSDSweep), and the next try goes on from there.
 func (o *onchainSource) usdPoolsInHistory(ctx context.Context, asset string) (usdHistory, error) {
-	var set *usdPoolSet
-	for {
-		o.mu.Lock()
-		set = o.usdPools[asset]
-		busy := set.histBusy
-		if busy == nil {
-			set.histBusy = make(chan struct{})
-			o.mu.Unlock()
-			break
-		}
-		o.mu.Unlock()
-		select {
-		case <-busy:
-		case <-ctx.Done():
-			return usdHistory{}, ctx.Err()
-		}
+	set, release, err := o.lockUSDSweep(ctx, asset)
+	if err != nil {
+		return usdHistory{}, err
 	}
-	defer func() {
-		o.mu.Lock()
-		close(set.histBusy)
-		set.histBusy = nil
-		o.mu.Unlock()
-	}()
+	defer release()
 
 	head, err := o.rpc.blockNumber(ctx)
 	if err != nil {
@@ -348,133 +340,269 @@ func (o *onchainSource) usdPoolsInHistory(ctx context.Context, asset string) (us
 		}
 		return usdHistory{}, err
 	}
-	var found []*onchainState
-	n := [3]int{}
-	keep := func(st *onchainState) { // up to usdPoolsPerTier of each kind
-		if t := o.usdPoolTier(st.Quote); t > 0 && n[t] < usdPoolsPerTier {
-			n[t]++
-			found = append(found, st)
-		}
-	}
+	sw := o.newUSDSweep(set, asset, head, through, tm)
 	// v4: every pool initialised with the asset as one of its currencies.
 	v4, err := o.v4PoolsOf(ctx, asset, head)
 	if err != nil {
+		return usdHistory{}, err // nothing of this try read yet
+	}
+	sw.keepV4(v4)
+	// v2/v3: the counterparties of the transfers not read yet, plus those
+	// read by an earlier sweep but not checked.
+	if err := sw.readTransfers(ctx); err != nil {
+		o.saveUSDSweep(sw, false)
 		return usdHistory{}, err
 	}
+	if err := sw.checkCounterparties(ctx); err != nil {
+		o.saveUSDSweep(sw, false)
+		return usdHistory{}, err
+	}
+	// Pools seen in earlier sweeps are already in the asset's set.
+	if err := sw.fillQuotes(ctx); err != nil {
+		o.saveUSDSweep(sw, false)
+		return usdHistory{}, err
+	}
+	pending := o.saveUSDSweep(sw, true)
+	h := usdHistory{pools: o.mergeUSDPools(asset, "", sw.found), through: through, complete: sw.readTo == head && pending == 0}
+	if !h.complete {
+		h.progress = fmt.Sprintf("transfers read through block %d of %d, %d counterparties left to check", sw.readTo, head, pending)
+	}
+	return h, nil
+}
+
+// lockUSDSweep waits until no sweep of the asset is running (or ctx ends),
+// then marks one running; release ends it. The asset's set must exist.
+func (o *onchainSource) lockUSDSweep(ctx context.Context, asset string) (*usdPoolSet, func(), error) {
+	for {
+		o.mu.Lock()
+		set := o.usdPools[asset]
+		busy := set.histBusy
+		if busy == nil {
+			set.histBusy = make(chan struct{})
+			o.mu.Unlock()
+			release := func() {
+				o.mu.Lock()
+				close(set.histBusy)
+				set.histBusy = nil
+				o.mu.Unlock()
+			}
+			return set, release, nil
+		}
+		o.mu.Unlock()
+		select {
+		case <-busy:
+		case <-ctx.Done():
+			return nil, nil, ctx.Err()
+		}
+	}
+}
+
+// usdSweep is one try of a whole-history sweep (usdPoolsInHistory). It starts
+// from the progress kept in the asset's set and is written back by
+// saveUSDSweep; only the goroutine holding the sweep (lockUSDSweep) uses it.
+type usdSweep struct {
+	o             *onchainSource
+	set           *usdPoolSet
+	asset         string
+	tm            tokenMeta
+	head, through uint64
+	from          uint64          // the first block whose transfers were not read before
+	readTo        uint64          // transfers read through this block (from-1: none)
+	nLogs         int             // transfer logs read by the sweep (its earlier tries included)
+	checksLeft    int             // counterparties this try may check
+	counts        map[string]int  // counterparty → transfers read (earlier sweeps' unchecked ones included)
+	seen          map[string]bool // counterparties checked before this try
+	checked       []string        // counterparties checked by this try, in order
+	kept          map[string]bool // … of those, the ones kept as pools (in found)
+	found         []*onchainState // pools kept, up to usdPoolsPerTier of each kind
+	n             [3]int          // pools kept per tier
+}
+
+// newUSDSweep starts a try from the progress kept in set.
+func (o *onchainSource) newUSDSweep(set *usdPoolSet, asset string, head, through uint64, tm tokenMeta) *usdSweep {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	sw := &usdSweep{o: o, set: set, asset: asset, tm: tm, head: head, through: through,
+		from: set.histThrough + 1, readTo: set.histThrough, nLogs: set.histLogs, checksLeft: usdHistMaxChecks - set.histChecks,
+		counts: maps.Clone(set.histPending), seen: maps.Clone(set.histSeen), kept: map[string]bool{}}
+	if sw.counts == nil {
+		sw.counts = map[string]int{}
+	}
+	return sw
+}
+
+// keep adds a pool to found, up to usdPoolsPerTier of each kind; false: not
+// kept (not a USD pool, or its kind is full).
+func (sw *usdSweep) keep(st *onchainState) bool {
+	t := sw.o.usdPoolTier(st.Quote)
+	if t == 0 || sw.n[t] >= usdPoolsPerTier {
+		return false
+	}
+	sw.n[t]++
+	sw.found = append(sw.found, st)
+	return true
+}
+
+// keepV4 keeps the asset's v4 pools against WETH / ETH or a stablecoin.
+func (sw *usdSweep) keepV4(v4 []v4Pool) {
 	for _, p := range v4 {
-		st := &onchainState{Kind: "v4", Pool: o.cfg.PoolManagerV4, PoolID: p.id, TokenIs0: p.c0 == asset,
-			TokenDec: tm.Decimals, EntryBlock: p.block, Quote: p.c1}
+		st := &onchainState{Kind: "v4", Pool: sw.o.cfg.PoolManagerV4, PoolID: p.id, TokenIs0: p.c0 == sw.asset,
+			TokenDec: sw.tm.Decimals, EntryBlock: p.block, Quote: p.c1}
 		if !st.TokenIs0 {
 			st.Quote = p.c0
 		}
-		if strings.ToLower(st.Quote) != asset {
-			keep(st)
+		if strings.ToLower(st.Quote) != sw.asset {
+			sw.keep(st)
 		}
 	}
-	// v2/v3: the counterparties of the transfers not read yet, plus those
-	// read by an earlier sweep but not checked.
-	o.mu.Lock()
-	from := set.histThrough + 1
-	seen := maps.Clone(set.histSeen)
-	counts := maps.Clone(set.histPending)
-	o.mu.Unlock()
-	if counts == nil {
-		counts = map[string]int{}
+}
+
+// readTransfers reads the asset's transfers in [from, head] and counts their
+// counterparties, up to the sweep's log bound (then cut at a block boundary).
+// readTo is then the last block whose transfers are all counted: the head,
+// the block before the cut, or, when the read fails, the end of the last
+// range the node answered in full but at most through, so the blocks near the
+// head are read again as after a read to the head (from-1: none).
+func (sw *usdSweep) readTransfers(ctx context.Context) error {
+	if sw.from > sw.head {
+		sw.readTo = sw.head
+		return nil
 	}
-	readTo := head // transfers read through this block
-	if from <= head {
-		lctx, stop := context.WithCancel(ctx)
-		var nLogs int
-		var cut, last uint64 // cut: the first block not read (0 = read to the head)
-		err := o.rpc.getLogsChunkedUpTo(lctx, asset, []any{topicTransfer}, from, head, head+1, func(l rpcLog) {
-			if cut > 0 {
-				return
-			}
-			if b := l.block(); nLogs >= usdHistMaxLogs && b != last {
-				cut = b // logs come in block order: every block before b is complete
-				stop()
-				return
-			}
-			nLogs++
-			last = l.block()
-			if len(l.Topics) < 3 {
-				return
-			}
-			for _, t := range l.Topics[1:3] {
-				if a := addrFromWord(unhex(t)); a != zeroAddr && a != asset && a != o.cfg.PoolManagerV4 {
-					counts[a]++
-				}
-			}
-		})
-		stop()
-		if err != nil && (cut == 0 || ctx.Err() != nil) {
-			return usdHistory{}, fmt.Errorf("transfers of %s in blocks %d-%d: %w", asset, from, head, err)
-		}
+	lctx, stop := context.WithCancel(ctx)
+	defer stop()
+	lctx, reached := withScanReached(lctx)
+	var cut, last uint64 // cut: the first block not read (0 = none)
+	pm := sw.o.cfg.PoolManagerV4
+	err := sw.o.rpc.getLogsChunkedUpTo(lctx, sw.asset, []any{topicTransfer}, sw.from, sw.head, sw.head+1, func(l rpcLog) {
 		if cut > 0 {
-			readTo = cut - 1
+			return
 		}
+		if b := l.block(); sw.nLogs >= usdHistMaxLogs && b != last {
+			cut = b // logs come in block order: every block before b is complete
+			stop()
+			return
+		}
+		sw.nLogs++
+		last = l.block()
+		if len(l.Topics) < 3 {
+			return
+		}
+		for _, t := range l.Topics[1:3] {
+			if a := addrFromWord(unhex(t)); a != zeroAddr && a != sw.asset && a != pm {
+				sw.counts[a]++
+			}
+		}
+	})
+	switch {
+	case cut > 0:
+		sw.readTo = cut - 1
+	case err == nil:
+		sw.readTo = sw.head
+	case *reached >= sw.from:
+		// The ranges answered before the error, but at most through: the
+		// blocks near the head are read again next time.
+		sw.readTo = max(sw.readTo, min(*reached, sw.through))
 	}
+	if err != nil && (cut == 0 || ctx.Err() != nil) {
+		return fmt.Errorf("transfers of %s in blocks %d-%d: %w", sw.asset, sw.from, sw.head, err)
+	}
+	return nil
+}
+
+// checkCounterparties checks the counterparties not checked before, the
+// busiest first, up to checksLeft; each kept pool goes to found. A pool beyond
+// usdPoolsPerTier of its kind is left out (the busier ones of that kind came
+// first) and not asked again.
+func (sw *usdSweep) checkCounterparties(ctx context.Context) error {
 	var cands []string
-	for a := range counts {
-		if !seen[a] {
+	for a := range sw.counts {
+		if !sw.seen[a] {
 			cands = append(cands, a)
 		}
 	}
 	sort.Slice(cands, func(i, j int) bool {
-		if counts[cands[i]] != counts[cands[j]] {
-			return counts[cands[i]] > counts[cands[j]]
+		if sw.counts[cands[i]] != sw.counts[cands[j]] {
+			return sw.counts[cands[i]] > sw.counts[cands[j]]
 		}
 		return cands[i] < cands[j]
 	})
-	var checked []string
-	pending := map[string]int{}
 	for i, a := range cands {
-		if i >= usdHistMaxChecks {
-			pending[a] = counts[a] // left for the next sweep
-			continue
+		if i >= sw.checksLeft {
+			break // left for the next sweep
 		}
-		st := &onchainState{TokenDec: tm.Decimals, EntryBlock: head}
-		ok, err := o.resolveV2V3(ctx, st, asset, a)
+		st := &onchainState{TokenDec: sw.tm.Decimals, EntryBlock: sw.head}
+		ok, err := sw.o.resolveV2V3(ctx, st, sw.asset, a)
+		if err == nil && ctx.Err() != nil {
+			// The end of ctx may have cut off the calls it read as "not a
+			// pool" (getReserves / slot0): not kept as checked.
+			err = ctx.Err()
+		}
 		if err != nil {
-			return usdHistory{}, fmt.Errorf("is %s a pool of %s: %w", a, asset, err)
+			return fmt.Errorf("is %s a pool of %s: %w", a, sw.asset, err)
 		}
-		if ok && o.usdPoolTier(st.Quote) > 0 && strings.ToLower(st.Quote) != asset {
-			// A pool beyond usdPoolsPerTier of its kind is left out (the
-			// busier ones of that kind came first) and not asked again.
-			keep(st)
+		if ok && strings.ToLower(st.Quote) != sw.asset && sw.keep(st) {
+			sw.kept[a] = true
 		}
-		checked = append(checked, a)
+		sw.checked = append(sw.checked, a)
 	}
-	// Pools seen in earlier sweeps are already in the asset's set.
-	for _, st := range found {
-		qm, err := o.rpc.tokenInfo(ctx, st.Quote)
+	return nil
+}
+
+// fillQuotes reads the decimals and symbol of each kept pool's other side.
+func (sw *usdSweep) fillQuotes(ctx context.Context) error {
+	for _, st := range sw.found {
+		qm, err := sw.o.rpc.tokenInfo(ctx, st.Quote)
 		if err != nil {
-			return usdHistory{}, err
+			return err
 		}
 		st.QuoteDec, st.QuoteSym = qm.Decimals, qm.Symbol
 	}
+	return nil
+}
+
+// saveUSDSweep writes a try's progress into the asset's set and returns the
+// number of counterparties left to check. finished: the try ran to its end
+// (the caller merges its pools). Otherwise it stopped on an error, and the
+// next try goes on from what is kept: the transfers read (through the last
+// range the node answered in full, at most through), the counterparties checked that are not
+// pools (a pool found goes back to those left, so it is not lost and the
+// per-kind limit counts it the same), and what the try used of the sweep's
+// bounds, so a resumed sweep ends where one uninterrupted sweep would.
+func (o *onchainSource) saveUSDSweep(sw *usdSweep, finished bool) int {
 	o.mu.Lock()
+	defer o.mu.Unlock()
+	set := sw.set
 	if set.histSeen == nil {
 		set.histSeen = map[string]bool{}
 	}
-	for _, a := range checked {
-		set.histSeen[a] = true
+	settled := 0
+	for _, a := range sw.checked {
+		if finished || !sw.kept[a] {
+			set.histSeen[a] = true
+			settled++
+		}
+	}
+	pending := map[string]int{}
+	for a, c := range sw.counts {
+		if !set.histSeen[a] {
+			pending[a] = c
+		}
 	}
 	set.histPending = pending
-	if readTo < head {
-		set.histThrough = readTo // stopped at the log cap: go on from the cut
+	if sw.readTo < sw.head {
+		set.histThrough = max(set.histThrough, sw.readTo) // stopped before the head: go on from there
 	} else {
-		set.histThrough = max(set.histThrough, through) // blocks near the head are read again next time
+		set.histThrough = max(set.histThrough, sw.through) // blocks near the head are read again next time
 	}
-	if tm.Symbol != "" {
-		set.sym = tm.Symbol
+	if finished {
+		set.histLogs, set.histChecks = 0, 0
+		if sw.tm.Symbol != "" {
+			set.sym = sw.tm.Symbol
+		}
+	} else {
+		set.histLogs, set.histChecks = sw.nLogs, set.histChecks+settled
 	}
-	o.mu.Unlock()
-	h := usdHistory{pools: o.mergeUSDPools(asset, "", found), through: through, complete: readTo == head && len(pending) == 0}
-	if !h.complete {
-		h.progress = fmt.Sprintf("transfers read through block %d of %d, %d counterparties left to check", readTo, head, len(pending))
-	}
-	return h, nil
+	return len(pending)
 }
 
 // noteUSDSource records the pool an asset was priced from, and logs one line

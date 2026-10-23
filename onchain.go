@@ -1405,6 +1405,23 @@ func withScanProgress(ctx context.Context, label string, every time.Duration) co
 	}))
 }
 
+// withScanReached returns a context for one log scan (getLogsChunkedUpTo)
+// and the last block that scan has handed over in full: every log of every
+// block through it given to fn (0 = none yet). The scan reports a range only
+// after fn has had all of its logs, in block order, so after a failed scan
+// the blocks through it need not be asked again. The context's progress
+// lines (withScanProgress), if any, are still printed.
+func withScanReached(ctx context.Context) (context.Context, *uint64) {
+	reached := new(uint64)
+	outer := progressFrom(ctx)
+	return context.WithValue(ctx, progressKey{}, progressFunc(func(from, done, to uint64, events int, size uint64) {
+		*reached = max(*reached, done) // called by the scan's own goroutine, read after it returns
+		if outer != nil {
+			outer(from, done, to, events, size)
+		}
+	})), reached
+}
+
 // blockTime returns a block's timestamp (cached).
 func (c *rpcClient) blockTime(ctx context.Context, n uint64) (int64, error) {
 	c.cacheMu.Lock()

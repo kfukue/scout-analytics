@@ -240,8 +240,14 @@ that last block, so the answer does not depend on what earlier lookups cached.
    `eth_call`, a contract two to four); the next search goes on from there, and until the
    history is covered the answer is "USD pool search not finished": the call is retried
    every 5 minutes (each try moves the search on), never capped or taken for "no USD source";
-   the progress is kept in memory, so a restart starts the search over. Once covered, a
-   later search reads only the new blocks. One search per asset runs at a time; other
+   the progress is kept in memory, so it lasts as long as the process: a restart starts the
+   search over. Within the process, a search stopped by a node error or time-out keeps its
+   progress (the transfers read through the last block range the node answered, but not
+   the last 1,000 blocks, which are read again; the addresses found not to be pools), and the
+   next try goes on from there. A search stopped by its caller (a shutdown) ends with the
+   process, and its progress with it. The per-call time limit
+   (`SCOUT_LATEST_ROW_TIMEOUT`) does not stop the search: it runs for the whole pass. Once
+   covered, a later search reads only the new blocks. One search per asset runs at a time; other
    workers wait for it. What is remembered (in memory, per process): pools found, the
    searched history, and prices per asset and hour; "no pool anywhere" for 1 hour (for the
    blocks the search covered) and "no price yet" (pools, but no trade before that block) for
