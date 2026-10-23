@@ -87,9 +87,6 @@ func SetupDatabaseMaxConns(maxConns int32) (*sql.DB, *pgxpool5.Pool, error) {
 			log.Fatal(fmt.Errorf("sql.Open: %v", err))
 		}
 	} else {
-		dir := utils.GoDotEnvVariable("SSL_CERT_FILE_PATH")
-		filepath.Abs(dir)
-		fmt.Println("in base : " + dir)
 		user := utils.GoDotEnvVariable("DB_USER")
 		password := utils.GoDotEnvVariable("DB_PASS")
 		dbname := utils.GoDotEnvVariable("DB_NAME_DEV")
@@ -104,6 +101,7 @@ func SetupDatabaseMaxConns(maxConns int32) (*sql.DB, *pgxpool5.Pool, error) {
 			if err != nil {
 				log.Fatal(err)
 			}
+			dir := utils.GoDotEnvVariable("SSL_CERT_FILE_PATH")
 			dbURI = fmt.Sprintf(dbURI, host, port, user, password, dbname, sslmode, filepath.Join(dir, sslrootcert), filepath.Join(dir, sslcert), filepath.Join(dir, sslkey))
 		}
 	}
