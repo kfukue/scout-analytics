@@ -67,6 +67,11 @@ type fakeChain struct {
 	callErr func(to, sel string, block uint64) string
 	// callErrCode: the JSON-RPC error code of callErr's errors (0 = -32000).
 	callErrCode int
+	// callHTTP (optional): how the node answers an eth_call outside JSON-RPC
+	// (an HTTP status such as 429 or 503, a body that is not JSON, a dropped
+	// connection), written instead of a JSON-RPC answer (nil = none); asked
+	// before callErr, with f.mu held.
+	callHTTP func(to, sel string) http.HandlerFunc
 	// blockErr (optional): a JSON-RPC error message for eth_getBlockByNumber of
 	// block n ("" = none). Called with f.mu held.
 	blockErr func(n uint64) string
@@ -306,6 +311,12 @@ func (f *fakeChain) serve(w http.ResponseWriter, r *http.Request) {
 			sel = sel[:10]
 		}
 		f.callTags = append(f.callTags, tag)
+		if f.callHTTP != nil {
+			if answer := f.callHTTP(strings.ToLower(c.To), strings.ToLower(sel)); answer != nil {
+				answer(w, r)
+				return
+			}
+		}
 		if f.callErr != nil {
 			if msg := f.callErr(strings.ToLower(c.To), strings.ToLower(sel), num(tag)); msg != "" {
 				code := f.callErrCode
