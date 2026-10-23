@@ -796,20 +796,30 @@ func blockTag(n uint64) string {
 // var so tests can set it to 0).
 var headCacheTTL = time.Second
 
-// headFlight is one eth_blockNumber in progress; done is closed when n and err
-// are set.
+// headFlight is one eth_blockNumber in progress; done is closed when n, err
+// and askerStopped are set.
+//
+// askerStopped: the context of the caller that sent the request had ended
+// (cancelled, or past its own deadline, such as a latest-price row's time
+// limit) when the request finished. Its error is then that caller's, not the
+// node's, and a waiting caller whose context is still alive asks again itself.
+// It is read from the asker's context, not from the error: the client's own
+// time limit (http.Client.Timeout) also reports context.DeadlineExceeded, and
+// that one is shared with the waiters as the node's answer.
 type headFlight struct {
-	done chan struct{}
-	n    uint64
-	err  error
+	done         chan struct{}
+	n            uint64
+	err          error
+	askerStopped bool
 }
 
 // blockNumber returns the chain's head block (eth_blockNumber). An answer is
 // reused for headCacheTTL by every caller of this client (all workers share
 // it). One request at a time: callers that arrive while it runs take its
 // answer, an error included, instead of asking again (so a node that does not
-// answer costs one round of retries, not one per worker). An error is never
-// kept: the next call after it asks again.
+// answer costs one round of retries, not one per worker). Only when the
+// asker's own context ended does a waiter whose context is alive ask again
+// (see headFlight). An error is never kept: the next call after it asks again.
 func (c *rpcClient) blockNumber(ctx context.Context) (uint64, error) {
 	for {
 		c.headMu.Lock()
@@ -825,8 +835,8 @@ func (c *rpcClient) blockNumber(ctx context.Context) (uint64, error) {
 			case <-ctx.Done():
 				return 0, ctx.Err()
 			}
-			if fl.err != nil && ctx.Err() == nil && (errors.Is(fl.err, context.Canceled) || errors.Is(fl.err, context.DeadlineExceeded)) {
-				continue // the asker gave up (its context), not the node: ask again
+			if fl.err != nil && fl.askerStopped && ctx.Err() == nil {
+				continue // the asker's own context ended (Ctrl+C, a row's time limit), ours did not: ask ourselves
 			}
 			return fl.n, fl.err
 		}
@@ -835,6 +845,7 @@ func (c *rpcClient) blockNumber(ctx context.Context) (uint64, error) {
 		c.headMu.Unlock()
 
 		fl.n, fl.err = c.fetchBlockNumber(ctx)
+		fl.askerStopped = ctx.Err() != nil
 		c.headMu.Lock()
 		if fl.err == nil {
 			c.headVal, c.headAt = fl.n, time.Now()
