@@ -210,6 +210,9 @@ HOLD_NOT_FEATURES = ("transfers_post", "lp_events_post", "venues_post", "post_en
 # Holder pilot analysis (holders_report.py, scout_ml/holders.py; report only, no model).
 # The pilot sample is about 1/3 per group, not the natural base rates: AUC only.
 HOLD_GROUPS = ("dead7", "held2x7", "neither")
+# The Q6 query's sort-prefixed grp labels, also accepted in the ids file (exact forms only,
+# after trimming; owner, 23 Oct 2026) and read as the plain group.
+HOLD_GROUP_LABELS = {"1 dead7": "dead7", "2 held2x7": "held2x7", "3 neither": "neither"}
 HOLD_STOP_AUC_LOWER = 0.60     # pre-registered 19 Oct 2026 (HANDOFF.md, "Stop rules, fixed before P1")
 HOLD_STRATA_AUC_LOWER = 0.50   # the PM's reading of "the separation vanishes within strata"
 HOLD_MIN_CLASS_N = 30          # non-NULL rows per class for an AUC; analysable rows per group for a verdict
@@ -219,6 +222,18 @@ HOLD_BOOTSTRAP_SEED = 7
 HOLD_CI = (2.5, 97.5)
 HOLD_PERM_REPS = 500           # grp shuffled within week: chance level of the best of N
 HOLD_PERM_SEED = 7
+# "Beyond posted holders and age" (report only, never in the verdict; owner, 23 Oct 2026,
+# added after the pilot, not pre-registered): cross-validated logistic regression of
+# log1p(holders_at_call) + log1p(age_s_at_call), with and without log1p(feature). Its
+# bootstraps reuse HOLD_BOOTSTRAP_REPS / HOLD_BOOTSTRAP_SEED / HOLD_CI; n/a below HOLD_MIN_CLASS_N.
+HOLD_INCR_FEATURES = ("pre_hold_holders", "pre_hold_sellers")   # each alone, then all together
+HOLD_INCR_FOLDS = 5            # stratified K-fold on the contrast label
+HOLD_INCR_REPEATS = 20         # fold assignments; repeat r shuffles with seed HOLD_INCR_SEED + r
+HOLD_INCR_SEED = 7
+HOLD_INCR_LOGIT_C = 1.0        # sklearn LogisticRegression C (L2) on standardised inputs
+HOLD_INCR_DECILES = 10         # posted-holder quantile bins x the HOLD_AGE_BAND_S age band
+HOLD_INCR_ADDS_DELTA_LOWER = 0.0    # PM's reading: "adds" if delta AUC 95 % lower bound > this
+HOLD_INCR_ADDS_STRATA_LOWER = 0.50  # ... and the decile-strata AUC 95 % lower bound > this
 FORBIDDEN_COLUMNS = (set(BOOKKEEPING) - {"quote_asset"} | set(IDENTITY)
                      | {"pre_vol_unit", "token_name", "post_kind"} | set(LATEST)
                      | set(TRACKER_DISCOVERY) | set(AFTER_CALL_VIEW)

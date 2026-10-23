@@ -954,7 +954,9 @@ source of truth, read up to its last newline like the Go reader; `columns.json`;
 `runs.jsonl` for the failed-call count) and the owner's Q6 pilot ids CSV (`call_id,
 grp, week_utc, rn_week, rn, ca, kind, entry_at, entry_block, pool_address, pool_id,
 holders_at_call, age_s_at_call, max_gain_late_7d, ret_late_7d, tax_buy_pct,
-tax_sell_pct`; `grp` is `dead7`, `held2x7` or `neither`), joined on `call_id`.
+tax_sell_pct`; `grp` is `dead7`, `held2x7` or `neither`, or the Q6 query's sort-prefixed
+`1 dead7`, `2 held2x7` or `3 neither`, read as the plain group; quoted or not, surrounding
+spaces ignored; any other value, such as `2 dead7` or `Dead7`, is refused), joined on `call_id`.
 Defaults, from the repo root: `data/holders`, `data/holder_pilot_ids.csv`, and
 `data/holders_analysis` for the output. Each run writes a new folder
 `<out>/<YYYYMMDD-HHMM UTC>/` with `report.md` and `summary.json` (refused if it
@@ -975,8 +977,9 @@ error.
   on the full sample), 95 % percentile bootstrap within groups
   (`HOLD_BOOTSTRAP_REPS` 2000, seed 7), and the AUC over the pairs in the same week
   and in the same stratum (posted-holder terciles from the pilot x age < 1 h /
-  >= 1 h, with its bootstrap). n/a below 30 non-NULL rows per class. AUC only:
-  the sample is about a third per group, so lift and precision would mean nothing.
+  >= 1 h, with its bootstrap). n/a below 30 non-NULL rows per class. Group shares
+  come from the sample, not necessarily the natural base rates, so AUC only; lift
+  and precision would mean nothing.
 - **Baseline and checks:** the AUC of `holders_at_call` and of `age_s_at_call` alone
   (the Q5b reference); the strata counts; the correlation of
   `pre_hold_launch_age_s` with `age_s_at_call` and `pre_hold_holders` with
@@ -996,6 +999,44 @@ error.
   evaluated.
 - **After the call:** every `post24h_*` column, peak and 7d return (also net of tax
   when the tax columns are there) per group, description only.
+- **Beyond posted holders and age (report only, never in the verdict):** the last
+  section, added 23 Oct 2026 after the pilot (not pre-registered; a PM reading for
+  the owner). For `dead7` vs rest and `held2x7` vs rest and each of
+  `HOLD_INCR_FEATURES` (default `pre_hold_holders`, `pre_hold_sellers`) alone, then
+  together: a logistic regression (L2, `HOLD_INCR_LOGIT_C` 1.0) on
+  log1p(`holders_at_call`) + log1p(`age_s_at_call`) (the baseline) with and without
+  log1p(feature). Per model, rows with a baseline value or the feature NULL or
+  negative are dropped and counted, and baseline and model use the same rows.
+  Stratified `HOLD_INCR_FOLDS` (5) fold cross-validation on the contrast label,
+  repeated `HOLD_INCR_REPEATS` (20) times (shuffle seed `HOLD_INCR_SEED` 7 + repeat),
+  with the same folds for baseline and model and the scaler fitted in each training
+  part. AUC and the point delta are of each row's out-of-fold score averaged over
+  the repeats. The delta AUC 95 % CI is a paired percentile bootstrap (the
+  `HOLD_BOOTSTRAP_*` settings, within groups): each rep uses the out-of-fold scores
+  of one repeat drawn at random (seed `HOLD_INCR_SEED`), the same repeat and
+  resample for baseline and model, so it covers the sampling of calls and the fold
+  assignment. Each rep's delta is one repeat's delta, so the CI is centred on the
+  repeat-delta mean (shown in the table), not necessarily on the point delta of the
+  averaged scores. No model is refitted per rep, so the refit variance is not in it: it
+  is a floor on the uncertainty. The min / mean / max delta over the repeats shows
+  the fold noise; a delta whose repeat range spans 0, or that is no larger than that
+  range, is no evidence either way. These are random stratified folds, not the
+  project's time-based validation, so the delta is a within-sample contrast, not a
+  forward estimate. One call per token (the duplicate-`ca` refusal in `load_ids`)
+  holds only when the ids file has a `ca` column; without it, calls of one token can
+  sit in different folds. Also shown: the feature's standardised coefficient on all
+  rows (its direction given the baseline); the AUC of the residual of log1p(feature)
+  after a least-squares fit on the baseline (fitted on all rows: it never sees the
+  group), with its bootstrap CI; and the within-strata AUC with posted-holder
+  terciles (the strata above) and with up to `HOLD_INCR_DECILES` (10) posted-holder
+  quantile bins, each x the age band, with bootstrap CIs. The within-strata AUCs are
+  oriented by the feature's pooled direction while the coefficient is conditional on
+  the baseline, so the two can disagree; a † after the coefficient (with a footnote)
+  marks a single feature whose coefficient sign disagrees with its pooled direction.
+  The suggested reading per single feature: "adds" if the delta lower bound > 0 and
+  the decile-strata lower bound > 0.50, otherwise "no addition shown beyond posted
+  holders and age"; the joint model has no reading. NOT JUDGED with the verdict's
+  strata reasons. Its settings are appended to the report's Settings line.
 
 The output holds counts and metrics only (no address, no per-call row; the ids
 without a row are listed by call id in `summary.json` only), plus the sha256 of

@@ -1,5 +1,6 @@
 """Holder pilot analysis (scout_ml/holders.py, holders_report.py): synthetic
 export and ids files only (make_synthetic.make_holder_pilot)."""
+import csv
 import json
 import re
 from datetime import datetime, timezone
@@ -24,6 +25,7 @@ ADDRESS = re.compile(r"0x[0-9a-fA-F]{40}")
 def few_reps(monkeypatch):
     monkeypatch.setattr(C, "HOLD_BOOTSTRAP_REPS", 200)
     monkeypatch.setattr(C, "HOLD_PERM_REPS", 40)
+    monkeypatch.setattr(C, "HOLD_INCR_REPEATS", 3)
 
 
 @pytest.fixture(scope="module")
@@ -119,6 +121,22 @@ def first_value(col, value):
 def test_refuses_bad_ids(pilot, capsys, change, text):
     change(pilot)
     refused(pilot.write(), capsys, text)
+
+
+# Only the three exact Q6 forms are read as a group: a wrong number ('2 dead7' is held2x7's
+# number), another case, extra or missing spaces inside, or a prefix on an unknown name.
+@pytest.mark.parametrize("label", ["4 dead7", "Dead7", "2 dead7", "1 Dead7", "1  dead7", "1dead7",
+                                   "01 dead7", "1 dead7x", "4 other"])
+def test_refuses_grp_labels_other_than_the_accepted_forms(pilot, capsys, label):
+    first_value("grp", lambda ids: label)(pilot)
+    refused(pilot.write(), capsys, "1 ids row(s) with grp outside "
+            "['dead7', 'held2x7', 'neither', '1 dead7', '2 held2x7', '3 neither']")
+
+
+def test_q6_prefixed_labels_map_to_the_plain_groups():
+    assert C.HOLD_GROUP_LABELS == {"1 dead7": "dead7", "2 held2x7": "held2x7", "3 neither": "neither"}
+    got = H.plain_groups(pd.Series(["1 dead7", "2 held2x7", "3 neither", "dead7", "2 dead7", "Dead7"]))
+    assert got.tolist() == ["dead7", "held2x7", "neither", "dead7", "2 dead7", "Dead7"]
 
 
 @pytest.mark.parametrize("name", [H.ROWS_FILE, H.COLUMNS_FILE])
@@ -233,6 +251,37 @@ def test_end_to_end_writes_both_files_without_addresses(pilot, capsys):
         assert text in header, text
 
 
+PREFIXED = {g: f"{n} {g}" for n, g in enumerate(C.HOLD_GROUPS, 1)}   # the Q6 query's labels
+
+
+def run_with_labels(tmp_path, made, name, label, quoted=False):
+    """report.md and summary.json (minus the ids file's hash) of a run whose ids grp values are
+    label(i, grp); quoted writes every ids value in double quotes, as a pgAdmin export may."""
+    p = Pilot(tmp_path / name, made).write()
+    p.ids = p.ids.assign(grp=[label(i, g) for i, g in enumerate(p.ids.grp)])
+    p.ids.to_csv(p.csv, index=False, quoting=csv.QUOTE_ALL if quoted else csv.QUOTE_MINIMAL)
+    assert p.main() == H.EXIT_OK
+    run = p.out / "20261021-0315"
+    s = json.loads((run / "summary.json").read_text(encoding="utf-8"))
+    del s["inputs"]["sha256"]["ids (ids.csv)"]
+    return (run / "report.md").read_text(encoding="utf-8"), s
+
+
+@pytest.mark.parametrize("name, label, quoted", [
+    ("prefixed", lambda i, g: PREFIXED[g], False),
+    ("prefixed_quoted", lambda i, g: PREFIXED[g], True),
+    ("padded_quoted", lambda i, g: f"  {PREFIXED[g]} ", True),
+    ("mixed", lambda i, g: PREFIXED[g] if i % 2 else g, False),
+])
+def test_q6_prefixed_labels_give_the_same_report_as_plain_labels(tmp_path, made, name, label, quoted):
+    assert PREFIXED == {"dead7": "1 dead7", "held2x7": "2 held2x7", "neither": "3 neither"}
+    plain = run_with_labels(tmp_path, made, "plain", lambda i, g: g)
+    got = run_with_labels(tmp_path, made, name, label, quoted)
+    assert got[0] == plain[0]
+    assert got[1] == plain[1]
+    assert got[1]["inputs"]["analysable_rows"] > 0
+
+
 def test_row_classes_counted_per_group(pilot):
     s = pilot.write().summary()
     rc = s["row_classes"]
@@ -268,7 +317,7 @@ def test_shuffling_after_call_and_description_columns_changes_no_auc(pilot):
     for c in desc:
         pilot.ids[c] = rng.permutation(pilot.ids[c].to_numpy())
     shuffled = pilot.write(cols).summary()
-    for key in ("contrasts", "baseline", "verdict", "multiple_comparisons", "features", "strata"):
+    for key in ("contrasts", "baseline", "verdict", "multiple_comparisons", "features", "strata", H.INCR_KEY):
         assert shuffled[key] == base[key], key
     assert "post24h_grp_code" in base["after_call"]
     assert all("post24h_grp_code" not in block for block in base["contrasts"].values())
@@ -405,8 +454,11 @@ def test_not_judged_without_strata_columns(pilot):
     s = json.loads((run / "summary.json").read_text(encoding="utf-8"))
     assert s["verdict"]["verdict"] == "NOT JUDGED" and "older Q6 export" in s["verdict"]["reasons"][0]
     assert s["baseline"] is None and "not_judged" in s["strata"] and s["outcomes"] == {}
+    assert s[H.INCR_KEY] == {"not_judged": s["strata"]["not_judged"]}
     assert "pre_hold_top10_share" in s["contrasts"]["dead7 vs rest"]
-    assert "Verdict: NOT JUDGED" in (run / "report.md").read_text(encoding="utf-8")
+    report = (run / "report.md").read_text(encoding="utf-8")
+    assert "Verdict: NOT JUDGED" in report
+    assert "NOT JUDGED: ids file lacks" in report.split(H.INCR_HEAD)[1]
 
 
 def test_not_judged_with_too_few_rows_in_a_group(pilot):
@@ -423,3 +475,261 @@ def test_permutation_null_is_reproducible_and_near_chance(pilot):
     assert m == b["multiple_comparisons"]
     assert m["tests"] == 2 * len(C.HOLD_FEATURES)
     assert 0.5 < m["perm_p95_best"]["dead7 vs rest"] < 0.7 and m["perm_p95_best"]["both"] >= m["perm_p95_best"]["dead7 vs rest"]
+
+
+# --- beyond posted holders and age (report only) ---------------------------------------
+SINGLE_KEYS = {"features", "contrast_rows", "dropped_baseline_missing", "dropped_feature_missing", "n_pos", "n_neg",
+               "baseline_auc", "model_auc", "delta", "delta_ci", "repeat_delta", "coef", "direction", "residual",
+               "terciles", "deciles", "reading"}
+JOINT = "pre_hold_holders + pre_hold_sellers"
+INCR_SETTING_NAMES = ("HOLD_INCR_FEATURES", "HOLD_INCR_FOLDS", "HOLD_INCR_REPEATS", "HOLD_INCR_SEED",
+                      "HOLD_INCR_LOGIT_C", "HOLD_INCR_DECILES", "HOLD_INCR_ADDS_DELTA_LOWER",
+                      "HOLD_INCR_ADDS_STRATA_LOWER")
+
+
+def controlled(n=900, seed=5):
+    """dead7 driven by the posted holders (unbalanced groups); pre_hold_holders a noisy copy of
+    holders_at_call, pre_hold_sellers higher for dead7 independently of holders and age."""
+    rng = np.random.default_rng(seed)
+    h = rng.lognormal(np.log(120), 0.7, n)
+    age = rng.choice([600.0, 7200.0], n) * rng.uniform(0.5, 1.5, n)
+    z = (np.log(h) - np.log(h).mean()) / np.log(h).std()
+    dead = rng.random(n) < 1 / (1 + np.exp(-(1.5 * z - 0.7)))
+    grp = pd.Series(np.where(dead, "dead7", rng.choice(["held2x7", "neither"], n, p=[0.2, 0.8])))
+    a = pd.DataFrame({"holders_at_call": h, "age_s_at_call": age})
+    X = pd.DataFrame({"pre_hold_holders": h * rng.uniform(0.9, 1.1, n),
+                      "pre_hold_sellers": rng.poisson(np.exp(3 + 0.4 * dead)).astype(float)})
+    return a, X, grp
+
+
+def test_beyond_baseline_noisy_copy_shows_no_addition_and_independent_signal_adds():
+    a, X, grp = controlled()
+    inc = H.beyond_baseline(a, X, grp, H.stratum_labels(a)[0])
+    d = inc["contrasts"]["dead7 vs rest"]
+    copy, sig = d["pre_hold_holders"], d["pre_hold_sellers"]
+    assert copy["baseline_auc"] > 0.7 and copy["n_pos"] + copy["n_neg"] == len(a)
+    assert abs(copy["delta"]) < 0.02 and copy["delta_ci"][0] <= 0, copy["delta_ci"]
+    assert copy["reading"] == H.NO_ADDITION
+    assert sig["delta"] > 0.05 and sig["delta_ci"][0] > C.HOLD_INCR_ADDS_DELTA_LOWER
+    assert sig["deciles"]["strata_ci"][0] > C.HOLD_INCR_ADDS_STRATA_LOWER and sig["deciles"]["direction"] == "higher"
+    assert sig["coef"]["pre_hold_sellers"] > 0 and sig["residual"]["ci"][0] > 0.5 and sig["reading"] == "adds"
+    assert copy["direction"] == sig["direction"] == "higher" and not H.coef_disagrees(copy) and not H.coef_disagrees(sig)
+    assert d[JOINT]["reading"] is None and set(d[JOINT]["coef"]) == {"pre_hold_holders", "pre_hold_sellers"}
+    assert inc["decile_strata"]["strata"] == 2 * C.HOLD_INCR_DECILES
+
+
+def test_beyond_baseline_small_class_is_na_per_contrast_and_renders_an_aligned_row():
+    """10 dead7 rows: every dead7 vs rest model is n/a (reading "n/a", nothing computed), while
+    held2x7 vs rest (60 / 140) is computed on the same data, so the n/a is per class, not global."""
+    a, X, _ = controlled(n=200)
+    grp = pd.Series(["dead7"] * 10 + ["held2x7"] * 60 + ["neither"] * 130, index=a.index)
+    inc = H.beyond_baseline(a, X, grp, H.stratum_labels(a)[0])
+    na = f"< {C.HOLD_MIN_CLASS_N} rows with the baseline and feature(s) in a class"
+    for name, m in inc["contrasts"]["dead7 vs rest"].items():
+        assert (m["n_pos"], m["n_neg"], m["na"], m["reading"]) == (10, 190, na, "n/a"), name
+        assert not {"delta", "delta_ci", "coef", "residual", "direction"} & set(m), name
+    held = inc["contrasts"]["held2x7 vs rest"]["pre_hold_holders"]
+    assert "na" not in held and held["n_pos"] == 60 and held["delta_ci"] and held["reading"] != "n/a"
+    m = inc["contrasts"]["dead7 vs rest"]["pre_hold_holders"]
+    assert len(H.fdelta(m)) == len(H.fdelta(held)) == 7          # keeps the table aligned
+    st = {k: getattr(C, k) for k in ("HOLD_BOOTSTRAP_REPS", "HOLD_BOOTSTRAP_SEED") + H.INCR_SETTINGS}
+    lines = H.render_incremental(inc, st)
+    rows = [x for x in lines if x.startswith("| dead7 vs rest | pre_hold_holders |")]
+    assert rows == [f"| dead7 vs rest | pre_hold_holders | 10 / 190 | 0 / 0 | n/a ({na}) |" + "  |" * 5 + " n/a |"]
+    assert rows[0][2:-2].split(" | ")[4:] == [f"n/a ({na})"] + [""] * 5 + ["n/a"]
+    assert len([x for x in lines if x.startswith("| held2x7 vs rest | pre_hold_holders |")]) == 2  # + checks row
+    assert not any(H.coef_disagrees(x) for x in inc["contrasts"]["dead7 vs rest"].values())  # never daggered
+
+
+def test_reading_needs_both_bounds():
+    m = {"features": ["f"], "delta_ci": [0.01, 0.1], "deciles": {"strata_ci": [0.51, 0.7]}}
+    assert H.incr_reading(m) == "adds"
+    assert H.incr_reading({**m, "delta_ci": [C.HOLD_INCR_ADDS_DELTA_LOWER, 0.1]}) == H.NO_ADDITION
+    assert H.incr_reading({**m, "deciles": {"strata_ci": [C.HOLD_INCR_ADDS_STRATA_LOWER, 0.7]}}) == H.NO_ADDITION
+    assert H.incr_reading({**m, "deciles": {"na": "no strata"}}) == "n/a"
+    assert H.incr_reading({**m, "features": ["f", "g"]}) is None
+
+
+def test_beyond_baseline_is_deterministic_and_uses_its_seed(monkeypatch):
+    a, X, grp = controlled(n=400)
+    t = H.stratum_labels(a)[0]
+    first, again = H.beyond_baseline(a, X, grp, t), H.beyond_baseline(a, X, grp, t)
+    assert first == again
+    monkeypatch.setattr(C, "HOLD_INCR_SEED", 8)
+    other = H.beyond_baseline(a, X, grp, t)["contrasts"]["dead7 vs rest"]["pre_hold_sellers"]
+    was = first["contrasts"]["dead7 vs rest"]["pre_hold_sellers"]
+    assert other["repeat_delta"] != was["repeat_delta"] and other["delta_ci"] != was["delta_ci"]
+
+
+def test_delta_ci_with_one_repeat_is_the_fixed_score_bootstrap(monkeypatch):
+    monkeypatch.setattr(C, "HOLD_INCR_REPEATS", 1)
+    rng = np.random.default_rng(3)
+    y, g = rng.random(300) < 0.3, rng.choice(["a", "b"], 300)
+    Zb = rng.normal(size=(300, 2))
+    Zm = np.column_stack([Zb, Zb[:, 0] + rng.normal(size=300) + y])
+    sb, sm = H.oof_pair(Zb, Zm, y)
+    w = H.boot_weights(g)
+    fixed = H.ci(H.pair_auc(sm[0], y, None, w) - H.pair_auc(sb[0], y, None, w))
+    assert H.delta_auc(Zb, Zm, y, g)["delta_ci"] == fixed
+
+
+def test_delta_ci_includes_the_fold_noise():
+    """Two repeats whose deltas have opposite signs: each rep uses one drawn repeat, so the CI
+    spans both, where the repeat-averaged scores would give a delta near 0 with a narrow CI."""
+    rng = np.random.default_rng(6)
+    y = np.arange(400) % 4 == 0
+    sb = np.tile(rng.random(400), (2, 1))
+    sm = np.vstack([np.where(y, 0.9, 0.1), np.where(y, 0.1, 0.9)])
+    w = H.boot_weights(np.where(y, "p", "n"))
+    pick = H.draw_repeats(len(w), 2)
+    assert 0.3 < pick.mean() < 0.7 and np.array_equal(pick, H.draw_repeats(len(w), 2))
+    lo, hi = H.ci(H.boot_delta(sb, sm, y, w))
+    assert lo < -0.3 and hi > 0.3
+
+
+def test_baseline_and_model_share_the_folds():
+    rng = np.random.default_rng(4)
+    y = rng.random(200) < 0.3
+    Zb = rng.normal(size=(200, 2))
+    sb, sm = H.oof_pair(Zb, Zb.copy(), y)     # model == baseline: identical scores in every repeat
+    assert sb.shape == (C.HOLD_INCR_REPEATS, 200) and np.array_equal(sb, sm)
+
+
+def test_missing_and_negative_baseline_rows_are_dropped_and_counted(pilot):
+    pilot.write()
+    df = H.join(H.load_export(pilot.dir), H.load_ids(pilot.csv))
+    ok = df.loc[df.row_class.eq("analysable"), "call_id"].tolist()
+    blank, negative, no_feature = ok[:10], ok[10:13], ok[13:18]
+    pilot.ids["holders_at_call"] = pilot.ids["holders_at_call"].astype(object)
+    pilot.ids.loc[pilot.ids.call_id.isin(blank[:6]), "holders_at_call"] = ""
+    pilot.ids.loc[pilot.ids.call_id.isin(blank[6:]), "age_s_at_call"] = None
+    pilot.ids.loc[pilot.ids.call_id.isin(negative), "age_s_at_call"] = -5
+    for r in pilot.rows:
+        if r["call_id"] in no_feature:
+            r["pre_hold_sellers"] = None
+    s = pilot.write().summary()
+    for c in ("dead7 vs rest", "held2x7 vs rest"):
+        models = s[H.INCR_KEY]["contrasts"][c]
+        assert models["pre_hold_holders"]["dropped_baseline_missing"] == 13
+        assert models["pre_hold_holders"]["dropped_feature_missing"] == 0
+        assert models["pre_hold_sellers"]["dropped_feature_missing"] == 5
+        assert models[JOINT]["dropped_feature_missing"] == 5
+        for m in models.values():
+            assert "delta" in m
+            assert m["n_pos"] + m["n_neg"] + m["dropped_baseline_missing"] + m["dropped_feature_missing"] \
+                == m["contrast_rows"] == len(ok)
+    assert s[H.INCR_KEY]["decile_strata"]["rows_without_stratum"] == 10   # a negative age still has a stratum
+    assert pilot.main() == H.EXIT_OK
+    section = (pilot.out / "20261021-0315" / "report.md").read_text(encoding="utf-8").split(H.INCR_HEAD)[1]
+    assert "| dead7 vs rest | pre_hold_sellers |" in section and "| 13 / 5 |" in section
+
+
+def test_log1p_count_and_decile_ties():
+    v = H.log1p_count(pd.Series([0.0, 3.0, -1.0, np.nan]))
+    assert v.iloc[0] == 0 and v.iloc[1] == pytest.approx(np.log(4)) and v.iloc[2:].isna().all()
+    a = pd.DataFrame({"holders_at_call": [5.0] * 60 + list(range(6, 46)), "age_s_at_call": [600.0] * 100})
+    lab, cuts = H.decile_labels(a)
+    assert cuts == sorted(set(cuts)) and len(cuts) < C.HOLD_INCR_DECILES - 1   # tied cut points merge
+    assert lab.iloc[:60].nunique() == 1 and lab.notna().all() and lab.nunique() <= len(cuts) + 1
+    assert H.decile_labels(a.head(C.HOLD_INCR_DECILES - 1)) == (None, None)
+
+
+@pytest.mark.parametrize("feats, text", [
+    (("post24h_holders",), "inputs must be pre_hold_*"), (("holders_at_call",), "inputs must be pre_hold_*"),
+    (("pre_hold_incomplete",), "HOLD_INCR_FEATURES must be"), (("pre_hold_holders",) * 2, "HOLD_INCR_FEATURES must be"),
+    ((), "HOLD_INCR_FEATURES must be")])
+def test_refuses_bad_incremental_features(pilot, monkeypatch, capsys, feats, text):
+    monkeypatch.setattr(C, "HOLD_INCR_FEATURES", feats)
+    refused(pilot.write(), capsys, text)
+
+
+def strip_incremental(s: dict) -> dict:
+    return {k: v for k, v in s.items() if k != H.INCR_KEY}
+
+
+def test_new_section_is_appended_and_leaves_the_rest_byte_identical(pilot):
+    assert pilot.write().main() == H.EXIT_OK
+    run = pilot.out / "20261021-0315"
+    report = (run / "report.md").read_text(encoding="utf-8")
+    s = json.loads((run / "summary.json").read_text(encoding="utf-8"))
+    head, section = report.split(H.INCR_HEAD)
+    assert head == H.render_report(strip_incremental(s)) + "\n"
+    assert [x for x in report.splitlines() if x.startswith("## ")][-1] == H.INCR_HEAD
+    for text in ("never part of the verdict", "not pre-registered", "Group shares come from the sample, not "
+                 "necessarily the natural base rates: ranking (AUC) only.", "PM's suggestion",
+                 f'otherwise "{H.NO_ADDITION}"', "one repeat drawn at random", "floor on the uncertainty",
+                 "no evidence either way", "not the project's time-based validation", "within-sample contrast",
+                 "the CI is centred on the repeat-delta mean (shown in the table), not necessarily on the point "
+                 "delta of the averaged scores",
+                 "only when the ids file has a ca column", "oriented by the feature's pooled direction"):
+        assert text in section, text
+    assert "one third" not in report
+    assert ("Group shares come from the sample, not necessarily the natural base rates: ranking (AUC) only, never "
+            "lift or precision.") in head      # the report header's line, changed with this section
+    assert not ADDRESS.search(section)
+
+
+def test_verdict_and_other_keys_ignore_the_incremental_check(pilot, monkeypatch):
+    base = pilot.write().summary()
+    monkeypatch.setattr(C, "HOLD_INCR_FEATURES", ("pre_hold_top10_share",))
+    monkeypatch.setattr(C, "HOLD_INCR_SEED", 99)
+    other = pilot.summary()
+    assert strip_incremental(other) == strip_incremental(base)
+    assert list(other[H.INCR_KEY]["contrasts"]["dead7 vs rest"]) == ["pre_hold_top10_share"]
+
+
+def test_incremental_summary_keys_and_settings(pilot):
+    assert C.HOLD_INCR_FEATURES == ("pre_hold_holders", "pre_hold_sellers")
+    assert pilot.write().main() == H.EXIT_OK
+    s = json.loads((pilot.out / "20261021-0315" / "summary.json").read_text(encoding="utf-8"))
+    assert list(s)[-1] == H.INCR_KEY and set(s[H.INCR_KEY]) == {"decile_strata", "contrasts"}
+    assert set(s[H.INCR_KEY]["decile_strata"]) == {"cut_points", "strata", "rows_without_stratum"}
+    assert list(s["settings"])[-len(INCR_SETTING_NAMES):] == list(INCR_SETTING_NAMES)
+    inc = s[H.INCR_KEY]["contrasts"]
+    assert list(inc) == ["dead7 vs rest", "held2x7 vs rest"]
+    for c, models in inc.items():
+        assert list(models) == ["pre_hold_holders", "pre_hold_sellers", JOINT]
+        assert set(models[JOINT]) == SINGLE_KEYS - {"direction", "residual", "terciles", "deciles"}
+        for f in ("pre_hold_holders", "pre_hold_sellers"):
+            assert set(models[f]) == SINGLE_KEYS
+            assert models[f]["reading"] == H.NO_ADDITION          # the pilot plants no signal in either
+            # the tercile check is the existing within-strata number on the same rows
+            assert models[f]["terciles"]["within_strata"] == pytest.approx(s["contrasts"][c][f]["within_strata"])
+
+
+def test_coefficient_against_pooled_direction_is_marked():
+    """pre_hold_holders tracks the posted holders (pooled: higher for dead7) but is lower for dead7
+    given them, so its coefficient is negative: marked with the dagger and the footnote."""
+    a, X, grp = controlled()
+    rng = np.random.default_rng(11)
+    dead = (grp == "dead7").to_numpy()
+    X["pre_hold_holders"] = a["holders_at_call"] * np.exp(-0.6 * dead + rng.normal(0, 0.1, len(a)))
+    inc = H.beyond_baseline(a, X, grp, H.stratum_labels(a)[0])
+    m = inc["contrasts"]["dead7 vs rest"]["pre_hold_holders"]
+    assert m["direction"] == "higher" and m["coef"]["pre_hold_holders"] < 0 and H.coef_disagrees(m)
+    assert m["terciles"]["direction"] == m["deciles"]["direction"] == "higher"
+    st = {k: getattr(C, k) for k in ("HOLD_BOOTSTRAP_REPS", "HOLD_BOOTSTRAP_SEED") + H.INCR_SETTINGS}
+    lines = H.render_incremental(inc, st)
+    def model_row(f):
+        n = inc["contrasts"]["dead7 vs rest"][f]
+        return [x for x in lines if x.startswith(f"| dead7 vs rest | {f} | {n['n_pos']} / {n['n_neg']} |")]
+    assert len(model_row("pre_hold_holders")) == 1 and model_row("pre_hold_holders")[0].count(H.DAGGER) == 1
+    assert len(model_row("pre_hold_sellers")) == 1 and H.DAGGER not in model_row("pre_hold_sellers")[0]
+    assert f"{H.DAGGER} {H.DAGGER_NOTE}" in lines
+
+
+def test_coef_disagrees():
+    m = {"features": ["f"], "coef": {"f": 0.2}, "direction": "higher"}
+    assert not H.coef_disagrees(m)
+    assert H.coef_disagrees({**m, "direction": "lower"})
+    assert H.coef_disagrees({**m, "coef": {"f": -0.2}})
+    assert not H.coef_disagrees({**m, "coef": {"f": 0.0}, "direction": "lower"})
+    assert not H.coef_disagrees({"features": ["f", "g"], "coef": {"f": -1.0, "g": 1.0}})
+
+
+def test_no_footnote_without_a_disagreement(pilot):
+    assert pilot.write().main() == H.EXIT_OK
+    report = (pilot.out / "20261021-0315" / "report.md").read_text(encoding="utf-8")
+    s = json.loads((pilot.out / "20261021-0315" / "summary.json").read_text(encoding="utf-8"))
+    flagged = [m for ms in s[H.INCR_KEY]["contrasts"].values() for m in ms.values() if H.coef_disagrees(m)]
+    assert (H.DAGGER_NOTE in report) == bool(flagged)

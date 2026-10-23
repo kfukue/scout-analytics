@@ -1,7 +1,9 @@
 """Holder pilot analysis (P1, report only; no model): the -export-holders files
 joined on call_id to the owner's Q6 pilot ids, row classes, per-feature AUC with
 bootstrap intervals, within-week and within-strata checks, a permutation null
-and the pre-registered stop rule. Pure functions except load_*, check_out_dir
+and the pre-registered stop rule, plus a report-only check of what the
+HOLD_INCR_FEATURES add beyond the posted holders and age (never in the verdict).
+Pure functions except load_*, check_out_dir
 and run; holders_report.py is the command line. The output holds counts and
 metrics only, never an address or a per-call row, so it is safe to paste back."""
 import hashlib
@@ -12,7 +14,11 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import roc_auc_score
+from sklearn.model_selection import StratifiedKFold
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
 
 from . import config as C
 from .features import assert_no_leakage, num
@@ -35,6 +41,14 @@ CONTRASTS = PRIMARY + (("dead7 vs held2x7", "dead7", "held2x7"),)
 EXPORT_REQUIRED = ("call_id", "status", "skip_reason", "entry_block", "venues_pre", "transfers_pre",
                    "code_version", "pre_hold_incomplete")
 CLASS_ORDER = ("no row", "skipped", "capped", "incomplete", "entry-block mismatch", "analysable")
+INCR_KEY, INCR_HEAD = "beyond_baseline", "## Beyond posted holders and age (report only)"
+NO_ADDITION = "no addition shown beyond posted holders and age"
+DAGGER = chr(0x2020)   # the dagger sign
+DAGGER_NOTE = ("the coefficient's sign (given the baseline) disagrees with the feature's pooled direction on the same "
+               "rows, which orients the strata AUCs below.")
+INCR_SETTINGS = ("HOLD_INCR_FEATURES", "HOLD_INCR_FOLDS", "HOLD_INCR_REPEATS", "HOLD_INCR_SEED",
+                 "HOLD_INCR_LOGIT_C", "HOLD_INCR_DECILES", "HOLD_INCR_ADDS_DELTA_LOWER",
+                 "HOLD_INCR_ADDS_STRATA_LOWER")
 EXIT_OK, EXIT_REFUSED = 0, 1
 
 
@@ -53,6 +67,15 @@ def check_inputs(features) -> list:
         assert_no_leakage(feats)
     except ValueError as e:
         raise Refused(str(e)) from None
+    return feats
+
+
+def incr_features() -> list:
+    """The features of the beyond-baseline check: HOLD_INCR_FEATURES, a non-empty subset of HOLD_FEATURES."""
+    feats = check_inputs(C.HOLD_INCR_FEATURES)
+    bad = [f for f in feats if f not in C.HOLD_FEATURES]
+    if bad or not feats or len(set(feats)) != len(feats):
+        raise Refused(f"HOLD_INCR_FEATURES must be distinct HOLD_FEATURES names, not {feats}")
     return feats
 
 
@@ -121,6 +144,11 @@ def check_export(ex: dict, features) -> None:
         raise Refused(f"{len(ids) - len(set(ids))} duplicate call_id value(s) in {ROWS_FILE}")
 
 
+def plain_groups(grp: pd.Series) -> pd.Series:
+    """The Q6 sort-prefixed labels ('1 dead7', ...) as the plain group; any other value unchanged."""
+    return grp.map(lambda g: C.HOLD_GROUP_LABELS.get(g, g))
+
+
 def load_ids(path) -> pd.DataFrame:
     p = Path(path)
     if not p.is_file():
@@ -134,9 +162,10 @@ def load_ids(path) -> pd.DataFrame:
     if missing:
         raise Refused(f"ids file lacks column(s) {missing}")
     ids = ids.apply(lambda s: s.str.strip())
+    ids["grp"] = plain_groups(ids["grp"])
     bad = int((~ids["grp"].isin(C.HOLD_GROUPS)).sum())
     if bad:
-        raise Refused(f"{bad} ids row(s) with grp outside {list(C.HOLD_GROUPS)}")
+        raise Refused(f"{bad} ids row(s) with grp outside {list(C.HOLD_GROUPS) + list(C.HOLD_GROUP_LABELS)}")
     cid = pd.to_numeric(ids["call_id"], errors="coerce")
     bad = cid.isna() | (cid % 1 != 0)
     if bad.any():
@@ -320,6 +349,169 @@ def perm_null(X: pd.DataFrame, grp: pd.Series, week: pd.Series, eligible: dict) 
     return {k: (float(np.nanpercentile(v, 95)) if np.isfinite(v).any() else None) for k, v in best.items()}
 
 
+# --- beyond posted holders and age (report only, never in the verdict) ----------------
+def log1p_count(v: pd.Series) -> pd.Series:
+    """log1p of a count; NaN for NULL and for a negative value (such rows are dropped and counted)."""
+    return np.log1p(v.where(v >= 0))
+
+
+def decile_labels(a: pd.DataFrame):
+    """Posted-holder quantile bins (HOLD_INCR_DECILES; tied cut points merge) x age band, cut
+    points from the rows with both values; None without enough such rows."""
+    h, age = num(a, "holders_at_call"), num(a, "age_s_at_call")
+    ok, d = (h.notna() & age.notna()).to_numpy(), C.HOLD_INCR_DECILES
+    if ok.sum() < d:
+        return None, None
+    cuts = np.unique(np.quantile(h[ok], np.arange(1, d) / d))
+    bins = np.searchsorted(cuts, h.to_numpy(), side="left")     # h <= cut goes below, as stratum_labels
+    band = np.where(age < C.HOLD_AGE_BAND_S, "< 1 h", ">= 1 h")
+    lab = [f"D{b + 1} x age {s}" if o else None for b, s, o in zip(bins, band, ok)]
+    return pd.Series(lab, index=a.index, dtype=object), [float(c) for c in cuts]
+
+
+def logit():
+    return make_pipeline(StandardScaler(), LogisticRegression(C=C.HOLD_INCR_LOGIT_C, max_iter=1000))
+
+
+def oof_pair(Zb: np.ndarray, Zm: np.ndarray, y: np.ndarray):
+    """(repeats, n) out-of-fold P(positive) of the baseline and of the model: the same
+    stratified folds for both in each repeat, scaler and fit on the training part only."""
+    sb, sm = np.empty((2, C.HOLD_INCR_REPEATS, len(y)))
+    for r in range(C.HOLD_INCR_REPEATS):
+        folds = StratifiedKFold(C.HOLD_INCR_FOLDS, shuffle=True, random_state=C.HOLD_INCR_SEED + r)
+        for tr, te in folds.split(Zm, y):
+            sb[r, te] = logit().fit(Zb[tr], y[tr]).predict_proba(Zb[te])[:, 1]
+            sm[r, te] = logit().fit(Zm[tr], y[tr]).predict_proba(Zm[te])[:, 1]
+    return sb, sm
+
+
+def draw_repeats(reps: int, repeats: int) -> np.ndarray:
+    """One cross-validation repeat per bootstrap rep, drawn at random (seed HOLD_INCR_SEED; its own
+    generator, so the bootstrap resample itself is the same as without the draw)."""
+    return np.random.default_rng(C.HOLD_INCR_SEED).integers(0, repeats, reps)
+
+
+def boot_delta(sb: np.ndarray, sm: np.ndarray, y, w: np.ndarray) -> np.ndarray:
+    """Model minus baseline AUC per bootstrap rep (row of w), each rep on the out-of-fold scores
+    of one randomly drawn repeat, the same repeat and resample for both (paired; no refit)."""
+    pick, out = draw_repeats(len(w), len(sb)), np.empty(len(w))
+    for r in np.unique(pick):
+        rows = pick == r
+        out[rows] = pair_auc(sm[r], y, None, w[rows]) - pair_auc(sb[r], y, None, w[rows])
+    return out
+
+
+def delta_auc(Zb, Zm, y, g) -> dict:
+    """Baseline / model AUC of each row's out-of-fold score averaged over the repeats and their
+    difference (the point delta); its paired bootstrap CI (within groups, each rep on one drawn
+    repeat's scores, so fold-assignment noise is in it; no refit); and the per-repeat difference
+    range (fold-assignment noise only)."""
+    sb, sm = oof_pair(Zb, Zm, y)
+    per_rep = [roc_auc_score(y, m) - roc_auc_score(y, b) for b, m in zip(sb, sm)]
+    base, model = float(roc_auc_score(y, sb.mean(0))), float(roc_auc_score(y, sm.mean(0)))
+    return {"baseline_auc": base, "model_auc": model, "delta": model - base,
+            "delta_ci": ci(boot_delta(sb, sm, y, boot_weights(g))),
+            "repeat_delta": [float(min(per_rep)), float(np.mean(per_rep)), float(max(per_rep))]}
+
+
+def std_coefs(Zm, y, names) -> dict:
+    """Standardised coefficients of the model fitted on all its rows (the direction)."""
+    coef = logit().fit(Zm, y)[-1].coef_[0]
+    return {n: float(c) for n, c in zip(names, coef[-len(names):])}
+
+
+def residual(f: pd.Series, B: pd.DataFrame) -> pd.Series:
+    """f minus its least-squares fit on [1, B], fitted on all the given rows (it never sees the group)."""
+    A = np.column_stack([np.ones(len(B)), B.to_numpy()])
+    beta = np.linalg.lstsq(A, f.to_numpy(), rcond=None)[0]
+    return pd.Series(f.to_numpy() - A @ beta, index=f.index)
+
+
+def model_rows(B, F, grp, contrast, feats):
+    """Rows of the contrast with both baseline values and every feature of the model, and the drop counts."""
+    _, pos, neg = contrast
+    in_c = grp.isin([pos, neg]) if neg else pd.Series(True, index=grp.index)
+    base_ok, feat_ok = B.notna().all(axis=1), F[list(feats)].notna().all(axis=1)
+    keep = in_c & base_ok & feat_ok
+    y = grp[keep] == pos
+    return keep, {"contrast_rows": int(in_c.sum()), "dropped_baseline_missing": int((in_c & ~base_ok).sum()),
+                  "dropped_feature_missing": int((in_c & base_ok & ~feat_ok).sum()),
+                  "n_pos": int(y.sum()), "n_neg": int((~y).sum())}
+
+
+def strata_auc(x, grp, contrast, strata) -> dict:
+    """Within-strata AUC and its CI from auc_block (orientation fixed on these rows, pooled)."""
+    if strata is None:
+        return {"na": "no strata"}
+    b = auc_block(x, grp, contrast, None, strata)
+    if "auc" not in b:
+        return {"na": b["na"]}
+    if "strata_na" in b:
+        return {"na": b["strata_na"]}
+    return {"within_strata": b["within_strata"], "strata_ci": b["strata_ci"], "direction": b["direction"]}
+
+
+def incr_reading(m: dict):
+    """The PM's suggested reading of one single-feature model; None for a joint model."""
+    if len(m["features"]) != 1:
+        return None
+    dec = m.get("deciles", {})
+    if not m.get("delta_ci") or not dec.get("strata_ci"):
+        return "n/a"
+    adds = (m["delta_ci"][0] > C.HOLD_INCR_ADDS_DELTA_LOWER
+            and dec["strata_ci"][0] > C.HOLD_INCR_ADDS_STRATA_LOWER)
+    return "adds" if adds else NO_ADDITION
+
+
+def pooled_direction(x, y) -> str:
+    """The feature's pooled direction on these rows, oriented as auc_block: "higher" if AUC >= 0.5."""
+    return "higher" if roc_auc_score(y, x) >= 0.5 else "lower"
+
+
+def coef_disagrees(m: dict) -> bool:
+    """Whether a single-feature model's standardised coefficient has the opposite sign of the
+    feature's pooled direction (a zero coefficient never disagrees)."""
+    if "direction" not in m:
+        return False
+    c = m["coef"][m["features"][0]]
+    return c < 0 if m["direction"] == "higher" else c > 0
+
+
+def incr_model(B, F, X, grp, contrast, feats, terciles, deciles) -> dict:
+    """One model (baseline + log1p of feats) in one contrast; single features also get their
+    pooled direction, the residual and the tercile / decile within-strata checks on the same rows."""
+    keep, counts = model_rows(B, F, grp, contrast, feats)
+    out = {"features": list(feats), **counts}
+    if min(out["n_pos"], out["n_neg"]) < C.HOLD_MIN_CLASS_N:
+        return {**out, "na": f"< {C.HOLD_MIN_CLASS_N} rows with the baseline and feature(s) in a class", "reading": "n/a"}
+    g = grp[keep]
+    y, Zb = (g == contrast[1]).to_numpy(), B[keep].to_numpy()
+    Zm = np.column_stack([Zb, F.loc[keep, list(feats)].to_numpy()])
+    out.update(delta_auc(Zb, Zm, y, g.to_numpy()), coef=std_coefs(Zm, y, list(feats)))
+    if len(feats) == 1:
+        f = feats[0]
+        out["direction"] = pooled_direction(X.loc[keep, f].to_numpy(), y)
+        r = residual(F.loc[keep, f], B[keep])
+        out["residual"] = {key: v for key, v in auc_block(r, g, contrast).items() if key not in ("n_pos", "n_neg")}
+        for key, strata in (("terciles", terciles), ("deciles", deciles)):
+            out[key] = strata_auc(X.loc[keep, f], g, contrast, None if strata is None else strata[keep])
+    out["reading"] = incr_reading(out)
+    return out
+
+
+def beyond_baseline(a: pd.DataFrame, X: pd.DataFrame, grp: pd.Series, terciles) -> dict:
+    """Per primary contrast: each HOLD_INCR_FEATURES model alone, then all together."""
+    feats = incr_features()
+    B = pd.DataFrame({c: log1p_count(num(a, c)) for c in IDS_STRATA}, index=a.index)
+    F = pd.DataFrame({f: log1p_count(X[f]) for f in feats}, index=X.index)
+    deciles, cuts = decile_labels(a)
+    sets = [(f,) for f in feats] + ([tuple(feats)] if len(feats) > 1 else [])
+    return {"decile_strata": {"cut_points": cuts, "strata": None if deciles is None else int(deciles.nunique()),
+                              "rows_without_stratum": len(a) if deciles is None else int(deciles.isna().sum())},
+            "contrasts": {c[0]: {" + ".join(s): incr_model(B, F, X, grp, c, s, terciles, deciles) for s in sets}
+                          for c in PRIMARY}}
+
+
 # --- description ------------------------------------------------------------------
 def stats(v: pd.Series) -> dict:
     d = v.dropna()
@@ -422,13 +614,14 @@ def analyse(ex: dict, ids: pd.DataFrame, features) -> dict:
         "after_call": by_group(pd.DataFrame({c: values(a[c], strict=False) for c in post_cols}), grp),
         "outcomes": by_group(outcome, grp),
         "verdict": verdict(contrasts, counts, strata_reason),
+        INCR_KEY: {"not_judged": strata_reason} if strata_reason else beyond_baseline(a, X, grp, strata),
     }
 
 
 def settings() -> dict:
     return {k: getattr(C, k) for k in ("HOLD_STOP_AUC_LOWER", "HOLD_STRATA_AUC_LOWER", "HOLD_MIN_CLASS_N",
                                        "HOLD_AGE_BAND_S", "HOLD_BOOTSTRAP_REPS", "HOLD_BOOTSTRAP_SEED",
-                                       "HOLD_CI", "HOLD_PERM_REPS", "HOLD_PERM_SEED")}
+                                       "HOLD_CI", "HOLD_PERM_REPS", "HOLD_PERM_SEED") + INCR_SETTINGS}
 
 
 # --- report --------------------------------------------------------------------
@@ -481,7 +674,7 @@ def render_report(s: dict) -> str:
     runs = "absent" if i["runs"] is None else f"{i['runs']} run(s), {i['failed_calls']} failed call(s)"
     L = [f"# Holder pilot analysis (report only), run {s['run']} UTC", "",
          "Report only: no model, nothing saved or served; the owner decides on the result.",
-         "The pilot sample is about one third per group, not the natural base rates: ranking (AUC) "
+         "Group shares come from the sample, not necessarily the natural base rates: ranking (AUC) "
          "only, never lift or precision.",
          f"The stop bound (bootstrap 95 % lower AUC bound > {st['HOLD_STOP_AUC_LOWER']:.2f}) is pre-registered "
          "(19 Oct 2026). The strata definition (posted-holder terciles from the pilot x age < 1 h / >= 1 h), "
@@ -541,7 +734,93 @@ def render_report(s: dict) -> str:
     L += group_table(s["after_call"])
     L += ["Peak and 7d return from the ids file (net of tax as labels.net_pct, when both tax columns are there):", ""]
     L += group_table(s["outcomes"])
+    if INCR_KEY in s:
+        L += render_incremental(s[INCR_KEY], st)
     return "\n".join(L)
+
+
+def incr_method(st: dict) -> list:
+    reps, seed, r, s0 = st["HOLD_BOOTSTRAP_REPS"], st["HOLD_BOOTSTRAP_SEED"], st["HOLD_INCR_REPEATS"], st["HOLD_INCR_SEED"]
+    return [
+        "Report only, never part of the verdict. Added on 23 Oct 2026 after seeing the pilot (not pre-registered): "
+        "a PM reading for the owner, not a ruling. Group shares come from the sample, not necessarily the natural "
+        "base rates: ranking (AUC) only.",
+        "These are random stratified folds, not the project's time-based validation, so the delta is a within-sample "
+        "contrast, not a forward estimate. One call per token (the duplicate-ca refusal of the ids file) holds only "
+        "when the ids file has a ca column; without it, calls of one token can sit in different folds.",
+        "",
+        "- Models: logistic regression (L2, C = "
+        f"{st['HOLD_INCR_LOGIT_C']}) on log1p(holders_at_call) + log1p(age_s_at_call) (baseline), and the baseline "
+        "+ log1p(feature), each feature alone, then all together. Per model, rows with a baseline value or a feature "
+        "NULL or negative are dropped and counted; baseline and model use the same rows.",
+        f"- Cross-validation: {st['HOLD_INCR_FOLDS']}-fold stratified on the contrast label, repeated {r} times "
+        f"(shuffle seeds {s0} to {s0 + r - 1}); in each repeat baseline and model use the same folds, the "
+        "standardisation and the fit are on the training part only. AUC and delta (model minus baseline) are of each "
+        "row's out-of-fold score averaged over the repeats.",
+        f"- Delta 95 % CI: paired percentile bootstrap ({reps} reps, seed {seed}, resampled within groups); each rep "
+        f"uses the out-of-fold scores of one repeat drawn at random (seed {s0}), the same repeat and resample for "
+        "baseline and model, so it covers which calls were sampled and the fold assignment. Each rep's delta is one "
+        "repeat's delta, so the CI is centred on the repeat-delta mean (shown in the table), not necessarily on the "
+        "point delta of the averaged scores. It does not cover the refit (no model is refitted per bootstrap rep), "
+        "so it is a floor on the uncertainty. Repeat delta: min / "
+        "mean / max over the repeats (fold-assignment noise only, not a CI); a delta whose repeat range spans 0, or "
+        "that is no larger than that range, is no evidence either way.",
+        "- Coefficient: of the feature, standardised, in the model fitted on all its rows: its direction given the "
+        "baseline. The strata AUCs below are oriented by the feature's pooled direction instead, so the two can "
+        f"disagree; {DAGGER} marks a single feature whose coefficient sign disagrees with its pooled direction.",
+        "- Residual: log1p(feature) minus its least-squares fit on the two baseline columns, fitted on all rows of "
+        "the model (it never sees the group, so no label leaks in); its AUC with the bootstrap CI (residuals fixed).",
+        f"- Strata: pairs in the same stratum only, orientation of the feature's pooled AUC on the same rows; "
+        f"posted-holder terciles x age band (the strata above) and up to {st['HOLD_INCR_DECILES']} posted-holder "
+        "quantile bins x age band (tied cut points merge).",
+        f"- Reading (PM's suggestion): \"adds\" if the delta AUC 95 % lower bound > "
+        f"{st['HOLD_INCR_ADDS_DELTA_LOWER']:.2f} and the decile-strata 95 % lower bound > "
+        f"{st['HOLD_INCR_ADDS_STRATA_LOWER']:.2f}; otherwise \"{NO_ADDITION}\". A joint model has no reading.", ""]
+
+
+def fdelta(m: dict) -> list:
+    if "na" in m:
+        return [f"n/a ({m['na']})"] + [""] * 5 + [m["reading"]]
+    rd = m["repeat_delta"]
+    return [f3(m["baseline_auc"]), f3(m["model_auc"]), f3(m["delta"]), fci(m["delta_ci"]),
+            f"{f3(rd[0])} / {f3(rd[1])} / {f3(rd[2])}",
+            "; ".join(f"{k} {v:+.3f}" for k, v in m["coef"].items()) + (f" {DAGGER}" if coef_disagrees(m) else ""),
+            m["reading"] or ""]
+
+
+def fstrata(b: dict) -> list:
+    if "na" in b:
+        return [f"n/a ({b['na']})", ""]
+    return [f"{f3(b['within_strata'])} ({b['direction']})", fci(b["strata_ci"])]
+
+
+def render_incremental(inc: dict, st: dict) -> list:
+    L = [INCR_HEAD, ""] + incr_method(st)
+    if "not_judged" in inc:
+        return L + [f"NOT JUDGED: {inc['not_judged']}.", ""]
+    d = inc["decile_strata"]
+    cuts = ", ".join(fg(c) for c in d["cut_points"]) if d["cut_points"] else "n/a"
+    L += [f"Decile strata: {d['strata'] if d['strata'] is not None else 'n/a'} strata (holder bins x age band), "
+          f"holder cut points {cuts}; {d['rows_without_stratum']} analysable row(s) without one.", ""]
+    rows, checks = [], []
+    for c, models in inc["contrasts"].items():
+        for name, m in models.items():
+            rows.append([c, name, f"{m['n_pos']} / {m['n_neg']}",
+                         f"{m['dropped_baseline_missing']} / {m['dropped_feature_missing']}"] + fdelta(m))
+            if "residual" in m:
+                res = m["residual"]
+                checks.append([c, name, f"{f3(res.get('oriented'))} ({res.get('direction', 'n/a')})", fci(res.get("ci"))]
+                              + fstrata(m["terciles"]) + fstrata(m["deciles"]))
+    L += table(["contrast", "model (+ baseline)", "n pos / neg", "dropped: baseline / feature", "baseline AUC",
+                "model AUC", "delta", "delta 95 % CI", "repeat delta min / mean / max", "coefficient (std.)",
+                "reading"], rows)
+    if any(coef_disagrees(m) for models in inc["contrasts"].values() for m in models.values()):
+        L += [f"{DAGGER} {DAGGER_NOTE}", ""]
+    if checks:
+        L += ["Partial-rank and strata checks (single features; AUC oriented, direction in brackets):", ""]
+        L += table(["contrast", "feature", "residual AUC", "residual 95 % CI", "tercile-strata AUC",
+                    "tercile 95 % CI", "decile-strata AUC", "decile 95 % CI"], checks)
+    return L
 
 
 def clean(o):
@@ -586,6 +865,7 @@ def check_out_dir(out, repo_root) -> Path:
 def run(holders_dir, ids_path, out, repo_root, now=None) -> Path:
     """Check, analyse, then write <out>/<YYYYMMDD-HHMM UTC>/report.md and summary.json."""
     features = check_inputs(C.HOLD_FEATURES)
+    incr_features()
     dest = check_out_dir(out, repo_root) / (now or datetime.now(timezone.utc)).strftime("%Y%m%d-%H%M")
     if dest.exists():
         raise Refused(f"output folder {dest.name} already exists")
