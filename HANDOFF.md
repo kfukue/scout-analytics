@@ -1,8 +1,39 @@
 # Scout analytics: handoff to Claude Code
 
-## Session state (23 Oct 2026 PDT (23 Oct UTC): main 9527073 after #42-#63)
+## Session state (23 Oct 2026 PDT (23 Oct UTC): main a96bb78 after #42-#68)
 
 This section supersedes the ones below wherever they differ.
+
+**Update, 23 Oct 12:52 PDT (19:52 UTC): holder pilot CONTINUE; full
+export (P2) running.**
+- #64-#68 merged 23 Oct 12:32-12:34 PDT (19:32-19:34 UTC). Tracker
+  restart after them: not confirmed yet (no start-up lines pasted).
+- Full pilot export done 23 Oct 04:17 PDT (11:17 UTC): 440 ok, 0
+  failed, 52,522 `eth_getLogs`, 4h41m, paused 1m29s; 4 ranges refused
+  as too large, split and answered.
+- `holders_report.py` first refused all 450 rows: Q6 labels groups
+  `1 dead7` / `2 held2x7` / `3 neither`, the report wants `dead7` /
+  `held2x7` / `neither`. Worked around with a `sed` copy
+  (`data/holder_pilot_ids_grp.csv`); a fix so the report accepts both
+  forms is in progress.
+- Report (run 20261023-1939 UTC): verdict CONTINUE. Passing, dead7 vs
+  rest: `pre_hold_holders` AUC 0.675 (lower bound 0.625; within-strata
+  AUC 0.592, lower bound 0.529) and `pre_hold_sellers` 0.671 (lower
+  bound 0.624; within-strata AUC 0.624, lower bound 0.564). PM's reading: holders repeats the posted holder count
+  (Spearman 0.995; baseline 0.672); sellers is the one new candidate.
+  held2x7 vs rest: best 0.568, below the chance level of 0.582.
+- Owner's decisions (23 Oct, in the PM skill): the cheap check on the
+  pilot files (what holders and sellers add beyond the posted holder
+  count and age), and P2 started without waiting for it.
+- P2: Q7 (the pilot query without sampling, plain group labels,
+  posted before 16 Oct UTC) gave `data/holder_full_ids.csv`, 4,760
+  ids; the pilot files were copied to `data/holders_pilot_20261023`
+  and the run writes into `data/holders`, skipping the 450 done. Dry
+  run: 4,310 to do, about 478k `eth_getLogs`, at least 33 h at 4
+  req/s (about 45 h at the pilot's pace). Owner started it 23 Oct
+  after 12:49 PDT (19:49 UTC); log in `~/holders-full.log` if started
+  with the command given (not confirmed). Speed not confirmed (the
+  default 4 req/s suggested; `SCOUT_HOLDERS_RPS=8` offered).
 
 **Update, 23 Oct 01:35 PDT (08:35 UTC): overnight PRs open; full
 holder pilot running.**
