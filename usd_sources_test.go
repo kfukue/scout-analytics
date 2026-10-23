@@ -172,7 +172,9 @@ func TestQuoteUSDSourceOrder(t *testing.T) {
 }
 
 // An error of the node while looking for an asset's own pools is returned and
-// never kept as "no pool": the next lookup asks again and finds the pool.
+// no answer of it is kept (no pool, no "no pool", no "no price yet"; the
+// whole-history search's progress may be kept: usd_sweep_resume_test.go): the
+// next lookup asks again and finds the pool.
 func TestQuoteViaPoolsNodeErrorNotCached(t *testing.T) {
 	old := rpcRetryBase
 	rpcRetryBase = time.Millisecond
@@ -213,11 +215,10 @@ func TestQuoteViaPoolsNodeErrorNotCached(t *testing.T) {
 			}
 			o.mu.Lock()
 			set := o.usdPools[asset]
-			cached := set != nil && (!set.noPoolUntil.IsZero() || len(set.pools) > 0 || len(set.noPrice) > 0 ||
-				set.histThrough > 0 || len(set.histSeen) > 0 || len(set.histPending) > 0)
+			cached := set != nil && (!set.noPoolUntil.IsZero() || len(set.pools) > 0 || len(set.noPrice) > 0)
 			o.mu.Unlock()
 			if cached {
-				t.Fatalf("busy node: the failure was cached: %+v", set)
+				t.Fatalf("busy node: an answer of the failed lookup was kept: %+v", set)
 			}
 			on = false
 			if p, ok, err := o.quoteUSD(ctx, asset, b); err != nil || !ok || !near6(p, 2.5) {
@@ -679,8 +680,10 @@ func TestQuoteViaPoolsPoolOnlyAfterBlock(t *testing.T) {
 }
 
 // A node error during the whole-history search (the wide transfer read, the
-// v4 Initialize read, a counterparty's token0()) is returned and nothing of
-// it is kept; once the node answers, the far pool prices the block.
+// v4 Initialize read, a counterparty's token0()) is returned and no answer of
+// it is kept (no pool, no "no pool", no "no price yet"); its progress may be
+// kept (usd_sweep_resume_test.go). Once the node answers, the far pool prices
+// the block.
 func TestQuoteViaPoolsHistoryNodeErrorNotCached(t *testing.T) {
 	fastRetries(t)
 	old := rpcRetryBase
@@ -726,10 +729,10 @@ func TestQuoteViaPoolsHistoryNodeErrorNotCached(t *testing.T) {
 			}
 			o.mu.Lock()
 			set := o.usdPools[farAsset]
-			kept := set != nil && (!set.noPoolUntil.IsZero() || len(set.pools) > 0 || len(set.noPrice) > 0 || set.histThrough > 0 || len(set.histSeen) > 0 || len(set.histPending) > 0)
+			kept := set != nil && (!set.noPoolUntil.IsZero() || len(set.pools) > 0 || len(set.noPrice) > 0)
 			o.mu.Unlock()
 			if kept {
-				t.Fatalf("busy node: the failed search was kept: %+v", set)
+				t.Fatalf("busy node: an answer of the failed search was kept: %+v", set)
 			}
 			on = false
 			if p, ok, err := o.quoteUSD(ctx, farAsset, fc.b1); err != nil || !ok || !near6(p, 2) {
