@@ -48,6 +48,8 @@ type priceConfig struct {
 	LatestRecent time.Duration // SCOUT_LATEST_REFRESH_RECENT: calls younger than 30 days
 	LatestOld    time.Duration // SCOUT_LATEST_REFRESH_OLD: calls 30 days or older
 	LatestBatch  int           // SCOUT_LATEST_BATCH: rows per cycle at most
+	// SCOUT_LATEST_ROW_TIMEOUT: the longest one row of the pass may take (0 = no limit)
+	LatestRowTimeout time.Duration
 }
 
 type horizon struct {

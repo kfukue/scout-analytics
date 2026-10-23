@@ -43,8 +43,8 @@ func (s *scanner) trackLoop(ctx context.Context) {
 		s.reloadFeeds(ctx) // the asset database's Chainlink feeds, before the first line names them
 		log.Printf("performance tracking on: %s via %s; %d call(s) at a time", horizonNames(s.pc.Horizons), s.onchain.describe(), max(s.pc.Workers, 1))
 		if s.pc.LatestOn {
-			log.Printf("latest prices on: refreshed every %s for calls under 30 days old, every %s for older ones; at most %s call(s) per cycle (SCOUT_LATEST_REFRESH=off turns this off)",
-				s.pc.LatestRecent, s.pc.LatestOld, commas(s.pc.LatestBatch))
+			log.Printf("latest prices on: refreshed every %s for calls under 30 days old, every %s for older ones; at most %s call(s) per cycle (SCOUT_LATEST_REFRESH=off turns this off); %s",
+				s.pc.LatestRecent, s.pc.LatestOld, commas(s.pc.LatestBatch), latestRowLimitText(s.pc.LatestRowTimeout))
 		} else {
 			log.Printf("latest prices off (SCOUT_LATEST_REFRESH=off)")
 		}

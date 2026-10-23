@@ -39,3 +39,8 @@ const (
 // searches over a token's or feed's whole history (onchain.go,
 // getLogsChunkedUpTo); 0 = no cap.
 const rpcHistoryChunkSetting = "SCOUT_RPC_HISTORY_CHUNK"
+
+// latestRowTimeoutSetting: the longest one call of the latest-price pass may
+// take (tracker_latest.go); a call stopped there counts as failed. 0 = no
+// limit.
+const latestRowTimeoutSetting = "SCOUT_LATEST_ROW_TIMEOUT"
