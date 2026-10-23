@@ -533,8 +533,9 @@ func (sw *usdSweep) checkCounterparties(ctx context.Context) error {
 		st := &onchainState{TokenDec: sw.tm.Decimals, EntryBlock: sw.head}
 		ok, err := sw.o.resolveV2V3(ctx, st, sw.asset, a)
 		if err == nil && ctx.Err() != nil {
-			// The end of ctx may have cut off the calls it read as "not a
-			// pool" (getReserves / slot0): not kept as checked.
+			// resolveV2V3 returns the end of ctx (and any call the node did
+			// not answer) as an error; this guard only makes sure an answer
+			// given as ctx ended is not kept as checked either.
 			err = ctx.Err()
 		}
 		if err != nil {

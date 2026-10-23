@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"maps"
+	"net/http"
 	"slices"
 	"strconv"
 	"sync"
@@ -357,10 +358,9 @@ func TestUSDSweepResumesAfterCheckFailure(t *testing.T) {
 }
 
 // The caller's context ends while the far pool is checked (after its
-// token0() and token1(), during getReserves()): the check reads as "not a
-// pool" (getReserves and slot0 both fail), but it is not kept, so the next
-// try checks the pool again and prices the block; kept, it would end in the
-// definitive "no USD source".
+// token0() and token1(), during getReserves()): the check is an error, not
+// "not a pool", and it is not kept, so the next try checks the pool again and
+// prices the block; kept, it would end in the definitive "no USD source".
 func TestUSDSweepContextEndsDuringCheck(t *testing.T) {
 	want, _ := uninterruptedSweep(t)
 	s := newSweepTest(t)
@@ -389,6 +389,60 @@ func TestUSDSweepContextEndsDuringCheck(t *testing.T) {
 	wantPrice(t, "next try", p, ok, err, 2)
 	if got := sweepStateOf(s.o, farAsset); !got.equal(want) {
 		t.Fatalf("after the next try: got %+v, want %+v (as one uninterrupted sweep)", got, want)
+	}
+}
+
+// The node does not answer the far pool's getReserves() or slot0() during the
+// sweep (it is a v3 pool: getReserves() reverts, slot0() answers): the check
+// is the node's error, not "not a pool", so neither the pool (histSeen) nor
+// "no USD source" is kept. Once the node answers, the next try checks the
+// pool again, prices the block and ends like one uninterrupted sweep.
+func TestUSDSweepNodeErrorDuringPoolCheck(t *testing.T) {
+	want, wantSrc := uninterruptedSweep(t)
+	for _, getter := range []string{selSlot0, selGetReserves} {
+		for _, fl := range poolCheckNodeFailures {
+			t.Run(getterName(getter)+" "+fl.name, func(t *testing.T) {
+				s := newSweepTest(t)
+				var failing atomic.Bool
+				failing.Store(true)
+				hit := func(to, sel string) bool { return failing.Load() && to == farPool && sel == getter }
+				s.f.mu.Lock()
+				s.f.callErrCode = fl.code
+				s.callHook = func(to, sel string) string {
+					if hit(to, sel) {
+						return fl.msg // "" for an answer outside JSON-RPC
+					}
+					return ""
+				}
+				s.f.callHTTP = func(to, sel string) http.HandlerFunc {
+					if hit(to, sel) {
+						return fl.answer // nil for a JSON-RPC failure
+					}
+					return nil
+				}
+				s.f.mu.Unlock()
+				p, ok, err := s.o.quoteUSD(context.Background(), farAsset, s.b1)
+				wantFailure(t, "first try ("+getterName(getter)+" not answered)", p, ok, err)
+				got := sweepStateOf(s.o, farAsset)
+				if slices.Contains(got.seen, farPool) || got.pending[farPool] == 0 || got.noPool || got.priced || len(got.pools) != 0 {
+					t.Fatalf("after %s was not answered: got %+v, want the pool left to check (not in histSeen), no answer kept", getterName(getter), got)
+				}
+
+				failing.Store(false)
+				s.reset()
+				p, ok, err = s.o.quoteUSD(context.Background(), farAsset, s.b1)
+				wantPrice(t, "next try", p, ok, err, 2)
+				if n := s.token0Asked(farPool); n != 1 {
+					t.Fatalf("next try asked token0() of the far pool %d time(s), want 1 (checked again)", n)
+				}
+				if got := sweepStateOf(s.o, farAsset); !got.equal(want) {
+					t.Fatalf("after the next try: got %+v, want %+v (as one uninterrupted sweep)", got, want)
+				}
+				if src := s.o.quoteSource(farAsset); src != wantSrc {
+					t.Fatalf("quoteSource after the next try: got %q, want %q", src, wantSrc)
+				}
+			})
+		}
 	}
 }
 

@@ -1907,9 +1907,11 @@ func (o *onchainSource) transferCounterparties(ctx context.Context, token string
 }
 
 // resolveV2V3 checks whether addr is a v2 pair or v3 pool containing token.
+// false with no error is a definitive "not a pool", from the contract's own
+// answers; a call the node did not answer (transientCallErr) is an error, so
+// the caller tries again later rather than keeping "not a pool".
 func (o *onchainSource) resolveV2V3(ctx context.Context, st *onchainState, token, addr string) (bool, error) {
-	// Wallets and routers have no token0(): not a pool. A node that is busy or
-	// rate limiting is an error (tried again later), never "not a pool".
+	// Wallets and routers have no token0(): not a pool.
 	b0, err := o.rpc.ethCall(ctx, addr, selToken0, 0)
 	if err != nil {
 		return false, transientCallErr(err)
@@ -1928,22 +1930,62 @@ func (o *onchainSource) resolveV2V3(ctx context.Context, st *onchainState, token
 		return false, nil
 	}
 	st.Pool = addr
-	if r, err := o.rpc.ethCall(ctx, addr, selGetReserves, 0); err == nil && len(r) >= 64 {
+	// getReserves() first (a contract answering both is a v2); not answered
+	// by the node, it is an error, not a reason to try slot0().
+	v2, err := o.poolGetterAnswers(ctx, addr, selGetReserves, "getReserves()", 64)
+	if err != nil {
+		return false, err
+	}
+	if v2 {
 		st.Kind = "v2"
 		return true, nil
 	}
-	if r, err := o.rpc.ethCall(ctx, addr, selSlot0, 0); err == nil && len(r) >= 32 {
+	v3, err := o.poolGetterAnswers(ctx, addr, selSlot0, "slot0()", 32)
+	if err != nil {
+		return false, err
+	}
+	if v3 {
 		st.Kind = "v3"
 		return true, nil
 	}
 	return false, nil
 }
 
+// poolGetterAnswers calls a pool getter (getReserves() / slot0()) on addr:
+// true when it answers with at least minLen bytes; false with no error when
+// the contract has no such value (a revert, an EVM failure such as an invalid
+// opcode or out of gas, an empty result) or answers too short to read; an
+// error when the node did not answer (transientCallErr).
+func (o *onchainSource) poolGetterAnswers(ctx context.Context, addr, sel, name string, minLen int) (bool, error) {
+	r, err := o.rpc.ethCall(ctx, addr, sel, 0)
+	if err != nil {
+		if terr := transientCallErr(err); terr != nil {
+			return false, fmt.Errorf("%s of %s: %w", name, addr, terr)
+		}
+		return false, nil
+	}
+	return len(r) >= minLen, nil
+}
+
 // transientCallErr keeps the eth_call errors that say nothing about the
-// contract (transport, busy or rate-limited node) and drops a revert or an
-// empty result (nil).
+// contract and drops the contract's own answers (nil): a revert, an EVM
+// failure or an empty result. Kept: transport errors and the client's
+// time-out, HTTP 429 / 5xx (already retried by call), the end of ctx, a
+// response that cannot be read, the node's "no state" answer (isNoStateErr),
+// and every other JSON-RPC error that is not isNoSuchValue (a busy, timed-out
+// or rate-limited node such as -32005 or -32002, or an unknown error).
+//
+// Only for calls at latest (resolveV2V3): there, no state means a pruned,
+// mid-sync or unhealthy node, not a contract without the value, although
+// isNoSuchValue counts it for the historical reads (o.noState).
 func transientCallErr(err error) error {
-	if isRevert(err) || isNoSuchValue(err) {
+	if isRevert(err) {
+		return nil
+	}
+	if isNoStateErr(err) {
+		return err
+	}
+	if isNoSuchValue(err) {
 		return nil
 	}
 	return err
