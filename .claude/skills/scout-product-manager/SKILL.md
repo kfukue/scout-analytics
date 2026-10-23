@@ -508,7 +508,7 @@ From the repo root on the server:
 
 Every Go start applies `scoutanalytics.sql` unless `SCOUT_DB_AUTO_MIGRATE=false`.
 
-## Owner decisions in force (8-22 October 2026)
+## Owner decisions in force (8-23 October 2026)
 
 - The `long` model waits for data (about 25 December) rather than loosening the
   threshold.
@@ -735,6 +735,17 @@ Every Go start applies `scoutanalytics.sql` unless `SCOUT_DB_AUTO_MIGRATE=false`
   reached a pool), which the export does not know as a venue, so their
   holder numbers would likely be wrong. Adding that launchpad as a venue is a deferred item in
   `HANDOFF.md` ("Deferred / open"), to look at again after the pilot.
+- 23 Oct (owner, "check both. sure perform cheap check. p2. yea we can
+  run the full run. we have our own node so we can just run it"), on
+  the holder pilot's CONTINUE (450 calls; `pre_hold_holders` and
+  `pre_hold_sellers` passed for `dead7` vs rest, nothing for
+  `held2x7`): (1) a report-only check, on the pilot files, of how much
+  each of the two adds beyond the posted holder count and the age at
+  the call (the PM's reading of "check both"); (2) P2, the full export
+  of every first call with an on-chain entry and a done 7d row posted
+  before 16 Oct 2026 UTC (Q7: 4,760 ids, the pilot's 450 reused; about
+  478k `eth_getLogs` by the dry run), started 23 Oct on the owner's
+  node without waiting for (1).
 - 22 Oct (owner, "go"): the 20 calls stuck in error retries were parked
   as `gave_up` by a one-off ops script (#57), and whole-history
   `eth_getLogs` searches are capped by `SCOUT_RPC_HISTORY_CHUNK`
