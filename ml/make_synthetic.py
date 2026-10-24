@@ -293,6 +293,14 @@ def _addr(rng) -> str:
     return "0x" + "".join(rng.choice(list("0123456789abcdef"), 40))
 
 
+def _pgadmin_times(week, seed: int) -> list:
+    """A post time inside each row's week_utc, written as pgAdmin shows a timestamptz in US Pacific
+    summer time ("2026-08-05 05:00:00-07"). Its own generator, so the other columns stay as before."""
+    off = np.random.default_rng(seed + 1000).integers(0, 7 * 86400, len(week))
+    at = week + pd.to_timedelta(off, unit="s") - pd.Timedelta(hours=7)
+    return [t.strftime("%Y-%m-%d %H:%M:%S") + "-07" for t in at]
+
+
 def make_holder_pilot(n_per_group: int = 150, weeks: int = 6, seed: int = 7, signal: float = 1.0):
     """Invented pilot: (export rows as dicts in HOLDER_COLUMNS order, ids DataFrame).
     Per group ~3 % without a row, skipped, capped, incomplete and entry-block
@@ -313,7 +321,7 @@ def make_holder_pilot(n_per_group: int = 150, weeks: int = 6, seed: int = 7, sig
     ids = pd.DataFrame({
         "call_id": np.arange(1, n + 1) * 7, "grp": grp, "week_utc": week.strftime("%Y-%m-%d"),
         "rn_week": np.arange(n) // weeks + 1, "rn": np.arange(1, n + 1), "ca": [_addr(rng) for _ in range(n)],
-        "kind": rng.choice(["v4", "pons", "v3", "v2"], n), "entry_at": "2026-08-05T12:00:00Z",
+        "kind": rng.choice(["v4", "pons", "v3", "v2"], n), "entry_at": _pgadmin_times(week, seed),
         "entry_block": block, "pool_address": [_addr(rng) for _ in range(n)], "pool_id": "",
         "holders_at_call": holders, "age_s_at_call": age, "max_gain_late_7d": peak.round(2),
         "ret_late_7d": np.where(grp == "dead7", -95.0, rng.normal(10, 60, n)).round(2),

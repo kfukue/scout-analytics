@@ -234,6 +234,32 @@ HOLD_INCR_LOGIT_C = 1.0        # sklearn LogisticRegression C (L2) on standardis
 HOLD_INCR_DECILES = 10         # posted-holder quantile bins x the HOLD_AGE_BAND_S age band
 HOLD_INCR_ADDS_DELTA_LOWER = 0.0    # PM's reading: "adds" if delta AUC 95 % lower bound > this
 HOLD_INCR_ADDS_STRATA_LOWER = 0.50  # ... and the decile-strata AUC 95 % lower bound > this
+# Forward (time-based) check inside that section (report only; part (c) of the P2 rule below):
+# analysable rows ordered by the ids file's entry_at (ties by call_id), the earliest share
+# trains, the latest HOLD_FWD_TEST_SHARE tests; training calls posted within HOLD_FWD_EMBARGO_S
+# before the first test call are dropped (their 7d label overlaps the test period). n/a below
+# HOLD_MIN_CLASS_N rows per class in training or HOLD_FWD_MIN_TEST_CLASS_N rows per class in the test.
+HOLD_FWD_TEST_SHARE = 0.30
+HOLD_FWD_EMBARGO_S = 7 * 86400
+HOLD_FWD_MIN_TEST_CLASS_N = 20     # minimum test rows in each class (positives, and negatives too)
+# P2 rule, pre-registered by the owner on 23 Oct 2026 ("approve") for the full holder run
+# (P2, about 4,760 calls, data not yet seen); shown for information on any other run.
+# PASS if (a) the random-fold delta AUC 95 % lower bound > HOLD_P2_DELTA_LOWER, (b) the
+# decile-strata AUC 95 % lower bound > HOLD_P2_STRATA_LOWER and (c) the forward delta AUC
+# 95 % lower bound > HOLD_P2_FWD_DELTA_LOWER, all strict, and (d) direction (owner, 24 Oct
+# 2026): the feature's pooled direction in the contrast on the model's rows (the one that
+# orients (b)) is HOLD_P2_DIRECTION and its standardised coefficient given the baseline is
+# > 0. FAIL if any part fails (even when another part is n/a); else NOT JUDGED if any part
+# is n/a; PASS only if all four pass. The n/a handling (NOT JUDGED when no part fails but a
+# part could not be computed) is the PM's reading, not part of the approved rule.
+HOLD_P2_FEATURE = "pre_hold_sellers"
+HOLD_P2_CONTRAST = "dead7 vs rest"
+HOLD_P2_DELTA_LOWER = 0.0
+HOLD_P2_STRATA_LOWER = 0.50
+HOLD_P2_FWD_DELTA_LOWER = 0.0
+# Owner, 24 Oct 2026 ("ok go with your recommendation"): the feature must point the same way
+# as in the pilot, more sellers before the call -> more likely dead7.
+HOLD_P2_DIRECTION = "higher"
 FORBIDDEN_COLUMNS = (set(BOOKKEEPING) - {"quote_asset"} | set(IDENTITY)
                      | {"pre_vol_unit", "token_name", "post_kind"} | set(LATEST)
                      | set(TRACKER_DISCOVERY) | set(AFTER_CALL_VIEW)

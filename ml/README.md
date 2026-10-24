@@ -1037,6 +1037,45 @@ error.
   the decile-strata lower bound > 0.50, otherwise "no addition shown beyond posted
   holders and age"; the joint model has no reading. NOT JUDGED with the verdict's
   strata reasons. Its settings are appended to the report's Settings line.
+- **Forward (time-based) check (in that section, report only):** part (c) of the P2
+  rule below. The analysable rows are ordered by the ids file's `entry_at` (ties by
+  `call_id`); the earliest 70 % train, the latest `HOLD_FWD_TEST_SHARE` (0.30, rounded
+  to whole rows) test, and training calls posted within `HOLD_FWD_EMBARGO_S` (7 days)
+  before the first test call, or at the same time, are dropped (embargoed: their 7d
+  label overlaps the test period). One split for every feature and contrast. Every
+  `entry_at` must be a timestamp with a UTC offset (`Z`, or pgAdmin's
+  `2026-09-09 20:59:16-07`); without the column, or with any analysable row whose
+  value is blank, has no offset or does not parse, the whole check is n/a (no row is
+  dropped). For `dead7` vs rest and `held2x7` vs rest and each of `HOLD_INCR_FEATURES`
+  alone (no joint model): the baseline and baseline + log1p(feature) logistic
+  regressions as above, standardisation and fit on the training rows, AUC on the
+  test rows, the delta, and its 95 % CI by a paired percentile bootstrap of the test
+  rows within groups (the `HOLD_BOOTSTRAP_*` settings; no refit, so a floor on the
+  uncertainty). Reported: the train / test / embargoed counts and UTC date ranges,
+  the first test call, and per model the train and test class counts. n/a below
+  `HOLD_MIN_CLASS_N` (30) training rows or `HOLD_FWD_MIN_TEST_CLASS_N` (20) test rows in
+  either class. `summary.json`: `beyond_baseline.forward`.
+- **P2 rule (pre-registered 23 Oct 2026, report only):** the owner's rule for the
+  full holder run (P2, about 4,760 calls); on any other run, such as the pilot, the
+  same block is shown for information only. For `HOLD_P2_FEATURE`
+  (`pre_hold_sellers`) in `HOLD_P2_CONTRAST` (`dead7` vs rest): (a) the delta AUC 95 %
+  lower bound of the section above > `HOLD_P2_DELTA_LOWER` (0), (b) its decile-strata
+  95 % lower bound > `HOLD_P2_STRATA_LOWER` (0.50), (c) the forward delta 95 % lower
+  bound > `HOLD_P2_FWD_DELTA_LOWER` (0), all strict, and (d) direction, the owner's
+  addition of 24 Oct 2026: the feature must point the same way as in the pilot (more
+  sellers before the call, more likely `dead7`), so its pooled direction on the
+  model's rows (the one that orients (b)) is `HOLD_P2_DIRECTION` (`higher`) and its
+  standardised coefficient given the baseline is > 0; (d) shows both values and is
+  n/a only if either is missing. Each part is shown with its value
+  and PASS / FAIL / n/a; the rule is FAIL if any part fails (a definite failure
+  decides even when another part is n/a), otherwise NOT JUDGED if any part is n/a,
+  and PASS only if all four pass. The n/a handling (NOT JUDGED when no part fails
+  but a part could not be computed) is the PM's reading, not part of the approved
+  rule. PASS leads to a `dead7` model trial with the feature through the
+  walk-forward gate (a separate step); FAIL stops the holder work. Never part of
+  the verdict. `summary.json`: `beyond_baseline.p2_rule` (parts `a` to `d`; `d` holds
+  `expected`, `observed` and `coef`). The forward and P2 settings follow the section's on the
+  Settings line.
 
 The output holds counts and metrics only (no address, no per-call row; the ids
 without a row are listed by call id in `summary.json` only), plus the sha256 of
