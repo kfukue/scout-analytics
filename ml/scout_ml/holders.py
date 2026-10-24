@@ -2,13 +2,15 @@
 joined on call_id to the owner's Q6 pilot ids, row classes, per-feature AUC with
 bootstrap intervals, within-week and within-strata checks, a permutation null
 and the pre-registered stop rule, plus a report-only check of what the
-HOLD_INCR_FEATURES add beyond the posted holders and age (never in the verdict).
+HOLD_INCR_FEATURES add beyond the posted holders and age, with its forward
+(time-based) check and the owner's pre-registered P2 rule (never in the verdict).
 Pure functions except load_*, check_out_dir
 and run; holders_report.py is the command line. The output holds counts and
 metrics only, never an address or a per-call row, so it is safe to paste back."""
 import hashlib
 import json
 import os
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -49,6 +51,21 @@ DAGGER_NOTE = ("the coefficient's sign (given the baseline) disagrees with the f
 INCR_SETTINGS = ("HOLD_INCR_FEATURES", "HOLD_INCR_FOLDS", "HOLD_INCR_REPEATS", "HOLD_INCR_SEED",
                  "HOLD_INCR_LOGIT_C", "HOLD_INCR_DECILES", "HOLD_INCR_ADDS_DELTA_LOWER",
                  "HOLD_INCR_ADDS_STRATA_LOWER")
+FWD_KEY, P2_KEY = "forward", "p2_rule"
+FWD_HEAD, P2_HEAD = "### Forward (time-based) check", "### P2 rule (pre-registered 23 Oct 2026)"
+FWD_SETTINGS = ("HOLD_FWD_TEST_SHARE", "HOLD_FWD_EMBARGO_S", "HOLD_FWD_MIN_TEST_CLASS_N", "HOLD_P2_FEATURE",
+                "HOLD_P2_CONTRAST", "HOLD_P2_DELTA_LOWER", "HOLD_P2_STRATA_LOWER", "HOLD_P2_FWD_DELTA_LOWER",
+                "HOLD_P2_DIRECTION")
+TRAIN, TEST, EMBARGOED = "train", "test", "embargoed"
+# a timestamp with a time of day and an explicit UTC offset: Z, +HH, +HHMM or +HH:MM (pgAdmin: -07)
+STAMP = re.compile(r"\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}(:?\d{2})?)$")
+PASS, FAIL, NA, NOT_JUDGED = "PASS", "FAIL", "n/a", "NOT JUDGED"
+# (part, what it is, threshold setting)
+P2_PARTS = (("a", "delta AUC 95 % lower bound (random folds, the table above)", "HOLD_P2_DELTA_LOWER"),
+            ("b", "decile-strata AUC 95 % lower bound", "HOLD_P2_STRATA_LOWER"),
+            ("c", "forward delta AUC 95 % lower bound", "HOLD_P2_FWD_DELTA_LOWER"))
+# part (d), the owner's addition of 24 Oct 2026: no threshold, a direction and a coefficient sign
+P2_DIRECTION = ("d", "direction (owner, 24 Oct 2026): pooled direction and standardised coefficient given the baseline")
 EXIT_OK, EXIT_REFUSED = 0, 1
 
 
@@ -499,17 +516,172 @@ def incr_model(B, F, X, grp, contrast, feats, terciles, deciles) -> dict:
     return out
 
 
-def beyond_baseline(a: pd.DataFrame, X: pd.DataFrame, grp: pd.Series, terciles) -> dict:
-    """Per primary contrast: each HOLD_INCR_FEATURES model alone, then all together."""
+def beyond_baseline(a: pd.DataFrame, X: pd.DataFrame, grp: pd.Series, terciles, entry=None) -> dict:
+    """Per primary contrast: each HOLD_INCR_FEATURES model alone, then all together; the forward
+    check of each feature alone (entry: the ids file's entry_at per row, None without the column)
+    and the P2 rule."""
     feats = incr_features()
     B = pd.DataFrame({c: log1p_count(num(a, c)) for c in IDS_STRATA}, index=a.index)
     F = pd.DataFrame({f: log1p_count(X[f]) for f in feats}, index=X.index)
     deciles, cuts = decile_labels(a)
     sets = [(f,) for f in feats] + ([tuple(feats)] if len(feats) > 1 else [])
-    return {"decile_strata": {"cut_points": cuts, "strata": None if deciles is None else int(deciles.nunique()),
-                              "rows_without_stratum": len(a) if deciles is None else int(deciles.isna().sum())},
-            "contrasts": {c[0]: {" + ".join(s): incr_model(B, F, X, grp, c, s, terciles, deciles) for s in sets}
-                          for c in PRIMARY}}
+    call_id = a["call_id"] if "call_id" in a.columns else pd.Series(a.index, index=a.index)
+    out = {"decile_strata": {"cut_points": cuts, "strata": None if deciles is None else int(deciles.nunique()),
+                             "rows_without_stratum": len(a) if deciles is None else int(deciles.isna().sum())},
+           "contrasts": {c[0]: {" + ".join(s): incr_model(B, F, X, grp, c, s, terciles, deciles) for s in sets}
+                         for c in PRIMARY},
+           FWD_KEY: forward_check(B, F, grp, feats, call_id, entry)}
+    out[P2_KEY] = p2_rule(out)
+    return out
+
+
+def incr_not_judged(reason: str) -> dict:
+    """The section without the baseline columns: the forward check and the P2 rule not judged either."""
+    out = {"not_judged": reason, FWD_KEY: {"na": reason}}
+    out[P2_KEY] = p2_rule(out)
+    return out
+
+
+# --- forward (time-based) check and the P2 rule (report only, never in the verdict) ----
+def parse_entry_at(v: pd.Series) -> pd.Series:
+    """The ids file's entry_at text as UTC timestamps; NaT for a blank, for a value without a time
+    of day and an explicit UTC offset (a time without one is never guessed as UTC), or for one
+    that is not a timestamp."""
+    s = v.astype(object).where(v.notna(), "").astype(str).str.strip()
+    ok = s.map(lambda x: bool(STAMP.search(x)))
+    return pd.to_datetime(s.where(ok, ""), utc=True, errors="coerce", format="ISO8601")
+
+
+def time_split(t: pd.Series, call_id: pd.Series) -> pd.Series:
+    """TRAIN / TEST / EMBARGOED per row: ordered by (t, call_id), the latest HOLD_FWD_TEST_SHARE of
+    the rows (rounded) are the test; earlier rows posted at or after the first test call minus
+    HOLD_FWD_EMBARGO_S are embargoed (a row tied with the first test call too)."""
+    order = pd.DataFrame({"t": t, "id": call_id}).sort_values(["t", "id"], kind="mergesort").index
+    n_test = int(round(C.HOLD_FWD_TEST_SHARE * len(order)))
+    part = pd.Series(TRAIN, index=t.index, dtype=object)
+    if n_test == 0:
+        return part
+    test = order[-n_test:]
+    part[test] = TEST
+    start = t[test].min() - pd.Timedelta(seconds=C.HOLD_FWD_EMBARGO_S)
+    part[part.eq(TRAIN) & (t >= start)] = EMBARGOED
+    return part
+
+
+def date_range(t: pd.Series):
+    """[first, last] UTC date of t; None when empty."""
+    return [t.min().strftime("%Y-%m-%d"), t.max().strftime("%Y-%m-%d")] if len(t) else None
+
+
+def split_info(t: pd.Series, part: pd.Series) -> dict:
+    """Row counts and UTC date ranges of the three parts, the first test call and the embargo start."""
+    test = t[part.eq(TEST)]
+    first = None if test.empty else test.min()
+    return {"n": len(t), **{f"n_{p}": int(part.eq(p).sum()) for p in (TRAIN, TEST, EMBARGOED)},
+            **{f"{p}_entry_at": date_range(t[part.eq(p)]) for p in (TRAIN, TEST, EMBARGOED)},
+            "first_test_at": None if first is None else first.strftime("%Y-%m-%d %H:%M:%S"),
+            "embargo_from": None if first is None else
+            (first - pd.Timedelta(seconds=C.HOLD_FWD_EMBARGO_S)).strftime("%Y-%m-%d %H:%M:%S")}
+
+
+def forward_check(B, F, grp, feats, call_id, entry) -> dict:
+    """One time split of the analysable rows, then per primary contrast each feature alone; n/a
+    without entry_at or with any row whose entry_at is blank or unparseable (no row is dropped)."""
+    if entry is None:
+        return {"na": "the ids file lacks entry_at"}
+    t = parse_entry_at(entry)
+    bad = int(t.isna().sum())
+    if bad:
+        return {"na": f"{bad} analysable row(s) with entry_at blank or not a timestamp with a UTC offset"}
+    part = time_split(t, call_id)
+    return {"split": split_info(t, part),
+            "contrasts": {c[0]: {f: forward_model(B, F, grp, c, f, part) for f in feats} for c in PRIMARY}}
+
+
+def forward_model(B, F, grp, contrast, f, part) -> dict:
+    """Baseline and baseline + log1p(f) fitted on the training rows (the scaler too), AUC on the
+    test rows, and the paired bootstrap CI of the delta over the test rows (within groups; no refit)."""
+    keep, counts = model_rows(B, F, grp, contrast, (f,))
+    y = grp == contrast[1]
+    tr, te = keep & part.eq(TRAIN), keep & part.eq(TEST)
+    out = {"features": [f], **{k: counts[k] for k in ("contrast_rows", "dropped_baseline_missing",
+                                                      "dropped_feature_missing")},
+           "n_train": int(tr.sum()), "n_test": int(te.sum()), "n_embargoed": int((keep & part.eq(EMBARGOED)).sum()),
+           "train_pos": int((tr & y).sum()), "train_neg": int((tr & ~y).sum()),
+           "test_pos": int((te & y).sum()), "test_neg": int((te & ~y).sum())}
+    if (min(out["train_pos"], out["train_neg"]) < C.HOLD_MIN_CLASS_N
+            or min(out["test_pos"], out["test_neg"]) < C.HOLD_FWD_MIN_TEST_CLASS_N):
+        return {**out, "na": f"< {C.HOLD_MIN_CLASS_N} training or < {C.HOLD_FWD_MIN_TEST_CLASS_N} test rows in a class"}
+    tr, te, yv = tr.to_numpy(), te.to_numpy(), y.to_numpy()
+    Zb = B.to_numpy()
+    Zm = np.column_stack([Zb, F[f].to_numpy()])
+    sb = logit().fit(Zb[tr], yv[tr]).predict_proba(Zb[te])[:, 1]
+    sm = logit().fit(Zm[tr], yv[tr]).predict_proba(Zm[te])[:, 1]
+    w = boot_weights(grp.to_numpy()[te])
+    base, model = float(roc_auc_score(yv[te], sb)), float(roc_auc_score(yv[te], sm))
+    return {**out, "baseline_auc": base, "model_auc": model, "delta": model - base,
+            "delta_ci": ci(pair_auc(sm, yv[te], None, w) - pair_auc(sb, yv[te], None, w))}
+
+
+def p2_sources(inc: dict) -> dict:
+    """Per part: (the block holding the CI, the CI key, why n/a when the block is missing); for (d)
+    the single-feature model block, whose pooled direction also orients (b), with no CI key."""
+    f, c = C.HOLD_P2_FEATURE, C.HOLD_P2_CONTRAST
+    keys = [k for k, _, _ in P2_PARTS] + [P2_DIRECTION[0]]
+    if "not_judged" in inc:
+        return {k: (None, None, inc["not_judged"]) for k in keys}
+    missing = f"{f} in {c} is not among the models (HOLD_INCR_FEATURES x primary contrasts)"
+    m = inc.get("contrasts", {}).get(c, {}).get(f)
+    fw = inc.get(FWD_KEY, {})
+    fm = fw.get("contrasts", {}).get(c, {}).get(f)
+    return {"a": (m, "delta_ci", missing),
+            "b": (None if m is None else m.get("deciles", m), "strata_ci", missing),
+            "c": (fm, "delta_ci", fw.get("na", missing)),
+            "d": (m, None, missing)}
+
+
+def p2_part(block, key, why_missing, threshold) -> dict:
+    """One part: the CI's lower bound against its threshold (strict), or n/a with the reason."""
+    if block is None or "na" in block or not block.get(key):
+        why = why_missing if block is None else block.get("na", "no confidence interval")
+        return {"lower": None, "threshold": threshold, "result": NA, "na": why}
+    low = block[key][0]
+    out = {"lower": low, "threshold": threshold, "result": PASS if low > threshold else FAIL}
+    return {**out, "direction": block["direction"]} if key == "strata_ci" and "direction" in block else out
+
+
+def p2_coef(block: dict, f: str):
+    """The feature's standardised coefficient in the block; None when absent or not finite."""
+    c = (block.get("coef") or {}).get(f)
+    return float(c) if c is not None and np.isfinite(c) else None
+
+
+def p2_direction(block, _key, why_missing) -> dict:
+    """Part (d), the owner's addition (24 Oct 2026): PASS only if the feature's pooled direction on the
+    model's rows is HOLD_P2_DIRECTION and its standardised coefficient given the baseline is > 0;
+    n/a when either value is missing."""
+    out = {"expected": C.HOLD_P2_DIRECTION}
+    if block is None or "na" in block:
+        why = why_missing if block is None else block["na"]
+        return {**out, "observed": None, "coef": None, "result": NA, "na": why}
+    d, c = block.get("direction"), p2_coef(block, C.HOLD_P2_FEATURE)
+    out.update(observed=d, coef=c)
+    if d is None or c is None:
+        return {**out, "result": NA, "na": "no pooled direction" if d is None else "no coefficient"}
+    return {**out, "result": PASS if d == C.HOLD_P2_DIRECTION and c > 0 else FAIL}
+
+
+def p2_rule(inc: dict) -> dict:
+    """The owner's pre-registered P2 rule (23 Oct 2026; (d) added by the owner on 24 Oct 2026; result
+    logic per the PM, 23 Oct 2026): FAIL if any part fails (a definite failure decides even when another
+    part is n/a); else NOT JUDGED if any part is n/a; PASS only if all four pass."""
+    src = p2_sources(inc)
+    parts = {k: {"what": what, **p2_part(*src[k], getattr(C, th))} for k, what, th in P2_PARTS}
+    k, what = P2_DIRECTION
+    parts[k] = {"what": what, **p2_direction(*src[k])}
+    res = [p["result"] for p in parts.values()]
+    overall = FAIL if FAIL in res else NOT_JUDGED if NA in res else PASS
+    return {"feature": C.HOLD_P2_FEATURE, "contrast": C.HOLD_P2_CONTRAST, "parts": parts, "result": overall}
 
 
 # --- description ------------------------------------------------------------------
@@ -580,6 +752,7 @@ def analyse(ex: dict, ids: pd.DataFrame, features) -> dict:
     baseline = None if strata_reason else {
         c[0]: {col: auc_block(num(a, col), grp, c, week) for col in IDS_STRATA} for c in PRIMARY}
     eligible = {c: [f for f, b in contrasts[c].items() if "auc" in b] for c, _, _ in PRIMARY}
+    entry = a["call_id"].map(ids.set_index("call_id")["entry_at"]) if "entry_at" in ids.columns else None
     checks = {}
     for f, col in (("pre_hold_launch_age_s", "age_s_at_call"), ("pre_hold_holders", "holders_at_call")):
         if col in a.columns and f in X.columns:
@@ -614,14 +787,14 @@ def analyse(ex: dict, ids: pd.DataFrame, features) -> dict:
         "after_call": by_group(pd.DataFrame({c: values(a[c], strict=False) for c in post_cols}), grp),
         "outcomes": by_group(outcome, grp),
         "verdict": verdict(contrasts, counts, strata_reason),
-        INCR_KEY: {"not_judged": strata_reason} if strata_reason else beyond_baseline(a, X, grp, strata),
+        INCR_KEY: incr_not_judged(strata_reason) if strata_reason else beyond_baseline(a, X, grp, strata, entry),
     }
 
 
 def settings() -> dict:
     return {k: getattr(C, k) for k in ("HOLD_STOP_AUC_LOWER", "HOLD_STRATA_AUC_LOWER", "HOLD_MIN_CLASS_N",
                                        "HOLD_AGE_BAND_S", "HOLD_BOOTSTRAP_REPS", "HOLD_BOOTSTRAP_SEED",
-                                       "HOLD_CI", "HOLD_PERM_REPS", "HOLD_PERM_SEED") + INCR_SETTINGS}
+                                       "HOLD_CI", "HOLD_PERM_REPS", "HOLD_PERM_SEED") + INCR_SETTINGS + FWD_SETTINGS}
 
 
 # --- report --------------------------------------------------------------------
@@ -797,7 +970,7 @@ def fstrata(b: dict) -> list:
 def render_incremental(inc: dict, st: dict) -> list:
     L = [INCR_HEAD, ""] + incr_method(st)
     if "not_judged" in inc:
-        return L + [f"NOT JUDGED: {inc['not_judged']}.", ""]
+        return L + [f"NOT JUDGED: {inc['not_judged']}.", ""] + render_forward(inc, st) + render_p2(inc, st)
     d = inc["decile_strata"]
     cuts = ", ".join(fg(c) for c in d["cut_points"]) if d["cut_points"] else "n/a"
     L += [f"Decile strata: {d['strata'] if d['strata'] is not None else 'n/a'} strata (holder bins x age band), "
@@ -820,7 +993,104 @@ def render_incremental(inc: dict, st: dict) -> list:
         L += ["Partial-rank and strata checks (single features; AUC oriented, direction in brackets):", ""]
         L += table(["contrast", "feature", "residual AUC", "residual 95 % CI", "tercile-strata AUC",
                     "tercile 95 % CI", "decile-strata AUC", "decile 95 % CI"], checks)
-    return L
+    return L + render_forward(inc, st) + render_p2(inc, st)
+
+
+def forward_method(st: dict) -> list:
+    share, emb = st["HOLD_FWD_TEST_SHARE"], st["HOLD_FWD_EMBARGO_S"]
+    return [
+        "Part (c) of the owner's P2 rule below (pre-registered 23 Oct 2026). Report only, never part of the verdict.",
+        "",
+        f"- Split: the analysable rows ordered by the ids file's entry_at (ties by call_id); the earliest "
+        f"{100 * (1 - share):.0f} % train, the latest {100 * share:.0f} % test (HOLD_FWD_TEST_SHARE, rounded to "
+        f"whole rows); training calls posted within {emb / 86400:g} d (HOLD_FWD_EMBARGO_S) before the first test "
+        "call, or at the same time, are dropped (embargoed: their 7d label overlaps the test period). One split for "
+        "every feature and contrast. Every entry_at must be a timestamp with a UTC offset (Z, or e.g. pgAdmin's "
+        "2026-09-09 20:59:16-07); a blank, a time without an offset or an unparseable value makes the whole check "
+        "n/a, no row is dropped.",
+        "- Models: the same logistic regressions as above (baseline, and baseline + log1p(feature), each feature "
+        "alone), standardisation and fit on the training rows only; AUC on the test rows; delta = model minus "
+        "baseline. Rows with a baseline value or the feature NULL or negative are dropped and counted as above.",
+        f"- Delta 95 % CI: paired percentile bootstrap of the test rows ({st['HOLD_BOOTSTRAP_REPS']} reps, seed "
+        f"{st['HOLD_BOOTSTRAP_SEED']}, resampled within groups), the same resample for baseline and model. No model "
+        "is refitted per rep, so it covers only which test calls were drawn: a floor on the uncertainty. One "
+        "calendar split: it shows whether the addition holds on the latest calls, not on every period.",
+        f"- n/a below {st['HOLD_MIN_CLASS_N']} training rows (HOLD_MIN_CLASS_N) or {st['HOLD_FWD_MIN_TEST_CLASS_N']} "
+        "test rows (HOLD_FWD_MIN_TEST_CLASS_N) in either class. Dates are UTC.", ""]
+
+
+def fdates(r) -> str:
+    return "n/a" if not r else f"{r[0]} to {r[1]}"
+
+
+def fforward(m: dict) -> list:
+    counts = [f"{m['n_train']} / {m['n_test']} / {m['n_embargoed']}", f"{m['train_pos']} / {m['train_neg']}",
+              f"{m['test_pos']} / {m['test_neg']}",
+              f"{m['dropped_baseline_missing']} / {m['dropped_feature_missing']}"]
+    if "na" in m:
+        return counts + [f"n/a ({m['na']})", "", "", ""]
+    return counts + [f3(m["baseline_auc"]), f3(m["model_auc"]), f3(m["delta"]), fci(m["delta_ci"])]
+
+
+def render_forward(inc: dict, st: dict) -> list:
+    if FWD_KEY not in inc:
+        return []
+    fw = inc[FWD_KEY]
+    L = [FWD_HEAD, ""] + forward_method(st)
+    if "na" in fw:
+        return L + [f"n/a: {fw['na']}.", ""]
+    sp = fw["split"]
+    L += [f"Split: {sp['n']} analysable rows: train {sp['n_train']} (entry_at {fdates(sp['train_entry_at'])}), "
+          f"embargoed {sp['n_embargoed']} ({fdates(sp['embargoed_entry_at'])}), test {sp['n_test']} "
+          f"({fdates(sp['test_entry_at'])}); first test call {sp['first_test_at'] or 'n/a'} UTC, embargo from "
+          f"{sp['embargo_from'] or 'n/a'} UTC.", ""]
+    rows = [[c, f] + fforward(m) for c, models in fw["contrasts"].items() for f, m in models.items()]
+    return L + table(["contrast", "model (+ baseline)", "n train / test / embargoed", "train pos / neg",
+                      "test pos / neg", "dropped: baseline / feature", "baseline AUC (test)", "model AUC (test)",
+                      "delta", "delta 95 % CI"], rows)
+
+
+def fdirection(p: dict, pos: str) -> str:
+    """Part (d): the observed direction and coefficient (when known) against what passes."""
+    seen = [f"pooled {p['observed']} for {pos}" if p.get("observed") else "",
+            f"coefficient {p['coef']:+.3f}" if p.get("coef") is not None else ""]
+    return f"{', '.join(s for s in seen if s) or 'n/a'}, needs {p['expected']} and coefficient > 0"
+
+
+def fpart(k: str, p: dict, pos: str) -> str:
+    head = f"- ({k}) {p['what']}: "
+    if k == P2_DIRECTION[0]:
+        return head + fdirection(p, pos) + (f": n/a ({p['na']})" if p["result"] == NA else f": {p['result']}")
+    if p["result"] == NA:
+        return head + f"n/a ({p['na']}): n/a"
+    d = f" (oriented: {p['direction']} for {pos})" if "direction" in p else ""
+    return head + f"{f3(p['lower'])}{d}, needs > {p['threshold']:.2f}: {p['result']}"
+
+
+def render_p2(inc: dict, st: dict) -> list:
+    if P2_KEY not in inc:
+        return []
+    p = inc[P2_KEY]
+    why = {NOT_JUDGED: " (no part fails, a part is n/a)", PASS: " (every part passes)",
+           FAIL: " (a part fails)"}[p["result"]]
+    return [P2_HEAD, "",
+            "The owner's pre-registered rule (approved 23 Oct 2026) for the full holder run (P2, about 4,760 calls, "
+            "data not seen when it was fixed). It applies to that run only; on any other run, such as the pilot, it "
+            "is shown for information only. PASS leads to a dead7 model trial with the feature through the "
+            "walk-forward gate (a separate step); FAIL stops the holder work. Never part of the verdict above.",
+            "",
+            "The rule has four parts. (a), (b) and (c) were approved on 23 Oct 2026; (d), direction, is the owner's "
+            "addition of 24 Oct 2026: the feature passes only if it points the same way as in the pilot (more "
+            f"sellers before the call, more likely {p['contrast'].split(' vs ')[0]}), that is its pooled direction "
+            "on the model's rows (the one that orients (b)) is the expected one and its standardised coefficient "
+            "given the baseline is > 0; n/a only if either value is missing.",
+            "",
+            f"Feature {p['feature']}, contrast {p['contrast']}; every bound strict (>); FAIL if any part "
+            "fails (even when another part is n/a), else NOT JUDGED if any part is n/a, PASS only if all four pass. "
+            "The n/a handling (NOT JUDGED when no part fails but a part could not be computed) is the PM's reading, "
+            "not part of the approved rule.",
+            ""] + [fpart(k, part, p["contrast"].split(" vs ")[0]) for k, part in p["parts"].items()] + [
+        f"- P2 rule: {p['result']}{why}", ""]
 
 
 def clean(o):
