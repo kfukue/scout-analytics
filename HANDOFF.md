@@ -1,8 +1,42 @@
 # Scout analytics: handoff to Claude Code
 
-## Session state (23 Oct 2026 PDT (23 Oct UTC): main bca6e91 after #42-#73)
+## Session state (24 Oct 2026 PDT (24 Oct UTC): main fe9740e after #42-#74)
 
 This section supersedes the ones below wherever they differ.
+
+**Update, 24 Oct 01:10 PDT (08:10 UTC): P2 rule gets a direction part;
+the report that applies it is in #75.**
+- Owner, 24 Oct ("ok go with your recommendation", in the PM skill):
+  sellers passes the P2 rule only if it points the pilot's way (more
+  sellers before the call, more likely `dead7`): pooled direction
+  "higher" and standardised coefficient given posted holders and age
+  > 0. So the rule has four parts: (a) delta lower bound > 0, (b)
+  decile-strata lower bound > 0.50, (c) forward delta lower bound > 0,
+  (d) direction. The PM's reading for the result: FAIL if any part
+  fails, else NOT JUDGED if a part is n/a, PASS only if all four pass.
+- #75 (open, reviewed PASS): the forward check (earliest 70 % of calls
+  by the ids file's `entry_at` train, latest 30 % test, 7-day embargo,
+  paired bootstrap of the test rows) and the "P2 rule" block in the
+  holder report. The Q7 ids file's `entry_at` has the pgAdmin offset
+  form (`2026-09-09 20:59:16-07`, first data row seen 23 Oct), which
+  the check needs.
+- After the full run finishes (expected about 25 Oct 13:30 PDT (20:30
+  UTC) at 23 Oct's pace) and #75 is merged: from `ml/`,
+  `"$ML/venv/bin/python" holders_report.py --ids
+  "$REPO/data/holder_full_ids.csv"` (default `--holders` is
+  `data/holders`); the PM reads the "Forward check" and "P2 rule"
+  parts. PASS: plan the `dead7` model trial with adoption rules fixed
+  first; FAIL: the holder work stops.
+- Still open for the owner: tracker restart for #71/#72 (not
+  confirmed); dropping the backup tables
+  `scout_call_tracking_bak_price_rug_fill_20261020` and
+  `scout_call_tracking_bak_park_stuck_20261022` (commands in their ops
+  READMEs); the `-web` legend check from #45; PC worktree clean-up.
+- Open question for the owner (asked 24 Oct): the full run's 4,760
+  calls include the pilot's 450, which produced the hypothesis; the
+  PM recommends judging the rule on the 4,310 new calls only (an ids
+  file without the pilot's ids), with the all-4,760 run for
+  information.
 
 **Update, 23 Oct 15:57 PDT (22:57 UTC): pilot check done; full-run
 (P2) rule fixed; P2 at 274 of 4,310.**

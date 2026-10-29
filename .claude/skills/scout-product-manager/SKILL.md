@@ -508,7 +508,7 @@ From the repo root on the server:
 
 Every Go start applies `scoutanalytics.sql` unless `SCOUT_DB_AUTO_MIGRATE=false`.
 
-## Owner decisions in force (8-23 October 2026)
+## Owner decisions in force (8-24 October 2026)
 
 - The `long` model waits for data (about 25 December) rather than loosening the
   threshold.
@@ -735,6 +735,13 @@ Every Go start applies `scoutanalytics.sql` unless `SCOUT_DB_AUTO_MIGRATE=false`
   reached a pool), which the export does not know as a venue, so their
   holder numbers would likely be wrong. Adding that launchpad as a venue is a deferred item in
   `HANDOFF.md` ("Deferred / open"), to look at again after the pilot.
+- 24 Oct (owner, "ok go with your recommendation"), adding to the 23
+  Oct P2 rule below before the full run's data is seen:
+  `pre_hold_sellers` passes only if it points the same way as in the
+  pilot (more sellers before the call, more likely `dead7`): its
+  pooled direction for `dead7` vs rest is "higher" and its
+  standardised coefficient given posted holders and age is positive.
+  A clear separation the other way is a FAIL.
 - 23 Oct (owner, "approve"), on the PM's proposal after the pilot's
   check beyond posted holders and age (`pre_hold_sellers` added +0.039
   AUC, 95 % interval 0.009-0.066, for `dead7` vs rest;
