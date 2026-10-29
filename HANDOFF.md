@@ -24,8 +24,8 @@ PASS on the 4,310 new calls.**
   rows; the report refuses export rows not in the ids file). Reason:
   the pilot produced the sellers hypothesis, so it does not judge it.
   The report's P2 text says "about 4,760 calls"; the rule was judged
-  on 4,310. Recording this as an owner decision in the PM skill waits
-  for his confirmation in words.
+  on 4,310. Owner confirmed in words 29 Oct, after the report ("new
+  calls only"; in the PM skill).
 - Report run 20261029-2301 UTC (29 Oct 16:01 PDT), `--holders
   data/holders_new --ids data/holder_full_new_ids.csv`: 4,310 rows,
   4,308 analysable (2 `dead7` incomplete); dead7 1,315, held2x7 618,
