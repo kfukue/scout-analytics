@@ -1,8 +1,63 @@
 # Scout analytics: handoff to Claude Code
 
-## Session state (24 Oct 2026 PDT (24 Oct UTC): main fe9740e after #42-#74)
+## Session state (29 Oct 2026 PDT (29 Oct UTC): main 5136017 after #42-#76)
 
 This section supersedes the ones below wherever they differ.
+
+**Update, 29 Oct 16:30 PDT (23:30 UTC): full holder run done; P2 rule
+PASS on the 4,310 new calls.**
+- #75 and #76 merged 29 Oct 12:49 and 12:54 PDT (19:49 and 19:54 UTC).
+- Node stall: on 25 Oct from about 09:42 PDT (16:42 UTC) the node took
+  no new blocks (head lag grew 30 s every 30 s, 2m44s to 31m45s). The
+  export paused and stopped at 10:14 PDT (17:14 UTC) on
+  `SCOUT_HOLDERS_MAX_PAUSE` (30m): 4,108 rows written that run, 2
+  failed, 202 left. Cause not known (node log not seen). Times are the
+  server's log clock, Pacific (inferred from the 29 Oct run's order).
+- Resumed 29 Oct after the node caught up: 202 ok, 0 failed, 30,678
+  `eth_getLogs`, ended 14:35 PDT (21:35 UTC), 0 calls still to do.
+  `data/holders` now holds all 4,760 rows (pilot 450 + 4,310).
+- Population: before the report ran, the owner made
+  `data/holder_full_new_ids.csv` (Q7's 4,760 ids minus the pilot's
+  450: 4,310) and the folder `data/holders_new` (only those 4,310
+  rows; the report refuses export rows not in the ids file). Reason:
+  the pilot produced the sellers hypothesis, so it does not judge it.
+  The report's P2 text says "about 4,760 calls"; the rule was judged
+  on 4,310. Recording this as an owner decision in the PM skill waits
+  for his confirmation in words.
+- Report run 20261029-2301 UTC (29 Oct 16:01 PDT), `--holders
+  data/holders_new --ids data/holder_full_new_ids.csv`: 4,310 rows,
+  4,308 analysable (2 `dead7` incomplete); dead7 1,315, held2x7 618,
+  neither 2,375. Top verdict CONTINUE (the 19 Oct stop bound; 8
+  features clear it), not the P2 result.
+- P2 rule, `pre_hold_sellers`, dead7 vs rest: **PASS**, every part.
+  - (a) delta AUC over posted holders + age (random folds): +0.035,
+    95 % 0.027-0.043 (pilot: +0.039). Baseline 0.770, model 0.805.
+  - (b) decile-strata AUC 0.624, lower bound 0.604 (> 0.50).
+  - (c) forward (train 2026-07-28 to 09-09 UTC, 7-day embargo, test
+    09-16 to 10-15, 1,292 test rows): baseline 0.751, model 0.826,
+    delta +0.075, 95 % 0.053-0.097.
+  - (d) direction "higher" for dead7, standardised coefficient +0.858.
+- Context (not part of the rule): sellers makes the held2x7 forward
+  ranking worse (delta -0.045, 95 % -0.061 to -0.030): a sign of
+  death, not of quality. `pre_hold_holders` adds +0.005 (posted
+  holders repeat it: Spearman 0.993). The P2 baseline is posted holders
+  + age only; the live model already has `pre_sells_*`, so the trial
+  is a higher bar and P2 PASS does not predict its result.
+- Next (owner's 23 Oct decision: PASS leads to a `dead7` model trial
+  through the walk-forward gate, adoption rules fixed first): a trial
+  plan is drafted (report-only `dead7` classifier, current inputs with
+  and without sellers, judged only on calls posted from 16 Oct 00:00
+  UTC, never served). Its timing depends on call volume: Q7's weeks
+  fell from 432 analysable calls (week of 28 Sep) to 104 (week of
+  5 Oct, 8 dead7). A read-only weekly count since September comes
+  before any trial rule is put to the owner. Serving the feature live
+  is a later question: the export takes 10-40 s a call against a 10 s
+  delivery budget.
+- Still open for the owner: node log for the 25 Oct stall; tracker
+  restart for #71/#72 (not confirmed); dropping the backup tables
+  `scout_call_tracking_bak_price_rug_fill_20261020` and
+  `scout_call_tracking_bak_park_stuck_20261022`; the `-web` legend
+  check from #45; PC worktree clean-up.
 
 **Update, 24 Oct 01:10 PDT (08:10 UTC): P2 rule gets a direction part;
 the report that applies it is in #75.**
