@@ -4,7 +4,7 @@
 
 This section supersedes the ones below wherever they differ.
 
-**Update, 29 Oct 16:30 PDT (23:30 UTC): full holder run done; P2 rule
+**Update, 29 Oct 16:10 PDT (23:10 UTC): full holder run done; P2 rule
 PASS on the 4,310 new calls.**
 - #75 and #76 merged 29 Oct 12:49 and 12:54 PDT (19:49 and 19:54 UTC).
 - Node stall: on 25 Oct from about 09:42 PDT (16:42 UTC) the node took
@@ -15,6 +15,8 @@ PASS on the 4,310 new calls.**
   server's log clock, Pacific (inferred from the 29 Oct run's order).
 - Resumed 29 Oct after the node caught up: 202 ok, 0 failed, 30,678
   `eth_getLogs`, ended 14:35 PDT (21:35 UTC), 0 calls still to do.
+  It still paused 26m49s in total (node more than 2 min behind) in a
+  run of about 1h40m: the node lag came back, short of the 30m stop.
   `data/holders` now holds all 4,760 rows (pilot 450 + 4,310).
 - Population: before the report ran, the owner made
   `data/holder_full_new_ids.csv` (Q7's 4,760 ids minus the pilot's
@@ -50,10 +52,12 @@ PASS on the 4,310 new calls.**
   UTC, never served). Its timing depends on call volume: Q7's weeks
   fell from 432 analysable calls (week of 28 Sep) to 104 (week of
   5 Oct, 8 dead7). A read-only weekly count since September comes
-  before any trial rule is put to the owner. Serving the feature live
+  before any trial rule is put to the owner (the draft's rules and
+  questions are with the PM until then). Serving the feature live
   is a later question: the export takes 10-40 s a call against a 10 s
   delivery budget.
-- Still open for the owner: node log for the 25 Oct stall; tracker
+- Still open for the owner: node log for the 25 Oct stall and the 29
+  Oct lag (the tracker reads the same node); tracker
   restart for #71/#72 (not confirmed); dropping the backup tables
   `scout_call_tracking_bak_price_rug_fill_20261020` and
   `scout_call_tracking_bak_park_stuck_20261022`; the `-web` legend
