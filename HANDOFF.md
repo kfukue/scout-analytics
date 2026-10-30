@@ -4,6 +4,21 @@
 
 This section supersedes the ones below wherever they differ.
 
+**Update, 29 Oct about 17:30 PDT (30 Oct 00:30 UTC): `dead7` trial
+rules approved; trial being built.**
+- Owner approved the trial's rules R0-R5, the confirmation run (>= 100
+  `dead7` among calls from 16 Oct 00:00 UTC; deadline 31 Jan 2027) and
+  what each result leads to (PM skill, "approve", 29 Oct PDT).
+- `implement` builds it as a separate report-only script in `ml/` (no
+  Go, database or view change; the saved model untouched). At run time
+  the owner supplies a fresh dataset-view export covering 27 Jul - 15
+  Oct 2026 with the tax columns, plus `data/holders`,
+  `data/holder_full_ids.csv` and `data/holder_pilot_ids.csv`.
+- Wording fixes to the update below: "on-chain entries match calls"
+  holds for October; in September `onchain_entry` exceeds `calls`
+  (update posts had entries too): no call lacks an on-chain entry.
+  "29 Oct evening" was about 17:00 PDT (30 Oct 00:00 UTC).
+
 **Update, 29 Oct evening PDT (30 Oct UTC): call volume fell about
 12x; `dead7` trial runs now on the full run's calls (owner "B").**
 - Two read-only weekly counts (owner, 29 Oct), UTC weeks from Monday:

@@ -508,7 +508,7 @@ From the repo root on the server:
 
 Every Go start applies `scoutanalytics.sql` unless `SCOUT_DB_AUTO_MIGRATE=false`.
 
-## Owner decisions in force (8-29 October 2026)
+## Owner decisions in force (8-30 October 2026)
 
 - The `long` model waits for data (about 25 December) rather than loosening the
   threshold.
@@ -735,6 +735,38 @@ Every Go start applies `scoutanalytics.sql` unless `SCOUT_DB_AUTO_MIGRATE=false`
   reached a pool), which the export does not know as a venue, so their
   holder numbers would likely be wrong. Adding that launchpad as a venue is a deferred item in
   `HANDOFF.md` ("Deferred / open"), to look at again after the pilot.
+- 29 Oct PDT (30 Oct UTC) (owner, "approve"), on the PM's proposal,
+  fixed before the trial is built or run: the `dead7` trial's rules.
+  Two LightGBM `dead7` models on the same rows, the current model
+  inputs with and without `pre_hold_sellers`; label `dead7` as in P2
+  (the ids file's `grp`); report only, nothing saved or served. Calls:
+  Q7's 4,760, weekly expanding walk-forward with a 7-day embargo; the
+  pilot's 450 train but are never test rows. PASS only if all pass,
+  FAIL if any fails, else NOT JUDGED if any is n/a:
+  R0 at least 2 counted test weeks, each with >= 1,000 training rows,
+  >= 50 test rows and >= 5 `dead7` test rows (else NOT JUDGED);
+  R1 median over the 7 `STABILITY_SEEDS` of the pooled AUC delta (with
+  minus without sellers) > 0;
+  R2 seed 7: the paired pooled AUC delta's 95 % lower bound > 0
+  (bootstrap of test rows within week x class, 2,000 reps, seed 7);
+  R3 seed 7, skipping the top 30 % by the with-sellers `dead7` score:
+  `dead7` caught lower bound > 0.30, kept-minus-all net 7d return lower
+  bound > 0, and caught (point) >= the without-sellers model's;
+  R4 direction: pooled direction "higher" for `dead7` on the test rows,
+  and the mean seed-7 score change when `pre_hold_sellers` moves from
+  its 25th to its 75th percentile (other inputs held) > 0;
+  R5 drift: adversarial AUC with sellers <= without + 0.02, and
+  `pre_hold_sellers` not among the top 3 drifting inputs at a gain
+  share >= 0.40.
+  Thresholds are literal values dated with this approval; one run, no
+  re-run with changed settings. A PASS is provisional: R1-R5 must hold
+  again, one split (train before 9 Oct 2026 00:00 UTC, test on calls
+  posted from 16 Oct 00:00 UTC), run once those calls hold >= 100
+  `dead7` with done 7d rows; if not reached by 31 Jan 2027 the PM
+  brings what there is and the owner decides to judge or stop.
+  Provisional PASS: nothing live. Confirmed PASS: the PM brings a
+  separate plan for live use. FAIL at either step: the holder work
+  stops.
 - 29 Oct (owner, "B"), on the PM's three options after the weekly
   count showed the scout channel's first calls down from about 880 a
   week (early September) to about 70 (mid-October), with no calls
