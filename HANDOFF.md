@@ -4,7 +4,7 @@
 
 This section supersedes the ones below wherever they differ.
 
-**Update, 30 Oct 12:45 PDT (19:45 UTC): `dead7` trial FAIL; the holder
+**Update, 30 Oct 12:25 PDT (19:25 UTC): `dead7` trial FAIL; the holder
 work stops.**
 - Merged: #80 (the trial's rules in the PM skill) 29 Oct 23:04 PDT
   (30 Oct 06:04 UTC); #81 (`ml/dead7_trial.py`, report only, RUNBOOK
