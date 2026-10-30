@@ -823,6 +823,41 @@ repeats, or the export has a call id the ids file does not. Paste back the whole
 `report.md` (counts and metrics only, no addresses; the ids without a row are in
 `summary.json` only). The verdict is report only: the owner decides.
 
+## 11. dead7 trial (report only)
+
+This trial asks whether `pre_hold_sellers` adds to the live model's inputs for
+predicting `dead7`. The rules are in `ml/README.md`, "dead7 trial". Run it once:
+no re-run with changed settings. It needs three things:
+
+- the dataset export from step 4 at `$ML/data/calls.csv`. Export it again first
+  if it was deleted in step 6;
+- the full holder export in `$REPO/data/holders`;
+- the ids files `$REPO/data/holder_full_ids.csv` (Q7) and
+  `$REPO/data/holder_pilot_ids.csv` (Q6).
+
+It uses the venv of step 2. There is no database, no node, and no model is saved:
+it writes no model file, no `LATEST` and no `CANDIDATE`.
+
+```bash
+cd "$REPO" && git pull
+cd "$REPO/ml"
+"$ML/venv/bin/python" -m pytest tests/test_dead7.py -q -p no:cacheprovider   # optional; the first run also trains a test model, a few minutes
+"$ML/venv/bin/python" dead7_trial.py --csv "$ML/data/calls.csv" --holders "$REPO/data/holders" --ids "$REPO/data/holder_full_ids.csv" --pilot-ids "$REPO/data/holder_pilot_ids.csv"
+cat "$REPO/data/dead7_trial/$(ls "$REPO/data/dead7_trial" | tail -1)/report.md"
+rm -f "$ML/data/calls.csv"
+```
+
+It prints `wrote <folder> (report.md, summary.json)`. The folder name is the run's
+UTC time (`YYYYMMDD-HHMM`) under `$REPO/data/dead7_trial` (git-ignored), and a
+second run in the same minute is refused. `refused: <why>. Nothing written`
+(exit 1) means an input did not pass a check: for example the ids file lacks
+`call_id`, `grp`, `week_utc` or `entry_block`, or the CSV is not a dataset export.
+
+Paste back the whole `report.md`. It holds counts and metrics only, no addresses.
+The result is report only: the owner decides. The confirmation run uses the same
+command with `--mode confirm` (an ids file with the newer calls). It runs later,
+once the calls posted from 16 Oct 2026 hold 100 `dead7`.
+
 ## Cleanup (when done with the worktree)
 
 ```bash

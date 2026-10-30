@@ -388,6 +388,84 @@ def write_holder_pilot(folder, ids_path, rows, ids, columns=None, failed: int = 
     ids.to_csv(ids_path, index=False)
 
 
+def make_dead7_trial(d: pd.DataFrame, seed: int = 7, signal: float = 1.5, pilot_share: float = 0.10,
+                     not_usable: int = 6, not_in_view: int = 4, stray: int = 5):
+    """Invented inputs of the dead7 trial for make()'s calls `d`: (calls, export rows as dicts in
+    HOLDER_COLUMNS order, ids DataFrame, pilot ids DataFrame). The ids are d's first calls usable at
+    7 d, plus `not_usable` unusable view rows and `not_in_view` ids without a view row. dead7
+    depends on low liquidity a little and on pre_hold_sellers by `signal` (the planted sellers
+    signal, beyond every view input); about 5 % of sellers are NULL. The calls are a copy of `d`
+    whose dead7 calls end at -95 % at 7 d (ret_7d, ret_late_7d), so skipping them pays. Export
+    rows: ~3 % each without a row, skipped, incomplete and entry-block mismatch, `stray` rows for calls not in the ids file,
+    and pre_hold_buyers / post24h_sellers planted as copies of the label (an allowlist check: the
+    trial must never read them). The pilot: `pilot_share` of the ids from the older half, plus two
+    ids not in the ids file."""
+    from scout_ml.labels import build_labels   # the trial's own notion of "usable at 7 d"
+    rng = np.random.default_rng([seed, 77])
+    L = build_labels(d)
+    usable = np.flatnonzero(L["usable_medium"].to_numpy())
+    unusable = np.flatnonzero(~L["usable_medium"].to_numpy())[:not_usable]
+    pick = np.concatenate([usable, unusable])
+    n = len(pick)
+    u = rng.normal(size=n)
+    sellers = np.round(np.exp(2.5 + 0.8 * u)).astype(int)
+    liq = pd.to_numeric(d["liq_usd"], errors="coerce").to_numpy()[pick]
+    lz = np.nan_to_num((np.log1p(liq) - np.nanmean(np.log1p(liq))) / np.nanstd(np.log1p(liq)))
+    dead = rng.random(n) < 1 / (1 + np.exp(-(-0.8 + signal * u - 0.4 * lz)))
+    grp = np.where(dead, "dead7", rng.choice(["held2x7", "neither"], n))
+    d = d.copy()
+    for col in ("ret_7d", "ret_late_7d"):
+        vals = d[col].to_numpy(dtype=object).copy()
+        vals[pick[dead]] = -95.0
+        d[col] = vals
+    grp = np.where(rng.random(n) < 0.2, [{"dead7": "1 dead7", "held2x7": "2 held2x7", "neither": "3 neither"}[g]
+                                         for g in grp], grp)    # the Q6/Q7 sort-prefixed form, sometimes
+    call_id = d["call_id"].to_numpy()[pick]
+    block = 20_000_000 + np.arange(n) * 300
+    when = pd.to_datetime(d["message_date"], utc=True).to_numpy()[pick]
+    week = pd.to_datetime(when).tz_localize(None).to_period("W-SUN").start_time
+    missing_id = int(d["call_id"].max()) + 1 + np.arange(not_in_view)
+    ids = pd.DataFrame({c: "" for c in HOLDER_IDS_COLUMNS}, index=range(n + not_in_view))
+    ids["call_id"] = np.concatenate([call_id, missing_id])
+    ids["grp"] = np.concatenate([grp, rng.choice(["dead7", "neither"], not_in_view)])
+    ids["week_utc"] = list(week.strftime("%Y-%m-%d")) + ["2026-09-07"] * not_in_view
+    ids["entry_block"] = np.concatenate([block, 30_000_000 + np.arange(not_in_view)])
+    ids["entry_at"] = list(pd.DatetimeIndex(when).strftime("%Y-%m-%dT%H:%M:%SZ")) + [""] * not_in_view
+    kind = rng.choice(["ok"] * 88 + ["no row"] * 3 + ["skipped"] * 3 + ["incomplete"] * 3 + ["mismatch"] * 3, n)
+    rows = []
+    for i in range(n):
+        if kind[i] == "no row":
+            continue
+        r = dict.fromkeys(HOLDER_COLUMNS)
+        r.update(call_id=int(call_id[i]), token=_addr(rng), chain="evm", status="ok", venues_pre=[], venues_post=[],
+                 entry_block=int(block[i] + (5 if kind[i] == "mismatch" else 0)), capped=False,
+                 code_version=HOLDER_CODE_VERSION, transfers_pre=int(rng.integers(5, 500)))
+        if kind[i] == "skipped":
+            r.update(status="skipped", skip_reason="no_mint_found")
+        else:
+            r.update(pre_hold_incomplete=kind[i] == "incomplete",
+                     pre_hold_sellers=None if rng.random() < 0.05 else int(sellers[i]),
+                     pre_hold_buyers=int(1000 * dead[i]), post24h_sellers=float(dead[i]))
+        rows.append(r)
+    for j in range(stray):
+        r = dict.fromkeys(HOLDER_COLUMNS)
+        r.update(call_id=int(missing_id[-1]) + 100 + j, status="ok", entry_block=1, pre_hold_incomplete=False,
+                 pre_hold_sellers=1, code_version=HOLDER_CODE_VERSION)
+        rows.append(r)
+    times = pd.DatetimeIndex(when[:len(usable)])
+    old = np.flatnonzero(times <= times.sort_values()[len(times) // 2])
+    chosen = rng.choice(call_id[old], max(1, int(pilot_share * n)), replace=False)
+    outside = int(missing_id[-1]) + np.array([50, 51])
+    pilot = pd.DataFrame({"call_id": np.concatenate([chosen, outside]), "grp": "neither"})
+    return d, rows, ids, pilot
+
+
+def write_dead7_trial(folder, ids_path, pilot_path, rows, ids, pilot) -> None:
+    """The export folder and the ids CSV (`write_holder_pilot`) plus the pilot ids CSV."""
+    write_holder_pilot(folder, ids_path, rows, ids)
+    pilot.to_csv(pilot_path, index=False)
+
+
 def main(argv=None) -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawTextHelpFormatter)
     ap.add_argument("--out", default="calls.csv")

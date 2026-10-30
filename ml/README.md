@@ -1081,6 +1081,76 @@ The output holds counts and metrics only (no address, no per-call row; the ids
 without a row are listed by call id in `summary.json` only), plus the sha256 of
 each input file, so it is safe to paste back.
 
+## dead7 trial (report only)
+
+    python dead7_trial.py --csv <dataset export> [--holders DIR] [--ids PATH] [--pilot-ids PATH]
+                          [--mode trial|confirm] [--out DIR]
+
+The step after the P2 PASS: does `pre_hold_sellers` add to the live model's inputs
+for predicting `dead7`? Nothing is saved or served: no model file, no `LATEST` or
+`CANDIDATE`; the saved model is not touched. The owner decides on the result.
+
+- **Inputs:** the dataset-view export the model trains on (`--csv`, the Go
+  program's `-export-dataset`), the `-export-holders` folder (`--holders`), the ids
+  file with `grp` (`--ids`, the full run's `data/holder_full_ids.csv`) and the pilot
+  ids (`--pilot-ids`, `data/holder_pilot_ids.csv`). Defaults, from the repo root:
+  `data/holders`, `data/holder_full_ids.csv`, `data/holder_pilot_ids.csv`, and
+  `data/dead7_trial` for the output (a new folder `<YYYYMMDD-HHMM UTC>/` with
+  `report.md` and `summary.json`; same `--out` rules and exit codes as
+  `holders_report.py`).
+- **Rows:** the ids file's calls with a view row that the 7d bucket can use (first
+  call, a pool, USD, a 7d return, no extreme outcome) and an analysable export row
+  (as in the holder analysis), joined on `call_id`. Label: `grp` is `dead7` (1), any
+  other group (0). Only `pre_hold_sellers` is read from the export (an allowlist).
+  Every drop is counted in the report. Export rows for calls not in the ids file are
+  ignored and counted (`holders_report.py` refuses them).
+- **Models:** two LightGBM `dead7` classifiers per seed and window, on the same rows:
+  "without" = the live inputs (`FEATURES` through `build_features`), "with" = the same
+  plus the raw `pre_hold_sellers` count (NULL stays missing). A plain LightGBM fit,
+  with no validation part and no calibrator (as the dead score's walk-forward does per
+  week, but with one fixed round count, `DEAD7_ROUNDS` (150), instead of the dead
+  score's own tuned round count), for both arms, every window and every seed. No early
+  stopping, no tuning. `train()` still refuses any `pre_hold_*` name in `FEATURES`.
+- **Mode `trial` (default):** weekly expanding walk-forward (as the gates), 7-day
+  embargo. A week's test rows are its calls minus the pilot ids; pilot calls can be
+  training rows. A week counts only with >= 1,000 training rows, >= 50 test rows and
+  >= 5 `dead7` test rows. Counted weeks are pooled, each week scored by its own models.
+- **Mode `confirm`:** one split. Train on calls posted before 9 Oct 2026 00:00 UTC
+  (pilot included), test on calls posted from 16 Oct 2026 00:00 UTC. With fewer than
+  100 `dead7` test rows the result is NOT JUDGED ("needs 100 dead7; deadline
+  31 Jan 2027, then the owner decides").
+
+The rules (owner, 29 Oct 2026; `DEAD7_*` in `config.py`, literal values,
+`DEAD7_RULES_SET_ON`):
+
+- R0 (trial only): at least 2 counted weeks, else NOT JUDGED.
+- R1: the median over the 7 seeds (7, 11, 23, 31, 47, 61, 89) of the pooled ROC AUC
+  delta (with minus without, same seed) > 0.
+- R2: seed 7, the paired pooled AUC delta's 95 % lower bound > 0. Percentile
+  bootstrap, 2,000 reps, seed 7. Test rows are resampled within week x class (confirm:
+  within class), with the same resample for both arms. The week-block interval is
+  shown for information.
+- R3: seed 7. Skip the top 30 % of each week by the "with" score, as the collapse
+  filter does. "dead7 caught" lower bound > 0.30, "kept minus all" (net 7d return,
+  capped at `SIM_MAX_RET_PCT`) lower bound > 0, and the caught share of "with" at least
+  that of "without". The bootstrap is the collapse filter's week-block one (confirm:
+  within class). The first two parts test the filter itself; R1 and R2 test sellers.
+- R4: direction. The AUC of raw `pre_hold_sellers` for `dead7` on the pooled test
+  rows > 0.5, and (seed 7) the mean score change when `pre_hold_sellers` moves from
+  its training part's 25th to its 75th percentile, other inputs unchanged, > 0.
+- R5: drift, as the wallet drift rule. The adversarial AUC of "with" is at most
+  0.02 above "without", and `pre_hold_sellers` is not among the top 3 drifting
+  inputs with a gain share >= 0.40. Trial: the first counted week's training part
+  vs the pooled test rows. Confirm: train vs test.
+- Result: FAIL if any rule fails (even if another is n/a), else NOT JUDGED if any is
+  n/a, PASS only if all pass. A trial PASS reads "provisional PASS: must hold again
+  in the confirmation run".
+
+The report also shows, for information only: the Spearman correlation of
+`pre_hold_sellers` with each `pre_sells_*` input, and the pilot rows in training.
+Dates in the report are UTC. It holds counts and metrics only, plus the sha256 of
+each input file.
+
 ## Layout and tests
 
     scout_ml/config.py    buckets, thresholds, feature lists, forbidden columns, gates
@@ -1093,9 +1163,10 @@ each input file, so it is safe to paste back.
     scout_ml/wallet_rep.py   live-buy wallet reputation (wrep_* columns; a report-only variant)
     scout_ml/promote.py   promote / rollback / status checks (promote.py is its command line)
     scout_ml/holders.py   holder pilot analysis, report only (holders_report.py is its command line)
-    train.py  serve.py  promote.py  holders_report.py  make_synthetic.py  tests/
+    scout_ml/dead7.py     the dead7 trial, report only (dead7_trial.py is its command line)
+    train.py  serve.py  promote.py  holders_report.py  dead7_trial.py  make_synthetic.py  tests/
 
-    python -m pytest tests -q        # 480 tests: 480 passed on Linux; on Windows 479 passed, 1 skipped (POSIX-only), about 7 minutes
+    python -m pytest tests -q        # 583 tests: 583 passed on Linux; on Windows 582 passed, 1 skipped (POSIX-only), about 9 minutes
 
 `scout_ml/wallet_rep.py` (`wrep_frame(df, live_buys)`) scores the wallets in
 each call's live buys (the `-export-live-buys` CSV) by how the earlier first
