@@ -4,7 +4,7 @@
 
 This section supersedes the ones below wherever they differ.
 
-**Update, 29 Oct about 17:30 PDT (30 Oct 00:30 UTC): `dead7` trial
+**Update, 29 Oct 22:15 PDT (30 Oct 05:15 UTC): `dead7` trial
 rules approved; trial being built.**
 - Owner approved the trial's rules R0-R5, the confirmation run (>= 100
   `dead7` among calls from 16 Oct 00:00 UTC; deadline 31 Jan 2027) and
