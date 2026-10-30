@@ -1,8 +1,55 @@
 # Scout analytics: handoff to Claude Code
 
-## Session state (29 Oct 2026 PDT (30 Oct UTC): main 18d1ebe after #42-#78)
+## Session state (30 Oct 2026 PDT: main 9166f7e after #42-#81)
 
 This section supersedes the ones below wherever they differ.
+
+**Update, 30 Oct 12:45 PDT (19:45 UTC): `dead7` trial FAIL; the holder
+work stops.**
+- Merged: #80 (the trial's rules in the PM skill) 29 Oct 23:04 PDT
+  (30 Oct 06:04 UTC); #81 (`ml/dead7_trial.py`, report only, RUNBOOK
+  step 11) 30 Oct 12:21 PDT (19:21 UTC).
+- The owner ran it once, on a fresh dataset export (11,164 view rows):
+  report run 20261030-1921 UTC (30 Oct 12:21 PDT). **Result: FAIL**
+  (R2 and R5).
+  - Inputs: 4,760 ids (1,467 `dead7`); dropped 18 not usable at 7d
+    (14 no pool, 2 not USD, 2 extreme outcome) and 2 incomplete;
+    analysed 4,740 (1,462 `dead7`), 28 Jul - 15 Oct 2026 UTC; the
+    pilot's 450 in training only.
+  - 5 counted weeks (8 Sep - 6 Oct UTC); pooled test rows 2,195 (628
+    `dead7`); seed 7 AUC without sellers 0.857, with 0.860.
+  - R0 PASS (5 weeks). R1 PASS: median delta +0.003 (per seed 0.000 to
+    +0.005). **R2 FAIL**: seed 7 delta +0.003, 95 % -0.001 to 0.008
+    (week-block interval -0.003 to 0.012, information only). R3 PASS:
+    `dead7` caught 0.629 with sellers (95 % 0.550-0.845) vs 0.621
+    without; kept minus all +4.98 % net 7d (95 % 2.08-7.07). R4 PASS:
+    raw AUC 0.798, score change +0.0286. **R5 FAIL**: adversarial AUC
+    0.915 with vs 0.866 without, rise 0.048 (> 0.02); sellers is the
+    2nd drifting input at gain share 0.11 (`live_buy_max_usd` 0.24
+    first), so the top-3 part passes.
+- Reading: sellers alone separates `dead7` (0.798), but on top of the
+  live inputs, which already hold `pre_sells_*` (Spearman with
+  `pre_sells_60m` 0.400), it adds about +0.003 AUC, inside the noise.
+  Adding it also makes the training and test rows easier to tell apart
+  (adversarial AUC 0.866 to 0.915): its values moved over the period;
+  it ranks second among drifting inputs, behind `live_buy_max_usd`.
+  R3's first two parts test the filter itself (as the collapse filter
+  rule does), not sellers; its third part passed on 0.629 >= 0.621.
+- Per the owner's approved rule ("FAIL at either step: the holder work
+  stops"): stopped. No confirmation run (the ids file for calls from
+  16 Oct is no longer needed), no live-use plan, no re-run with other
+  settings. The holder export, holder report and trial code stay in
+  the repo unused; nothing on prod changed (the trial writes nothing
+  live). The owner-deferred `...7777` item under "Deferred / open" is
+  moot while the holder work is stopped.
+- Still open for the owner: tracker restart for #71/#72 (not
+  confirmed); dropping the backup tables
+  `scout_call_tracking_bak_price_rug_fill_20261020` and
+  `scout_call_tracking_bak_park_stuck_20261022`; the `-web` legend
+  check from #45; PC worktree clean-up. Optional: the holder files on
+  the server (`data/holders`, `data/holders_new`, the
+  `data/holder_*ids.csv` files, `data/dead7_trial`) can be kept or
+  deleted; nothing reads them now.
 
 **Update, 29 Oct 22:15 PDT (30 Oct 05:15 UTC): `dead7` trial
 rules approved; trial being built.**
@@ -2158,7 +2205,8 @@ rug-time decision (A or B) are in the top section.
   curve as venues. So the pilot leaves them out (Q6: `NOT ends7777`).
   To look at again after the pilot: if the holder data shows a signal,
   find that launchpad's contract and events and add it as a venue (its
-  own PR), then include these tokens.
+  own PR), then include these tokens. Moot since 30 Oct 2026 while the
+  holder work is stopped (the `dead7` trial failed; top section).
 
 Kept current by the PM whenever an item is deferred or an owner check is
 pending (14 October 2026 UTC). Everything through PR #53 is on `main`
