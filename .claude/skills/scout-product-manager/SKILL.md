@@ -735,6 +735,17 @@ Every Go start applies `scoutanalytics.sql` unless `SCOUT_DB_AUTO_MIGRATE=false`
   reached a pool), which the export does not know as a venue, so their
   holder numbers would likely be wrong. Adding that launchpad as a venue is a deferred item in
   `HANDOFF.md` ("Deferred / open"), to look at again after the pilot.
+- 29 Oct (owner, "B"), on the PM's three options after the weekly
+  count showed the scout channel's first calls down from about 880 a
+  week (early September) to about 70 (mid-October), with no calls
+  missed by the pipeline: the `dead7` trial (the 23 Oct P2 PASS step)
+  runs now on the full run's calls (walk-forward by week, the pilot's
+  450 never in a test week), with its pass rules fixed and put to the
+  owner before any result. Because these calls already confirmed P2, a
+  pass is provisional: it must hold again on calls posted from 16 Oct
+  2026 00:00 UTC on, once there are enough of them. Not chosen: (A)
+  wait for new calls only (about late December or January at that
+  volume); (C) pause the holder and model work.
 - 29 Oct (owner, "new calls only"), on the PM's recommendation of 24
   Oct (the owner made the new-calls ids file before the P2 report ran
   and confirmed it in words after): the P2 rule is judged on the

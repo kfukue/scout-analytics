@@ -1,8 +1,51 @@
 # Scout analytics: handoff to Claude Code
 
-## Session state (29 Oct 2026 PDT (29 Oct UTC): main 5136017 after #42-#76)
+## Session state (29 Oct 2026 PDT (30 Oct UTC): main 18d1ebe after #42-#78)
 
 This section supersedes the ones below wherever they differ.
+
+**Update, 29 Oct evening PDT (30 Oct UTC): call volume fell about
+12x; `dead7` trial runs now on the full run's calls (owner "B").**
+- Two read-only weekly counts (owner, 29 Oct), UTC weeks from Monday:
+
+  | week | posts | calls | first calls, on-chain entry | done 7d | dead7 |
+  |---|---|---|---|---|---|
+  | 31 Aug | 2,038 | 876 | 869 | 866 | 360 |
+  | 7 Sep | 1,915 | 897 | 874 | 872 | 385 |
+  | 14 Sep | 1,121 | 599 | 593 | 593 | 182 |
+  | 21 Sep | 839 | 441 | 438 | 438 | 82 |
+  | 28 Sep | 838 | 478 | 474 | 474 | 82 |
+  | 5 Oct | 305 | 143 | 143 | 143 | 21 |
+  | 12 Oct | 185 | 86 | 80 | 80 | 17 |
+  | 19 Oct | 138 | 69 | 67 | 39 | 9 |
+  | 26 Oct (Mon-Thu) | 75 | 46 | 44 | 0 | 0 |
+
+  The first-calls count rebuilds Q7 from Q6 (`holder_p0.sql`) without
+  the 16 Oct cut-off; Q7's own SQL text is not saved in the repo. Its
+  28 Sep week (474) matched the expected size, so the filters agree.
+- Reading: the channel slowed; the pipeline misses nothing (every call
+  has a tracking row bar one in the 28 Sep week; on-chain entries
+  match calls; no call older than 8 days lacks its 7d result;
+  `gave_up`/`error` a handful a week). The `dead7` share also fell,
+  from about 42-44 % (early Sep) to 15-23 % (Oct).
+- Side note, not checked: until 28 Sep nearly every update post had
+  status `repeat` (posts minus calls about equals `repeat`); in the
+  5 Oct week 34 of about 162, from 12 Oct none. Updates are outside
+  the model's population.
+- Correction to the update below: "432 analysable calls (week of 28
+  Sep) to 104 (week of 5 Oct)" were the report's analysable new calls
+  only; the population is 474 to 143.
+- Owner, 29 Oct ("B", in the PM skill): the `dead7` trial runs now on
+  the full run's calls, walk-forward by week, the pilot's 450 never in
+  a test week; its pass rules go to the owner before any result; a
+  pass is provisional and must hold again on calls from 16 Oct 00:00
+  UTC on, once there are enough. Not chosen: wait for new calls only
+  (about late December or January at this volume); pause the work.
+- Owner, 29 Oct: "ignore my node its up to date": the 25 Oct node
+  stall and the 29 Oct lag are closed without a cause found.
+- Next: the PM puts the trial's exact pass rules to the owner; then
+  `implement` builds the report-only trial (no Go, database or view
+  change; the saved model untouched).
 
 **Update, 29 Oct 16:10 PDT (23:10 UTC): full holder run done; P2 rule
 PASS on the 4,310 new calls.**
@@ -56,9 +99,8 @@ PASS on the 4,310 new calls.**
   questions are with the PM until then). Serving the feature live
   is a later question: the export takes 10-40 s a call against a 10 s
   delivery budget.
-- Still open for the owner: node log for the 25 Oct stall and the 29
-  Oct lag (the tracker reads the same node); tracker
-  restart for #71/#72 (not confirmed); dropping the backup tables
+- Still open for the owner (node item closed in the update above):
+  tracker restart for #71/#72 (not confirmed); dropping the backup tables
   `scout_call_tracking_bak_price_rug_fill_20261020` and
   `scout_call_tracking_bak_park_stuck_20261022`; the `-web` legend
   check from #45; PC worktree clean-up.
