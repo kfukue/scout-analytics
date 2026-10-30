@@ -176,6 +176,9 @@ TIMING_RUG_OUTCOMES = ["peak_late_after_s", "first_2x_after_s", "above_2x_s",
 # Holder export (-export-holders, ../holders_columns.go; tests/test_holder_columns.py
 # reads its json tags). pre_hold_* stops at the call's entry block: every one is
 # either a feature (HOLD_FEATURES) or left out with its reason (HOLD_EXCLUDED).
+# None is an input of the saved model: train() refuses a HOLD_PREFIX name in FEATURES
+# (serving has no holder data; the dead7 trial below tests one, report only).
+HOLD_PREFIX = "pre_hold_"
 HOLD_FEATURES = tuple(f"pre_hold_{n}" for n in (
     "launch_age_s", "transfers", "holders", "buyers", "sellers", "buys", "sells",
     "sell_buy_ratio", "first_buy_to_entry_blocks", "snipers", "first_block_buyers",
@@ -260,6 +263,65 @@ HOLD_P2_FWD_DELTA_LOWER = 0.0
 # Owner, 24 Oct 2026 ("ok go with your recommendation"): the feature must point the same way
 # as in the pilot, more sellers before the call -> more likely dead7.
 HOLD_P2_DIRECTION = "higher"
+
+# --- dead7 trial (dead7_trial.py, scout_ml/dead7.py; report only, nothing saved or served) ---
+# Does pre_hold_sellers add to the live model's inputs (FEATURES via build_features) for
+# predicting dead7 (the ids file's grp == "dead7") vs the rest? Two LightGBM classifiers per
+# seed and window on the same rows: "without" = FEATURES, "with" = FEATURES + DEAD7_FEATURE
+# (raw count, NULL stays NaN). Rules approved by the owner on 29 Oct 2026 PDT (30 Oct UTC),
+# fixed before the trial was built or run: one run, no re-run with changed settings.
+# Literal values on purpose (as WREP_ADOPTION / FILTER_RULES): a later change of the settings
+# named in the comments must not move these. Each comment names the setting it equalled then.
+DEAD7_RULES_SET_ON = "29 Oct 2026"
+DEAD7_FEATURE = "pre_hold_sellers"     # the only column taken from the holder export (an allowlist)
+DEAD7_GROUP = "dead7"                  # label 1 = this ids-file group, 0 = every other group
+DEAD7_HORIZON_DAYS = 7                 # walk-forward embargo: training calls posted before week start - 7 d
+DEAD7_ROUNDS = 150                     # one fixed LightGBM round count, both arms, every window and seed
+                                       # (= FALLBACK_ROUNDS); no early stopping, no tuning
+DEAD7_SEEDS = (7, 11, 23, 31, 47, 61, 89)   # = STABILITY_SEEDS; R1 takes the median over them
+DEAD7_SEED = 7                         # = LGBM_SEED: the seed of R2-R5 and the per-week table
+# R0, trial mode: a weekly walk-forward week COUNTS only with at least these (test rows after
+# removing the pilot ids); fewer than DEAD7_MIN_WEEKS counted weeks: NOT JUDGED (never PASS).
+DEAD7_MIN_TRAIN_ROWS = 1000            # = WF_MIN_TRAIN_ROWS
+DEAD7_MIN_TEST_ROWS = 50               # = MIN_WINDOW_TEST_ROWS
+DEAD7_MIN_TEST_DEAD7 = 5
+DEAD7_MIN_WEEKS = 2
+# R1: median over DEAD7_SEEDS of the pooled ROC AUC delta (with minus without) > this.
+DEAD7_MIN_MEDIAN_DELTA = 0.0
+# R2 (seed DEAD7_SEED): paired pooled AUC delta, 95 % percentile bootstrap lower bound > this;
+# test rows resampled within week x class (confirm mode: within class), the same resample for
+# both arms. The week-block interval is information only.
+DEAD7_MIN_DELTA_LOWER = 0.0
+DEAD7_BOOT_REPS = 2000                 # = POOLED_BOOTSTRAP_REPS / HOLD_BOOTSTRAP_REPS
+DEAD7_BOOT_SEED = 7                    # = POOLED_BOOTSTRAP_SEED / HOLD_BOOTSTRAP_SEED
+DEAD7_CI = (2.5, 97.5)                 # percentiles (= HOLD_CI; POOLED_CI as fractions)
+# R3 (seed DEAD7_SEED): skip the top DEAD7_SKIP_FRAC per counted week by the "with" score, as the
+# collapse filter (validate.collapse_filter_sums / collapse_filter_rates, its week-block bootstrap,
+# net 7d return capped at SIM_MAX_RET_PCT): "dead7 caught" lower bound > DEAD7_MIN_CAUGHT_LOWER,
+# "kept minus all" lower bound > DEAD7_MIN_KEPT_MINUS_ALL_LOWER, and caught (point) of "with" >=
+# caught (point) of "without".
+DEAD7_SKIP_FRAC = 0.30                 # = SKIP_FRAC
+DEAD7_MIN_CAUGHT_LOWER = 0.30          # = FILTER_RULES["min_caught_lower"]
+DEAD7_MIN_KEPT_MINUS_ALL_LOWER = 0.0   # = FILTER_RULES["min_kept_minus_all_lower"]
+# R4: direction "higher": (i) ROC AUC of raw DEAD7_FEATURE for dead7 on the pooled test rows > 0.5;
+# (ii) seed DEAD7_SEED: mean(score at the training part's 75th percentile of DEAD7_FEATURE minus
+# score at its 25th), other inputs unchanged, > 0.
+DEAD7_MIN_RAW_AUC = 0.5
+DEAD7_PD_QUANTILES = (25, 75)
+DEAD7_MIN_PD_DELTA = 0.0
+# R5: drift, as the wallet reputation drift rule (WREP_ADOPTION): adversarial AUC of "with" <=
+# "without" + DEAD7_MAX_ADV_AUC_RISE, and DEAD7_FEATURE not among the top DEAD7_DRIFT_TOP drifting
+# inputs of "with" at a gain share >= DEAD7_DRIFT_MAX_SHARE.
+DEAD7_MAX_ADV_AUC_RISE = 0.02          # = WREP_ADOPTION["max_adv_auc_rise"]
+DEAD7_DRIFT_TOP = 3                    # = WREP_ADOPTION["drift_top"]
+DEAD7_DRIFT_MAX_SHARE = 0.40           # = WREP_ADOPTION["drift_max_share"]
+# Confirmation run (--mode confirm): one split, train on calls posted before DEAD7_CONFIRM_TRAIN_END
+# (pilot included), test on calls posted from DEAD7_CONFIRM_TEST_START; NOT JUDGED while the test
+# rows hold fewer than DEAD7_CONFIRM_MIN_DEAD7 dead7 (deadline: then the owner decides).
+DEAD7_CONFIRM_TRAIN_END = "2026-10-09T00:00:00Z"
+DEAD7_CONFIRM_TEST_START = "2026-10-16T00:00:00Z"
+DEAD7_CONFIRM_MIN_DEAD7 = 100
+DEAD7_CONFIRM_DEADLINE = "31 Jan 2027"
 FORBIDDEN_COLUMNS = (set(BOOKKEEPING) - {"quote_asset"} | set(IDENTITY)
                      | {"pre_vol_unit", "token_name", "post_kind"} | set(LATEST)
                      | set(TRACKER_DISCOVERY) | set(AFTER_CALL_VIEW)

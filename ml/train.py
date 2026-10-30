@@ -1086,6 +1086,10 @@ def train(df: pd.DataFrame, out_root, version: str | None = None, variants: bool
         raise ValueError(f"the saved model's inputs (config FEATURES) must not include the "
                          f"wallet reputation columns {leaked}; set WALLET_REP = False (the "
                          "WALLET_REP_VARIANTS test them, report only)")
+    held = [c for c in C.FEATURES if c.startswith(C.HOLD_PREFIX)]
+    if held:   # holder export columns: serving has no holder data (dead7_trial.py tests one, report only)
+        raise ValueError(f"the saved model's inputs (config FEATURES) must not include the "
+                         f"holder export columns {held}")
     diag = diagnostics_on(diagnostics)
     version = version or version_name()
     out_dir = new_version_dir(out_root, version)
