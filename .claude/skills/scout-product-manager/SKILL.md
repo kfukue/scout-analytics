@@ -766,7 +766,9 @@ Every Go start applies `scoutanalytics.sql` unless `SCOUT_DB_AUTO_MIGRATE=false`
   brings what there is and the owner decides to judge or stop.
   Provisional PASS: nothing live. Confirmed PASS: the PM brings a
   separate plan for live use. FAIL at either step: the holder work
-  stops.
+  stops. Result (report 20261030-1921 UTC, 30 Oct 12:21 PDT): FAIL
+  (R2 lower bound -0.001; R5 adversarial AUC rise 0.048 > 0.02); the
+  holder work has stopped, with no confirmation run and no live plan.
 - 29 Oct (owner, "B"), on the PM's three options after the weekly
   count showed the scout channel's first calls down from about 880 a
   week (early September) to about 70 (mid-October), with no calls
